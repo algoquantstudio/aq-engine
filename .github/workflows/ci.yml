@@ -1,0 +1,25 @@
+name: AQE CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    name: Check AQE
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check default features
+        run: cargo check
+
+      - name: Check runtime features
+        run: cargo check --features runtime
+
+      - name: Test runtime features
+        run: cargo test --features runtime

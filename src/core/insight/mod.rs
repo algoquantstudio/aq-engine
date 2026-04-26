@@ -3,13 +3,13 @@ mod insight;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod snapshot;
 pub mod types;
+use crate::core::broker::types::Order;
 #[cfg(not(target_arch = "wasm32"))]
 pub use insight::Insight;
 #[cfg(not(target_arch = "wasm32"))]
 pub use insight::InsightStrategyContext;
 #[cfg(not(target_arch = "wasm32"))]
 pub use snapshot::{InsightPartialCloseSnapshot, InsightSnapshot, InsightStateHistorySnapshot};
-use crate::core::broker::types::Order;
 use std::collections::{HashMap, HashSet};
 use types::InsightState;
 use uuid::Uuid;

@@ -313,6 +313,8 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str("use aq_engine::core::strategy::{AqsAuth, StrategyState, Strategy, StrategyContext, StrategyMode};\n");
     src.push_str("use aq_engine::core::strategy::traits::BrokerAccess;\n");
     src.push_str("use aq_engine::core::broker::paper_broker::PaperBroker;\n");
+    src.push_str("use aq_engine::core::broker::mt5_broker::Mt5Broker;\n");
+    src.push_str("use aq_engine::core::broker::data_feeds::mt5::Mt5DataFeed;\n");
     src.push_str("use aq_engine::core::broker::data_feeds::yahoo::YahooFinanceDataFeed;\n");
     src.push_str("use aq_engine::core::broker::UnifiedBroker;\n");
     src.push_str("use aq_engine::core::broker::types::{Asset, BarData, AccountType};\n");
@@ -488,31 +490,44 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         meta.config.timeframe_amount, meta.config.timeframe_unit
     ));
 
+    let uses_mt5 = meta.broker == crate::node::types::ExecutionBrokerType::Mt5
+        || meta.data_feed == crate::node::types::DataFeedType::Mt5;
+
     // Broker
-    src.push_str("    let data_feed = YahooFinanceDataFeed::new();\n");
-    src.push_str("    let execution = if is_live {\n");
-    match meta.broker {
-        crate::node::types::ExecutionBrokerType::Paper => {
-            src.push_str(&format!(
-                "        PaperBroker::new(AccountType::Paper, {:.1}, 1)\n",
-                meta.config.starting_cash
-            ));
-        }
+    if uses_mt5 {
+        src.push_str("    if !is_live {\n");
+        src.push_str("        eprintln!(\"MT5 is live-only in AQE v1. Select Paper/Yahoo for backtests.\");\n");
+        src.push_str("        std::process::exit(1);\n");
+        src.push_str("    }\n");
+        src.push_str("    let data_feed = Mt5DataFeed::from_env().unwrap_or_else(|error| {\n");
+        src.push_str("        eprintln!(\"Failed to initialise MT5 data feed: {:?}\", error);\n");
+        src.push_str("        std::process::exit(1);\n");
+        src.push_str("    });\n");
+        src.push_str("    let execution = Mt5Broker::from_env().unwrap_or_else(|error| {\n");
+        src.push_str("        eprintln!(\"Failed to initialise MT5 broker: {:?}\", error);\n");
+        src.push_str("        std::process::exit(1);\n");
+        src.push_str("    });\n");
+        src.push_str("    let broker = UnifiedBroker::new(execution, data_feed);\n\n");
+    } else {
+        src.push_str("    let data_feed = YahooFinanceDataFeed::new();\n");
+        src.push_str(&format!(
+            "    let execution = PaperBroker::new(AccountType::Paper, {:.1}, 1);\n",
+            meta.config.starting_cash
+        ));
+        src.push_str("    let broker = UnifiedBroker::new(execution, data_feed);\n\n");
     }
-    src.push_str("    } else {\n");
-    src.push_str(&format!(
-        "        PaperBroker::new(AccountType::Paper, {:.1}, 1)\n",
-        meta.config.starting_cash
-    ));
-    src.push_str("    };\n");
-    src.push_str("    let broker = UnifiedBroker::new(execution, data_feed);\n\n");
 
     // Strategy State
     src.push_str(&format!(
-        "    let mut state = StrategyState::new(\n        \"{name}\".to_string(),\n        \"{version}\".to_string(),\n        {struct_name} {{}},\n        broker,\n        if is_live {{ StrategyMode::Live }} else {{ StrategyMode::Backtest }},\n        timeframe,\n    );\n\n",
+        "    let mut state = StrategyState::new(\n        \"{name}\".to_string(),\n        \"{version}\".to_string(),\n        {struct_name} {{}},\n        broker,\n        {mode},\n        timeframe,\n    );\n\n",
         name = meta.name,
         version = meta.version,
         struct_name = strategy_name,
+        mode = if uses_mt5 {
+            "StrategyMode::Live".to_string()
+        } else {
+            "if is_live { StrategyMode::Live } else { StrategyMode::Backtest }".to_string()
+        },
     ));
     // Set strategy Id
     src.push_str(&format!(
@@ -521,7 +536,11 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     ));
 
     // (Components and risk params are now registered inside on_start)
-    src.push_str("    if is_live {\n");
+    if uses_mt5 {
+        src.push_str("    {\n");
+    } else {
+        src.push_str("    if is_live {\n");
+    }
     src.push_str("        let session_secret = args.iter().position(|a| a == \"--session-secret\").and_then(|i| args.get(i+1)).cloned().unwrap_or_default();\n");
     src.push_str("        let access_method = args.iter().position(|a| a == \"--access-method\").and_then(|i| args.get(i+1)).cloned().unwrap_or_else(|| \"aqe_live\".to_string());\n");
     src.push_str("        let strategy_id = args.iter().position(|a| a == \"--strategy-id\").and_then(|i| args.get(i+1)).cloned().unwrap_or_default();\n");
@@ -548,49 +567,57 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str("            eprintln!(\"Live execution failed: {:?}\", e);\n");
     src.push_str("            std::process::exit(1);\n");
     src.push_str("        }\n");
-    src.push_str("    } else {\n");
-    src.push_str("        // Run backtest with configured start and end timestamps\n");
-    if let Some(ref s_time) = meta.config.start_time {
-        src.push_str(&format!("        let start = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now() - chrono::Duration::days(30));\n", s_time));
-    } else {
-        src.push_str("        let start = Utc::now() - chrono::Duration::days(30);\n");
-    }
+    if !uses_mt5 {
+        src.push_str("    } else {\n");
+        src.push_str("        // Run backtest with configured start and end timestamps\n");
+        if let Some(ref s_time) = meta.config.start_time {
+            src.push_str(&format!("        let start = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now() - chrono::Duration::days(30));\n", s_time));
+        } else {
+            src.push_str("        let start = Utc::now() - chrono::Duration::days(30);\n");
+        }
 
-    if let Some(ref e_time) = meta.config.end_time {
-        src.push_str(&format!("        let end = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now());\n\n", e_time));
+        if let Some(ref e_time) = meta.config.end_time {
+            src.push_str(&format!("        let end = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now());\n\n", e_time));
+        } else {
+            src.push_str("        let end = Utc::now();\n\n");
+        }
+        src.push_str("        match state.run_backtest(start, end, timeframe).await {\n");
+        src.push_str("            Ok(results) => {\n");
+        src.push_str(
+            "                info!(\"═══════════════════ Backtest Results ═══════════════════\");\n",
+        );
+        src.push_str("                results.print_metrics();\n");
+        src.push_str("                info!(\"Insights generated: {}\", state.insights.len());\n");
+        src.push_str(
+            "                info!(\"Insights: {:#?}\", state.insights.get_state_count());\n",
+        );
+        src.push_str("                let run_id = Uuid::new_v4().to_string();\n");
+        src.push_str("                let out_dir = std::env::current_dir().unwrap_or_default().join(\"backtests\").join(&run_id);\n");
+        src.push_str("                if let Err(e) = results.save_to_disk_async(&out_dir, &*state.broker.backtest_state.as_ref().unwrap().read()).await {\n");
+        src.push_str("                    eprintln!(\"Failed to save results to disk: {}\", e);\n");
+        src.push_str("                } else {\n");
+        src.push_str(
+            "                    if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {\n",
+        );
+        src.push_str(
+            "                        println!(\"RESULTS_SAVED_TO: {}\", abs_path.display());\n",
+        );
+        src.push_str("                    } else {\n");
+        src.push_str(
+            "                        println!(\"RESULTS_SAVED_TO: {}\", out_dir.display());\n",
+        );
+        src.push_str("                    }\n");
+        src.push_str("                }\n");
+        src.push_str("            }\n");
+        src.push_str("            Err(e) => {\n");
+        src.push_str("                eprintln!(\"Backtest failed: {:?}\", e);\n");
+        src.push_str("                std::process::exit(1);\n");
+        src.push_str("            }\n");
+        src.push_str("        }\n");
+        src.push_str("    }\n");
     } else {
-        src.push_str("        let end = Utc::now();\n\n");
+        src.push_str("    }\n");
     }
-    src.push_str("        match state.run_backtest(start, end, timeframe).await {\n");
-    src.push_str("            Ok(results) => {\n");
-    src.push_str(
-        "                info!(\"═══════════════════ Backtest Results ═══════════════════\");\n",
-    );
-    src.push_str("                results.print_metrics();\n");
-    src.push_str("                info!(\"Insights generated: {}\", state.insights.len());\n");
-    src.push_str("                info!(\"Insights: {:#?}\", state.insights.get_state_count());\n");
-    src.push_str("                let run_id = Uuid::new_v4().to_string();\n");
-    src.push_str("                let out_dir = std::env::current_dir().unwrap_or_default().join(\"backtests\").join(&run_id);\n");
-    src.push_str("                if let Err(e) = results.save_to_disk_async(&out_dir, &*state.broker.backtest_state.as_ref().unwrap().read()).await {\n");
-    src.push_str("                    eprintln!(\"Failed to save results to disk: {}\", e);\n");
-    src.push_str("                } else {\n");
-    src.push_str("                    if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {\n");
-    src.push_str(
-        "                        println!(\"RESULTS_SAVED_TO: {}\", abs_path.display());\n",
-    );
-    src.push_str("                    } else {\n");
-    src.push_str(
-        "                        println!(\"RESULTS_SAVED_TO: {}\", out_dir.display());\n",
-    );
-    src.push_str("                    }\n");
-    src.push_str("                }\n");
-    src.push_str("            }\n");
-    src.push_str("            Err(e) => {\n");
-    src.push_str("                eprintln!(\"Backtest failed: {:?}\", e);\n");
-    src.push_str("                std::process::exit(1);\n");
-    src.push_str("            }\n");
-    src.push_str("        }\n");
-    src.push_str("    }\n");
     src.push_str("}\n");
 
     Ok(src)

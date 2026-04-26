@@ -1,5 +1,7 @@
 use super::traits::{DataFeed, DataProvider, OrderManagementProvider};
-use super::types::{AccountType, Asset, Bar, BrokerError, OrderSide, OrderType, Quote, TradeUpdateEvent};
+use super::types::{
+    AccountType, Asset, Bar, BrokerError, OrderSide, OrderType, Quote, TradeUpdateEvent,
+};
 use super::{DataStreamMode, UnifiedBroker, paper_broker::PaperBroker};
 use crate::core::insight::Insight;
 use crate::core::insight::types::StrategyType;

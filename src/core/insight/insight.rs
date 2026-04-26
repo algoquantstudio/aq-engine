@@ -1169,8 +1169,8 @@ mod tests {
     use super::*;
     use crate::core::alpha::WrappedAlphaModel;
     use crate::core::broker::types::{
-        Account, AccountType, Asset, AssetExchange, AssetStatus, AssetType, BrokerError,
-        OrderSide, Quote,
+        Account, AccountType, Asset, AssetExchange, AssetStatus, AssetType, BrokerError, OrderSide,
+        Quote,
     };
     use crate::core::indicators::Indicator;
     use crate::core::pipeline::WrappedInsightPipe;
@@ -1419,11 +1419,15 @@ mod tests {
         assert_eq!(insight.state, InsightState::Rejected);
         assert!(ctx.canceled_orders.borrow().is_empty());
         assert!(ctx.closed_positions.borrow().is_empty());
-        assert!(insight
-            .state_history
-            .iter()
-            .any(|(_, state, message)| *state == InsightState::Rejected
-                && message.as_deref().is_some_and(|value| value.contains("Expired before submission fill window elapsed"))));
+        assert!(
+            insight
+                .state_history
+                .iter()
+                .any(|(_, state, message)| *state == InsightState::Rejected
+                    && message.as_deref().is_some_and(
+                        |value| value.contains("Expired before submission fill window elapsed")
+                    ))
+        );
     }
 
     #[test]
@@ -1442,11 +1446,12 @@ mod tests {
         assert!(insight.cancelling);
         assert_eq!(ctx.canceled_orders.borrow().as_slice(), ["order-123"]);
         assert!(ctx.closed_positions.borrow().is_empty());
-        assert!(insight
-            .state_history
-            .iter()
-            .any(|(_, state, message)| *state == InsightState::Executed
-                && message.as_deref().is_some_and(|value| value.contains("cancel requested"))));
+        assert!(insight.state_history.iter().any(|(_, state, message)| {
+            *state == InsightState::Executed
+                && message
+                    .as_deref()
+                    .is_some_and(|value| value.contains("cancel requested"))
+        }));
     }
 
     #[test]
@@ -1472,12 +1477,11 @@ mod tests {
             ctx.closed_positions.borrow().as_slice(),
             [("order-456".to_string(), 1.0, None)]
         );
-        assert!(insight
-            .state_history
-            .iter()
-            .any(|(_, state, message)| *state == InsightState::Filled
+        assert!(insight.state_history.iter().any(|(_, state, message)| {
+            *state == InsightState::Filled
                 && message
                     .as_deref()
-                    .is_some_and(|value| value.contains("Take-profit time window expired"))));
+                    .is_some_and(|value| value.contains("Take-profit time window expired"))
+        }));
     }
 }

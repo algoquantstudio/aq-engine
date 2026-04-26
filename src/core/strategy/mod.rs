@@ -153,9 +153,7 @@ where
             || message.contains("http error")
     }
 
-    async fn connect_live_sync_db(
-        auth: &AqsAuth,
-    ) -> Option<surrealdb::Surreal<any::Any>> {
+    async fn connect_live_sync_db(auth: &AqsAuth) -> Option<surrealdb::Surreal<any::Any>> {
         let signin_session_id = auth.session_id.clone();
         info!(
             "Authenticating AQS Cloud live sync with session id: {}",
@@ -177,10 +175,7 @@ where
                     if attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS {
                         warn!(
                             "Transient AQS live sync connection error for strategy {} on attempt {}/{}: {}",
-                            auth.strategy_id,
-                            attempt,
-                            LIVE_SYNC_CONNECT_MAX_ATTEMPTS,
-                            message
+                            auth.strategy_id, attempt, LIVE_SYNC_CONNECT_MAX_ATTEMPTS, message
                         );
                         tokio::time::sleep(Duration::from_millis(
                             LIVE_SYNC_RETRY_BASE_MS * attempt as u64,
@@ -197,10 +192,7 @@ where
                     {
                         warn!(
                             "Transient AQS live sync connection error for strategy {} on attempt {}/{}: {}",
-                            auth.strategy_id,
-                            attempt,
-                            LIVE_SYNC_CONNECT_MAX_ATTEMPTS,
-                            error
+                            auth.strategy_id, attempt, LIVE_SYNC_CONNECT_MAX_ATTEMPTS, error
                         );
                         tokio::time::sleep(Duration::from_millis(
                             LIVE_SYNC_RETRY_BASE_MS * attempt as u64,
@@ -230,12 +222,12 @@ where
                                     ]),
                                 })
                                 .await
-                                .map_err(|e| format!("Failed to authenticate AQS Cloud live sync: {}", e))?;
-                            client
-                                .use_ns("aqs")
-                                .use_db("aqs")
-                                .await
-                                .map_err(|e| format!("Failed to select AQS database for live sync: {}", e))?;
+                                .map_err(|e| {
+                                    format!("Failed to authenticate AQS Cloud live sync: {}", e)
+                                })?;
+                            client.use_ns("aqs").use_db("aqs").await.map_err(|e| {
+                                format!("Failed to select AQS database for live sync: {}", e)
+                            })?;
                             Ok::<(), String>(())
                         },
                     )
@@ -277,8 +269,7 @@ where
                                 Err(_) => {
                                     warn!(
                                         "Timed out marking AQS live session active for strategy {} after {}s",
-                                        auth.strategy_id,
-                                        LIVE_SYNC_QUERY_TIMEOUT_SECS
+                                        auth.strategy_id, LIVE_SYNC_QUERY_TIMEOUT_SECS
                                     );
                                 }
                             }
@@ -308,8 +299,7 @@ where
                                 Err(_) => {
                                     warn!(
                                         "Timed out persisting AQS live sync lifecycle event for strategy {} after {}s",
-                                        auth.strategy_id,
-                                        LIVE_SYNC_QUERY_TIMEOUT_SECS
+                                        auth.strategy_id, LIVE_SYNC_QUERY_TIMEOUT_SECS
                                     );
                                 }
                             }
@@ -422,8 +412,7 @@ where
             Err(_) => {
                 warn!(
                     "Timed out creating AQS strategy action stream for strategy {} after {}s",
-                    auth.strategy_id,
-                    LIVE_SYNC_STREAM_TIMEOUT_SECS
+                    auth.strategy_id, LIVE_SYNC_STREAM_TIMEOUT_SECS
                 );
                 None
             }
@@ -479,8 +468,7 @@ where
                 *action_stream = None;
                 warn!(
                     "AQE live sync reconnect timed out for strategy {} after {}s; will retry on the next live loop tick",
-                    auth.strategy_id,
-                    LIVE_SYNC_RECONNECT_TIMEOUT_SECS
+                    auth.strategy_id, LIVE_SYNC_RECONNECT_TIMEOUT_SECS
                 );
             }
         }
@@ -516,7 +504,9 @@ where
             PendingAqsSyncOp::StrategyEvent(event) => {
                 persist_strategy_event(client, auth, event).await
             }
-            PendingAqsSyncOp::LiveMetrics(metrics) => persist_live_metrics(client, auth, metrics).await,
+            PendingAqsSyncOp::LiveMetrics(metrics) => {
+                persist_live_metrics(client, auth, metrics).await
+            }
         }
     }
 
@@ -592,14 +582,12 @@ where
 
             match result {
                 Ok(_) => return Ok(()),
-                Err(error) if attempt < max_attempts && Self::is_transient_surreal_error(&error) => {
+                Err(error)
+                    if attempt < max_attempts && Self::is_transient_surreal_error(&error) =>
+                {
                     warn!(
                         "Transient live insight sync error for strategy {} insight {} on attempt {}/{}: {}",
-                        auth.strategy_id,
-                        snapshot.insight_id,
-                        attempt,
-                        max_attempts,
-                        error
+                        auth.strategy_id, snapshot.insight_id, attempt, max_attempts, error
                     );
                     tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
                 }
@@ -694,8 +682,7 @@ where
             if let Some(sl) = legs.stop_loss.as_ref().and_then(|leg| leg.limit_price) {
                 insight.add_stop_loss_levels(vec![sl]);
             }
-            if let Some(trailing_gap) =
-                legs.trailing_stop.as_ref().and_then(|leg| leg.trail_price)
+            if let Some(trailing_gap) = legs.trailing_stop.as_ref().and_then(|leg| leg.trail_price)
             {
                 insight.set_trailing_stop_price(Some(trailing_gap));
             }
@@ -1327,7 +1314,9 @@ where
 
         let mut persist_metrics_after_sync = false;
         let mut prune_after_sync = Vec::new();
-        let insight_ids = self.insights.insight_ids_for_live_sync(include_full_reconcile);
+        let insight_ids = self
+            .insights
+            .insight_ids_for_live_sync(include_full_reconcile);
 
         for insight_id in insight_ids {
             let Some(insight) = self.insights.get(&insight_id) else {
@@ -1355,9 +1344,7 @@ where
                 continue;
             }
 
-            let previous_state = synced_insight_states
-                .get(&snapshot.insight_id)
-                .cloned();
+            let previous_state = synced_insight_states.get(&snapshot.insight_id).cloned();
             if previous_state.as_deref() != Some(current_state.as_str()) {
                 persist_metrics_after_sync = true;
                 info!(
@@ -1420,9 +1407,7 @@ where
                     }
                     error!(
                         "Failed to persist live insight state event for strategy {} insight {}: {}",
-                        auth.strategy_id,
-                        snapshot.insight_id,
-                        error
+                        auth.strategy_id, snapshot.insight_id, error
                     );
                 }
                 synced_insight_states.insert(snapshot.insight_id.clone(), current_state.clone());
@@ -2006,8 +1991,13 @@ where
 
         let mut pending_sync_ops = VecDeque::new();
 
-        self.start(&mut strategy, db.as_ref(), auth.as_ref(), &mut pending_sync_ops)
-            .await?;
+        self.start(
+            &mut strategy,
+            db.as_ref(),
+            auth.as_ref(),
+            &mut pending_sync_ops,
+        )
+        .await?;
 
         // Channels for incoming events
         let (trade_tx, mut trade_rx) = tokio::sync::mpsc::channel(100);
@@ -2499,7 +2489,9 @@ where
             }
 
             self.live_metrics.finish(chrono::Utc::now());
-            let _ = self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await;
+            let _ = self
+                .persist_live_metrics_if_needed(client, a, &mut pending_sync_ops)
+                .await;
 
             if let Some(action_id) = stop_action_id {
                 update_strategy_action_status(

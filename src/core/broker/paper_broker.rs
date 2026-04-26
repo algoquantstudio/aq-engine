@@ -161,9 +161,7 @@ impl PaperBroker {
                 if let Some(fill_price) = fill_result {
                     let _now_ts = self.current_time_ts();
 
-                    if let Some(reason) =
-                        self.insufficient_funds_reason(order.qty, fill_price)
-                    {
+                    if let Some(reason) = self.insufficient_funds_reason(order.qty, fill_price) {
                         order.status = TradeUpdateEvent::Rejected;
                         order.rejection_reason = Some(reason);
                         order.updated_at = _now_ts;
@@ -354,24 +352,24 @@ impl PaperBroker {
                     // Check Stop Loss first (priority over TP)
                     if !closed {
                         if let Some(ref mut sl) = legs.stop_loss {
-                        if sl.status != TradeUpdateEvent::Filled {
-                            let sl_triggered = match side {
-                                OrderSide::Buy => {
-                                    sl.limit_price.map_or(false, |price| bar.low <= price)
+                            if sl.status != TradeUpdateEvent::Filled {
+                                let sl_triggered = match side {
+                                    OrderSide::Buy => {
+                                        sl.limit_price.map_or(false, |price| bar.low <= price)
+                                    }
+                                    OrderSide::Sell => {
+                                        sl.limit_price.map_or(false, |price| bar.high >= price)
+                                    }
+                                };
+                                if sl_triggered {
+                                    close_price = sl.limit_price.unwrap();
+                                    sl.status = TradeUpdateEvent::Filled;
+                                    sl.filled_price = Some(close_price);
+                                    sl.filled_at = Some(now_ts);
+                                    closed = true;
                                 }
-                                OrderSide::Sell => {
-                                    sl.limit_price.map_or(false, |price| bar.high >= price)
-                                }
-                            };
-                            if sl_triggered {
-                                close_price = sl.limit_price.unwrap();
-                                sl.status = TradeUpdateEvent::Filled;
-                                sl.filled_price = Some(close_price);
-                                sl.filled_at = Some(now_ts);
-                                closed = true;
                             }
                         }
-                    }
                     }
 
                     // Check Take Profit (only if SL didn't trigger)
@@ -854,7 +852,8 @@ impl PaperBroker {
 
         {
             let mut pending_orders = self.pending_orders.lock();
-            pending_orders.retain(|order_id| !release_ids.iter().any(|released| released == order_id));
+            pending_orders
+                .retain(|order_id| !release_ids.iter().any(|released| released == order_id));
         }
         {
             let mut close_queue = self.close_orders_queue.lock();
@@ -864,9 +863,8 @@ impl PaperBroker {
         }
         {
             let mut update_queue = self.update_orders_queue.lock();
-            update_queue.retain(|(order_id, _)| {
-                !release_ids.iter().any(|released| released == order_id)
-            });
+            update_queue
+                .retain(|(order_id, _)| !release_ids.iter().any(|released| released == order_id));
         }
 
         for order_id in release_ids {
@@ -1180,8 +1178,7 @@ impl OrderManagementProvider for PaperBroker {
                 let mut rejected_order = order.clone();
                 rejected_order.status = TradeUpdateEvent::Rejected;
                 rejected_order.rejection_reason = Some(reason);
-                self.orders
-                    .insert(order_id.clone(), rejected_order.clone());
+                self.orders.insert(order_id.clone(), rejected_order.clone());
                 self.emit_trade_event(&rejected_order, TradeUpdateEvent::Rejected);
                 self.mark_order_terminal_for_release(&order_id);
                 return Ok(rejected_order);

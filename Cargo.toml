@@ -22,6 +22,7 @@ dashmap = { version = "6.1.0", optional = true }
 futures = { version = "0.3.32", features = ["executor"], optional = true }
 surrealdb = { version = "3.0.2", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"], optional = true }
 turso = { version = "0.5.1", optional = true }
+axum = { version = "0.8", optional = true }
 
 
 [features]
@@ -37,6 +38,7 @@ runtime = [
     "dep:surrealdb",
     "dep:turso",
     "dep:log",
+    "dep:axum",
 ]
 
 [dev-dependencies]

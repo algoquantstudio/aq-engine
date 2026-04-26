@@ -48,6 +48,7 @@ pub enum InsightState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DataFeedType {
     YahooFinance,
+    Mt5,
 }
 
 impl Default for DataFeedType {
@@ -60,13 +61,14 @@ impl std::fmt::Display for DataFeedType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::YahooFinance => write!(f, "Yahoo Finance"),
+            Self::Mt5 => write!(f, "MT5"),
         }
     }
 }
 
 impl DataFeedType {
     pub fn variants() -> &'static [DataFeedType] {
-        &[DataFeedType::YahooFinance]
+        &[DataFeedType::YahooFinance, DataFeedType::Mt5]
     }
 }
 
@@ -75,6 +77,7 @@ impl DataFeedType {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExecutionBrokerType {
     Paper,
+    Mt5,
 }
 
 impl Default for ExecutionBrokerType {
@@ -87,13 +90,38 @@ impl std::fmt::Display for ExecutionBrokerType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Paper => write!(f, "Paper Broker"),
+            Self::Mt5 => write!(f, "MT5 Broker"),
         }
     }
 }
 
 impl ExecutionBrokerType {
     pub fn variants() -> &'static [ExecutionBrokerType] {
-        &[ExecutionBrokerType::Paper]
+        &[ExecutionBrokerType::Paper, ExecutionBrokerType::Mt5]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Mt5BridgeConfig {
+    pub bind_addr: String,
+    pub token_env: String,
+    pub session_id_env: String,
+    pub request_timeout_ms: u64,
+    pub poll_interval_ms: u64,
+    pub symbol_map: Option<String>,
+}
+
+impl Default for Mt5BridgeConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:18080".to_string(),
+            token_env: "AQE_MT5_BRIDGE_TOKEN".to_string(),
+            session_id_env: "AQE_MT5_SESSION_ID".to_string(),
+            request_timeout_ms: 5_000,
+            poll_interval_ms: 250,
+            symbol_map: None,
+        }
     }
 }
 

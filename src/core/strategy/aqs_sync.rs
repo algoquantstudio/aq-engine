@@ -1,7 +1,6 @@
 use super::aqs_types::{
     AqsAuth, LatestPersistedAccountState, StrategyAccountSnapshotRecord, StrategyEquityPointRecord,
-    StrategyEventRecord, StrategyLiveMetricsRecord, StrategyUniverseAssetRecord,
-    live_session_key,
+    StrategyEventRecord, StrategyLiveMetricsRecord, StrategyUniverseAssetRecord, live_session_key,
 };
 use crate::core::broker::types::Account;
 use chrono::{DateTime, Utc};

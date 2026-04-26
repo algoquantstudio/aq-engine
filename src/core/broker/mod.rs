@@ -3,6 +3,8 @@
 pub mod backtest_state;
 pub mod data_feeds;
 pub mod data_stream;
+pub mod mt5_bridge;
+pub mod mt5_broker;
 pub mod paper_broker;
 pub mod types;
 
@@ -11,6 +13,7 @@ mod tests;
 
 pub enum BrokerType {
     Paper(paper_broker::PaperBroker),
+    Mt5(mt5_broker::Mt5Broker),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

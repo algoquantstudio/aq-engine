@@ -853,7 +853,10 @@ mod tests {
             .expect("submitted order should contain trailing stop leg");
 
         let expected_insight_id = insight.insight_id().to_string();
-        assert_eq!(order.insight_id.as_deref(), Some(expected_insight_id.as_str()));
+        assert_eq!(
+            order.insight_id.as_deref(),
+            Some(expected_insight_id.as_str())
+        );
         assert_eq!(trailing_leg.limit_price, None);
         assert_eq!(trailing_leg.trail_price, Some(222.25));
         assert_eq!(trailing_leg.side, OrderSide::Sell);
@@ -1963,8 +1966,8 @@ mod tests {
         }
     }
 
-    fn pipeline_harness_state(
-    ) -> StrategyState<PipelineHarnessStrategy, PaperBroker, FixedScaleOutDataFeed> {
+    fn pipeline_harness_state()
+    -> StrategyState<PipelineHarnessStrategy, PaperBroker, FixedScaleOutDataFeed> {
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
         let data = FixedScaleOutDataFeed::new();
         let broker = UnifiedBroker::new_backtest(execution, data);
