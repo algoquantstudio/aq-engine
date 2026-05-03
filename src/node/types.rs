@@ -106,7 +106,6 @@ impl ExecutionBrokerType {
 pub struct Mt5BridgeConfig {
     pub bind_addr: String,
     pub token_env: String,
-    pub session_id_env: String,
     pub request_timeout_ms: u64,
     pub poll_interval_ms: u64,
     pub symbol_map: Option<String>,
@@ -117,7 +116,6 @@ impl Default for Mt5BridgeConfig {
         Self {
             bind_addr: "127.0.0.1:18080".to_string(),
             token_env: "AQE_MT5_BRIDGE_TOKEN".to_string(),
-            session_id_env: "AQE_MT5_SESSION_ID".to_string(),
             request_timeout_ms: 5_000,
             poll_interval_ms: 250,
             symbol_map: None,

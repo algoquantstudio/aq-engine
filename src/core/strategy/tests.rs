@@ -7,9 +7,11 @@ mod tests {
     use super::*;
     use crate::core::alpha::{AlphaModel, AlphaResult, WrappedAlphaModel};
     use crate::core::broker::DataStreamMode;
+    use crate::core::broker::data_feeds::mt5::Mt5DataFeed;
     use crate::core::broker::data_feeds::yahoo::YahooFinanceDataFeed;
+    use crate::core::broker::mt5_broker::Mt5Broker;
     use crate::core::broker::paper_broker::PaperBroker;
-    use crate::core::broker::traits::{DataFeed, DataProvider, OrderManagementProvider};
+    use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
     use crate::core::broker::types::{
         AccountType, Asset, AssetExchange, AssetStatus, AssetType, Bar, BarData, BrokerError,
         OrderClass, OrderSide, OrderType, Quote, TradeUpdateEvent,
@@ -2290,6 +2292,505 @@ mod tests {
             Err(_) => {
                 panic!("Live test timed out after 60s");
             }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running MT5 terminal with AqeMt5BridgeEA attached and bridge env vars configured"]
+    async fn test_run_backtest_mt5_datafeed_paper_broker_single_entry_close() {
+        init_test_logger("info");
+
+        if std::env::var("AQE_MT5_BRIDGE_TOKEN").is_err() {
+            println!(
+                "Skipping MT5 paper backtest: AQE_MT5_BRIDGE_TOKEN is required. See integrations/mt5/README.md."
+            );
+            return;
+        }
+
+        const TEST_SYMBOL: &str = "BTCUSD";
+
+        struct Mt5PaperBacktestStrategy {
+            submitted: bool,
+            close_requested: bool,
+        }
+
+        impl Strategy for Mt5PaperBacktestStrategy {
+            fn name(&self) -> &str {
+                "Mt5PaperBacktestStrategy"
+            }
+
+            fn on_start(&mut self, _ctx: &mut dyn StrategyContext) {
+                println!("[MT5 Paper Backtest] Started");
+            }
+
+            fn init(&mut self, _ctx: &mut dyn StrategyContext, asset: &Asset) {
+                println!(
+                    "[MT5 Paper Backtest] Initialised asset {} ({:?})",
+                    asset.symbol, asset.asset_type
+                );
+            }
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                HashSet::from([TEST_SYMBOL.to_string()])
+            }
+
+            fn on_bar(&mut self, ctx: &mut dyn StrategyContext, symbol: &str, bar: &BarData) {
+                println!("[MT5 Paper Backtest] Bar for {}: {:?}", symbol, bar);
+
+                if self.close_requested {
+                    return;
+                }
+
+                let close_request = ctx
+                    .insights()
+                    .values()
+                    .find(|insight| {
+                        insight.symbol() == symbol && insight.state() == &InsightState::Filled
+                    })
+                    .and_then(|insight| {
+                        Some((
+                            insight.order_id.as_ref()?.clone(),
+                            insight.quantity.unwrap_or(0.0),
+                        ))
+                    });
+
+                if let Some((order_id, qty)) = close_request {
+                    if qty > 0.0 {
+                        ctx.close_position(&order_id, qty, None)
+                            .expect("paper close_position should succeed");
+                        self.close_requested = true;
+                        println!(
+                            "[MT5 Paper Backtest] Requested paper close for {}",
+                            order_id
+                        );
+                    }
+                }
+            }
+
+            fn generate_insights(&mut self, ctx: &mut dyn StrategyContext, symbol: &str) {
+                if self.submitted {
+                    return;
+                }
+
+                let mut insight = Insight::new(
+                    OrderSide::Buy,
+                    symbol.to_string(),
+                    StrategyType::Testing,
+                    ctx.timeframe().clone(),
+                    90,
+                    None,
+                );
+                insight.set_quantity(Some(0.01));
+                insight.submit(ctx);
+                ctx.add_insight(insight);
+                self.submitted = true;
+                println!("[MT5 Paper Backtest] Submitted paper BUY insight");
+            }
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {
+                println!("[MT5 Paper Backtest] Tearing down");
+            }
+        }
+
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = Mt5DataFeed::from_env().expect("failed to create MT5 datafeed from env");
+        let session_id = format!("mt5-paper-backtest-{}", uuid::Uuid::new_v4());
+        data.configure_live_session(&session_id)
+            .expect("failed to configure MT5 data smoke session");
+        data.connect()
+            .await
+            .expect("failed to start MT5 data bridge");
+        data.get_ticker_info(TEST_SYMBOL)
+            .await
+            .expect("MT5 datafeed preflight failed; confirm the EA is running and polling the AQE bridge URL");
+
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "Mt5PaperBacktest".into(),
+            "1.0".into(),
+            Mt5PaperBacktestStrategy {
+                submitted: false,
+                close_requested: false,
+            },
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+
+        let end = Utc::now();
+        let start = end - chrono::Duration::hours(2);
+        let results = state
+            .run_backtest(start, end, state.timeframe())
+            .await
+            .expect("MT5 datafeed paper backtest should complete");
+
+        println!(
+            "[MT5 Paper Backtest] trades={} final_equity={}",
+            results.total_trades, results.final_equity
+        );
+        assert!(
+            results.total_trades > 0,
+            "paper backtest should produce at least one trade"
+        );
+        assert!(
+            state
+                .insights
+                .values()
+                .any(|insight| insight.state() == &InsightState::Closed),
+            "paper backtest should close the submitted insight"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "places and closes a real MT5 order; requires AqeMt5BridgeEA, bridge env vars, and AQE_MT5_ENABLE_ORDER_TEST=1"]
+    async fn test_run_live_mt5_broker_datafeed_single_entry_close() {
+        init_test_logger("info");
+
+        if std::env::var("AQE_MT5_BRIDGE_TOKEN").is_err() {
+            println!(
+                "Skipping MT5 live order test: AQE_MT5_BRIDGE_TOKEN is required. See integrations/mt5/README.md."
+            );
+            return;
+        }
+        let enabled = std::env::var("AQE_MT5_ENABLE_ORDER_TEST")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        if !enabled {
+            println!(
+                "Skipping MT5 live order test: set AQE_MT5_ENABLE_ORDER_TEST=1 to place and close a real order."
+            );
+            return;
+        }
+
+        const TEST_SYMBOL: &str = "BTCUSD";
+        let qty = std::env::var("AQE_MT5_TEST_QTY")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.01);
+        let closed = Arc::new(Mutex::new(false));
+        let rejected = Arc::new(Mutex::new(false));
+
+        struct Mt5SingleEntryCloseStrategy {
+            qty: f64,
+            submitted: bool,
+            close_requested: bool,
+            closed: Arc<Mutex<bool>>,
+            rejected: Arc<Mutex<bool>>,
+        }
+
+        impl Strategy for Mt5SingleEntryCloseStrategy {
+            fn name(&self) -> &str {
+                "Mt5SingleEntryCloseStrategy"
+            }
+
+            fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+                println!(
+                    "[MT5 Live EntryClose] Started qty={} timeframe={:?}",
+                    self.qty,
+                    ctx.timeframe()
+                );
+            }
+
+            fn init(&mut self, _ctx: &mut dyn StrategyContext, asset: &Asset) {
+                println!(
+                    "[MT5 Live EntryClose] Initialised asset {} ({:?})",
+                    asset.symbol, asset.asset_type
+                );
+            }
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                HashSet::from([TEST_SYMBOL.to_string()])
+            }
+
+            fn on_bar(&mut self, ctx: &mut dyn StrategyContext, symbol: &str, bar: &BarData) {
+                println!("[MT5 Live EntryClose] Bar for {}: {:?}", symbol, bar);
+                let terminal_state = ctx
+                    .insights()
+                    .values()
+                    .find(|insight| insight.symbol() == symbol)
+                    .map(|insight| insight.state().clone());
+
+                match terminal_state {
+                    Some(InsightState::Closed) => {
+                        *self.closed.lock().unwrap() = true;
+                        println!("[MT5 Live EntryClose] Insight closed");
+                        ctx.shutdown();
+                        return;
+                    }
+                    Some(InsightState::Rejected | InsightState::Cancelled) => {
+                        *self.rejected.lock().unwrap() = true;
+                        println!(
+                            "[MT5 Live EntryClose] Insight terminal without close: {:?}",
+                            terminal_state
+                        );
+                        ctx.shutdown();
+                        return;
+                    }
+                    _ => {}
+                }
+
+                if !self.close_requested {
+                    let close_request = ctx
+                        .insights()
+                        .values()
+                        .find(|insight| {
+                            insight.symbol() == symbol && insight.state() == &InsightState::Filled
+                        })
+                        .and_then(|insight| {
+                            Some((
+                                insight.order_id.as_ref()?.clone(),
+                                insight.quantity.unwrap_or(self.qty),
+                            ))
+                        });
+
+                    if let Some((order_id, qty)) = close_request {
+                        ctx.close_position(&order_id, qty, None)
+                            .expect("MT5 close_position RPC should succeed");
+                        self.close_requested = true;
+                        println!("[MT5 Live EntryClose] Requested close for {}", order_id);
+                        return;
+                    }
+                }
+
+                if self.submitted {
+                    return;
+                }
+
+                let mut insight = Insight::new(
+                    OrderSide::Buy,
+                    symbol.to_string(),
+                    StrategyType::Testing,
+                    ctx.timeframe().clone(),
+                    90,
+                    None,
+                );
+                insight.set_quantity(Some(self.qty));
+                insight.submit(ctx);
+                ctx.add_insight(insight);
+                self.submitted = true;
+                println!("[MT5 Live EntryClose] Submitted live BUY insight");
+            }
+
+            fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {
+                println!("[MT5 Live EntryClose] Tearing down");
+            }
+        }
+
+        let execution = Mt5Broker::from_env().expect("failed to create MT5 broker from env");
+        let data = Mt5DataFeed::from_env().expect("failed to create MT5 datafeed from env");
+        let broker = UnifiedBroker::new(execution, data);
+        let mut state = StrategyState::new(
+            "Mt5SingleEntryClose".into(),
+            "1.0".into(),
+            Mt5SingleEntryCloseStrategy {
+                qty,
+                submitted: false,
+                close_requested: false,
+                closed: closed.clone(),
+                rejected: rejected.clone(),
+            },
+            broker,
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(180), state.run_live(None)).await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("MT5 live entry-close strategy failed: {:?}", error),
+            Err(_) => panic!("MT5 live entry-close strategy timed out after 180s"),
+        }
+
+        assert!(
+            !*rejected.lock().unwrap(),
+            "MT5 live entry-close insight was rejected or cancelled"
+        );
+        assert!(
+            *closed.lock().unwrap(),
+            "MT5 live entry-close strategy did not observe a Closed insight"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running MT5 terminal with AqeMt5BridgeEA attached and bridge env vars configured"]
+    async fn test_run_live_mt5_bridge_smoke() {
+        init_test_logger("info");
+
+        if std::env::var("AQE_MT5_BRIDGE_TOKEN").is_err() {
+            println!(
+                "Skipping MT5 smoke test: AQE_MT5_BRIDGE_TOKEN is required. See integrations/mt5/README.md."
+            );
+            return;
+        }
+
+        const TEST_SYMBOL: &str = "BTCUSD";
+        let submit_order = std::env::var("AQE_MT5_ENABLE_ORDER_TEST")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        let run_live_loop = std::env::var("AQE_MT5_RUN_LIVE_LOOP")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(submit_order);
+        let qty = std::env::var("AQE_MT5_TEST_QTY")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.01);
+
+        let execution = Mt5Broker::from_env().expect("failed to create MT5 broker from env");
+        let data = Mt5DataFeed::from_env().expect("failed to create MT5 datafeed from env");
+        let smoke_session_id = format!("mt5-smoke-{}", uuid::Uuid::new_v4());
+        execution
+            .configure_live_session(&smoke_session_id)
+            .expect("failed to configure MT5 execution smoke session");
+        data.configure_live_session(&smoke_session_id)
+            .expect("failed to configure MT5 data smoke session");
+        execution
+            .connect()
+            .await
+            .expect("failed to start MT5 execution bridge");
+        data.connect()
+            .await
+            .expect("failed to start MT5 data bridge");
+
+        let account = execution
+            .get_account()
+            .await
+            .expect("failed to fetch MT5 account through bridge");
+        println!(
+            "[MT5 Smoke] Account: equity={} cash={} buying_power={}",
+            account.equity, account.cash, account.buying_power
+        );
+        let asset = data
+            .get_ticker_info(TEST_SYMBOL)
+            .await
+            .expect("failed to fetch MT5 ticker info through bridge");
+        println!(
+            "[MT5 Smoke] Asset: {} {:?} min_qty={:?}",
+            asset.symbol, asset.asset_type, asset.min_order_size
+        );
+        let quote = data
+            .get_latest_quote(TEST_SYMBOL)
+            .await
+            .expect("failed to fetch MT5 latest quote through bridge");
+        println!(
+            "[MT5 Smoke] Quote: {} bid={} ask={} last={:?}",
+            quote.symbol, quote.bid, quote.ask, quote.last
+        );
+
+        if !run_live_loop {
+            println!(
+                "[MT5 Smoke] RPC smoke condition met. Set AQE_MT5_RUN_LIVE_LOOP=1 to wait for live bars."
+            );
+            return;
+        }
+
+        let broker = UnifiedBroker::new(execution, data);
+
+        struct Mt5SmokeStrategy {
+            symbol: String,
+            submit_order: bool,
+            qty: f64,
+            bars_received: usize,
+            order_submitted: bool,
+        }
+
+        impl Strategy for Mt5SmokeStrategy {
+            fn name(&self) -> &str {
+                "Mt5SmokeStrategy"
+            }
+
+            fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+                println!(
+                    "[MT5 Smoke] Started. submit_order={} qty={} timeframe={:?}",
+                    self.submit_order,
+                    self.qty,
+                    ctx.timeframe()
+                );
+            }
+
+            fn init(&mut self, _ctx: &mut dyn StrategyContext, asset: &Asset) {
+                println!(
+                    "[MT5 Smoke] Initialised asset {} ({:?})",
+                    asset.symbol, asset.asset_type
+                );
+            }
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                HashSet::from([self.symbol.clone()])
+            }
+
+            fn on_bar(&mut self, ctx: &mut dyn StrategyContext, symbol: &str, bar: &BarData) {
+                self.bars_received += 1;
+                println!(
+                    "[MT5 Smoke] Bar {} received for {}: {:?}",
+                    self.bars_received, symbol, bar
+                );
+
+                if self.submit_order && !self.order_submitted {
+                    let mut insight = Insight::new(
+                        OrderSide::Buy,
+                        symbol.to_string(),
+                        StrategyType::Testing,
+                        ctx.timeframe().clone(),
+                        90,
+                        None,
+                    );
+                    insight.set_quantity(Some(self.qty));
+                    insight.submit(ctx);
+                    ctx.add_insight(insight);
+                    self.order_submitted = true;
+                    println!(
+                        "[MT5 Smoke] Submitted BUY test insight for {} qty={}",
+                        symbol, self.qty
+                    );
+                }
+
+                if self.bars_received >= 1 && (!self.submit_order || self.order_submitted) {
+                    println!("[MT5 Smoke] Smoke condition met, shutting down");
+                    ctx.shutdown();
+                }
+            }
+
+            fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {
+                println!("[MT5 Smoke] Tearing down");
+            }
+        }
+
+        let mut state = StrategyState::new(
+            "Mt5Smoke".into(),
+            "1.0".into(),
+            Mt5SmokeStrategy {
+                symbol: TEST_SYMBOL.to_string(),
+                submit_order,
+                qty,
+                bars_received: 0,
+                order_submitted: false,
+            },
+            broker,
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(90), state.run_live(None)).await;
+
+        match result {
+            Ok(Ok(())) => println!("[MT5 Smoke] Finished gracefully"),
+            Ok(Err(error)) => panic!("MT5 smoke strategy failed: {:?}", error),
+            Err(_) => panic!(
+                "MT5 smoke strategy timed out after 90s. Confirm the EA is attached, WebRequest is enabled, and the symbol is streaming."
+            ),
         }
     }
 }

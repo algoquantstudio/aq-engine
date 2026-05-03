@@ -1478,7 +1478,12 @@ where
 
                 match (&insight.state, &event) {
                     // NEW → EXECUTED on accept
-                    (InsightState::New, TradeUpdateEvent::PendingNew | TradeUpdateEvent::New) => {
+                    (
+                        InsightState::New,
+                        TradeUpdateEvent::Accepted
+                        | TradeUpdateEvent::PendingNew
+                        | TradeUpdateEvent::New,
+                    ) => {
                         if matched {
                             insight.order_accepted(&order.order_id);
                             touched_insight_ids.insert(id);
@@ -1969,6 +1974,9 @@ where
             .strategy
             .take()
             .expect("strategy must be Some before run_live");
+
+        self.broker
+            .configure_live_session(&self.strategy_id.to_string())?;
 
         // 1. Connect broker
         self.broker.connect().await?;
