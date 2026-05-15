@@ -76,6 +76,7 @@ pub struct InsightSnapshot {
     pub filled_price: Option<f64>,
     pub close_order_id: Option<String>,
     pub close_price: Option<f64>,
+    pub broker_realized_pnl: Option<f64>,
     pub partial_closes: Vec<InsightPartialCloseSnapshot>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -143,6 +144,7 @@ impl InsightSnapshot {
             filled_price: insight.filled_price,
             close_order_id: insight.close_order_id.clone(),
             close_price: insight.close_price,
+            broker_realized_pnl: insight.broker_realized_pnl,
             partial_closes: insight
                 .partial_closes
                 .iter()

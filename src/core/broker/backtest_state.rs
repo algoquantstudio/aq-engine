@@ -29,6 +29,8 @@ pub struct BacktestState {
     pub trade_log: Vec<TradeRecord>,
     /// Historical insight snapshots captured throughout the backtest.
     pub insight_snapshots: HashMap<String, InsightSnapshot>,
+    /// Running minimum unrealized return per order, tracked while positions are open.
+    pub trade_mae_by_order_id: HashMap<String, f64>,
 
     executed_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
@@ -45,6 +47,7 @@ impl BacktestState {
             account_history: Vec::new(),
             trade_log: Vec::new(),
             insight_snapshots: HashMap::new(),
+            trade_mae_by_order_id: HashMap::new(),
             executed_at: Utc::now(),
             finished_at: None,
         }
@@ -134,6 +137,13 @@ impl BacktestState {
             .insert(snapshot.insight_id.clone(), snapshot);
     }
 
+    pub fn record_trade_mae(&mut self, order_id: &str, mae_pct: f64) {
+        self.trade_mae_by_order_id
+            .entry(order_id.to_string())
+            .and_modify(|value| *value = value.min(mae_pct))
+            .or_insert(mae_pct.min(0.0));
+    }
+
     pub fn set_executed_at(&mut self, executed_at: DateTime<Utc>) {
         self.executed_at = executed_at;
     }
@@ -181,7 +191,12 @@ pub struct BacktestMetrics {
     pub losing_trades: usize,
     pub win_rate: f64,
     pub max_drawdown: f64,
+    pub cagr: f64,
+    pub annualized_volatility: f64,
     pub sharpe_ratio: f64,
+    pub sortino_ratio: f64,
+    pub calmar_ratio: f64,
+    pub max_drawdown_duration_days: f64,
     pub expectancy: f64,
     pub profit_factor: f64,
     pub payoff_ratio: f64,
@@ -247,6 +262,7 @@ impl BacktestResults {
                         let hold_secs = (rec.date - entry.date).num_seconds();
 
                         trips.push(RoundTripTrade {
+                            order_id: entry.order_id.clone(),
                             symbol: entry.symbol.clone(),
                             side: entry.side.clone(),
                             insight_id: entry.insight_id.clone(),
@@ -277,11 +293,75 @@ impl BacktestResults {
     /// Annualised Sharpe ratio computed from daily equity returns.
     /// Uses 252 trading days. Returns 0.0 when there are fewer than 2 data points.
     pub fn sharpe_ratio(&self) -> f64 {
+        let returns = self.equity_returns();
+        annualized_sharpe(&returns)
+    }
+
+    pub fn annualized_volatility(&self) -> f64 {
+        let returns = self.equity_returns();
+        annualized_volatility(&returns)
+    }
+
+    pub fn sortino_ratio(&self) -> f64 {
+        let returns = self.equity_returns();
+        annualized_sortino(&returns)
+    }
+
+    pub fn cagr(&self) -> f64 {
+        if self.starting_cash.abs() <= f64::EPSILON || self.final_equity <= 0.0 {
+            return 0.0;
+        }
+
+        let days = (self.finished_at - self.executed_at).num_seconds().max(0) as f64 / 86_400.0;
+        if days <= f64::EPSILON {
+            return self.total_return_pct / 100.0;
+        }
+
+        let years = days / 365.25;
+        if years <= f64::EPSILON {
+            return self.total_return_pct / 100.0;
+        }
+
+        (self.final_equity / self.starting_cash).powf(1.0 / years) - 1.0
+    }
+
+    pub fn calmar_ratio(&self) -> f64 {
+        if self.max_drawdown <= f64::EPSILON {
+            return 0.0;
+        }
+        self.cagr() / self.max_drawdown.abs()
+    }
+
+    pub fn max_drawdown_duration_days(&self) -> f64 {
         if self.account_history.len() < 2 {
             return 0.0;
         }
+
+        let mut peak = self.account_history[0].1.equity;
+        let mut underwater_start: Option<DateTime<Utc>> = None;
+        let mut longest_secs = 0_i64;
+
+        for (timestamp, account) in &self.account_history {
+            if account.equity >= peak {
+                if let Some(start) = underwater_start.take() {
+                    longest_secs = longest_secs.max((*timestamp - start).num_seconds().max(0));
+                }
+                peak = account.equity;
+            } else if underwater_start.is_none() {
+                underwater_start = Some(*timestamp);
+            }
+        }
+
+        if let (Some(start), Some((end, _))) = (underwater_start, self.account_history.last()) {
+            longest_secs = longest_secs.max((*end - start).num_seconds().max(0));
+        }
+
+        longest_secs as f64 / 86_400.0
+    }
+
+    fn equity_returns(&self) -> Vec<f64> {
         let equities: Vec<f64> = self.account_history.iter().map(|(_, a)| a.equity).collect();
-        let returns: Vec<f64> = equities
+        equities
             .windows(2)
             .filter_map(|w| {
                 if w[0] != 0.0 {
@@ -290,25 +370,60 @@ impl BacktestResults {
                     None
                 }
             })
-            .collect();
-
-        if returns.is_empty() {
-            return 0.0;
-        }
-
-        let n = returns.len() as f64;
-        let mean = returns.iter().sum::<f64>() / n;
-        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
-        let std_dev = var.sqrt();
-
-        if std_dev == 0.0 {
-            return 0.0;
-        }
-        (mean / std_dev) * (252.0_f64).sqrt()
+            .collect()
     }
+}
 
+fn annualized_sharpe(returns: &[f64]) -> f64 {
+    let Some((mean, std_dev)) = return_mean_std(returns) else {
+        return 0.0;
+    };
+    if std_dev <= f64::EPSILON {
+        return 0.0;
+    }
+    (mean / std_dev) * (252.0_f64).sqrt()
+}
+
+fn annualized_volatility(returns: &[f64]) -> f64 {
+    let Some((_, std_dev)) = return_mean_std(returns) else {
+        return 0.0;
+    };
+    std_dev * (252.0_f64).sqrt()
+}
+
+fn annualized_sortino(returns: &[f64]) -> f64 {
+    if returns.is_empty() {
+        return 0.0;
+    }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let downside: Vec<f64> = returns
+        .iter()
+        .copied()
+        .filter(|value| *value < 0.0)
+        .collect();
+    if downside.is_empty() {
+        return 0.0;
+    }
+    let downside_deviation =
+        (downside.iter().map(|value| value.powi(2)).sum::<f64>() / downside.len() as f64).sqrt();
+    if downside_deviation <= f64::EPSILON {
+        return 0.0;
+    }
+    (mean / downside_deviation) * (252.0_f64).sqrt()
+}
+
+fn return_mean_std(returns: &[f64]) -> Option<(f64, f64)> {
+    if returns.len() < 2 {
+        return None;
+    }
+    let n = returns.len() as f64;
+    let mean = returns.iter().sum::<f64>() / n;
+    let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+    Some((mean, variance.sqrt()))
+}
+
+impl BacktestResults {
     // ───────────────────── Trade-Level Metrics ─────────────────────
-
     /// Expectancy = average PnL per trade (winners and losers combined).
     pub fn expectancy(&self) -> f64 {
         let trips = self.round_trip_trades();
@@ -638,6 +753,7 @@ impl BacktestResults {
 /// A completed entry→exit round-trip trade used for metric calculations.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RoundTripTrade {
+    pub order_id: String,
     pub symbol: String,
     pub side: OrderSide,
     #[serde(default)]
@@ -781,7 +897,12 @@ impl BacktestResults {
             losing_trades: self.losing_trades,
             win_rate: self.win_rate,
             max_drawdown: self.max_drawdown,
+            cagr: self.cagr(),
+            annualized_volatility: self.annualized_volatility(),
             sharpe_ratio: self.sharpe_ratio(),
+            sortino_ratio: self.sortino_ratio(),
+            calmar_ratio: self.calmar_ratio(),
+            max_drawdown_duration_days: self.max_drawdown_duration_days(),
             expectancy: self.expectancy(),
             profit_factor: self.profit_factor(),
             payoff_ratio: self.payoff_ratio(),

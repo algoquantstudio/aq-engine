@@ -14,7 +14,12 @@ pub struct LiveMetricsSnapshot {
     pub losing_trades: usize,
     pub win_rate: f64,
     pub max_drawdown: f64,
+    pub cagr: f64,
+    pub annualized_volatility: f64,
     pub sharpe_ratio: f64,
+    pub sortino_ratio: f64,
+    pub calmar_ratio: f64,
+    pub max_drawdown_duration_days: f64,
     pub expectancy: f64,
     pub profit_factor: f64,
     pub payoff_ratio: f64,
@@ -68,7 +73,11 @@ pub struct LivePerformanceTracker {
     return_count: u64,
     return_mean: f64,
     return_m2: f64,
+    downside_return_count: u64,
+    downside_return_sum_sq: f64,
     previous_equity: Option<f64>,
+    underwater_start: Option<DateTime<Utc>>,
+    max_drawdown_duration_secs: i64,
     executed_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -110,7 +119,11 @@ impl LivePerformanceTracker {
         self.return_count = 0;
         self.return_mean = 0.0;
         self.return_m2 = 0.0;
+        self.downside_return_count = 0;
+        self.downside_return_sum_sq = 0.0;
         self.previous_equity = Some(current_equity);
+        self.underwater_start = None;
+        self.max_drawdown_duration_secs = 0;
         self.executed_at = Some(executed_at);
         self.finished_at = None;
         self.updated_at = Some(executed_at);
@@ -127,12 +140,25 @@ impl LivePerformanceTracker {
             if previous_equity.abs() > f64::EPSILON {
                 let ret = (equity - previous_equity) / previous_equity;
                 self.update_online_returns(ret);
+                if ret < 0.0 {
+                    self.downside_return_count += 1;
+                    self.downside_return_sum_sq += ret.powi(2);
+                }
             }
         }
 
         self.current_equity = equity;
         self.previous_equity = Some(equity);
-        self.peak_equity = self.peak_equity.max(equity);
+        if equity >= self.peak_equity {
+            if let Some(start) = self.underwater_start.take() {
+                self.max_drawdown_duration_secs = self
+                    .max_drawdown_duration_secs
+                    .max((at - start).num_seconds().max(0));
+            }
+            self.peak_equity = equity;
+        } else if self.underwater_start.is_none() {
+            self.underwater_start = Some(at);
+        }
         if self.peak_equity.abs() > f64::EPSILON {
             let drawdown = (self.peak_equity - equity) / self.peak_equity;
             self.max_drawdown = self.max_drawdown.max(drawdown * 100.0);
@@ -273,7 +299,12 @@ impl LivePerformanceTracker {
             losing_trades: self.losing_trades,
             win_rate,
             max_drawdown: self.max_drawdown,
+            cagr: self.cagr(updated_at),
+            annualized_volatility: self.annualized_volatility(),
             sharpe_ratio: self.sharpe_ratio(),
+            sortino_ratio: self.sortino_ratio(),
+            calmar_ratio: self.calmar_ratio(updated_at),
+            max_drawdown_duration_days: self.max_drawdown_duration_days(updated_at),
             expectancy,
             profit_factor,
             payoff_ratio,
@@ -341,6 +372,63 @@ impl LivePerformanceTracker {
         }
         self.return_mean / std_dev * (252.0f64).sqrt()
     }
+
+    fn annualized_volatility(&self) -> f64 {
+        if self.return_count < 2 {
+            return 0.0;
+        }
+        let variance = self.return_m2 / (self.return_count as f64 - 1.0);
+        if variance <= f64::EPSILON {
+            return 0.0;
+        }
+        variance.sqrt() * (252.0f64).sqrt()
+    }
+
+    fn sortino_ratio(&self) -> f64 {
+        if self.downside_return_count == 0 {
+            return 0.0;
+        }
+        let downside_deviation =
+            (self.downside_return_sum_sq / self.downside_return_count as f64).sqrt();
+        if downside_deviation <= f64::EPSILON {
+            return 0.0;
+        }
+        self.return_mean / downside_deviation * (252.0f64).sqrt()
+    }
+
+    fn cagr(&self, updated_at: DateTime<Utc>) -> f64 {
+        let Some(executed_at) = self.executed_at else {
+            return 0.0;
+        };
+        if self.starting_cash.abs() <= f64::EPSILON || self.current_equity <= 0.0 {
+            return 0.0;
+        }
+        let days = (updated_at - executed_at).num_seconds().max(0) as f64 / 86_400.0;
+        if days <= f64::EPSILON {
+            return (self.current_equity - self.starting_cash) / self.starting_cash;
+        }
+        let years = days / 365.25;
+        if years <= f64::EPSILON {
+            return (self.current_equity - self.starting_cash) / self.starting_cash;
+        }
+        (self.current_equity / self.starting_cash).powf(1.0 / years) - 1.0
+    }
+
+    fn calmar_ratio(&self, updated_at: DateTime<Utc>) -> f64 {
+        let max_drawdown_fraction = self.max_drawdown / 100.0;
+        if max_drawdown_fraction <= f64::EPSILON {
+            return 0.0;
+        }
+        self.cagr(updated_at) / max_drawdown_fraction.abs()
+    }
+
+    fn max_drawdown_duration_days(&self, updated_at: DateTime<Utc>) -> f64 {
+        let mut secs = self.max_drawdown_duration_secs;
+        if let Some(start) = self.underwater_start {
+            secs = secs.max((updated_at - start).num_seconds().max(0));
+        }
+        secs as f64 / 86_400.0
+    }
 }
 
 fn trade_return_pct(snapshot: &InsightSnapshot) -> f64 {
@@ -365,6 +453,10 @@ fn trade_return_pct(snapshot: &InsightSnapshot) -> f64 {
 }
 
 fn trade_pnl(snapshot: &InsightSnapshot) -> f64 {
+    if let Some(realized_pnl) = snapshot.broker_realized_pnl {
+        return realized_pnl;
+    }
+
     let Some(entry_price) = snapshot
         .filled_price
         .or(snapshot.limit_price)

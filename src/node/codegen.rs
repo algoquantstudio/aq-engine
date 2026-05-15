@@ -42,15 +42,43 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         })
         .cloned()
         .collect();
+    let node_snapshot = |node_type: NodeType| -> Vec<serde_json::Value> {
+        reachable_nodes
+            .iter()
+            .filter(|node| node.node_type == node_type)
+            .map(|node| {
+                serde_json::json!({
+                    "id": node.id,
+                    "label": node.label,
+                    "sourceFile": node.source_file,
+                    "inputs": node.inputs.iter().map(|input| {
+                        serde_json::json!({
+                            "name": input.name,
+                            "type": input.input_type,
+                            "value": input.value,
+                            "isPublic": input.is_public,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    };
+    let alpha_models_json =
+        serde_json::to_string(&node_snapshot(NodeType::Alpha)).map_err(|e| e.to_string())?;
+    let insight_pipes_json =
+        serde_json::to_string(&node_snapshot(NodeType::Pipe)).map_err(|e| e.to_string())?;
+    let strategy_config_json = serde_json::to_string(&meta.config).map_err(|e| e.to_string())?;
+    let data_feed_id_json = serde_json::to_string(&meta.data_feed_id).map_err(|e| e.to_string())?;
+    let broker_id_json = serde_json::to_string(&meta.broker_id).map_err(|e| e.to_string())?;
 
     // ── 1. Toposort the reachable node graph ──
     let sorted = toposort(&reachable_nodes, &reachable_connections)?;
 
     // ── 2. Collect alpha and pipe nodes ──
-    let mut custom_alphas = Vec::new(); // (mod_name, struct_name, args_string)
+    let mut custom_alphas = Vec::new(); // (mod_name, struct_name, args_string, source_file)
     let mut built_in_alphas = Vec::new(); // (struct_name, args_string)
 
-    let mut custom_pipes = Vec::new(); // (mod_name, struct_name, args_string, allowed_alphas, target_state)
+    let mut custom_pipes = Vec::new(); // (mod_name, struct_name, args_string, allowed_alphas, target_state, source_file)
     let mut built_in_pipes = Vec::new(); // (mod_name, struct_name, args_string, allowed_alphas, target_state)
     let mut ordered_pipes = Vec::new(); // ordered pipe registration strings
 
@@ -207,7 +235,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                         built_in_alphas.push((struct_name, args_str));
                     } else {
                         let mod_name = source_file_to_mod_name(src);
-                        custom_alphas.push((mod_name, struct_name, args_str));
+                        custom_alphas.push((mod_name, struct_name, args_str, src.clone()));
                     }
                 }
             }
@@ -271,6 +299,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                             args_str.clone(),
                             allowed_alphas_constraint.clone(),
                             target_state_modifier.clone(),
+                            src.clone(),
                         ));
                         format!(
                             "InsightPipeBuilder::new(Box::new({}::{}::new({}))){}{}.build()",
@@ -333,14 +362,14 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
 
     // Module declarations for user alphas/pipes
     let mut emitted_mods = std::collections::HashSet::new();
-    for (mod_name, _, _) in &custom_alphas {
+    for (mod_name, _, _, source_file) in &custom_alphas {
         if emitted_mods.insert(mod_name.clone()) {
-            src.push_str(&format!("mod {};\n", mod_name));
+            push_custom_module_decl(&mut src, mod_name, source_file);
         }
     }
-    for (mod_name, _, _, _, _) in &custom_pipes {
+    for (mod_name, _, _, _, _, source_file) in &custom_pipes {
         if emitted_mods.insert(mod_name.clone()) {
-            src.push_str(&format!("mod {};\n", mod_name));
+            push_custom_module_decl(&mut src, mod_name, source_file);
         }
     }
 
@@ -403,7 +432,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     ));
 
     // Register alpha models
-    for (mod_name, struct_name, args) in &custom_alphas {
+    for (mod_name, struct_name, args, _) in &custom_alphas {
         src.push_str(&format!(
             "        ctx.add_alpha(AlphaModelBuilder::new(Box::new({}::{}::new({}))).build());\n",
             mod_name, struct_name, args
@@ -478,7 +507,10 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         "    let log_level = \"{}\";\n",
         meta.config.log_level.to_lowercase()
     ));
-    src.push_str("    let env = env_logger::Env::default().default_filter_or(log_level);\n");
+    src.push_str("    let default_log_filter = format!(\"{},tracing::span=warn,turso=warn,libsql=warn\", log_level);\n");
+    src.push_str(
+        "    let env = env_logger::Env::default().default_filter_or(default_log_filter);\n",
+    );
     src.push_str(
         "    let _ = env_logger::Builder::from_env(env).format_timestamp_millis().try_init();\n",
     );
@@ -490,57 +522,47 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         meta.config.timeframe_amount, meta.config.timeframe_unit
     ));
 
-    let uses_mt5 = meta.broker == crate::node::types::ExecutionBrokerType::Mt5
-        || meta.data_feed == crate::node::types::DataFeedType::Mt5;
-
-    // Broker
-    if uses_mt5 {
-        src.push_str("    if !is_live {\n");
-        src.push_str("        eprintln!(\"MT5 is live-only in AQE v1. Select Paper/Yahoo for backtests.\");\n");
-        src.push_str("        std::process::exit(1);\n");
-        src.push_str("    }\n");
-        src.push_str("    let data_feed = Mt5DataFeed::from_env().unwrap_or_else(|error| {\n");
-        src.push_str("        eprintln!(\"Failed to initialise MT5 data feed: {:?}\", error);\n");
-        src.push_str("        std::process::exit(1);\n");
-        src.push_str("    });\n");
-        src.push_str("    let execution = Mt5Broker::from_env().unwrap_or_else(|error| {\n");
-        src.push_str("        eprintln!(\"Failed to initialise MT5 broker: {:?}\", error);\n");
-        src.push_str("        std::process::exit(1);\n");
-        src.push_str("    });\n");
-        src.push_str("    let broker = UnifiedBroker::new(execution, data_feed);\n\n");
+    let data_feed_init = if meta.data_feed == crate::node::types::DataFeedType::Mt5 {
+        "        let data_feed = Mt5DataFeed::from_env().unwrap_or_else(|error| {\n            eprintln!(\"Failed to initialise MT5 data feed: {:?}\", error);\n            std::process::exit(1);\n        });\n".to_string()
     } else {
-        src.push_str("    let data_feed = YahooFinanceDataFeed::new();\n");
-        src.push_str(&format!(
-            "    let execution = PaperBroker::new(AccountType::Paper, {:.1}, 1);\n",
-            meta.config.starting_cash
-        ));
-        src.push_str("    let broker = UnifiedBroker::new(execution, data_feed);\n\n");
-    }
+        "        let data_feed = YahooFinanceDataFeed::new();\n".to_string()
+    };
 
-    // Strategy State
-    src.push_str(&format!(
-        "    let mut state = StrategyState::new(\n        \"{name}\".to_string(),\n        \"{version}\".to_string(),\n        {struct_name} {{}},\n        broker,\n        {mode},\n        timeframe,\n    );\n\n",
+    let live_execution_init = if meta.broker == crate::node::types::ExecutionBrokerType::Mt5 {
+        "        let execution = Mt5Broker::from_env().unwrap_or_else(|error| {\n            eprintln!(\"Failed to initialise MT5 broker: {:?}\", error);\n            std::process::exit(1);\n        });\n".to_string()
+    } else {
+        format!(
+            "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, 1);\n",
+            meta.config.starting_cash
+        )
+    };
+
+    let backtest_execution_init = format!(
+        "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, 1);\n",
+        meta.config.starting_cash
+    );
+
+    let live_state_init = format!(
+        "        let broker = UnifiedBroker::new(execution, data_feed);\n\n        let mut state = StrategyState::new(\n            \"{name}\".to_string(),\n            \"{version}\".to_string(),\n            {struct_name} {{}},\n            broker,\n            StrategyMode::Live,\n            timeframe,\n        );\n\n        state.strategy_id = Uuid::parse_str(\"{strategy_id}\").unwrap();\n\n",
         name = meta.name,
         version = meta.version,
         struct_name = strategy_name,
-        mode = if uses_mt5 {
-            "StrategyMode::Live".to_string()
-        } else {
-            "if is_live { StrategyMode::Live } else { StrategyMode::Backtest }".to_string()
-        },
-    ));
-    // Set strategy Id
-    src.push_str(&format!(
-        "    state.strategy_id = Uuid::parse_str(\"{}\").unwrap();\n\n",
-        meta.id
-    ));
+        strategy_id = meta.id,
+    );
+
+    let backtest_state_init = format!(
+        "        let broker = UnifiedBroker::new(execution, data_feed);\n\n        let mut state = StrategyState::new(\n            \"{name}\".to_string(),\n            \"{version}\".to_string(),\n            {struct_name} {{}},\n            broker,\n            StrategyMode::Backtest,\n            timeframe,\n        );\n\n        state.strategy_id = Uuid::parse_str(\"{strategy_id}\").unwrap();\n\n",
+        name = meta.name,
+        version = meta.version,
+        struct_name = strategy_name,
+        strategy_id = meta.id,
+    );
 
     // (Components and risk params are now registered inside on_start)
-    if uses_mt5 {
-        src.push_str("    {\n");
-    } else {
-        src.push_str("    if is_live {\n");
-    }
+    src.push_str("    if is_live {\n");
+    src.push_str(&data_feed_init);
+    src.push_str(&live_execution_init);
+    src.push_str(&live_state_init);
     src.push_str("        let session_secret = args.iter().position(|a| a == \"--session-secret\").and_then(|i| args.get(i+1)).cloned().unwrap_or_default();\n");
     src.push_str("        let access_method = args.iter().position(|a| a == \"--access-method\").and_then(|i| args.get(i+1)).cloned().unwrap_or_else(|| \"aqe_live\".to_string());\n");
     src.push_str("        let strategy_id = args.iter().position(|a| a == \"--strategy-id\").and_then(|i| args.get(i+1)).cloned().unwrap_or_default();\n");
@@ -567,57 +589,160 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str("            eprintln!(\"Live execution failed: {:?}\", e);\n");
     src.push_str("            std::process::exit(1);\n");
     src.push_str("        }\n");
-    if !uses_mt5 {
-        src.push_str("    } else {\n");
-        src.push_str("        // Run backtest with configured start and end timestamps\n");
-        if let Some(ref s_time) = meta.config.start_time {
-            src.push_str(&format!("        let start = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now() - chrono::Duration::days(30));\n", s_time));
-        } else {
-            src.push_str("        let start = Utc::now() - chrono::Duration::days(30);\n");
-        }
-
-        if let Some(ref e_time) = meta.config.end_time {
-            src.push_str(&format!("        let end = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now());\n\n", e_time));
-        } else {
-            src.push_str("        let end = Utc::now();\n\n");
-        }
-        src.push_str("        match state.run_backtest(start, end, timeframe).await {\n");
-        src.push_str("            Ok(results) => {\n");
-        src.push_str(
-            "                info!(\"═══════════════════ Backtest Results ═══════════════════\");\n",
-        );
-        src.push_str("                results.print_metrics();\n");
-        src.push_str("                info!(\"Insights generated: {}\", state.insights.len());\n");
-        src.push_str(
-            "                info!(\"Insights: {:#?}\", state.insights.get_state_count());\n",
-        );
-        src.push_str("                let run_id = Uuid::new_v4().to_string();\n");
-        src.push_str("                let out_dir = std::env::current_dir().unwrap_or_default().join(\"backtests\").join(&run_id);\n");
-        src.push_str("                if let Err(e) = results.save_to_disk_async(&out_dir, &*state.broker.backtest_state.as_ref().unwrap().read()).await {\n");
-        src.push_str("                    eprintln!(\"Failed to save results to disk: {}\", e);\n");
-        src.push_str("                } else {\n");
-        src.push_str(
-            "                    if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {\n",
-        );
-        src.push_str(
-            "                        println!(\"RESULTS_SAVED_TO: {}\", abs_path.display());\n",
-        );
-        src.push_str("                    } else {\n");
-        src.push_str(
-            "                        println!(\"RESULTS_SAVED_TO: {}\", out_dir.display());\n",
-        );
-        src.push_str("                    }\n");
-        src.push_str("                }\n");
-        src.push_str("            }\n");
-        src.push_str("            Err(e) => {\n");
-        src.push_str("                eprintln!(\"Backtest failed: {:?}\", e);\n");
-        src.push_str("                std::process::exit(1);\n");
-        src.push_str("            }\n");
-        src.push_str("        }\n");
-        src.push_str("    }\n");
-    } else {
-        src.push_str("    }\n");
+    src.push_str("    } else {\n");
+    src.push_str(&data_feed_init);
+    src.push_str(&backtest_execution_init);
+    src.push_str(&backtest_state_init);
+    if meta.broker != crate::node::types::ExecutionBrokerType::Paper {
+        src.push_str(&format!(
+            "        info!(\"Backtest mode uses Paper Broker execution. Selected live broker '{}' is ignored for this run.\");\n",
+            meta.broker
+        ));
     }
+    src.push_str("        // Run backtest with configured start and end timestamps\n");
+    if let Some(ref s_time) = meta.config.start_time {
+        src.push_str(&format!("        let start = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now() - chrono::Duration::days(30));\n", s_time));
+    } else {
+        src.push_str("        let start = Utc::now() - chrono::Duration::days(30);\n");
+    }
+
+    if let Some(ref e_time) = meta.config.end_time {
+        src.push_str(&format!("        let end = \"{}:00Z\".parse::<chrono::DateTime<Utc>>().unwrap_or_else(|_| Utc::now());\n\n", e_time));
+    } else {
+        src.push_str("        let end = Utc::now();\n\n");
+    }
+    src.push_str("        match state.run_backtest(start, end, timeframe).await {\n");
+    src.push_str("            Ok(results) => {\n");
+    src.push_str(
+        "                info!(\"═══════════════════ Backtest Results ═══════════════════\");\n",
+    );
+    src.push_str("                results.print_metrics();\n");
+    src.push_str("                info!(\"Insights generated: {}\", state.insights.len());\n");
+    src.push_str("                info!(\"Insights: {:#?}\", state.insights.get_state_count());\n");
+    src.push_str("                let run_id = Uuid::new_v4().to_string();\n");
+    src.push_str("                let out_dir = std::env::current_dir().unwrap_or_default().join(\"backtests\").join(&run_id);\n");
+    src.push_str("                if let Err(e) = results.save_to_disk_async(&out_dir, &*state.broker.backtest_state.as_ref().unwrap().read()).await {\n");
+    src.push_str("                    eprintln!(\"Failed to save results to disk: {}\", e);\n");
+    src.push_str("                } else {\n");
+    src.push_str("                    let mut aqmeta_copied = false;\n");
+    src.push_str("                    if let Ok(project_dir) = std::env::current_dir() {\n");
+    src.push_str(
+        "                        if let Ok(entries) = std::fs::read_dir(&project_dir) {\n",
+    );
+    src.push_str("                            for entry in entries.flatten() {\n");
+    src.push_str("                                let path = entry.path();\n");
+    src.push_str("                                if path.extension().and_then(|ext| ext.to_str()) == Some(\"aqmeta\") {\n");
+    src.push_str("                                    if std::fs::copy(&path, out_dir.join(\"strategy.aqmeta\")).is_ok() {\n");
+    src.push_str("                                        aqmeta_copied = true;\n");
+    src.push_str("                                    }\n");
+    src.push_str("                                    break;\n");
+    src.push_str("                                }\n");
+    src.push_str("                            }\n");
+    src.push_str("                        }\n");
+    src.push_str("                    }\n");
+    src.push_str("                    let metrics_path = out_dir.join(\"metrics.json\");\n");
+    src.push_str(
+        "                    if let Ok(content) = std::fs::read_to_string(&metrics_path) {\n",
+    );
+    src.push_str("                        if let Ok(mut metrics) = serde_json::from_str::<serde_json::Value>(&content) {\n");
+    src.push_str("                            if let Some(obj) = metrics.as_object_mut() {\n");
+    src.push_str("                                let run_config = serde_json::json!({\n");
+    src.push_str(&format!(
+        "                                    \"strategyId\": \"{}\",\n",
+        meta.id
+    ));
+    src.push_str(&format!(
+        "                                    \"strategyName\": \"{}\",\n",
+        meta.name.replace('\\', "\\\\").replace('"', "\\\"")
+    ));
+    src.push_str(&format!(
+        "                                    \"strategyVersion\": \"{}\",\n",
+        meta.version.replace('\\', "\\\\").replace('"', "\\\"")
+    ));
+    src.push_str(&format!(
+        "                                    \"dataFeed\": \"{}\",\n",
+        meta.data_feed
+    ));
+    src.push_str(&format!(
+        "                                    \"dataFeedId\": {},\n",
+        data_feed_id_json
+    ));
+    src.push_str(&format!(
+        "                                    \"executionBroker\": \"{}\",\n",
+        meta.broker
+    ));
+    src.push_str(&format!(
+        "                                    \"brokerId\": {},\n",
+        broker_id_json
+    ));
+    src.push_str(
+        "                                    \"backtestExecutionBroker\": \"Paper Broker\",\n",
+    );
+    src.push_str("                                    \"backtestStart\": start.to_rfc3339(),\n");
+    src.push_str("                                    \"backtestEnd\": end.to_rfc3339(),\n");
+    src.push_str(&format!(
+        "                                    \"timeframeAmount\": {},\n",
+        meta.config.timeframe_amount
+    ));
+    src.push_str(&format!(
+        "                                    \"timeframeUnit\": \"{}\",\n",
+        meta.config
+            .timeframe_unit
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    ));
+    src.push_str(&format!(
+        "                                    \"strategyConfig\": {},\n",
+        strategy_config_json
+    ));
+    src.push_str(&format!(
+        "                                    \"alphaModels\": {},\n",
+        alpha_models_json
+    ));
+    src.push_str(&format!(
+        "                                    \"insightPipes\": {},\n",
+        insight_pipes_json
+    ));
+    src.push_str("                                    \"aqmetaSnapshot\": if aqmeta_copied { serde_json::Value::String(\"strategy.aqmeta\".to_string()) } else { serde_json::Value::Null },\n");
+    src.push_str("                                });\n");
+    src.push_str("                                obj.insert(\"run_config\".to_string(), run_config.clone());\n");
+    src.push_str("                                obj.insert(\"data_feed\".to_string(), run_config[\"dataFeed\"].clone());\n");
+    src.push_str("                                obj.insert(\"data_feed_id\".to_string(), run_config[\"dataFeedId\"].clone());\n");
+    src.push_str("                                obj.insert(\"execution_broker\".to_string(), run_config[\"executionBroker\"].clone());\n");
+    src.push_str("                                obj.insert(\"broker_id\".to_string(), run_config[\"brokerId\"].clone());\n");
+    src.push_str("                                obj.insert(\"backtest_execution_broker\".to_string(), run_config[\"backtestExecutionBroker\"].clone());\n");
+    src.push_str("                                obj.insert(\"backtest_start\".to_string(), run_config[\"backtestStart\"].clone());\n");
+    src.push_str("                                obj.insert(\"backtest_end\".to_string(), run_config[\"backtestEnd\"].clone());\n");
+    src.push_str("                                obj.insert(\"timeframe_amount\".to_string(), run_config[\"timeframeAmount\"].clone());\n");
+    src.push_str("                                obj.insert(\"timeframe_unit\".to_string(), run_config[\"timeframeUnit\"].clone());\n");
+    src.push_str("                                obj.insert(\"alpha_models\".to_string(), run_config[\"alphaModels\"].clone());\n");
+    src.push_str("                                obj.insert(\"insight_pipes\".to_string(), run_config[\"insightPipes\"].clone());\n");
+    src.push_str("                                obj.insert(\"aqmeta_snapshot\".to_string(), run_config[\"aqmetaSnapshot\"].clone());\n");
+    src.push_str("                                if let Ok(updated) = serde_json::to_string_pretty(&metrics) {\n");
+    src.push_str(
+        "                                    let _ = std::fs::write(&metrics_path, updated);\n",
+    );
+    src.push_str("                                }\n");
+    src.push_str("                            }\n");
+    src.push_str("                        }\n");
+    src.push_str("                    }\n");
+    src.push_str("                    if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {\n");
+    src.push_str(
+        "                        println!(\"RESULTS_SAVED_TO: {}\", abs_path.display());\n",
+    );
+    src.push_str("                    } else {\n");
+    src.push_str(
+        "                        println!(\"RESULTS_SAVED_TO: {}\", out_dir.display());\n",
+    );
+    src.push_str("                    }\n");
+    src.push_str("                }\n");
+    src.push_str("            }\n");
+    src.push_str("            Err(e) => {\n");
+    src.push_str("                eprintln!(\"Backtest failed: {:?}\", e);\n");
+    src.push_str("                std::process::exit(1);\n");
+    src.push_str("            }\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n");
     src.push_str("}\n");
 
     Ok(src)
@@ -737,6 +862,18 @@ fn source_file_to_mod_name(path: &str) -> String {
         .or_else(|| file_name.strip_suffix(".pipe"))
         .unwrap_or(file_name);
     name.replace('-', "_").replace('.', "_")
+}
+
+fn push_custom_module_decl(src: &mut String, mod_name: &str, source_file: &str) {
+    let module_path = source_file
+        .strip_prefix("src/")
+        .unwrap_or(source_file)
+        .replace('\\', "/")
+        .replace('"', "\\\"");
+    src.push_str(&format!(
+        "#[path = \"{}\"]\nmod {};\n",
+        module_path, mod_name
+    ));
 }
 
 /// Convert "my_alpha_name" or "My Alpha Name" to "MyAlphaName".

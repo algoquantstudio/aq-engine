@@ -54,6 +54,26 @@ impl TestEntry {
         )
     }
 
+    fn active_spawn_count(&self, ctx: &dyn StrategyContext, symbol: &str) -> usize {
+        ctx.insights()
+            .values()
+            .filter(|insight| {
+                insight.symbol() == symbol
+                    && matches!(insight.strategy_type(), StrategyType::Testing)
+                    && insight.state().is_active()
+            })
+            .count()
+    }
+
+    fn sync_symbol_spawn_count(&self, ctx: &dyn StrategyContext, symbol: &str) -> usize {
+        let spawn_count = self.active_spawn_count(ctx, symbol);
+        ctx.variables().insert(
+            self.symbol_spawn_count_key(symbol),
+            serde_json::Value::from(spawn_count as u64),
+        );
+        spawn_count
+    }
+
     fn confidence_for_symbol(&self, ctx: &dyn StrategyContext, symbol: &str) -> Result<u8, String> {
         let mut confidence = ctx.base_confidence();
         if let Some(field) = &self.base_confidence_modifier_field {
@@ -90,6 +110,8 @@ impl AlphaModel for TestEntry {
     }
 
     fn generate_insights(&mut self, ctx: &mut dyn StrategyContext, symbol: &str) -> AlphaResult {
+        let spawn_count = self.sync_symbol_spawn_count(ctx, symbol);
+
         let confidence = match self.confidence_for_symbol(ctx, symbol) {
             Ok(value) => value,
             Err(message) => {
@@ -98,21 +120,6 @@ impl AlphaModel for TestEntry {
         };
 
         let spawn_key = self.symbol_spawn_count_key(symbol);
-
-        // Reset the per-symbol spawn counter once no insight for this symbol remains active.
-        let active_for_symbol = ctx.insights().values().any(|insight| {
-            insight.symbol() == symbol && insight.strategy_type().to_string() == self.name()
-        });
-        if !active_for_symbol {
-            ctx.variables()
-                .insert(spawn_key.clone(), serde_json::Value::from(0u64));
-        }
-
-        let spawn_count = self
-            .get_variables(ctx)
-            .get(&spawn_key)
-            .and_then(|value| value.value().as_u64())
-            .unwrap_or(0) as usize;
 
         if spawn_count >= self.max_spawn {
             return AlphaResult::new(

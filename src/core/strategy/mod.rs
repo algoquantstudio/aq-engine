@@ -46,13 +46,13 @@ use surrealdb::opt::auth::Record;
 type StrategyActionStream = QueryStream<Notification<surrealdb::types::Value>>;
 
 const MAX_PENDING_AQS_SYNC_OPS: usize = 512;
-const LIVE_SYNC_CONNECT_MAX_ATTEMPTS: usize = 5;
+const LIVE_SYNC_CONNECT_MAX_ATTEMPTS: usize = 3;
 const LIVE_SYNC_RETRY_BASE_MS: u64 = 500;
 const LIVE_SYNC_CONNECT_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_STREAM_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_QUERY_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_RECONCILE_SECS: u64 = 60;
-const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 30;
+const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 40;
 
 #[derive(Clone)]
 enum PendingAqsSyncOp {
@@ -101,6 +101,7 @@ where
 
     // Risk Management Parameters
     warm_up_bars: i32,
+    warm_up_progress: HashMap<String, i32>,
     pub execution_risk: f64,
     pub min_reward_risk_ratio: f64,
     pub base_confidence: f64,
@@ -153,7 +154,9 @@ where
             || message.contains("http error")
     }
 
-    async fn connect_live_sync_db(auth: &AqsAuth) -> Option<surrealdb::Surreal<any::Any>> {
+    async fn connect_live_sync_db(
+        auth: &AqsAuth,
+    ) -> Result<surrealdb::Surreal<any::Any>, BrokerError> {
         let signin_session_id = auth.session_id.clone();
         info!(
             "Authenticating AQS Cloud live sync with session id: {}",
@@ -174,7 +177,7 @@ where
                     );
                     if attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS {
                         warn!(
-                            "Transient AQS live sync connection error for strategy {} on attempt {}/{}: {}",
+                            "AQS live sync connection error for strategy {} on attempt {}/{}: {}",
                             auth.strategy_id, attempt, LIVE_SYNC_CONNECT_MAX_ATTEMPTS, message
                         );
                         tokio::time::sleep(Duration::from_millis(
@@ -184,15 +187,14 @@ where
                         continue;
                     }
                     error!("{}", message);
-                    return None;
+                    return Err(BrokerError::ConnectionError(message));
                 }
                 Ok(Err(error)) => {
-                    if Self::is_transient_surreal_error(&error)
-                        && attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS
-                    {
+                    let message = format!("Failed to connect to AQS Cloud: {}", error);
+                    if attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS {
                         warn!(
-                            "Transient AQS live sync connection error for strategy {} on attempt {}/{}: {}",
-                            auth.strategy_id, attempt, LIVE_SYNC_CONNECT_MAX_ATTEMPTS, error
+                            "AQS live sync connection error for strategy {} on attempt {}/{}: {}",
+                            auth.strategy_id, attempt, LIVE_SYNC_CONNECT_MAX_ATTEMPTS, message
                         );
                         tokio::time::sleep(Duration::from_millis(
                             LIVE_SYNC_RETRY_BASE_MS * attempt as u64,
@@ -200,8 +202,8 @@ where
                         .await;
                         continue;
                     }
-                    error!("Failed to connect to AQS Cloud: {}", error);
-                    return None;
+                    error!("{}", message);
+                    return Err(BrokerError::ConnectionError(message));
                 }
                 Ok(Ok(client)) => {
                     debug!(
@@ -303,21 +305,12 @@ where
                                     );
                                 }
                             }
-                            return Some(client);
+                            return Ok(client);
                         }
                         Ok(Err(error)) => {
-                            let transient = error.contains("503")
-                                || error.contains("service unavailable")
-                                || error.contains("connection reset")
-                                || error.contains("connection closed")
-                                || error.contains("timeout")
-                                || error.contains("timed out")
-                                || error.contains("transport")
-                                || error.contains("websocket error")
-                                || error.contains("http error");
-                            if transient && attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS {
+                            if attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS {
                                 warn!(
-                                    "Transient AQS live sync authentication error for strategy {} on attempt {}/{}: {}",
+                                    "AQS live sync authentication error for strategy {} on attempt {}/{}: {}",
                                     auth.strategy_id,
                                     attempt,
                                     LIVE_SYNC_CONNECT_MAX_ATTEMPTS,
@@ -330,7 +323,7 @@ where
                                 continue;
                             }
                             error!("{}", error);
-                            return None;
+                            return Err(BrokerError::ConnectionError(error));
                         }
                         Err(_) => {
                             let message = format!(
@@ -339,7 +332,7 @@ where
                             );
                             if attempt < LIVE_SYNC_CONNECT_MAX_ATTEMPTS {
                                 warn!(
-                                    "Transient AQS live sync authentication error for strategy {} on attempt {}/{}: {}",
+                                    "AQS live sync authentication error for strategy {} on attempt {}/{}: {}",
                                     auth.strategy_id,
                                     attempt,
                                     LIVE_SYNC_CONNECT_MAX_ATTEMPTS,
@@ -352,14 +345,17 @@ where
                                 continue;
                             }
                             error!("{}", message);
-                            return None;
+                            return Err(BrokerError::ConnectionError(message));
                         }
                     }
                 }
             }
         }
 
-        None
+        Err(BrokerError::ConnectionError(format!(
+            "Failed to connect to AQS Cloud after {} attempt(s)",
+            LIVE_SYNC_CONNECT_MAX_ATTEMPTS
+        )))
     }
 
     async fn create_strategy_action_stream(
@@ -423,7 +419,7 @@ where
         db: &mut Option<surrealdb::Surreal<any::Any>>,
         action_stream: &mut Option<StrategyActionStream>,
         auth: &AqsAuth,
-    ) {
+    ) -> Result<(), BrokerError> {
         warn!(
             "Reconnecting AQE live sync to AQS for strategy {}",
             auth.strategy_id
@@ -431,45 +427,41 @@ where
         let reconnect_result = tokio::time::timeout(
             Duration::from_secs(LIVE_SYNC_RECONNECT_TIMEOUT_SECS),
             async {
-                let next_db = Self::connect_live_sync_db(auth).await;
-                let next_action_stream = match next_db.as_ref() {
-                    Some(client) => Self::create_strategy_action_stream(client, auth).await,
-                    None => None,
-                };
-                (next_db, next_action_stream)
+                let next_db = Self::connect_live_sync_db(auth).await?;
+                let next_action_stream = Self::create_strategy_action_stream(&next_db, auth).await;
+                Ok::<_, BrokerError>((next_db, next_action_stream))
             },
         )
         .await;
 
         match reconnect_result {
-            Ok((next_db, next_action_stream)) => {
-                *db = next_db;
+            Ok(Ok((next_db, next_action_stream))) => {
+                *db = Some(next_db);
                 *action_stream = next_action_stream;
-                if db.is_some() {
-                    info!(
-                        "AQE live sync reconnect complete for strategy {}",
-                        auth.strategy_id
-                    );
-                    if action_stream.is_none() {
-                        warn!(
-                            "AQE live sync reconnected for strategy {} but the strategy action stream is unavailable",
-                            auth.strategy_id
-                        );
-                    }
-                } else {
+                info!(
+                    "AQE live sync reconnect complete for strategy {}",
+                    auth.strategy_id
+                );
+                if action_stream.is_none() {
                     warn!(
-                        "AQE live sync reconnect failed for strategy {}; will retry on the next live loop tick",
+                        "AQE live sync reconnected for strategy {} but the strategy action stream is unavailable",
                         auth.strategy_id
                     );
                 }
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                *db = None;
+                *action_stream = None;
+                Err(error)
             }
             Err(_) => {
                 *db = None;
                 *action_stream = None;
-                warn!(
-                    "AQE live sync reconnect timed out for strategy {} after {}s; will retry on the next live loop tick",
+                Err(BrokerError::ConnectionError(format!(
+                    "AQE live sync reconnect timed out for strategy {} after {}s",
                     auth.strategy_id, LIVE_SYNC_RECONNECT_TIMEOUT_SECS
-                );
+                )))
             }
         }
     }
@@ -712,6 +704,7 @@ where
             alpha_models: Vec::new(),
             indicators: HashMap::new(),
             warm_up_bars: 0,
+            warm_up_progress: HashMap::new(),
             execution_risk: 0.02,
             min_reward_risk_ratio: 2.0,
             base_confidence: 1.0,
@@ -853,7 +846,15 @@ where
             debug!("Loading asset metadata for {}", symbol);
             match self.broker.get_ticker_info(symbol).await {
                 Ok(asset) => {
-                    // Initialize empty history for this symbol
+                    // Initialize empty history for this symbol if its tradable, and add to universe_symbols
+                    if !asset.tradable {
+                        info!(
+                            "Asset {} is not tradable; skipping history initialization and strategy init",
+                            asset.symbol
+                        );
+                        debug!("Asset details: {:?}", asset);
+                        continue;
+                    }
                     self.history
                         .insert(asset.symbol.clone(), DataFrame::default());
                     self.universe.insert(asset.symbol.clone(), asset);
@@ -980,14 +981,28 @@ where
         // Warm-up check: skip strategy callbacks until enough bars accumulated
         if self.warm_up_bars > 0 {
             if let Some(history_df) = self.history.get(symbol) {
-                if (history_df.height() as i32) < self.warm_up_bars {
+                let loaded = history_df.height() as i32;
+                if loaded < self.warm_up_bars {
+                    let should_log =
+                        self.warm_up_progress.get(symbol).copied().unwrap_or(-1) != loaded;
+                    self.warm_up_progress.insert(symbol.to_string(), loaded);
+                    if should_log {
+                        info!(
+                            "[warm up] {} {}/{} candles",
+                            symbol, loaded, self.warm_up_bars
+                        );
+                    }
                     debug!(
                         "Warm-up active for {}: {}/{} bars loaded, skipping strategy callbacks",
-                        symbol,
-                        history_df.height(),
-                        self.warm_up_bars
+                        symbol, loaded, self.warm_up_bars
                     );
                     return;
+                }
+                if self.warm_up_progress.remove(symbol).is_some() {
+                    info!(
+                        "[warm up] {} complete ({}/{})",
+                        symbol, loaded, self.warm_up_bars
+                    );
                 }
             }
         }
@@ -1187,13 +1202,228 @@ where
 
     fn insights_state_counts_json(&self) -> serde_json::Value {
         let mut counts = serde_json::Map::new();
-        for (state, count) in self.insights.lifetime_state_counts() {
+        for (state, count) in self.insights.get_state_count() {
             counts.insert(
                 format!("{:?}", state),
-                serde_json::Value::from(*count as u64),
+                serde_json::Value::from(count as u64),
             );
         }
         serde_json::Value::Object(counts)
+    }
+
+    async fn persist_live_strategy_summary<C: surrealdb::Connection>(
+        &self,
+        client: &surrealdb::Surreal<C>,
+        auth: &AqsAuth,
+    ) -> Result<(), surrealdb::Error> {
+        client
+            .query(
+                "UPDATE type::record('strategy', $id)
+                 SET status = $status,
+                     is_live = true,
+                     live_session_id = type::record('live_strategy_session', <uuid>$live_session_key),
+                     insights_count = $insights_count,
+                     last_heartbeat = time::now()",
+            )
+            .bind(("id", auth.strategy_id.clone()))
+            .bind(("status", format!("{:?}", self.status)))
+            .bind(("live_session_key", Self::live_session_key_for_auth(auth)))
+            .bind(("insights_count", self.insights_state_counts_json()))
+            .await
+            .and_then(|response| response.check())
+            .map(|_| ())
+    }
+
+    async fn reconcile_remote_active_insights<C: surrealdb::Connection>(
+        &self,
+        client: &surrealdb::Surreal<C>,
+        auth: &AqsAuth,
+        synced_insight_states: &mut HashMap<String, String>,
+        pending_ops: &mut VecDeque<PendingAqsSyncOp>,
+    ) -> Result<usize, surrealdb::Error> {
+        let live_session_key = Self::live_session_key_for_auth(auth);
+        let local_active_ids = self
+            .insights
+            .values()
+            .filter(|insight| insight.state().is_active())
+            .map(|insight| insight.insight_id().to_string())
+            .collect::<HashSet<_>>();
+
+        let mut result: IndexedResults = client
+            .query(
+                "SELECT insight_id, symbol, state, side
+                 FROM insights
+                 WHERE strategy_id = type::record('strategy', $strategy_id)
+                   AND live_session_id = type::record('live_strategy_session', <uuid>$live_session_key)
+                   AND state IN ['New', 'Executed', 'Filled']",
+            )
+            .bind(("strategy_id", auth.strategy_id.clone()))
+            .bind(("live_session_key", live_session_key.clone()))
+            .await?;
+        let rows: Vec<serde_json::Value> = result.take(0)?;
+        let mut reconciled = 0usize;
+
+        for row in rows {
+            let Some(insight_id) = row
+                .get("insight_id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+
+            if local_active_ids.contains(&insight_id) {
+                continue;
+            }
+
+            let symbol = row
+                .get("symbol")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-");
+            let previous_state = row
+                .get("state")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-");
+            let side = row
+                .get("side")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-");
+            let now = chrono::Utc::now();
+            let record_id = Self::live_insight_record_id(auth, &insight_id);
+            let reason = format!(
+                "AQS reconciliation marked stale active insight as Cancelled; AQE no longer has active insight {}",
+                insight_id
+            );
+
+            let update_result = client
+                .query(
+                    "UPDATE type::record('insights', $record_id)
+                     SET state = 'Cancelled',
+                         cancelling = false,
+                         closing = false,
+                         first_on_fill = false,
+                         updated_at = <datetime>$now,
+                         closed_at = <datetime>$now",
+                )
+                .bind(("record_id", record_id))
+                .bind(("now", now))
+                .await
+                .and_then(|response| response.check());
+
+            if let Err(error) = update_result {
+                if Self::is_transient_surreal_error(&error) {
+                    return Err(error);
+                }
+                error!(
+                    "Failed to reconcile stale AQS insight {} for strategy {}: {}",
+                    insight_id, auth.strategy_id, error
+                );
+                continue;
+            }
+
+            synced_insight_states.remove(&insight_id);
+            reconciled += 1;
+
+            let event = StrategyEventRecord {
+                event_type: "insight_reconcile".into(),
+                level: "warn".into(),
+                title: "Stale insight cancelled".into(),
+                message: reason.clone(),
+                payload: Some(serde_json::json!({
+                    "insight_id": insight_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "previous_state": previous_state,
+                    "state": "Cancelled",
+                    "reason": reason,
+                })),
+                created_at: Some(now),
+            };
+
+            if let Err(error) = persist_strategy_event(client, auth, event.clone()).await {
+                if Self::is_transient_surreal_error(&error) {
+                    Self::enqueue_pending_aqs_sync_op(
+                        pending_ops,
+                        PendingAqsSyncOp::StrategyEvent(event),
+                    );
+                    return Err(error);
+                }
+                error!(
+                    "Failed to persist stale insight reconciliation event for strategy {} insight {}: {}",
+                    auth.strategy_id, insight_id, error
+                );
+            }
+        }
+
+        if reconciled > 0 {
+            warn!(
+                "AQS reconciliation cancelled {} stale active insight(s) for strategy {}",
+                reconciled, auth.strategy_id
+            );
+        }
+
+        Ok(reconciled)
+    }
+
+    async fn persist_unsynced_insight_transitions<C: surrealdb::Connection>(
+        client: &surrealdb::Surreal<C>,
+        auth: &AqsAuth,
+        snapshot: &InsightSnapshot,
+        synced_history_offsets: &mut HashMap<String, usize>,
+        pending_ops: &mut VecDeque<PendingAqsSyncOp>,
+    ) -> Result<(), surrealdb::Error> {
+        let start_index = synced_history_offsets
+            .get(&snapshot.insight_id)
+            .copied()
+            .unwrap_or(0);
+        let mut next_offset = start_index;
+
+        for (index, history) in snapshot.state_history.iter().enumerate().skip(start_index) {
+            next_offset = index + 1;
+            let is_state_transition = history
+                .message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("State changed from "));
+            if !is_state_transition {
+                continue;
+            }
+
+            let event = StrategyEventRecord {
+                event_type: "insight_state".into(),
+                level: "info".into(),
+                title: format!("Insight {}", history.state),
+                message: history
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| format!("{} changed to {}", snapshot.symbol, history.state)),
+                payload: Some(serde_json::json!({
+                    "insight_id": snapshot.insight_id,
+                    "symbol": snapshot.symbol,
+                    "state": history.state,
+                    "side": snapshot.side,
+                    "history_index": index,
+                    "history": history,
+                })),
+                created_at: Some(history.at),
+            };
+
+            if let Err(error) = persist_strategy_event(client, auth, event.clone()).await {
+                if Self::is_transient_surreal_error(&error) {
+                    Self::enqueue_pending_aqs_sync_op(
+                        pending_ops,
+                        PendingAqsSyncOp::StrategyEvent(event),
+                    );
+                    return Err(error);
+                }
+                error!(
+                    "Failed to persist live insight transition event for strategy {} insight {} history_index={}: {}",
+                    auth.strategy_id, snapshot.insight_id, index, error
+                );
+            }
+        }
+
+        synced_history_offsets.insert(snapshot.insight_id.clone(), next_offset);
+        Ok(())
     }
 
     fn refresh_live_open_position_metrics(&mut self) {
@@ -1279,6 +1509,7 @@ where
         client: &surrealdb::Surreal<C>,
         auth: &AqsAuth,
         synced_insight_states: &mut HashMap<String, String>,
+        synced_insight_history_offsets: &mut HashMap<String, usize>,
         pending_ops: &mut VecDeque<PendingAqsSyncOp>,
         include_full_reconcile: bool,
     ) -> Result<bool, surrealdb::Error> {
@@ -1287,22 +1518,7 @@ where
             auth.strategy_id,
             self.insights.len()
         );
-        if let Err(error) = client
-            .query(
-                "UPDATE type::record('strategy', $id)
-                 SET status = $status,
-                     is_live = true,
-                     live_session_id = type::record('live_strategy_session', <uuid>$live_session_key),
-                     insights_count = $insights_count,
-                     last_heartbeat = time::now()",
-            )
-            .bind(("id", auth.strategy_id.clone()))
-            .bind(("status", format!("{:?}", self.status)))
-            .bind(("live_session_key", Self::live_session_key_for_auth(auth)))
-            .bind(("insights_count", self.insights_state_counts_json()))
-            .await
-            .and_then(|response| response.check())
-        {
+        if let Err(error) = self.persist_live_strategy_summary(client, auth).await {
             if Self::is_transient_surreal_error(&error) {
                 return Err(error);
             }
@@ -1345,70 +1561,23 @@ where
             }
 
             let previous_state = synced_insight_states.get(&snapshot.insight_id).cloned();
+            Self::persist_unsynced_insight_transitions(
+                client,
+                auth,
+                &snapshot,
+                synced_insight_history_offsets,
+                pending_ops,
+            )
+            .await?;
+
             if previous_state.as_deref() != Some(current_state.as_str()) {
                 persist_metrics_after_sync = true;
                 info!(
                     "Live insight synced: strategy={} insight={} symbol={} state={}",
                     auth.strategy_id, snapshot.insight_id, snapshot.symbol, current_state
                 );
-                let latest_history = snapshot.state_history.last().cloned();
                 if current_state == "Closed" {
                     self.live_metrics.record_closed_insight(&snapshot);
-                }
-                if let Err(error) = persist_strategy_event(
-                    client,
-                    auth,
-                    StrategyEventRecord {
-                        event_type: "insight_state".into(),
-                        level: "info".into(),
-                        title: format!("Insight {}", current_state),
-                        message: latest_history
-                            .as_ref()
-                            .and_then(|entry| entry.message.clone())
-                            .unwrap_or_else(|| {
-                                format!("{} changed to {}", snapshot.symbol, current_state)
-                            }),
-                        payload: Some(serde_json::json!({
-                            "insight_id": snapshot.insight_id,
-                            "symbol": snapshot.symbol,
-                            "state": current_state,
-                            "side": snapshot.side,
-                            "history": latest_history,
-                        })),
-                        created_at: Some(chrono::Utc::now()),
-                    },
-                )
-                .await
-                {
-                    if Self::is_transient_surreal_error(&error) {
-                        Self::enqueue_pending_aqs_sync_op(
-                            pending_ops,
-                            PendingAqsSyncOp::StrategyEvent(StrategyEventRecord {
-                                event_type: "insight_state".into(),
-                                level: "info".into(),
-                                title: format!("Insight {}", current_state),
-                                message: latest_history
-                                    .as_ref()
-                                    .and_then(|entry| entry.message.clone())
-                                    .unwrap_or_else(|| {
-                                        format!("{} changed to {}", snapshot.symbol, current_state)
-                                    }),
-                                payload: Some(serde_json::json!({
-                                    "insight_id": snapshot.insight_id,
-                                    "symbol": snapshot.symbol,
-                                    "state": current_state,
-                                    "side": snapshot.side,
-                                    "history": latest_history,
-                                })),
-                                created_at: Some(chrono::Utc::now()),
-                            }),
-                        );
-                        return Err(error);
-                    }
-                    error!(
-                        "Failed to persist live insight state event for strategy {} insight {}: {}",
-                        auth.strategy_id, snapshot.insight_id, error
-                    );
                 }
                 synced_insight_states.insert(snapshot.insight_id.clone(), current_state.clone());
             } else {
@@ -1424,6 +1593,26 @@ where
         for insight_id in prune_after_sync {
             self.insights.prune_terminal_insight(&insight_id);
             synced_insight_states.remove(&insight_id.to_string());
+            synced_insight_history_offsets.remove(&insight_id.to_string());
+        }
+
+        if include_full_reconcile {
+            let reconciled = self
+                .reconcile_remote_active_insights(client, auth, synced_insight_states, pending_ops)
+                .await?;
+            if reconciled > 0 {
+                persist_metrics_after_sync = true;
+            }
+        }
+
+        if let Err(error) = self.persist_live_strategy_summary(client, auth).await {
+            if Self::is_transient_surreal_error(&error) {
+                return Err(error);
+            }
+            error!(
+                "Failed to update live strategy summary after reconciliation for {}: {}",
+                auth.strategy_id, error
+            );
         }
 
         Ok(persist_metrics_after_sync)
@@ -1478,7 +1667,12 @@ where
 
                 match (&insight.state, &event) {
                     // NEW → EXECUTED on accept
-                    (InsightState::New, TradeUpdateEvent::PendingNew | TradeUpdateEvent::New) => {
+                    (
+                        InsightState::New,
+                        TradeUpdateEvent::Accepted
+                        | TradeUpdateEvent::PendingNew
+                        | TradeUpdateEvent::New,
+                    ) => {
                         if matched {
                             insight.order_accepted(&order.order_id);
                             touched_insight_ids.insert(id);
@@ -1591,11 +1785,19 @@ where
                     // FILLED → CLOSED (SL/TP/manual close)
                     (InsightState::Filled, TradeUpdateEvent::Filled | TradeUpdateEvent::Closed) => {
                         if matched {
+                            if event == TradeUpdateEvent::Filled && order.side == insight.side {
+                                continue;
+                            }
                             let price = Self::close_price_from_order(&order);
                             // again we dont need to sync the TP/SL again on close because we will
                             // have the close price.
                             // Self::sync_broker_managed_levels(insight, &order);
-                            insight.position_closed(price, &order.order_id, order.filled_qty);
+                            insight.position_closed(
+                                price,
+                                &order.order_id,
+                                order.filled_qty,
+                                order.realized_pnl,
+                            );
                             touched_insight_ids.insert(id);
 
                             // Close/Cancel any open children
@@ -1692,7 +1894,22 @@ where
                 insight.insight_id(),
                 Self::order_log_summary(&order)
             );
-            insight.order_id = Some(order.order_id.clone());
+            if order.order_id.is_empty() {
+                error!(
+                    "Broker returned an empty order id after submit: insight_id={} {}",
+                    insight.insight_id(),
+                    Self::order_log_summary(&order)
+                );
+            } else {
+                insight.order_id = Some(order.order_id.clone());
+            }
+        } else if let Err(error) = result {
+            error!(
+                "Broker submit_order failed for insight_id={} {}: {:?}",
+                insight.insight_id(),
+                insight.log_summary(),
+                error
+            );
         }
     }
 
@@ -1964,21 +2181,23 @@ where
     /// This will register callbacks for trade events & bar streams,
     /// then loop via `tokio::select!` block listening on channels to drive the pipeline.
     pub async fn run_live(&mut self, auth: Option<AqsAuth>) -> Result<(), BrokerError> {
+        let mut db = if let Some(ref a) = auth {
+            Some(Self::connect_live_sync_db(a).await?)
+        } else {
+            None
+        };
+
         // Take strategy out to avoid split-borrow
         let mut strategy = self
             .strategy
             .take()
             .expect("strategy must be Some before run_live");
 
+        self.broker
+            .configure_live_session(&self.strategy_id.to_string())?;
+
         // 1. Connect broker
         self.broker.connect().await?;
-
-        // ── SurrealDB Connection for Live Sync ──
-        let mut db = if let Some(ref a) = auth {
-            Self::connect_live_sync_db(a).await
-        } else {
-            None
-        };
 
         let mut action_stream = if let (Some(client), Some(a)) = (&db, &auth) {
             Self::create_strategy_action_stream(client, a).await
@@ -1988,6 +2207,7 @@ where
 
         let mut stop_action_id: Option<String> = None;
         let mut synced_insight_states: HashMap<String, String> = HashMap::new();
+        let mut synced_insight_history_offsets: HashMap<String, usize> = HashMap::new();
 
         let mut pending_sync_ops = VecDeque::new();
 
@@ -2015,6 +2235,12 @@ where
         // 6. Subscribe to market data stream
         let symbols: Vec<String> = self.universe.keys().cloned().collect();
         let time_frame = self.timeframe.clone();
+        info!(
+            "Subscribing live market data symbols={:?} timeframe={:?} mode={:?}",
+            symbols,
+            time_frame,
+            DataStreamMode::CompletedBar
+        );
 
         let bar_tx_clone = bar_tx.clone();
         let bar_callback = Arc::new(move |bar| {
@@ -2061,6 +2287,28 @@ where
         let mut reconcile_interval =
             tokio::time::interval(std::time::Duration::from_secs(LIVE_SYNC_RECONCILE_SECS));
         let mut force_full_reconcile = true;
+        let mut live_sync_failure: Option<BrokerError> = None;
+
+        macro_rules! reconnect_live_sync_or_stop {
+            ($auth:expr) => {{
+                match Self::reconnect_live_sync(&mut db, &mut action_stream, $auth).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let message = format!(
+                            "AQS live sync unavailable for strategy {} after {} attempt(s); stopping live run: {}",
+                            $auth.strategy_id,
+                            LIVE_SYNC_CONNECT_MAX_ATTEMPTS,
+                            error
+                        );
+                        error!("{}", message);
+                        live_sync_failure = Some(BrokerError::ConnectionError(message));
+                        self.status = StrategyStatus::Stopping;
+                        self.shutdown();
+                        continue;
+                    }
+                }
+            }};
+        }
 
         loop {
             tokio::select! {
@@ -2073,15 +2321,9 @@ where
                     );
                     // Process trade events (we let `on_trade_update()` drain all pending broker state)
                     self.on_trade_update();
-                    if auth.is_none() {
-                        let pruned_ids = self.insights.prune_terminal_insights_without_aqs();
-                        for insight_id in pruned_ids {
-                            synced_insight_states.remove(&insight_id.to_string());
-                        }
-                    }
                     if let Some(a) = auth.as_ref() {
                         if db.is_none() {
-                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                            reconnect_live_sync_or_stop!(a);
                             force_full_reconcile = true;
                         }
                         if let Some(client) = db.as_ref() {
@@ -2090,11 +2332,11 @@ where
                                     "Live sync could not flush pending AQS ops for strategy {} after trade event: {}",
                                     a.strategy_id, error
                                 );
-                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                reconnect_live_sync_or_stop!(a);
                                 continue;
                             }
                             let sync_result = self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut pending_sync_ops, force_full_reconcile)
+                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
                                 .await;
                             match sync_result {
                                 Ok(persist_metrics_after_sync) => {
@@ -2105,7 +2347,7 @@ where
                                                 "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
                                                 a.strategy_id, error
                                             );
-                                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                            reconnect_live_sync_or_stop!(a);
                                             continue;
                                         }
                                     }
@@ -2126,7 +2368,7 @@ where
                                                     "Live sync lost AQS connection for strategy {} while persisting account state: {}",
                                                     a.strategy_id, error
                                                 );
-                                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                                reconnect_live_sync_or_stop!(a);
                                                 continue;
                                             }
                                             error!(
@@ -2139,7 +2381,7 @@ where
                                                 "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
                                                 a.strategy_id, error
                                             );
-                                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                            reconnect_live_sync_or_stop!(a);
                                             continue;
                                         }
                                     }
@@ -2169,7 +2411,7 @@ where
                                                 "Live sync lost AQS connection for strategy {} while persisting trade event: {}",
                                                 a.strategy_id, error
                                             );
-                                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                            reconnect_live_sync_or_stop!(a);
                                             continue;
                                         }
                                         error!(
@@ -2183,7 +2425,7 @@ where
                                         "Live sync lost AQS connection for strategy {} after trade event: {}",
                                         a.strategy_id, error
                                     );
-                                    Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                    reconnect_live_sync_or_stop!(a);
                                     force_full_reconcile = true;
                                 }
                             }
@@ -2194,22 +2436,29 @@ where
                 // Handle incoming market data bars
                 Some(bar) = bar_rx.recv() => {
                     let symbol = bar.symbol.clone();
+                    info!(
+                        "Live market data bar symbol={} timeframe={:?} timestamp={}",
+                        symbol,
+                        self.timeframe,
+                        bar.timestamp
+                    );
                     debug!("Live loop processing completed bar for {}", symbol);
                     self.broker.process_live_bar(&bar);
                     debug!("Live loop processed execution broker for {}", symbol);
                     self.on_trade_update();
+                    debug!("Live loop processed trade events after execution step for {}", symbol);
+                    self._on_bar(&mut strategy, &symbol, &BarData::Bars(vec![bar]));
+                    debug!("Live loop completed _on_bar for {}", symbol);
                     if auth.is_none() {
                         let pruned_ids = self.insights.prune_terminal_insights_without_aqs();
                         for insight_id in pruned_ids {
                             synced_insight_states.remove(&insight_id.to_string());
+                            synced_insight_history_offsets.remove(&insight_id.to_string());
                         }
                     }
-                    debug!("Live loop processed trade events after execution step for {}", symbol);
-                    self._on_bar(&mut strategy, &symbol, &BarData::Bars(vec![bar]));
-                    debug!("Live loop completed _on_bar for {}", symbol);
                     if let Some(a) = auth.as_ref() {
                         if db.is_none() {
-                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                            reconnect_live_sync_or_stop!(a);
                             force_full_reconcile = true;
                         }
                         if let Some(client) = db.as_ref() {
@@ -2218,11 +2467,11 @@ where
                                     "Live sync could not flush pending AQS ops for strategy {} after bar processing: {}",
                                     a.strategy_id, error
                                 );
-                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                reconnect_live_sync_or_stop!(a);
                                 continue;
                             }
                             match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut pending_sync_ops, force_full_reconcile)
+                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
                                 .await
                             {
                                 Ok(persist_metrics_after_sync) => {
@@ -2233,7 +2482,7 @@ where
                                                 "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
                                                 a.strategy_id, error
                                             );
-                                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                            reconnect_live_sync_or_stop!(a);
                                             continue;
                                         }
                                     }
@@ -2243,7 +2492,7 @@ where
                                         "Live sync lost AQS connection for strategy {} after bar processing: {}",
                                         a.strategy_id, error
                                     );
-                                    Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                    reconnect_live_sync_or_stop!(a);
                                     force_full_reconcile = true;
                                 }
                             }
@@ -2260,13 +2509,14 @@ where
                         let pruned_ids = self.insights.prune_terminal_insights_without_aqs();
                         for insight_id in pruned_ids {
                             synced_insight_states.remove(&insight_id.to_string());
+                            synced_insight_history_offsets.remove(&insight_id.to_string());
                         }
                     }
 
                     // Optional Push to SurrealDB
                     if let Some(a) = auth.as_ref() {
                         if db.is_none() {
-                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                            reconnect_live_sync_or_stop!(a);
                             force_full_reconcile = true;
                         }
                         if let Some(client) = db.as_ref() {
@@ -2275,11 +2525,11 @@ where
                                     "Live sync could not flush pending AQS ops for strategy {} during pipeline sync: {}",
                                     a.strategy_id, error
                                 );
-                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                reconnect_live_sync_or_stop!(a);
                                 continue;
                             }
                             match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut pending_sync_ops, force_full_reconcile)
+                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
                                 .await
                             {
                                 Ok(persist_metrics_after_sync) => {
@@ -2290,7 +2540,7 @@ where
                                                 "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
                                                 a.strategy_id, error
                                             );
-                                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                            reconnect_live_sync_or_stop!(a);
                                             continue;
                                         }
                                     }
@@ -2312,7 +2562,7 @@ where
                                                     "Live sync lost AQS connection for strategy {} while persisting account state: {}",
                                                     a.strategy_id, error
                                                 );
-                                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                                reconnect_live_sync_or_stop!(a);
                                                 continue;
                                             }
                                             error!(
@@ -2325,7 +2575,7 @@ where
                                                 "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
                                                 a.strategy_id, error
                                             );
-                                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                            reconnect_live_sync_or_stop!(a);
                                             continue;
                                         }
                                     }
@@ -2335,7 +2585,7 @@ where
                                         "Live sync lost AQS connection for strategy {} during pipeline sync: {}",
                                         a.strategy_id, error
                                     );
-                                    Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                    reconnect_live_sync_or_stop!(a);
                                     force_full_reconcile = true;
                                 }
                             }
@@ -2346,7 +2596,7 @@ where
                 _ = reconcile_interval.tick() => {
                     if let Some(a) = auth.as_ref() {
                         if db.is_none() {
-                            Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                            reconnect_live_sync_or_stop!(a);
                             force_full_reconcile = true;
                         }
                         if let Some(client) = db.as_ref() {
@@ -2355,12 +2605,12 @@ where
                                     "Live sync could not flush pending AQS ops for strategy {} during reconcile: {}",
                                     a.strategy_id, error
                                 );
-                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                reconnect_live_sync_or_stop!(a);
                                 force_full_reconcile = true;
                                 continue;
                             }
                             match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut pending_sync_ops, true)
+                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, true)
                                 .await
                             {
                                 Ok(_) => {
@@ -2371,7 +2621,7 @@ where
                                         "Live sync lost AQS connection for strategy {} during periodic reconcile: {}",
                                         a.strategy_id, error
                                     );
-                                    Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                    reconnect_live_sync_or_stop!(a);
                                     force_full_reconcile = true;
                                 }
                             }
@@ -2428,7 +2678,7 @@ where
                         Some(Err(error)) => {
                             error!("Strategy action live stream error: {}", error);
                             if let Some(a) = auth.as_ref() {
-                                Self::reconnect_live_sync(&mut db, &mut action_stream, a).await;
+                                reconnect_live_sync_or_stop!(a);
                             }
                         }
                         None => {}
@@ -2518,6 +2768,10 @@ where
                 },
             )
             .await;
+        }
+
+        if let Some(error) = live_sync_failure {
+            return Err(error);
         }
 
         Ok(())

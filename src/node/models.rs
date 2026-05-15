@@ -153,7 +153,11 @@ pub struct StrategyMeta {
     #[serde(default)]
     pub data_feed: DataFeedType,
     #[serde(default)]
+    pub data_feed_id: Option<String>,
+    #[serde(default)]
     pub broker: ExecutionBrokerType,
+    #[serde(default)]
+    pub broker_id: Option<String>,
     pub nodes: Vec<Node>,
     pub connections: Vec<Connection>,
     pub created_at: String,
@@ -171,7 +175,9 @@ impl StrategyMeta {
             name: name.to_string(),
             version: "1.0.0".to_string(),
             data_feed: DataFeedType::default(),
+            data_feed_id: None,
             broker: ExecutionBrokerType::default(),
+            broker_id: None,
             nodes: Vec::new(),
             connections: Vec::new(),
             created_at: chrono::Utc::now().to_rfc3339(),

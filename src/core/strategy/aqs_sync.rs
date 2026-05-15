@@ -4,7 +4,7 @@ use super::aqs_types::{
 };
 use crate::core::broker::types::Account;
 use chrono::{DateTime, Utc};
-use log::{debug, info};
+use log::debug;
 use surrealdb::IndexedResults;
 use uuid::Uuid;
 
@@ -189,7 +189,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
     });
 
     if account_changed {
-        info!(
+        debug!(
             "AQS live sync: account state changed for strategy {} -> equity {:.2}, cash {:.2}, buying power {:.2}",
             auth.strategy_id, account.equity, account.cash, account.buying_power
         );
@@ -233,7 +233,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
         .and_then(|response| response.check());
 
     match account_result {
-        Ok(_) => info!(
+        Ok(_) => debug!(
             "AQS live sync: wrote strategy_accounts snapshot for strategy {}",
             auth.strategy_id
         ),
@@ -328,7 +328,12 @@ pub async fn persist_live_metrics<C: surrealdb::Connection>(
                 losing_trades: $metrics.losing_trades,
                 win_rate: $metrics.win_rate,
                 max_drawdown: $metrics.max_drawdown,
+                cagr: $metrics.cagr,
+                annualized_volatility: $metrics.annualized_volatility,
                 sharpe_ratio: $metrics.sharpe_ratio,
+                sortino_ratio: $metrics.sortino_ratio,
+                calmar_ratio: $metrics.calmar_ratio,
+                max_drawdown_duration_days: $metrics.max_drawdown_duration_days,
                 expectancy: $metrics.expectancy,
                 profit_factor: $metrics.profit_factor,
                 payoff_ratio: $metrics.payoff_ratio,

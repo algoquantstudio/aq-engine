@@ -75,6 +75,7 @@ pub struct Insight {
     pub filled_price: Option<f64>,
     pub close_order_id: Option<String>,
     pub close_price: Option<f64>,
+    pub broker_realized_pnl: Option<f64>,
     pub partial_closes: Vec<PartialCloseResult>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -410,9 +411,16 @@ impl Insight {
     }
 
     /// Position closed (SL/TP/manual). Transitions FILLED → CLOSED.
-    pub fn position_closed(&mut self, close_price: f64, close_order_id: &str, _close_qty: f64) {
+    pub fn position_closed(
+        &mut self,
+        close_price: f64,
+        close_order_id: &str,
+        _close_qty: f64,
+        broker_realized_pnl: Option<f64>,
+    ) {
         self.close_price = Some(close_price);
         self.close_order_id = Some(close_order_id.to_string());
+        self.broker_realized_pnl = broker_realized_pnl;
         self.closed_at = Some(self.current_time());
         let pnl = self.get_pl(None, true);
         let pnl_pct = self.get_pl_pct();
@@ -461,7 +469,12 @@ impl Insight {
         if let Some(order_id) = &self.order_id {
             if let Err(e) = ctx.cancel_order(order_id) {
                 warn!("Failed to cancel order {}: {:?}", order_id, e);
+                self.cancelling = false;
+                return self;
             }
+        } else {
+            self.cancelling = false;
+            return self;
         }
 
         debug!("Cancel requested for insight: {}", self.log_summary());
@@ -476,6 +489,8 @@ impl Insight {
         self.cancelling = true;
         if let Err(e) = ctx.cancel_order(&order_id) {
             warn!("Failed to cancel order {}: {:?}", order_id, e);
+            self.cancelling = false;
+            return self;
         }
         debug!(
             "Cancel requested by order id for insight: {} order_id={}",
@@ -496,11 +511,14 @@ impl Insight {
                 "Failed to close position for {}: no filled order id is associated with the insight",
                 self.symbol
             );
+            self.closing = false;
             return self;
         };
         self.cancel_active_legs(ctx);
         if let Err(e) = ctx.close_position(&order_id, qty, None) {
             eprintln!("Failed to close position for {}: {:?}", self.symbol, e);
+            self.closing = false;
+            return self;
         }
         self.update_state(self.state.clone(), Some("Insight closed".to_string()));
         self
@@ -554,6 +572,12 @@ impl Insight {
         let entry = self.entry_price().unwrap_or(0.0);
         let remaining_qty = self.remaining_quantity();
 
+        if self.close_price.is_some() {
+            if let Some(realized_pnl) = self.broker_realized_pnl {
+                return ((realized_pnl + partial_pl) * 100.0).round() / 100.0;
+            }
+        }
+
         let remaining_pl = if self.side == OrderSide::Buy {
             (price - entry) * remaining_qty
         } else {
@@ -568,12 +592,23 @@ impl Insight {
         let Some(entry) = self.entry_price() else {
             return 0.0;
         };
+        let qty = self.quantity.unwrap_or(0.0);
+        if entry.abs() <= f64::EPSILON || qty <= f64::EPSILON {
+            return 0.0;
+        }
+
+        if let Some(realized_pnl) = self.broker_realized_pnl {
+            let notional = entry * qty;
+            if notional.abs() <= f64::EPSILON {
+                return 0.0;
+            }
+            let raw = (realized_pnl / notional) * 100.0;
+            return (raw * 100.0).round() / 100.0;
+        }
+
         let Some(close) = self.close_price else {
             return 0.0;
         };
-        if entry.abs() <= f64::EPSILON {
-            return 0.0;
-        }
 
         let raw = match self.side {
             OrderSide::Buy => ((close - entry) / entry) * 100.0,
@@ -1070,6 +1105,13 @@ impl Insight {
     fn update_state(&mut self, new_state: InsightState, message: Option<String>) {
         let at = self.current_time();
         self.updated_at = at;
+        if matches!(new_state, InsightState::Filled) {
+            self.cancelling = false;
+        }
+        if new_state.is_inactive() {
+            self.cancelling = false;
+            self.closing = false;
+        }
         if self.state != new_state {
             self.state_history.push((
                 at,
@@ -1140,6 +1182,7 @@ impl Default for Insight {
             filled_price: None,
             close_order_id: None,
             close_price: None,
+            broker_realized_pnl: None,
             partial_closes: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

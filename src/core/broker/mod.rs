@@ -117,6 +117,11 @@ where
         self.data.disconnect().await
     }
 
+    pub fn configure_live_session(&self, session_id: &str) -> Result<(), BrokerError> {
+        self.execution.configure_live_session(session_id)?;
+        self.data.configure_live_session(session_id)
+    }
+
     /// Check if the data feed is connected.
     pub fn is_datafeed_connected(&self) -> bool {
         self.data.is_connected()
@@ -391,6 +396,12 @@ where
 
             // Convert DataFrame to Vec<Bar> for fast indexed access in BacktestState
             let bars = Self::dataframe_to_bars(symbol, &df)?;
+            if bars.is_empty() {
+                return Err(BrokerError::DataFeedError(format!(
+                    "Backtest history request returned 0 bars for {} timeframe={:?} start={} end={}",
+                    symbol, time_frame, start, end
+                )));
+            }
             info!("Loaded {} bars for {}", bars.len(), symbol);
 
             let mut state_guard = state.write();
@@ -556,6 +567,10 @@ pub mod traits {
         }
         fn get_name(&self) -> String;
         fn get_account_type(&self) -> Result<AccountType, BrokerError>;
+
+        fn configure_live_session(&self, _session_id: &str) -> Result<(), BrokerError> {
+            Ok(())
+        }
     }
 
     pub trait OrderManagementProvider: Broker {
@@ -649,6 +664,10 @@ pub mod traits {
             &self,
             symbols: Vec<String>,
         ) -> Result<(), BrokerError>;
+
+        fn configure_live_session(&self, _session_id: &str) -> Result<(), BrokerError> {
+            Ok(())
+        }
 
         /// Format raw bar data into Polars DataFrame for the strategy layer.
         ///

@@ -1,10 +1,11 @@
-use super::mt5_bridge::{Mt5Bridge, Mt5Command, Mt5CommandAction};
+use super::mt5_bridge::{Mt5Bridge, Mt5RpcAction};
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
     Account, AccountType, BrokerError, Order, OrderClass, OrderLeg, OrderLegs, OrderSide,
     OrderType, Position, TimeInForce, TradeUpdateEvent,
 };
 use crate::core::insight::Insight;
+use crate::core::utils::tools::dynamic_round_for_asset;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -28,6 +29,20 @@ impl Mt5Broker {
 
     fn now_ts() -> u64 {
         Utc::now().timestamp().max(0) as u64
+    }
+
+    fn order_comment(order: &Order) -> Option<String> {
+        let strategy_type = order
+            .strategy_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let insight_id = order
+            .insight_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        Some(format!("{}:{}", strategy_type, insight_id))
     }
 
     fn order_from_insight(&self, insight: Insight) -> Result<Order, BrokerError> {
@@ -112,6 +127,7 @@ impl Mt5Broker {
             updated_at: now_ts,
             submitted_at: now_ts,
             filled_at: None,
+            realized_pnl: None,
             rejection_reason: None,
             legs,
         })
@@ -143,50 +159,114 @@ impl Broker for Mt5Broker {
     fn get_account_type(&self) -> Result<AccountType, BrokerError> {
         Ok(AccountType::Live)
     }
+
+    fn configure_live_session(&self, session_id: &str) -> Result<(), BrokerError> {
+        self.bridge.set_session_id(session_id);
+        Ok(())
+    }
 }
 
 impl OrderManagementProvider for Mt5Broker {
     async fn submit_order(&self, insight: Insight) -> Result<Order, BrokerError> {
         let order = self.order_from_insight(insight)?;
-        self.bridge.upsert_order(order.clone());
-        self.bridge.enqueue_command(Mt5Command {
-            command_id: Uuid::new_v4().to_string(),
-            action: Mt5CommandAction::SubmitOrder,
-            order: Some(order.clone()),
-            order_id: Some(order.order_id.clone()),
-            symbol: Some(order.asset.symbol.clone()),
-            qty: Some(order.qty),
-            price: order.limit_price.or(order.stop_price),
-            side: Some(order.side.clone()),
-            order_type: Some(order.order_type.clone()),
-            take_profit: order
-                .legs
-                .as_ref()
-                .and_then(|legs| legs.take_profit.as_ref())
-                .and_then(|leg| leg.limit_price),
-            stop_loss: order
-                .legs
-                .as_ref()
-                .and_then(|legs| legs.stop_loss.as_ref())
-                .and_then(|leg| leg.limit_price),
-        })?;
-        Ok(order)
+        let take_profit = order
+            .legs
+            .as_ref()
+            .and_then(|legs| legs.take_profit.as_ref())
+            .and_then(|leg| leg.limit_price)
+            .map(|price| dynamic_round_for_asset(price, &order.asset));
+        let stop_loss = order
+            .legs
+            .as_ref()
+            .and_then(|legs| legs.stop_loss.as_ref())
+            .and_then(|leg| leg.limit_price)
+            .map(|price| dynamic_round_for_asset(price, &order.asset));
+        let side = match order.side {
+            OrderSide::Buy => "Buy",
+            OrderSide::Sell => "Sell",
+        };
+        let order_type = match order.order_type {
+            OrderType::Market => "Market",
+            OrderType::Limit => "Limit",
+            OrderType::Stop => "Stop",
+            OrderType::StopLimit => "StopLimit",
+            OrderType::TrailingStop => "TrailingStop",
+        };
+        let mut payload = serde_json::json!({
+            "clientOrderId": order.order_id.clone(),
+            "symbol": order.asset.symbol.clone(),
+            "qty": order.qty,
+            "price": order.limit_price.or(order.stop_price),
+            "side": side,
+            "orderType": order_type,
+        });
+        if let Some(comment) = Self::order_comment(&order) {
+            payload["comment"] = serde_json::json!(comment);
+        }
+        if let Some(take_profit) = take_profit.filter(|price| *price > 0.0) {
+            payload["takeProfit"] = serde_json::json!(take_profit);
+        }
+        if let Some(stop_loss) = stop_loss.filter(|price| *price > 0.0) {
+            payload["stopLoss"] = serde_json::json!(stop_loss);
+        }
+        self.bridge
+            .request_order_action(Mt5RpcAction::SubmitOrder, Some(order), payload)
+            .await
     }
 
     async fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError> {
-        self.bridge.enqueue_command(Mt5Command {
-            command_id: Uuid::new_v4().to_string(),
-            action: Mt5CommandAction::CancelOrder,
-            order: None,
-            order_id: Some(order_id.to_string()),
-            symbol: None,
-            qty: None,
-            price: None,
-            side: None,
-            order_type: None,
-            take_profit: None,
-            stop_loss: None,
-        })?;
+        let existing_order = match self.bridge.order(order_id) {
+            Ok(order) => Some(order),
+            Err(_) => self
+                .bridge
+                .request_orders()
+                .await?
+                .into_iter()
+                .find(|order| order.order_id == order_id),
+        };
+
+        let Some(existing_order) = existing_order else {
+            return Err(BrokerError::OrderCancellationError(format!(
+                "MT5 order {} was not found for cancellation",
+                order_id
+            )));
+        };
+
+        if matches!(
+            existing_order.status,
+            TradeUpdateEvent::Filled
+                | TradeUpdateEvent::Closed
+                | TradeUpdateEvent::Canceled
+                | TradeUpdateEvent::Rejected
+                | TradeUpdateEvent::Expired
+        ) {
+            return Err(BrokerError::OrderCancellationError(format!(
+                "MT5 order {} is already terminal with status {:?}",
+                order_id, existing_order.status
+            )));
+        }
+
+        self.bridge
+            .request_rpc(
+                Mt5RpcAction::CancelOrder,
+                serde_json::json!({ "orderId": order_id }),
+            )
+            .await?;
+
+        let cancelled = !self
+            .bridge
+            .request_orders()
+            .await?
+            .into_iter()
+            .any(|order| order.order_id == order_id);
+
+        if !cancelled {
+            return Err(BrokerError::OrderCancellationError(format!(
+                "MT5 did not confirm cancellation for order {}",
+                order_id
+            )));
+        }
+
         Ok(true)
     }
 
@@ -207,57 +287,61 @@ impl OrderManagementProvider for Mt5Broker {
         qty: f64,
         price: Option<f64>,
     ) -> Result<bool, BrokerError> {
-        self.bridge.enqueue_command(Mt5Command {
-            command_id: Uuid::new_v4().to_string(),
-            action: Mt5CommandAction::ClosePosition,
-            order: None,
-            order_id: Some(order_id.to_string()),
-            symbol: None,
-            qty: Some(qty),
-            price,
-            side: None,
-            order_type: None,
-            take_profit: None,
-            stop_loss: None,
-        })?;
+        let existing_order = self.bridge.order(order_id).ok();
+        let symbol = existing_order
+            .as_ref()
+            .map(|order| order.asset.symbol.clone());
+        let comment = existing_order.as_ref().and_then(Self::order_comment);
+        self.bridge
+            .request_rpc(
+                Mt5RpcAction::ClosePosition,
+                serde_json::json!({
+                    "orderId": order_id,
+                    "symbol": symbol,
+                    "qty": qty,
+                    "price": price,
+                    "comment": comment
+                }),
+            )
+            .await?;
         Ok(true)
     }
 
     async fn close_all_positions(&self) -> Result<bool, BrokerError> {
-        self.bridge.enqueue_command(Mt5Command {
-            command_id: Uuid::new_v4().to_string(),
-            action: Mt5CommandAction::CloseAllPositions,
-            order: None,
-            order_id: None,
-            symbol: None,
-            qty: None,
-            price: None,
-            side: None,
-            order_type: None,
-            take_profit: None,
-            stop_loss: None,
-        })?;
+        self.bridge
+            .request_rpc(Mt5RpcAction::CloseAllPositions, serde_json::json!({}))
+            .await?;
         Ok(true)
     }
 
     async fn get_orders(&self) -> Result<Vec<Order>, BrokerError> {
-        Ok(self.bridge.orders())
+        self.bridge.request_orders().await
     }
 
     async fn get_order(&self, order_id: &str) -> Result<Order, BrokerError> {
-        self.bridge.order(order_id)
+        self.bridge
+            .request_orders()
+            .await?
+            .into_iter()
+            .find(|order| order.order_id == order_id)
+            .ok_or_else(|| BrokerError::OrderError(format!("MT5 order {} not found", order_id)))
     }
 
     async fn get_positions(&self) -> Result<Vec<Position>, BrokerError> {
-        Ok(self.bridge.positions())
+        self.bridge.request_positions().await
     }
 
     async fn get_position(&self, symbol: &str) -> Result<Position, BrokerError> {
-        self.bridge.position(symbol)
+        self.bridge
+            .request_positions()
+            .await?
+            .into_iter()
+            .find(|position| position.asset.symbol == symbol)
+            .ok_or_else(|| BrokerError::PositionError(format!("MT5 position {} not found", symbol)))
     }
 
     async fn get_account(&self) -> Result<Account, BrokerError> {
-        self.bridge.account()
+        self.bridge.request_account().await
     }
 
     fn drain_trade_events(&self) -> Vec<(Order, TradeUpdateEvent)> {

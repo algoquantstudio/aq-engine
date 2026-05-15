@@ -571,6 +571,21 @@ impl PaperBroker {
                         OrderSide::Buy => (bar.close - pos.avg_entry_price) * pos.qty,
                         OrderSide::Sell => (pos.avg_entry_price - bar.close) * pos.qty,
                     };
+                    if let Some(ref state) = self.backtest_state {
+                        let mae_pct = if pos.avg_entry_price.abs() > f64::EPSILON {
+                            match pos.side {
+                                OrderSide::Buy => {
+                                    ((bar.low - pos.avg_entry_price) / pos.avg_entry_price) * 100.0
+                                }
+                                OrderSide::Sell => {
+                                    ((pos.avg_entry_price - bar.high) / pos.avg_entry_price) * 100.0
+                                }
+                            }
+                        } else {
+                            0.0
+                        };
+                        state.write().record_trade_mae(pos.key(), mae_pct);
+                    }
                     total_unrealized_pnl += pos.unrealized_pnl;
                     _total_market_value += pos.market_value;
                 }
@@ -1168,6 +1183,7 @@ impl OrderManagementProvider for PaperBroker {
             updated_at: now_ts,
             submitted_at: now_ts,
             filled_at: None,
+            realized_pnl: None,
             rejection_reason: None,
             legs,
         };
@@ -1206,7 +1222,7 @@ impl OrderManagementProvider for PaperBroker {
         if let Some(mut order) = self.orders.get_mut(order_id) {
             if order.status == TradeUpdateEvent::Filled || order.status == TradeUpdateEvent::Closed
             {
-                return Err(BrokerError::OrderError(
+                return Err(BrokerError::OrderCancellationError(
                     "Cannot cancel filled/closed order".into(),
                 ));
             }
@@ -1258,7 +1274,7 @@ impl OrderManagementProvider for PaperBroker {
                 }
             }
 
-            Err(BrokerError::OrderError(format!(
+            Err(BrokerError::OrderCancellationError(format!(
                 "Order not found: {}",
                 order_id
             )))

@@ -106,7 +106,6 @@ impl ExecutionBrokerType {
 pub struct Mt5BridgeConfig {
     pub bind_addr: String,
     pub token_env: String,
-    pub session_id_env: String,
     pub request_timeout_ms: u64,
     pub poll_interval_ms: u64,
     pub symbol_map: Option<String>,
@@ -117,7 +116,6 @@ impl Default for Mt5BridgeConfig {
         Self {
             bind_addr: "127.0.0.1:18080".to_string(),
             token_env: "AQE_MT5_BRIDGE_TOKEN".to_string(),
-            session_id_env: "AQE_MT5_SESSION_ID".to_string(),
             request_timeout_ms: 5_000,
             poll_interval_ms: 250,
             symbol_map: None,
@@ -155,6 +153,18 @@ pub struct DataFeedConfig {
     pub api_secret: Option<String>,
     pub environment: Option<DataFeedEnvironment>,
     pub symbols: Option<Vec<String>>,
+    #[serde(default)]
+    pub mt5_account_id: Option<String>,
+    #[serde(default)]
+    pub mt5_server: Option<String>,
+    #[serde(default)]
+    pub mt5_password: Option<String>,
+    #[serde(default)]
+    pub mt5_bridge_token: Option<String>,
+    #[serde(default)]
+    pub mt5_bind_addr: Option<String>,
+    #[serde(default)]
+    pub mt5_test_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -162,6 +172,8 @@ pub struct DataFeedConfig {
 pub struct DataFeed {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub service_type: DataFeedServiceType,
     pub status: DataFeedStatus,
     pub config: DataFeedConfig,

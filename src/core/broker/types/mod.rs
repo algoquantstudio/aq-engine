@@ -154,6 +154,8 @@ pub struct Order {
     pub updated_at: u64,
     pub submitted_at: u64,
     pub filled_at: Option<u64>,
+    #[serde(default)]
+    pub realized_pnl: Option<f64>,
     pub rejection_reason: Option<String>,
     pub legs: Option<OrderLegs>,
 }
@@ -284,6 +286,7 @@ pub enum BrokerError {
     DataFeedConnectionError(String),
     DataFeedDisconnectionError(String),
     InvalidTicker(String),
+    OrderCancellationError(String),
 }
 
 impl fmt::Display for BrokerError {
@@ -304,6 +307,9 @@ impl fmt::Display for BrokerError {
                 write!(f, "Data feed disconnection error: {}", msg)
             }
             BrokerError::InvalidTicker(msg) => write!(f, "Invalid ticker: {}", msg),
+            BrokerError::OrderCancellationError(msg) => {
+                write!(f, "Order cancellation error: {}", msg)
+            }
         }
     }
 }
