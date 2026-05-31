@@ -64,6 +64,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("built_in_test_entry".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -97,6 +100,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("insight_submit".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -153,6 +159,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("allow_trading_window".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -195,6 +204,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("and_pipe".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -237,6 +249,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("or_pipe".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -270,6 +285,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("cancel_opposite".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -303,6 +321,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("market_order_entry".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -359,6 +380,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("built_in_ema_price_crossover".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -429,6 +453,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("built_in_rsi_divergance_alpha".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -478,6 +505,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("dynamic_quantity_to_risk".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -511,6 +541,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("full_account_quantity_to_risk".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -553,6 +586,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("minimum_risk_to_reward".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -586,6 +622,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("reject_expired_insight".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -635,6 +674,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("percentage_dca_levels".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -668,6 +710,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("basic_stop_loss".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -701,6 +746,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("basic_take_profit".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -743,6 +791,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("scale_out".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
         Node {
@@ -776,6 +827,9 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 },
             ],
             source_file: Some("close_market_changed".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: false,
         },
     ]

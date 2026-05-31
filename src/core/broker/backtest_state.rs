@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::types::{Account, Bar, OrderSide, TradeRecord, TradeRecordType};
 use crate::core::insight::InsightSnapshot;
@@ -31,6 +31,10 @@ pub struct BacktestState {
     pub insight_snapshots: HashMap<String, InsightSnapshot>,
     /// Running minimum unrealized return per order, tracked while positions are open.
     pub trade_mae_by_order_id: HashMap<String, f64>,
+    /// Configured backtest start timestamp.
+    pub backtest_start: Option<DateTime<Utc>>,
+    /// Configured backtest end timestamp.
+    pub backtest_end: Option<DateTime<Utc>>,
 
     executed_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
@@ -48,6 +52,8 @@ impl BacktestState {
             trade_log: Vec::new(),
             insight_snapshots: HashMap::new(),
             trade_mae_by_order_id: HashMap::new(),
+            backtest_start: None,
+            backtest_end: None,
             executed_at: Utc::now(),
             finished_at: None,
         }
@@ -60,6 +66,11 @@ impl BacktestState {
         self.bar_indices.insert(symbol.clone(), 0);
         self.historical_bars.insert(symbol, bars);
         self.total_bars = self.total_bars.max(len);
+    }
+
+    pub fn set_backtest_window(&mut self, start: DateTime<Utc>, end: DateTime<Utc>) {
+        self.backtest_start = Some(start);
+        self.backtest_end = Some(end);
     }
 
     /// Get the current bar for a symbol (at the current bar index).
@@ -773,6 +784,343 @@ pub struct RoundTripTrade {
     pub hold_secs: i64,
 }
 
+#[cfg(feature = "runtime")]
+fn is_aqmeta_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("aqmeta"))
+}
+
+#[cfg(feature = "runtime")]
+fn find_current_project_aqmeta() -> Option<PathBuf> {
+    let project_dir = std::env::current_dir().ok()?;
+    std::fs::read_dir(project_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| is_aqmeta_path(path))
+}
+
+#[cfg(feature = "runtime")]
+fn json_string(value: Option<&serde_json::Value>, fallback: &str) -> serde_json::Value {
+    serde_json::Value::String(
+        value
+            .and_then(|value| value.as_str())
+            .unwrap_or(fallback)
+            .to_string(),
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn display_data_feed(value: Option<&serde_json::Value>) -> serde_json::Value {
+    let label = match value.and_then(|value| value.as_str()).unwrap_or_default() {
+        "YahooFinance" | "yahooFinance" | "YAHOO_FINANCE" => "Yahoo Finance",
+        "Mt5" | "mt5" | "MT5" => "MT5",
+        other if !other.is_empty() => other,
+        _ => "Yahoo Finance",
+    };
+    serde_json::Value::String(label.to_string())
+}
+
+#[cfg(feature = "runtime")]
+fn display_execution_broker(value: Option<&serde_json::Value>) -> serde_json::Value {
+    let label = match value.and_then(|value| value.as_str()).unwrap_or_default() {
+        "Paper" | "paper" | "PAPER" => "Paper Broker",
+        "Mt5" | "mt5" | "MT5" => "MT5 Broker",
+        other if !other.is_empty() => other,
+        _ => "Paper Broker",
+    };
+    serde_json::Value::String(label.to_string())
+}
+
+#[cfg(feature = "runtime")]
+fn object_field<'a>(
+    object: &'a serde_json::Value,
+    camel_case: &str,
+    snake_case: &str,
+) -> Option<&'a serde_json::Value> {
+    object.get(camel_case).or_else(|| object.get(snake_case))
+}
+
+#[cfg(feature = "runtime")]
+fn node_id(node: &serde_json::Value) -> Option<String> {
+    node.get("id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+#[cfg(feature = "runtime")]
+fn node_type_matches(node: &serde_json::Value, expected: &str) -> bool {
+    node.get("type")
+        .or_else(|| node.get("nodeType"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(feature = "runtime")]
+fn endpoint_node_id(endpoint: &serde_json::Value) -> Option<String> {
+    object_field(endpoint, "nodeId", "node_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+#[cfg(feature = "runtime")]
+fn endpoint_port(endpoint: &serde_json::Value) -> Option<&str> {
+    endpoint
+        .get("port")
+        .or_else(|| endpoint.get("input"))
+        .or_else(|| endpoint.get("output"))
+        .and_then(|value| value.as_str())
+}
+
+#[cfg(feature = "runtime")]
+fn reachable_aqmeta_node_ids(aqmeta: &serde_json::Value) -> HashSet<String> {
+    let nodes = aqmeta
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let all_ids: HashSet<String> = nodes.iter().filter_map(node_id).collect();
+    let roots: Vec<String> = nodes
+        .iter()
+        .filter(|node| node_type_matches(node, "strategy"))
+        .filter_map(node_id)
+        .collect();
+
+    if roots.is_empty() {
+        return all_ids;
+    }
+
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(connections) = aqmeta.get("connections").and_then(|value| value.as_array()) {
+        for connection in connections {
+            let to_endpoint = connection.get("to");
+            let Some(from_id) = connection.get("from").and_then(endpoint_node_id) else {
+                continue;
+            };
+            let Some(to_id) = to_endpoint.and_then(endpoint_node_id) else {
+                continue;
+            };
+            adjacency
+                .entry(from_id.clone())
+                .or_default()
+                .push(to_id.clone());
+            if to_endpoint
+                .and_then(endpoint_port)
+                .is_some_and(|port| port == "insights_pipes")
+            {
+                adjacency.entry(to_id).or_default().push(from_id);
+            }
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    let mut queue: VecDeque<String> = roots.into_iter().collect();
+    while let Some(node_id) = queue.pop_front() {
+        if !reachable.insert(node_id.clone()) {
+            continue;
+        }
+        if let Some(children) = adjacency.get(&node_id) {
+            for child in children {
+                queue.push_back(child.clone());
+            }
+        }
+    }
+
+    reachable
+}
+
+#[cfg(feature = "runtime")]
+fn aqmeta_node_snapshot(aqmeta: &serde_json::Value, expected_type: &str) -> serde_json::Value {
+    let reachable = reachable_aqmeta_node_ids(aqmeta);
+    let nodes = aqmeta
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let snapshot = nodes
+        .iter()
+        .filter(|node| node_type_matches(node, expected_type))
+        .filter(|node| {
+            node_id(node)
+                .as_ref()
+                .is_some_and(|id| reachable.contains(id))
+        })
+        .map(|node| {
+            let inputs = node
+                .get("inputs")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|input| {
+                    serde_json::json!({
+                        "name": input.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "type": object_field(input, "inputType", "input_type")
+                            .or_else(|| input.get("type"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "value": input.get("value").cloned().unwrap_or(serde_json::Value::Null),
+                        "isPublic": object_field(input, "isPublic", "is_public")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Bool(true)),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            serde_json::json!({
+                "id": node.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "label": node.get("label").cloned().unwrap_or(serde_json::Value::Null),
+                "sourceFile": object_field(node, "sourceFile", "source_file")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "inputs": inputs,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::Value::Array(snapshot)
+}
+
+#[cfg(feature = "runtime")]
+fn backtest_time_value(value: Option<DateTime<Utc>>) -> serde_json::Value {
+    value
+        .map(|value| serde_json::Value::String(value.to_rfc3339()))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(feature = "runtime")]
+fn build_aqmeta_run_config(
+    aqmeta: &serde_json::Value,
+    state: &BacktestState,
+    aqmeta_copied: bool,
+) -> serde_json::Value {
+    let config = aqmeta
+        .get("config")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    serde_json::json!({
+        "strategyId": aqmeta.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "strategyName": json_string(aqmeta.get("name"), "Unknown Strategy"),
+        "strategyVersion": json_string(aqmeta.get("version"), "1.0.0"),
+        "dataFeed": display_data_feed(aqmeta.get("dataFeed")),
+        "dataFeedId": object_field(aqmeta, "dataFeedId", "data_feed_id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "executionBroker": display_execution_broker(aqmeta.get("broker")),
+        "brokerId": object_field(aqmeta, "brokerId", "broker_id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "backtestExecutionBroker": "Paper Broker",
+        "brokerLeverage": config
+            .get("brokerLeverage")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1)),
+        "backtestStart": backtest_time_value(state.backtest_start),
+        "backtestEnd": backtest_time_value(state.backtest_end),
+        "timeframeAmount": config
+            .get("timeframeAmount")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1)),
+        "timeframeUnit": config
+            .get("timeframeUnit")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("Minute")),
+        "strategyConfig": config,
+        "alphaModels": aqmeta_node_snapshot(aqmeta, "alpha"),
+        "insightPipes": aqmeta_node_snapshot(aqmeta, "pipe"),
+        "aqmetaSnapshot": if aqmeta_copied {
+            serde_json::Value::String("strategy.aqmeta".to_string())
+        } else {
+            serde_json::Value::Null
+        },
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn attach_run_config_to_metrics(metrics: &mut serde_json::Value, run_config: serde_json::Value) {
+    let Some(obj) = metrics.as_object_mut() else {
+        return;
+    };
+
+    obj.insert("run_config".to_string(), run_config.clone());
+    obj.insert("data_feed".to_string(), run_config["dataFeed"].clone());
+    obj.insert("data_feed_id".to_string(), run_config["dataFeedId"].clone());
+    obj.insert(
+        "execution_broker".to_string(),
+        run_config["executionBroker"].clone(),
+    );
+    obj.insert("broker_id".to_string(), run_config["brokerId"].clone());
+    obj.insert(
+        "backtest_execution_broker".to_string(),
+        run_config["backtestExecutionBroker"].clone(),
+    );
+    obj.insert(
+        "broker_leverage".to_string(),
+        run_config["brokerLeverage"].clone(),
+    );
+    obj.insert(
+        "backtest_start".to_string(),
+        run_config["backtestStart"].clone(),
+    );
+    obj.insert(
+        "backtest_end".to_string(),
+        run_config["backtestEnd"].clone(),
+    );
+    obj.insert(
+        "timeframe_amount".to_string(),
+        run_config["timeframeAmount"].clone(),
+    );
+    obj.insert(
+        "timeframe_unit".to_string(),
+        run_config["timeframeUnit"].clone(),
+    );
+    obj.insert(
+        "alpha_models".to_string(),
+        run_config["alphaModels"].clone(),
+    );
+    obj.insert(
+        "insight_pipes".to_string(),
+        run_config["insightPipes"].clone(),
+    );
+    obj.insert(
+        "aqmeta_snapshot".to_string(),
+        run_config["aqmetaSnapshot"].clone(),
+    );
+}
+
+#[cfg(feature = "runtime")]
+fn enrich_backtest_metrics_with_aqmeta_path(
+    metrics: &mut serde_json::Value,
+    dir_path: &Path,
+    state: &BacktestState,
+    aqmeta_path: &Path,
+) -> Result<(), String> {
+    let aqmeta_copied = std::fs::copy(aqmeta_path, dir_path.join("strategy.aqmeta")).is_ok();
+    let content = std::fs::read_to_string(aqmeta_path).map_err(|error| error.to_string())?;
+    let aqmeta =
+        serde_json::from_str::<serde_json::Value>(&content).map_err(|error| error.to_string())?;
+    let run_config = build_aqmeta_run_config(&aqmeta, state, aqmeta_copied);
+    attach_run_config_to_metrics(metrics, run_config);
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
+fn enrich_backtest_metrics_with_project_aqmeta(
+    metrics: &mut serde_json::Value,
+    dir_path: &Path,
+    state: &BacktestState,
+) {
+    let Some(aqmeta_path) = find_current_project_aqmeta() else {
+        return;
+    };
+
+    let _ = enrich_backtest_metrics_with_aqmeta_path(metrics, dir_path, state, &aqmeta_path);
+}
+
 impl BacktestResults {
     /// Save the results to the specified directory.
     /// Metrics are saved as JSON and the larger backtest artifacts are stored in `backtest.db`.
@@ -926,10 +1274,120 @@ impl BacktestResults {
             symbols,
         };
 
-        // Save metrics to JSON
-        let metrics_json = serde_json::to_string_pretty(&metrics).map_err(|e| e.to_string())?;
+        // Save metrics to JSON. If the project has an `.aqmeta` file, attach the AQS
+        // run metadata and copy the snapshot without requiring generated main.rs code.
+        let mut metrics_json_value = serde_json::to_value(&metrics).map_err(|e| e.to_string())?;
+        enrich_backtest_metrics_with_project_aqmeta(&mut metrics_json_value, dir_path, state);
+        let metrics_json =
+            serde_json::to_string_pretty(&metrics_json_value).map_err(|e| e.to_string())?;
         std::fs::write(dir_path.join("metrics.json"), metrics_json).map_err(|e| e.to_string())?;
         crate::core::backtest_storage::write_backtest_db(dir_path, self, state).await?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod tests {
+    use super::*;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aqe_backtest_metrics_{}_{}",
+                label,
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn enriches_metrics_from_aqmeta_without_codegen_metadata_block() {
+        let source_dir = TestDir::new("source");
+        let output_dir = TestDir::new("output");
+        let aqmeta_path = source_dir.path.join("strategy.aqmeta");
+        std::fs::write(
+            &aqmeta_path,
+            serde_json::json!({
+                "id": "strategy-1",
+                "name": "Prop Test",
+                "version": "2.0.0",
+                "dataFeed": "yahooFinance",
+                "dataFeedId": "feed-1",
+                "broker": "paper",
+                "brokerId": "broker-1",
+                "config": {
+                    "timeframeAmount": 5,
+                    "timeframeUnit": "Minute",
+                    "brokerLeverage": 4,
+                    "startingCash": 25000.0
+                },
+                "nodes": [
+                    { "id": "strategy_root", "type": "strategy", "label": "Prop Test", "inputs": [] },
+                    { "id": "alpha-1", "type": "alpha", "label": "Entry Alpha", "sourceFile": "entry_alpha.rs", "inputs": [
+                        { "name": "lookback", "inputType": "INT", "value": 20, "isPublic": true }
+                    ] },
+                    { "id": "pipe-1", "type": "pipe", "label": "Submit Pipe", "sourceFile": "built_in/insight_submit.rs", "inputs": [] },
+                    { "id": "unused-alpha", "type": "alpha", "label": "Unused Alpha", "inputs": [] }
+                ],
+                "connections": [
+                    { "from": { "nodeId": "strategy_root", "port": "on_bar" }, "to": { "nodeId": "alpha-1", "port": "on_bar" } },
+                    { "from": { "nodeId": "alpha-1", "port": "insights_out" }, "to": { "nodeId": "pipe-1", "port": "insights" } }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let start = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let end = "2026-01-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut state = BacktestState::new();
+        state.set_backtest_window(start, end);
+
+        let mut metrics = serde_json::json!({ "starting_cash": 25000.0 });
+        enrich_backtest_metrics_with_aqmeta_path(
+            &mut metrics,
+            &output_dir.path,
+            &state,
+            &aqmeta_path,
+        )
+        .unwrap();
+
+        assert!(output_dir.path.join("strategy.aqmeta").is_file());
+        assert_eq!(metrics["broker_leverage"], serde_json::json!(4));
+        assert_eq!(
+            metrics["backtest_start"],
+            serde_json::json!(start.to_rfc3339())
+        );
+        assert_eq!(metrics["backtest_end"], serde_json::json!(end.to_rfc3339()));
+        assert_eq!(metrics["data_feed"], serde_json::json!("Yahoo Finance"));
+        assert_eq!(
+            metrics["execution_broker"],
+            serde_json::json!("Paper Broker")
+        );
+        assert_eq!(
+            metrics["run_config"]["strategyName"],
+            serde_json::json!("Prop Test")
+        );
+        assert_eq!(
+            metrics["run_config"]["aqmetaSnapshot"],
+            serde_json::json!("strategy.aqmeta")
+        );
+
+        let alpha_models = metrics["alpha_models"].as_array().unwrap();
+        assert_eq!(alpha_models.len(), 1);
+        assert_eq!(alpha_models[0]["label"], serde_json::json!("Entry Alpha"));
+        assert_eq!(metrics["insight_pipes"].as_array().unwrap().len(), 1);
     }
 }

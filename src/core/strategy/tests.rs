@@ -18,13 +18,19 @@ mod tests {
     };
     use crate::core::insight::Insight;
     use crate::core::insight::types::{InsightState, StrategyType};
+    use crate::core::lifecycle::{
+        LifecycleResult, LifecycleTiming, OnInitLogic, OnInitLogicBuilder, OnStartLogic,
+        OnStartLogicBuilder, OnTeardownLogic, OnTeardownLogicBuilder,
+    };
     use crate::core::pipeline::insight_submit::InsightSubmitPipe;
     use crate::core::pipeline::scale_out::ScaleOutPipe;
     use crate::core::pipeline::{InsightPipe, InsightPipeResult, WrappedInsightPipe};
     use crate::core::strategy::StrategyMode;
+    use crate::core::universe::{UniverseModel, UniverseModelBuilder, UniverseResult};
     use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
     use chrono::{TimeZone, Utc};
     use polars::prelude::*;
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
 
     static MT5_INTEGRATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1200,6 +1206,213 @@ mod tests {
         );
 
         println!("  ✓ Lifecycle order verified: start → init → generate");
+    }
+
+    #[tokio::test]
+    async fn test_strategy_lifecycle_logic_and_universe_models_run() {
+        struct VariableOnStartLogic {
+            key: &'static str,
+        }
+
+        impl OnStartLogic for VariableOnStartLogic {
+            fn version(&self) -> &str {
+                "1.0"
+            }
+
+            fn run(&mut self, ctx: &mut dyn StrategyContext) -> LifecycleResult {
+                ctx.variables().insert(self.key.to_string(), json!(true));
+                LifecycleResult::passed(self.name().to_string())
+            }
+        }
+
+        struct VariableOnInitLogic {
+            key: &'static str,
+        }
+
+        impl OnInitLogic for VariableOnInitLogic {
+            fn version(&self) -> &str {
+                "1.0"
+            }
+
+            fn run(&mut self, ctx: &mut dyn StrategyContext, asset: &Asset) -> LifecycleResult {
+                let mut symbols = ctx
+                    .variables()
+                    .get(self.key)
+                    .and_then(|entry| entry.value().as_array().cloned())
+                    .unwrap_or_default();
+                symbols.push(json!(asset.symbol.clone()));
+                ctx.variables().insert(self.key.to_string(), json!(symbols));
+                LifecycleResult::passed(self.name().to_string())
+            }
+        }
+
+        struct VariableOnTeardownLogic {
+            key: &'static str,
+        }
+
+        impl OnTeardownLogic for VariableOnTeardownLogic {
+            fn version(&self) -> &str {
+                "1.0"
+            }
+
+            fn run(&mut self, ctx: &mut dyn StrategyContext) -> LifecycleResult {
+                ctx.variables().insert(self.key.to_string(), json!(true));
+                LifecycleResult::passed(self.name().to_string())
+            }
+        }
+
+        struct StaticUniverseModel {
+            symbols: Vec<&'static str>,
+        }
+
+        impl UniverseModel for StaticUniverseModel {
+            fn version(&self) -> &str {
+                "1.0"
+            }
+
+            fn run(&mut self, _ctx: &mut dyn StrategyContext) -> UniverseResult {
+                UniverseResult::passed(
+                    self.symbols
+                        .iter()
+                        .map(|symbol| symbol.to_string())
+                        .collect(),
+                    self.name().to_string(),
+                )
+            }
+        }
+
+        struct GeneratedStyleLifecycleStrategy;
+
+        impl Strategy for GeneratedStyleLifecycleStrategy {
+            fn name(&self) -> &str {
+                "GeneratedStyleLifecycleStrategy"
+            }
+
+            fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+                ctx.variables()
+                    .insert("generated_on_start".to_string(), json!(true));
+                ctx.add_universe_model(
+                    UniverseModelBuilder::new(Box::new(StaticUniverseModel {
+                        symbols: vec!["AAPL", "MSFT"],
+                    }))
+                    .build(),
+                );
+                ctx.add_universe_model(
+                    UniverseModelBuilder::new(Box::new(StaticUniverseModel {
+                        symbols: vec!["MSFT", "GOOG"],
+                    }))
+                    .build(),
+                );
+            }
+
+            fn init(&mut self, _ctx: &mut dyn StrategyContext, _asset: &Asset) {}
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                ["AAPL".to_string(), "STATIC_ONLY".to_string()]
+                    .into_iter()
+                    .collect()
+            }
+
+            fn on_bar(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str, _bar: &BarData) {}
+
+            fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+        }
+
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = FixedScaleOutDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+
+        let mut state = StrategyState::new(
+            "LifecycleLogicStateTest".to_string(),
+            "1.0".to_string(),
+            GeneratedStyleLifecycleStrategy,
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+        state.add_on_start_logic(
+            OnStartLogicBuilder::new(Box::new(VariableOnStartLogic {
+                key: "on_start_before",
+            }))
+            .timing(LifecycleTiming::BeforeGenerated)
+            .build(),
+        );
+        state.add_on_start_logic(
+            OnStartLogicBuilder::new(Box::new(VariableOnStartLogic {
+                key: "on_start_after",
+            }))
+            .timing(LifecycleTiming::AfterGenerated)
+            .build(),
+        );
+        state.add_on_init_logic(
+            OnInitLogicBuilder::new(Box::new(VariableOnInitLogic {
+                key: "on_init_symbols",
+            }))
+            .timing(LifecycleTiming::BeforeGenerated)
+            .build(),
+        );
+        state.add_on_teardown_logic(
+            OnTeardownLogicBuilder::new(Box::new(VariableOnTeardownLogic {
+                key: "on_teardown_after",
+            }))
+            .timing(LifecycleTiming::AfterGenerated)
+            .build(),
+        );
+        state.set_warm_up_bars(0);
+
+        let start = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 9, 3, 0, 0, 0).unwrap();
+        let result = state.run_backtest(start, end, state.timeframe()).await;
+        if assert_backtest_or_skip(result, "Lifecycle logic strategy backtest should complete")
+            .is_none()
+        {
+            return;
+        }
+
+        assert_eq!(
+            state.variables.get("on_start_before").map(|v| v.clone()),
+            Some(json!(true))
+        );
+        assert_eq!(
+            state.variables.get("generated_on_start").map(|v| v.clone()),
+            Some(json!(true))
+        );
+        assert_eq!(
+            state.variables.get("on_start_after").map(|v| v.clone()),
+            Some(json!(true))
+        );
+        assert_eq!(
+            state.variables.get("on_teardown_after").map(|v| v.clone()),
+            Some(json!(true))
+        );
+
+        let loaded_symbols: HashSet<String> = state.universe.keys().cloned().collect();
+        assert_eq!(
+            loaded_symbols,
+            [
+                "AAPL".to_string(),
+                "MSFT".to_string(),
+                "GOOG".to_string(),
+                "STATIC_ONLY".to_string()
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let mut init_symbols = state
+            .variables
+            .get("on_init_symbols")
+            .and_then(|entry| entry.value().as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        init_symbols.sort();
+        assert_eq!(init_symbols, vec!["AAPL", "GOOG", "MSFT", "STATIC_ONLY"]);
     }
 
     // ═══════════════════════════════════════════════════════════════════

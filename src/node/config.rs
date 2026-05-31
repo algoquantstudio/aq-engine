@@ -15,6 +15,8 @@ pub struct StrategyBacktestConfig {
     pub base_confidence: f64,
     #[serde(default = "default_starting_cash")]
     pub starting_cash: f64,
+    #[serde(default = "default_broker_leverage")]
+    pub broker_leverage: u8,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +34,7 @@ impl Default for StrategyBacktestConfig {
             min_reward_risk_ratio: default_min_reward_risk_ratio(),
             base_confidence: default_base_confidence(),
             starting_cash: default_starting_cash(),
+            broker_leverage: default_broker_leverage(),
             log_level: default_log_level(),
             start_time: None,
             end_time: None,
@@ -56,6 +59,9 @@ fn default_base_confidence() -> f64 {
 }
 fn default_starting_cash() -> f64 {
     100_000.0
+}
+fn default_broker_leverage() -> u8 {
+    1
 }
 fn default_log_level() -> String {
     "info".to_string()

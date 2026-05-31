@@ -8,6 +8,8 @@ pub mod broker;
 pub mod indicators;
 pub mod insight;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod lifecycle;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod pipeline;
 #[cfg(not(target_arch = "wasm32"))]
 mod portfolio;
@@ -16,5 +18,5 @@ mod risk;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod strategy;
 #[cfg(not(target_arch = "wasm32"))]
-mod universe;
+pub mod universe;
 pub mod utils;

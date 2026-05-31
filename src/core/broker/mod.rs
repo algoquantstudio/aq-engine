@@ -381,6 +381,7 @@ where
         }
 
         let state = self.backtest_state.as_ref().unwrap().clone();
+        state.write().set_backtest_window(start, end);
 
         for symbol in symbols {
             info!(

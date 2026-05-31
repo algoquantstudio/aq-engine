@@ -7,6 +7,7 @@ use crate::core::indicators::Indicator;
 use crate::core::insight::{Insight, InsightCollection};
 use crate::core::pipeline::WrappedInsightPipe;
 use crate::core::strategy::StrategyMode;
+use crate::core::universe::WrappedUniverseModel;
 use crate::core::utils::timeframe::TimeFrame;
 use crate::core::utils::tools::TradingTools;
 use chrono::{DateTime, Utc};
@@ -31,6 +32,7 @@ pub trait StrategyContext {
 
     fn add_alpha(&mut self, alpha: WrappedAlphaModel);
     fn add_pipe(&mut self, pipe: WrappedInsightPipe);
+    fn add_universe_model(&mut self, model: WrappedUniverseModel);
     fn set_execution_risk(&mut self, risk: f64);
     fn set_min_reward_risk_ratio(&mut self, ratio: f64);
     fn set_base_confidence(&mut self, confidence: f64);

@@ -1,4 +1,4 @@
-use crate::node::{Connection, Node, NodeType, StrategyMeta};
+use crate::node::{Connection, LifecyclePhase, LifecycleTiming, Node, NodeType, StrategyMeta};
 use std::collections::{HashMap, VecDeque};
 
 fn format_number_literal(input_type: &crate::node::InputType, n: &serde_json::Number) -> String {
@@ -15,6 +15,73 @@ fn format_number_literal(input_type: &crate::node::InputType, n: &serde_json::Nu
             }
         }
         _ => n.to_string(),
+    }
+}
+
+fn lifecycle_timing_expr(timing: LifecycleTiming) -> &'static str {
+    match timing {
+        LifecycleTiming::BeforeGenerated => "LifecycleTiming::BeforeGenerated",
+        LifecycleTiming::AfterGenerated => "LifecycleTiming::AfterGenerated",
+    }
+}
+
+fn lifecycle_builder_name(phase: LifecyclePhase) -> &'static str {
+    match phase {
+        LifecyclePhase::OnStart => "OnStartLogicBuilder",
+        LifecyclePhase::OnInit => "OnInitLogicBuilder",
+        LifecyclePhase::OnTeardown => "OnTeardownLogicBuilder",
+    }
+}
+
+fn lifecycle_add_method(phase: LifecyclePhase) -> &'static str {
+    match phase {
+        LifecyclePhase::OnStart => "add_on_start_logic",
+        LifecyclePhase::OnInit => "add_on_init_logic",
+        LifecyclePhase::OnTeardown => "add_on_teardown_logic",
+    }
+}
+
+fn push_state_component_registrations(
+    src: &mut String,
+    custom_lifecycle_logic: &[(
+        LifecyclePhase,
+        LifecycleTiming,
+        bool,
+        String,
+        String,
+        String,
+        String,
+    )],
+) {
+    for (phase, timing, can_fail, mod_name, struct_name, args, _) in custom_lifecycle_logic {
+        src.push_str(&format!(
+            "        state.{}({}::new(Box::new({}::{}::new({}))).timing({}).can_fail({}).build());\n",
+            lifecycle_add_method(*phase),
+            lifecycle_builder_name(*phase),
+            mod_name,
+            struct_name,
+            args,
+            lifecycle_timing_expr(*timing),
+            can_fail
+        ));
+    }
+    if !custom_lifecycle_logic.is_empty() {
+        src.push('\n');
+    }
+}
+
+fn push_on_start_universe_registrations(
+    src: &mut String,
+    custom_universe_models: &[(bool, String, String, String, String)],
+) {
+    for (can_fail, mod_name, struct_name, args, _) in custom_universe_models {
+        src.push_str(&format!(
+            "        ctx.add_universe_model(UniverseModelBuilder::new(Box::new({}::{}::new({}))).can_fail({}).build());\n",
+            mod_name, struct_name, args, can_fail
+        ));
+    }
+    if !custom_universe_models.is_empty() {
+        src.push('\n');
     }
 }
 
@@ -42,35 +109,6 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         })
         .cloned()
         .collect();
-    let node_snapshot = |node_type: NodeType| -> Vec<serde_json::Value> {
-        reachable_nodes
-            .iter()
-            .filter(|node| node.node_type == node_type)
-            .map(|node| {
-                serde_json::json!({
-                    "id": node.id,
-                    "label": node.label,
-                    "sourceFile": node.source_file,
-                    "inputs": node.inputs.iter().map(|input| {
-                        serde_json::json!({
-                            "name": input.name,
-                            "type": input.input_type,
-                            "value": input.value,
-                            "isPublic": input.is_public,
-                        })
-                    }).collect::<Vec<_>>(),
-                })
-            })
-            .collect()
-    };
-    let alpha_models_json =
-        serde_json::to_string(&node_snapshot(NodeType::Alpha)).map_err(|e| e.to_string())?;
-    let insight_pipes_json =
-        serde_json::to_string(&node_snapshot(NodeType::Pipe)).map_err(|e| e.to_string())?;
-    let strategy_config_json = serde_json::to_string(&meta.config).map_err(|e| e.to_string())?;
-    let data_feed_id_json = serde_json::to_string(&meta.data_feed_id).map_err(|e| e.to_string())?;
-    let broker_id_json = serde_json::to_string(&meta.broker_id).map_err(|e| e.to_string())?;
-
     // ── 1. Toposort the reachable node graph ──
     let sorted = toposort(&reachable_nodes, &reachable_connections)?;
 
@@ -81,6 +119,8 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     let mut custom_pipes = Vec::new(); // (mod_name, struct_name, args_string, allowed_alphas, target_state, source_file)
     let mut built_in_pipes = Vec::new(); // (mod_name, struct_name, args_string, allowed_alphas, target_state)
     let mut ordered_pipes = Vec::new(); // ordered pipe registration strings
+    let mut custom_lifecycle_logic = Vec::new(); // (phase, timing, can_fail, mod_name, struct_name, args_string, source_file)
+    let mut custom_universe_models = Vec::new(); // (can_fail, mod_name, struct_name, args_string, source_file)
 
     let mut universe_symbols: Vec<String> = Vec::new();
 
@@ -191,6 +231,9 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                 && !matches!(
                     i.input_type,
                     crate::node::InputType::Trigger
+                        | crate::node::InputType::OnStart
+                        | crate::node::InputType::Init
+                        | crate::node::InputType::OnTeardown
                         | crate::node::InputType::Insights
                         | crate::node::InputType::OnBar
                         | crate::node::InputType::AlphaResult
@@ -320,6 +363,23 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                     }
                 }
             }
+            NodeType::LogicBlock => {
+                let struct_name = to_pascal_case(&node.label);
+                if let (Some(src), Some(phase)) = (&node.source_file, node.lifecycle_phase) {
+                    let mod_name = source_file_to_mod_name(src);
+                    let timing = node.lifecycle_timing.unwrap_or_default();
+                    let default_can_fail = phase == LifecyclePhase::OnTeardown;
+                    custom_lifecycle_logic.push((
+                        phase,
+                        timing,
+                        node.can_fail.unwrap_or(default_can_fail),
+                        mod_name,
+                        struct_name,
+                        args_str,
+                        src.clone(),
+                    ));
+                }
+            }
             NodeType::Universe => {
                 // Extract symbols from the node's "symbols" input
                 if let Some(input) = node.inputs.iter().find(|i| i.name == "symbols") {
@@ -328,6 +388,19 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                             universe_symbols = syms;
                         }
                     }
+                }
+            }
+            NodeType::UniverseModel => {
+                let struct_name = to_pascal_case(&node.label);
+                if let Some(ref src) = node.source_file {
+                    let mod_name = source_file_to_mod_name(src);
+                    custom_universe_models.push((
+                        node.can_fail.unwrap_or(false),
+                        mod_name,
+                        struct_name,
+                        args_str,
+                        src.clone(),
+                    ));
                 }
             }
             _ => {}
@@ -355,6 +428,8 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str(
         "use aq_engine::core::pipeline::{InsightPipe, InsightPipeResult, InsightPipeBuilder};\n",
     );
+    src.push_str("use aq_engine::core::lifecycle::{LifecycleTiming, OnStartLogicBuilder, OnInitLogicBuilder, OnTeardownLogicBuilder};\n");
+    src.push_str("use aq_engine::core::universe::UniverseModelBuilder;\n");
     src.push_str("use std::collections::HashSet;\n");
     src.push_str("use chrono::Utc;\n");
     src.push_str("use log::{debug, info};\n");
@@ -368,6 +443,16 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         }
     }
     for (mod_name, _, _, _, _, source_file) in &custom_pipes {
+        if emitted_mods.insert(mod_name.clone()) {
+            push_custom_module_decl(&mut src, mod_name, source_file);
+        }
+    }
+    for (_, _, _, mod_name, _, _, source_file) in &custom_lifecycle_logic {
+        if emitted_mods.insert(mod_name.clone()) {
+            push_custom_module_decl(&mut src, mod_name, source_file);
+        }
+    }
+    for (_, mod_name, _, _, source_file) in &custom_universe_models {
         if emitted_mods.insert(mod_name.clone()) {
             push_custom_module_decl(&mut src, mod_name, source_file);
         }
@@ -393,6 +478,8 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
 
     if !custom_alphas.is_empty()
         || !custom_pipes.is_empty()
+        || !custom_lifecycle_logic.is_empty()
+        || !custom_universe_models.is_empty()
         || !built_in_pipes.is_empty()
         || !built_in_alphas.is_empty()
     {
@@ -444,6 +531,15 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
             struct_name, args
         ));
     }
+    if (!custom_alphas.is_empty() || !built_in_alphas.is_empty())
+        && !custom_universe_models.is_empty()
+    {
+        src.push('\n');
+    }
+
+    // Register universe models before universe loading. The engine merges these symbols with
+    // the symbols returned by Strategy::universe.
+    push_on_start_universe_registrations(&mut src, &custom_universe_models);
 
     // Register insight pipes - preserving topological order
     for pipe_code in &ordered_pipes {
@@ -522,6 +618,8 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         meta.config.timeframe_amount, meta.config.timeframe_unit
     ));
 
+    let broker_leverage = meta.config.broker_leverage.max(1);
+
     let data_feed_init = if meta.data_feed == crate::node::types::DataFeedType::Mt5 {
         "        let data_feed = Mt5DataFeed::from_env().unwrap_or_else(|error| {\n            eprintln!(\"Failed to initialise MT5 data feed: {:?}\", error);\n            std::process::exit(1);\n        });\n".to_string()
     } else {
@@ -532,14 +630,14 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         "        let execution = Mt5Broker::from_env().unwrap_or_else(|error| {\n            eprintln!(\"Failed to initialise MT5 broker: {:?}\", error);\n            std::process::exit(1);\n        });\n".to_string()
     } else {
         format!(
-            "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, 1);\n",
-            meta.config.starting_cash
+            "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, {});\n",
+            meta.config.starting_cash, broker_leverage
         )
     };
 
     let backtest_execution_init = format!(
-        "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, 1);\n",
-        meta.config.starting_cash
+        "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, {});\n",
+        meta.config.starting_cash, broker_leverage
     );
 
     let live_state_init = format!(
@@ -563,6 +661,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str(&data_feed_init);
     src.push_str(&live_execution_init);
     src.push_str(&live_state_init);
+    push_state_component_registrations(&mut src, &custom_lifecycle_logic);
     src.push_str("        let session_secret = args.iter().position(|a| a == \"--session-secret\").and_then(|i| args.get(i+1)).cloned().unwrap_or_default();\n");
     src.push_str("        let access_method = args.iter().position(|a| a == \"--access-method\").and_then(|i| args.get(i+1)).cloned().unwrap_or_else(|| \"aqe_live\".to_string());\n");
     src.push_str("        let strategy_id = args.iter().position(|a| a == \"--strategy-id\").and_then(|i| args.get(i+1)).cloned().unwrap_or_default();\n");
@@ -593,6 +692,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str(&data_feed_init);
     src.push_str(&backtest_execution_init);
     src.push_str(&backtest_state_init);
+    push_state_component_registrations(&mut src, &custom_lifecycle_logic);
     if meta.broker != crate::node::types::ExecutionBrokerType::Paper {
         src.push_str(&format!(
             "        info!(\"Backtest mode uses Paper Broker execution. Selected live broker '{}' is ignored for this run.\");\n",
@@ -624,108 +724,6 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str("                if let Err(e) = results.save_to_disk_async(&out_dir, &*state.broker.backtest_state.as_ref().unwrap().read()).await {\n");
     src.push_str("                    eprintln!(\"Failed to save results to disk: {}\", e);\n");
     src.push_str("                } else {\n");
-    src.push_str("                    let mut aqmeta_copied = false;\n");
-    src.push_str("                    if let Ok(project_dir) = std::env::current_dir() {\n");
-    src.push_str(
-        "                        if let Ok(entries) = std::fs::read_dir(&project_dir) {\n",
-    );
-    src.push_str("                            for entry in entries.flatten() {\n");
-    src.push_str("                                let path = entry.path();\n");
-    src.push_str("                                if path.extension().and_then(|ext| ext.to_str()) == Some(\"aqmeta\") {\n");
-    src.push_str("                                    if std::fs::copy(&path, out_dir.join(\"strategy.aqmeta\")).is_ok() {\n");
-    src.push_str("                                        aqmeta_copied = true;\n");
-    src.push_str("                                    }\n");
-    src.push_str("                                    break;\n");
-    src.push_str("                                }\n");
-    src.push_str("                            }\n");
-    src.push_str("                        }\n");
-    src.push_str("                    }\n");
-    src.push_str("                    let metrics_path = out_dir.join(\"metrics.json\");\n");
-    src.push_str(
-        "                    if let Ok(content) = std::fs::read_to_string(&metrics_path) {\n",
-    );
-    src.push_str("                        if let Ok(mut metrics) = serde_json::from_str::<serde_json::Value>(&content) {\n");
-    src.push_str("                            if let Some(obj) = metrics.as_object_mut() {\n");
-    src.push_str("                                let run_config = serde_json::json!({\n");
-    src.push_str(&format!(
-        "                                    \"strategyId\": \"{}\",\n",
-        meta.id
-    ));
-    src.push_str(&format!(
-        "                                    \"strategyName\": \"{}\",\n",
-        meta.name.replace('\\', "\\\\").replace('"', "\\\"")
-    ));
-    src.push_str(&format!(
-        "                                    \"strategyVersion\": \"{}\",\n",
-        meta.version.replace('\\', "\\\\").replace('"', "\\\"")
-    ));
-    src.push_str(&format!(
-        "                                    \"dataFeed\": \"{}\",\n",
-        meta.data_feed
-    ));
-    src.push_str(&format!(
-        "                                    \"dataFeedId\": {},\n",
-        data_feed_id_json
-    ));
-    src.push_str(&format!(
-        "                                    \"executionBroker\": \"{}\",\n",
-        meta.broker
-    ));
-    src.push_str(&format!(
-        "                                    \"brokerId\": {},\n",
-        broker_id_json
-    ));
-    src.push_str(
-        "                                    \"backtestExecutionBroker\": \"Paper Broker\",\n",
-    );
-    src.push_str("                                    \"backtestStart\": start.to_rfc3339(),\n");
-    src.push_str("                                    \"backtestEnd\": end.to_rfc3339(),\n");
-    src.push_str(&format!(
-        "                                    \"timeframeAmount\": {},\n",
-        meta.config.timeframe_amount
-    ));
-    src.push_str(&format!(
-        "                                    \"timeframeUnit\": \"{}\",\n",
-        meta.config
-            .timeframe_unit
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    ));
-    src.push_str(&format!(
-        "                                    \"strategyConfig\": {},\n",
-        strategy_config_json
-    ));
-    src.push_str(&format!(
-        "                                    \"alphaModels\": {},\n",
-        alpha_models_json
-    ));
-    src.push_str(&format!(
-        "                                    \"insightPipes\": {},\n",
-        insight_pipes_json
-    ));
-    src.push_str("                                    \"aqmetaSnapshot\": if aqmeta_copied { serde_json::Value::String(\"strategy.aqmeta\".to_string()) } else { serde_json::Value::Null },\n");
-    src.push_str("                                });\n");
-    src.push_str("                                obj.insert(\"run_config\".to_string(), run_config.clone());\n");
-    src.push_str("                                obj.insert(\"data_feed\".to_string(), run_config[\"dataFeed\"].clone());\n");
-    src.push_str("                                obj.insert(\"data_feed_id\".to_string(), run_config[\"dataFeedId\"].clone());\n");
-    src.push_str("                                obj.insert(\"execution_broker\".to_string(), run_config[\"executionBroker\"].clone());\n");
-    src.push_str("                                obj.insert(\"broker_id\".to_string(), run_config[\"brokerId\"].clone());\n");
-    src.push_str("                                obj.insert(\"backtest_execution_broker\".to_string(), run_config[\"backtestExecutionBroker\"].clone());\n");
-    src.push_str("                                obj.insert(\"backtest_start\".to_string(), run_config[\"backtestStart\"].clone());\n");
-    src.push_str("                                obj.insert(\"backtest_end\".to_string(), run_config[\"backtestEnd\"].clone());\n");
-    src.push_str("                                obj.insert(\"timeframe_amount\".to_string(), run_config[\"timeframeAmount\"].clone());\n");
-    src.push_str("                                obj.insert(\"timeframe_unit\".to_string(), run_config[\"timeframeUnit\"].clone());\n");
-    src.push_str("                                obj.insert(\"alpha_models\".to_string(), run_config[\"alphaModels\"].clone());\n");
-    src.push_str("                                obj.insert(\"insight_pipes\".to_string(), run_config[\"insightPipes\"].clone());\n");
-    src.push_str("                                obj.insert(\"aqmeta_snapshot\".to_string(), run_config[\"aqmetaSnapshot\"].clone());\n");
-    src.push_str("                                if let Ok(updated) = serde_json::to_string_pretty(&metrics) {\n");
-    src.push_str(
-        "                                    let _ = std::fs::write(&metrics_path, updated);\n",
-    );
-    src.push_str("                                }\n");
-    src.push_str("                            }\n");
-    src.push_str("                        }\n");
-    src.push_str("                    }\n");
     src.push_str("                    if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {\n");
     src.push_str(
         "                        println!(\"RESULTS_SAVED_TO: {}\", abs_path.display());\n",
@@ -822,9 +820,9 @@ fn toposort(nodes: &[Node], connections: &[Connection]) -> Result<Vec<String>, S
     }
 
     let mut queue = VecDeque::new();
-    for (id, &deg) in &in_degrees {
-        if deg == 0 {
-            queue.push_back(id.clone());
+    for node in nodes {
+        if in_degrees.get(&node.id).copied().unwrap_or_default() == 0 {
+            queue.push_back(node.id.clone());
         }
     }
 
@@ -860,6 +858,8 @@ fn source_file_to_mod_name(path: &str) -> String {
     let name = file_name
         .strip_suffix(".alpha")
         .or_else(|| file_name.strip_suffix(".pipe"))
+        .or_else(|| file_name.strip_suffix(".logic"))
+        .or_else(|| file_name.strip_suffix(".universe"))
         .unwrap_or(file_name);
     name.replace('-', "_").replace('.', "_")
 }
@@ -954,39 +954,176 @@ fn get_builtin_pipe_info(src: &str, parsed_struct_name: &str) -> Option<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::StrategyMeta;
+    use crate::node::{
+        ConnectionEndpoint, InputType, NodeInput, NodeOutput, OutputType, StrategyMeta,
+    };
 
-    #[test]
-    fn test_universe_parse() {
-        let json =
-            std::fs::read_to_string("/Users/moustaphadiaby/TradingStrategies/aqs1/Test1.aqmeta")
-                .unwrap();
-        let meta: crate::node::StrategyMeta = serde_json::from_str(&json).unwrap();
-        let sorted = toposort(&meta.nodes, &meta.connections).unwrap();
-        println!("SORTED NODES: {:?}", sorted);
-        for node_id in &sorted {
-            let node = meta.nodes.iter().find(|n| n.id == *node_id).unwrap();
-            if node.node_type == crate::node::NodeType::Universe {
-                println!("FOUND UNIVERSE {:?}", node.inputs);
-                if let Some(input) = node.inputs.iter().find(|i| i.name == "symbols") {
-                    println!("FOUND SYMBOLS ARRAY RAW: {:?}", input.value);
-                    if let Some(ref val) = input.value {
-                        let parsed: Result<Vec<String>, _> = serde_json::from_value(val.clone());
-                        println!("PARSED JSON VALUE TO VEC: {:?}", parsed);
-                    }
-                }
-            }
+    fn custom_node(
+        id: &str,
+        node_type: NodeType,
+        label: &str,
+        source_file: &str,
+        inputs: Vec<NodeInput>,
+        outputs: Vec<NodeOutput>,
+    ) -> Node {
+        Node {
+            id: id.to_string(),
+            node_type,
+            label: label.to_string(),
+            x: 0.0,
+            y: 0.0,
+            inputs,
+            outputs,
+            source_file: Some(source_file.to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
+            undeletable: false,
         }
     }
 
     #[test]
-    fn test_regen_aqs1() {
-        let json =
-            std::fs::read_to_string("/Users/moustaphadiaby/TradingStrategies/aqs1/Test1.aqmeta")
-                .unwrap();
-        let meta: StrategyMeta = serde_json::from_str(&json).unwrap();
+    fn generated_backtest_save_does_not_inline_aqmeta_result_metadata() {
+        let mut meta = StrategyMeta::new("Codegen Metadata Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+
         let src = generate_main_rs(&meta).unwrap();
-        let out_path = std::env::temp_dir().join("aqs1_regen_main.rs");
-        std::fs::write(out_path, src).unwrap();
+
+        assert!(src.contains("results.save_to_disk_async"));
+        assert!(!src.contains("aqmeta_copied"));
+        assert!(!src.contains("strategy.aqmeta"));
+        assert!(!src.contains("\"run_config\""));
+    }
+
+    #[test]
+    fn generated_lifecycle_logic_registers_and_runs_by_timing() {
+        let mut meta = StrategyMeta::new("Lifecycle Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        let mut before = custom_node(
+            "before",
+            NodeType::LogicBlock,
+            "BeforeStart",
+            "src/before_start.logic.rs",
+            vec![NodeInput {
+                name: "on_start".to_string(),
+                input_type: InputType::OnStart,
+                value: None,
+                is_public: true,
+                insight_state: None,
+            }],
+            vec![NodeOutput {
+                name: "on_start".to_string(),
+                output_type: OutputType::OnStart,
+                insight_state: None,
+            }],
+        );
+        before.lifecycle_phase = Some(LifecyclePhase::OnStart);
+        before.lifecycle_timing = Some(LifecycleTiming::BeforeGenerated);
+        before.can_fail = Some(false);
+
+        let mut after = custom_node(
+            "after",
+            NodeType::LogicBlock,
+            "AfterStart",
+            "src/after_start.logic.rs",
+            vec![NodeInput {
+                name: "on_start".to_string(),
+                input_type: InputType::OnStart,
+                value: None,
+                is_public: true,
+                insight_state: None,
+            }],
+            vec![NodeOutput {
+                name: "on_start".to_string(),
+                output_type: OutputType::OnStart,
+                insight_state: None,
+            }],
+        );
+        after.lifecycle_phase = Some(LifecyclePhase::OnStart);
+        after.lifecycle_timing = Some(LifecycleTiming::AfterGenerated);
+        after.can_fail = Some(true);
+
+        meta.nodes.push(before);
+        meta.nodes.push(after);
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "on_start".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "before".to_string(),
+                port: "on_start".to_string(),
+            },
+        });
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "before".to_string(),
+                port: "on_start".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "after".to_string(),
+                port: "on_start".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains("state.add_on_start_logic"));
+        assert!(src.contains("OnStartLogicBuilder::new"));
+        assert!(src.contains("LifecycleTiming::BeforeGenerated"));
+        assert!(src.contains("LifecycleTiming::AfterGenerated"));
+        assert!(src.contains(".can_fail(false)"));
+        assert!(src.contains(".can_fail(true)"));
+        assert!(!src.contains("ctx.run_on_start_logic"));
+        assert!(
+            src.find("state.add_on_start_logic").unwrap() < src.find("state.run_backtest").unwrap()
+        );
+    }
+
+    #[test]
+    fn generated_universe_models_register_in_on_start_and_keep_static_universe() {
+        let mut meta = StrategyMeta::new("Universe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        let mut universe_model = custom_node(
+            "universe_model",
+            NodeType::UniverseModel,
+            "CustomUniverse",
+            "src/custom_universe.universe.rs",
+            vec![NodeInput {
+                name: "strategy.universe".to_string(),
+                input_type: InputType::Universe,
+                value: None,
+                is_public: true,
+                insight_state: None,
+            }],
+            vec![NodeOutput {
+                name: "universe".to_string(),
+                output_type: OutputType::Universe,
+                insight_state: None,
+            }],
+        );
+        universe_model.can_fail = Some(false);
+        meta.nodes.push(universe_model);
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "universe".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "universe_model".to_string(),
+                port: "strategy.universe".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains("ctx.add_universe_model"));
+        assert!(src.contains("UniverseModelBuilder::new"));
+        assert!(!src.contains("ctx.run_universe_models"));
+        assert!(src.contains("HashSet::new() // No symbols configured"));
+        assert!(src.find("ctx.add_universe_model").unwrap() < src.find("fn universe").unwrap());
     }
 }

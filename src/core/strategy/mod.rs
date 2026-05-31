@@ -7,7 +7,11 @@ use crate::core::broker::types::{Account, Asset, BarData, BrokerError, Order, Tr
 use crate::core::indicators::Indicator;
 use crate::core::insight::types::InsightState;
 use crate::core::insight::{Insight, InsightCollection, InsightSnapshot, InsightStrategyContext};
+use crate::core::lifecycle::{
+    LifecycleTiming, WrappedOnInitLogic, WrappedOnStartLogic, WrappedOnTeardownLogic,
+};
 use crate::core::pipeline::WrappedInsightPipe;
+use crate::core::universe::WrappedUniverseModel;
 use crate::core::utils::tools::{StrategyTools, TradingTools};
 use dashmap::DashMap;
 use polars::prelude::*;
@@ -95,6 +99,14 @@ where
 
     // Alpha Models
     alpha_models: Vec<WrappedAlphaModel>,
+
+    // Lifecycle logic blocks
+    on_start_logic: Vec<WrappedOnStartLogic>,
+    on_init_logic: Vec<WrappedOnInitLogic>,
+    on_teardown_logic: Vec<WrappedOnTeardownLogic>,
+
+    // Universe models
+    universe_models: Vec<WrappedUniverseModel>,
 
     // Indicators
     pub indicators: HashMap<String, Box<dyn Indicator>>,
@@ -702,6 +714,10 @@ where
             history: Default::default(),
             universe: Default::default(),
             alpha_models: Vec::new(),
+            on_start_logic: Vec::new(),
+            on_init_logic: Vec::new(),
+            on_teardown_logic: Vec::new(),
+            universe_models: Vec::new(),
             indicators: HashMap::new(),
             warm_up_bars: 0,
             warm_up_progress: HashMap::new(),
@@ -765,6 +781,82 @@ where
     /// Register multiple pipes at once (Python's `add_executors`).
     pub fn add_pipes(&mut self, pipes: Vec<WrappedInsightPipe>) {
         self.insight_pipeline.add_pipes(pipes);
+    }
+
+    pub fn add_on_start_logic(&mut self, logic: WrappedOnStartLogic) {
+        self.on_start_logic.push(logic);
+    }
+
+    pub fn add_on_init_logic(&mut self, logic: WrappedOnInitLogic) {
+        self.on_init_logic.push(logic);
+    }
+
+    pub fn add_on_teardown_logic(&mut self, logic: WrappedOnTeardownLogic) {
+        self.on_teardown_logic.push(logic);
+    }
+
+    fn run_on_start_logic(&mut self, timing: LifecycleTiming) {
+        let mut logic_blocks = std::mem::take(&mut self.on_start_logic);
+        for logic in logic_blocks.iter_mut() {
+            if logic.timing() == timing {
+                debug!("Running on_start logic {}", logic.name());
+                logic.run(self);
+            }
+        }
+        logic_blocks.append(&mut self.on_start_logic);
+        self.on_start_logic = logic_blocks;
+    }
+
+    fn run_on_init_logic(&mut self, timing: LifecycleTiming, asset: &Asset) {
+        let mut logic_blocks = std::mem::take(&mut self.on_init_logic);
+        for logic in logic_blocks.iter_mut() {
+            if logic.timing() == timing {
+                debug!(
+                    "Running on_init logic {} for {}",
+                    logic.name(),
+                    asset.symbol
+                );
+                logic.run(self, asset);
+            }
+        }
+        logic_blocks.append(&mut self.on_init_logic);
+        self.on_init_logic = logic_blocks;
+    }
+
+    fn run_on_teardown_logic(&mut self, timing: LifecycleTiming) {
+        let mut logic_blocks = std::mem::take(&mut self.on_teardown_logic);
+        for logic in logic_blocks.iter_mut() {
+            if logic.timing() == timing {
+                debug!("Running on_teardown logic {}", logic.name());
+                logic.run(self);
+            }
+        }
+        logic_blocks.append(&mut self.on_teardown_logic);
+        self.on_teardown_logic = logic_blocks;
+    }
+
+    pub fn add_universe_model(&mut self, model: WrappedUniverseModel) {
+        self.universe_models.push(model);
+    }
+
+    fn run_universe_models(&mut self) -> Option<HashSet<String>> {
+        if self.universe_models.is_empty() {
+            return None;
+        }
+
+        let mut symbols = HashSet::new();
+        let mut models = std::mem::take(&mut self.universe_models);
+        for model in models.iter_mut() {
+            debug!("Running universe model {}", model.name());
+            let result = model.run(self);
+            if result.success {
+                symbols.extend(result.symbols);
+            }
+        }
+        models.append(&mut self.universe_models);
+        self.universe_models = models;
+
+        Some(symbols)
     }
 
     // ─────────────────── Warm-Up ───────────────────
@@ -834,10 +926,13 @@ where
 
     // ─────────────────── Universe Loading ───────────────────
 
-    /// Load universe: strategy.universe() → broker.get_ticker_info() → strategy.init per asset.
+    /// Load universe: strategy.universe() + universe models → broker.get_ticker_info() → strategy.init per asset.
     /// Mirrors Python's `_loadUniverse()`.
     async fn load_universe(&mut self, strategy: &mut S) {
-        let symbol_set = strategy.universe(self);
+        let mut symbol_set = strategy.universe(self);
+        if let Some(model_symbols) = self.run_universe_models() {
+            symbol_set.extend(model_symbols);
+        }
         let mut universe_symbols: Vec<_> = symbol_set.iter().cloned().collect();
         universe_symbols.sort();
         info!("Loading strategy universe: {}", universe_symbols.join(", "));
@@ -869,7 +964,9 @@ where
         let assets: Vec<Asset> = self.universe.values().cloned().collect();
         for asset in &assets {
             debug!("Running strategy init for {}", asset.symbol);
+            self.run_on_init_logic(LifecycleTiming::BeforeGenerated, asset);
             strategy.init(self, asset);
+            self.run_on_init_logic(LifecycleTiming::AfterGenerated, asset);
         }
     }
 
@@ -1926,6 +2023,10 @@ where
         self.add_pipe(pipe);
     }
 
+    fn add_universe_model(&mut self, model: crate::core::universe::WrappedUniverseModel) {
+        self.add_universe_model(model);
+    }
+
     fn set_execution_risk(&mut self, risk: f64) {
         self.set_execution_risk(risk);
     }
@@ -2099,7 +2200,9 @@ where
 
         // ── 1. Strategy lifecycle: on_start ──
         debug!("Invoking strategy on_start");
+        self.run_on_start_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_start(self);
+        self.run_on_start_logic(LifecycleTiming::AfterGenerated);
 
         // ── 2. Load universe (strategy.init per asset) ──
         self.load_universe(&mut strategy).await;
@@ -2153,7 +2256,9 @@ where
 
         // ── 7. Teardown ──
         debug!("Invoking strategy on_teardown");
+        self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_teardown(self);
+        self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
         self.sync_backtest_insight_snapshots();
 
         // Disconnect data feed
@@ -2707,7 +2812,9 @@ where
 
         // Teardown
         debug!("Invoking strategy on_teardown");
+        self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_teardown(self);
+        self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
 
         // Clean up subscriptions
         let _ = self.broker.unsubscribe_from_trade_stream().await;
@@ -2792,7 +2899,9 @@ where
         pending_ops: &mut VecDeque<PendingAqsSyncOp>,
     ) -> Result<(), BrokerError> {
         debug!("Invoking strategy on_start");
+        self.run_on_start_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_start(self);
+        self.run_on_start_logic(LifecycleTiming::AfterGenerated);
         self.load_universe(strategy).await;
 
         assert!(

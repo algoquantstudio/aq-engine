@@ -1344,6 +1344,8 @@ mod tests {
 
         fn add_pipe(&mut self, _pipe: WrappedInsightPipe) {}
 
+        fn add_universe_model(&mut self, _model: crate::core::universe::WrappedUniverseModel) {}
+
         fn set_execution_risk(&mut self, _risk: f64) {}
 
         fn set_min_reward_risk_ratio(&mut self, _ratio: f64) {}

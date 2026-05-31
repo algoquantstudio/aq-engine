@@ -58,6 +58,9 @@ pub enum InputType {
     Array,
     Insights,
     Trigger,
+    OnStart,
+    Init,
+    OnTeardown,
     OnBar,
     AlphaResult,
     InsightPipeResult,
@@ -104,9 +107,32 @@ pub enum OutputType {
 pub enum NodeType {
     Alpha,
     Pipe,
+    LogicBlock,
     Trigger,
     Strategy,
     Universe,
+    UniverseModel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum LifecyclePhase {
+    OnStart,
+    OnInit,
+    OnTeardown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum LifecycleTiming {
+    BeforeGenerated,
+    AfterGenerated,
+}
+
+impl Default for LifecycleTiming {
+    fn default() -> Self {
+        Self::BeforeGenerated
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +148,12 @@ pub struct Node {
     pub outputs: Vec<NodeOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_phase: Option<LifecyclePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_timing: Option<LifecycleTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_fail: Option<bool>,
     #[serde(default)]
     pub undeletable: bool,
 }
@@ -233,6 +265,9 @@ impl StrategyMeta {
                 },
             ],
             source_file: None,
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
             undeletable: true,
         }
     }
