@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use turso::{Builder, Connection, params};
+use turso::{Builder, Connection, params, transaction::Transaction};
 
 mod types;
 
@@ -243,24 +243,27 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-async fn insert_trade_log(conn: &Connection, trade_log: &[TradeRecord]) -> Result<(), String> {
-    for record in trade_log {
-        conn.execute(
+async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
             "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, trade_type, payload_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                record.date.to_rfc3339(),
-                record.symbol.clone(),
-                format!("{:?}", record.side),
-                record.qty,
-                record.price,
-                record.order_id.clone(),
-                record.insight_id.clone(),
-                record.strategy_type.clone(),
-                format!("{:?}", record.trade_type),
-                serde_json::to_string(record).map_err(to_storage_err)?
-            ],
         )
+        .await
+        .map_err(to_storage_err)?;
+    for record in trade_log {
+        stmt.execute(params![
+            record.date.to_rfc3339(),
+            record.symbol.clone(),
+            format!("{:?}", record.side),
+            record.qty,
+            record.price,
+            record.order_id.clone(),
+            record.insight_id.clone(),
+            record.strategy_type.clone(),
+            format!("{:?}", record.trade_type),
+            serde_json::to_string(record).map_err(to_storage_err)?
+        ])
         .await
         .map_err(to_storage_err)?;
     }
@@ -385,50 +388,56 @@ fn build_trade_log_rows(
 }
 
 async fn insert_trade_log_rows(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     round_trips: &[RoundTripTrade],
     trade_events: &[TradeRecord],
 ) -> Result<(), String> {
     let rows = build_trade_log_rows(round_trips, trade_events);
-    for row in rows {
-        conn.execute(
+    let mut stmt = tx
+        .prepare(
             "INSERT INTO trade_log_rows (symbol, entry_time, insight_id, status, payload_json)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                row.symbol.clone(),
-                row.entry_time.clone(),
-                row.insight_id.clone(),
-                row.status.clone(),
-                serde_json::to_string(&row).map_err(to_storage_err)?
-            ],
         )
+        .await
+        .map_err(to_storage_err)?;
+    for row in rows {
+        stmt.execute(params![
+            row.symbol.clone(),
+            row.entry_time.clone(),
+            row.insight_id.clone(),
+            row.status.clone(),
+            serde_json::to_string(&row).map_err(to_storage_err)?
+        ])
         .await
         .map_err(to_storage_err)?;
     }
     Ok(())
 }
 
-async fn insert_round_trips(conn: &Connection, trips: &[RoundTripTrade]) -> Result<(), String> {
-    for trip in trips {
-        conn.execute(
+async fn insert_round_trips(tx: &Transaction<'_>, trips: &[RoundTripTrade]) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
             "INSERT INTO round_trips (symbol, side, insight_id, strategy_type, entry_time, exit_time, entry_price, exit_price, qty, pnl, return_pct, hold_secs, payload_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                trip.symbol.clone(),
-                format!("{:?}", trip.side),
-                trip.insight_id.clone(),
-                trip.strategy_type.clone(),
-                trip.entry_time.to_rfc3339(),
-                trip.exit_time.to_rfc3339(),
-                trip.entry_price,
-                trip.exit_price,
-                trip.qty,
-                trip.pnl,
-                trip.return_pct,
-                trip.hold_secs,
-                serde_json::to_string(trip).map_err(to_storage_err)?
-            ],
         )
+        .await
+        .map_err(to_storage_err)?;
+    for trip in trips {
+        stmt.execute(params![
+            trip.symbol.clone(),
+            format!("{:?}", trip.side),
+            trip.insight_id.clone(),
+            trip.strategy_type.clone(),
+            trip.entry_time.to_rfc3339(),
+            trip.exit_time.to_rfc3339(),
+            trip.entry_price,
+            trip.exit_price,
+            trip.qty,
+            trip.pnl,
+            trip.return_pct,
+            trip.hold_secs,
+            serde_json::to_string(trip).map_err(to_storage_err)?
+        ])
         .await
         .map_err(to_storage_err)?;
     }
@@ -436,49 +445,55 @@ async fn insert_round_trips(conn: &Connection, trips: &[RoundTripTrade]) -> Resu
 }
 
 async fn insert_account_history(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     account_history: &[(DateTime<Utc>, Account)],
 ) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO account_history (event_at, equity, cash, buying_power, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .await
+        .map_err(to_storage_err)?;
     for (timestamp, account) in account_history {
         let payload = serde_json::to_string(&AccountHistoryItem {
             timestamp: *timestamp,
             equity: account.equity,
         })
         .map_err(to_storage_err)?;
-        conn.execute(
-            "INSERT INTO account_history (event_at, equity, cash, buying_power, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                timestamp.to_rfc3339(),
-                account.equity,
-                account.cash,
-                account.buying_power,
-                payload
-            ],
-        )
+        stmt.execute(params![
+            timestamp.to_rfc3339(),
+            account.equity,
+            account.cash,
+            account.buying_power,
+            payload
+        ])
         .await
         .map_err(to_storage_err)?;
     }
     Ok(())
 }
 
-async fn insert_insights(conn: &Connection, insights: &[InsightSnapshot]) -> Result<(), String> {
-    for insight in insights {
-        conn.execute(
+async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
             "INSERT OR REPLACE INTO insights (insight_id, symbol, strategy_type, state, created_at, updated_at, filled_at, closed_at, payload_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                insight.insight_id.clone(),
-                insight.symbol.clone(),
-                insight.strategy_type.clone(),
-                insight.state.clone(),
-                insight.created_at.to_rfc3339(),
-                insight.updated_at.to_rfc3339(),
-                insight.filled_at.map(|value| value.to_rfc3339()),
-                insight.closed_at.map(|value| value.to_rfc3339()),
-                serde_json::to_string(insight).map_err(to_storage_err)?
-            ],
         )
+        .await
+        .map_err(to_storage_err)?;
+    for insight in insights {
+        stmt.execute(params![
+            insight.insight_id.clone(),
+            insight.symbol.clone(),
+            insight.strategy_type.clone(),
+            insight.state.clone(),
+            insight.created_at.to_rfc3339(),
+            insight.updated_at.to_rfc3339(),
+            insight.filled_at.map(|value| value.to_rfc3339()),
+            insight.closed_at.map(|value| value.to_rfc3339()),
+            serde_json::to_string(insight).map_err(to_storage_err)?
+        ])
         .await
         .map_err(to_storage_err)?;
     }
@@ -486,25 +501,28 @@ async fn insert_insights(conn: &Connection, insights: &[InsightSnapshot]) -> Res
 }
 
 async fn insert_bars(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     bars_by_symbol: &std::collections::HashMap<String, Vec<Bar>>,
 ) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO bars (symbol, event_at, open, high, low, close, volume, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .await
+        .map_err(to_storage_err)?;
     for bars in bars_by_symbol.values() {
         for bar in bars {
-            conn.execute(
-                "INSERT INTO bars (symbol, event_at, open, high, low, close, volume, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    bar.symbol.clone(),
-                    bar.timestamp.to_rfc3339(),
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    bar.volume,
-                    serde_json::to_string(bar).map_err(to_storage_err)?
-                ],
-            )
+            stmt.execute(params![
+                bar.symbol.clone(),
+                bar.timestamp.to_rfc3339(),
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                serde_json::to_string(bar).map_err(to_storage_err)?
+            ])
             .await
             .map_err(to_storage_err)?;
         }
@@ -1151,90 +1169,176 @@ fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelat
 }
 
 async fn insert_analysis_tables(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     results: &BacktestResults,
     state: &BacktestState,
     trips: &[RoundTripTrade],
 ) -> Result<(), String> {
-    for row in build_monthly_returns(&results.account_history) {
-        conn.execute(
+    let mut monthly_returns_stmt = tx
+        .prepare(
             "INSERT INTO monthly_returns (year, month, return_pct, payload_json) VALUES (?1, ?2, ?3, ?4)",
-            params![row.year, row.month as i64, row.return_pct, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_monthly_returns(&results.account_history) {
+        monthly_returns_stmt
+            .execute(params![
+                row.year,
+                row.month as i64,
+                row.return_pct,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_time_performance(trips) {
-        conn.execute(
+    let mut time_performance_stmt = tx
+        .prepare(
             "INSERT INTO time_performance (day_of_week, hour, avg_return_bps, trade_count, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![row.day_of_week as i64, row.hour as i64, row.avg_return_bps, row.trade_count as i64, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_time_performance(trips) {
+        time_performance_stmt
+            .execute(params![
+                row.day_of_week as i64,
+                row.hour as i64,
+                row.avg_return_bps,
+                row.trade_count as i64,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_drawdown_series(&results.account_history, primary_strategy_name(trips)) {
-        conn.execute(
+    let mut drawdown_series_stmt = tx
+        .prepare(
             "INSERT INTO drawdown_series (strategy_name, period, drawdown_pct, payload_json) VALUES (?1, ?2, ?3, ?4)",
-            params![row.strategy_name.clone(), row.period.clone(), row.drawdown_pct, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_drawdown_series(&results.account_history, primary_strategy_name(trips)) {
+        drawdown_series_stmt
+            .execute(params![
+                row.strategy_name.clone(),
+                row.period.clone(),
+                row.drawdown_pct,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_regime_performance(&results.account_history, &state.historical_bars) {
-        conn.execute(
+    let mut regime_performance_stmt = tx
+        .prepare(
             "INSERT INTO regime_performance (vol_regime, trend_regime, avg_return_pct, bar_count, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![row.vol_regime.clone(), row.trend_regime.clone(), row.avg_return_pct, row.bar_count as i64, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_regime_performance(&results.account_history, &state.historical_bars) {
+        regime_performance_stmt
+            .execute(params![
+                row.vol_regime.clone(),
+                row.trend_regime.clone(),
+                row.avg_return_pct,
+                row.bar_count as i64,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_rolling_sharpe(&results.account_history) {
-        conn.execute(
+    let mut rolling_sharpe_stmt = tx
+        .prepare(
             "INSERT INTO rolling_sharpe (window_days, period, sharpe, payload_json) VALUES (?1, ?2, ?3, ?4)",
-            params![row.window_days, row.period.clone(), row.sharpe, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_rolling_sharpe(&results.account_history) {
+        rolling_sharpe_stmt
+            .execute(params![
+                row.window_days,
+                row.period.clone(),
+                row.sharpe,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_trade_mae(trips, &state.historical_bars, &state.trade_mae_by_order_id) {
-        conn.execute(
+    let mut trade_mae_stmt = tx
+        .prepare(
             "INSERT INTO trade_mae (trade_id, mae_pct, final_pnl_pct, is_winner, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![row.trade_id.clone(), row.mae_pct, row.final_pnl_pct, row.is_winner, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_trade_mae(trips, &state.historical_bars, &state.trade_mae_by_order_id) {
+        trade_mae_stmt
+            .execute(params![
+                row.trade_id.clone(),
+                row.mae_pct,
+                row.final_pnl_pct,
+                row.is_winner,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_setup_performance(trips) {
-        conn.execute(
+    let mut setup_performance_stmt = tx
+        .prepare(
             "INSERT INTO setup_performance (setup_name, win_rate, payoff_ratio, trade_count, total_pnl, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![row.setup_name.clone(), row.win_rate, row.payoff_ratio, row.trade_count as i64, row.total_pnl, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_setup_performance(trips) {
+        setup_performance_stmt
+            .execute(params![
+                row.setup_name.clone(),
+                row.win_rate,
+                row.payoff_ratio,
+                row.trade_count as i64,
+                row.total_pnl,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_position_concentration(&results.trade_log) {
-        conn.execute(
+    let mut position_concentration_stmt = tx
+        .prepare(
             "INSERT INTO position_concentration (date, sector, weight_pct, payload_json) VALUES (?1, ?2, ?3, ?4)",
-            params![row.date.clone(), row.sector.clone(), row.weight_pct, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_position_concentration(&results.trade_log) {
+        position_concentration_stmt
+            .execute(params![
+                row.date.clone(),
+                row.sector.clone(),
+                row.weight_pct,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
-    for row in build_strategy_correlations(trips) {
-        conn.execute(
+    let mut strategy_correlations_stmt = tx
+        .prepare(
             "INSERT INTO strategy_correlations (strategy_a, strategy_b, correlation, payload_json) VALUES (?1, ?2, ?3, ?4)",
-            params![row.strategy_a.clone(), row.strategy_b.clone(), row.correlation, serde_json::to_string(&row).map_err(to_storage_err)?],
         )
         .await
         .map_err(to_storage_err)?;
+    for row in build_strategy_correlations(trips) {
+        strategy_correlations_stmt
+            .execute(params![
+                row.strategy_a.clone(),
+                row.strategy_b.clone(),
+                row.correlation,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
     }
 
     Ok(())
@@ -1246,16 +1350,18 @@ pub async fn write_backtest_db(
     state: &BacktestState,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir_path).map_err(to_storage_err)?;
-    let conn = connect_database(dir_path).await?;
+    let mut conn = connect_database(dir_path).await?;
     init_schema(&conn).await?;
-    insert_trade_log(&conn, &results.trade_log).await?;
+    let tx = conn.transaction().await.map_err(to_storage_err)?;
+    insert_trade_log(&tx, &results.trade_log).await?;
     let round_trips = results.round_trip_trades();
-    insert_round_trips(&conn, &round_trips).await?;
-    insert_trade_log_rows(&conn, &round_trips, &results.trade_log).await?;
-    insert_account_history(&conn, &results.account_history).await?;
+    insert_round_trips(&tx, &round_trips).await?;
+    insert_trade_log_rows(&tx, &round_trips, &results.trade_log).await?;
+    insert_account_history(&tx, &results.account_history).await?;
     let insights: Vec<InsightSnapshot> = state.insight_snapshots.values().cloned().collect();
-    insert_insights(&conn, &insights).await?;
-    insert_bars(&conn, &state.historical_bars).await?;
-    insert_analysis_tables(&conn, results, state, &round_trips).await?;
+    insert_insights(&tx, &insights).await?;
+    insert_bars(&tx, &state.historical_bars).await?;
+    insert_analysis_tables(&tx, results, state, &round_trips).await?;
+    tx.commit().await.map_err(to_storage_err)?;
     Ok(())
 }

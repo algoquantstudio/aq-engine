@@ -21,6 +21,51 @@ impl AqsAuth {
     pub const DEFAULT_URL: &'static str =
         "wss://certain-squirre-06echdjfsdvq70hkk9g8bb2s0k.aws-euw1.surreal.cloud";
 
+    pub fn from_args<I, S>(args: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let arg_value = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .and_then(|index| args.get(index + 1))
+                .cloned()
+        };
+
+        let session_secret = arg_value("--session-secret").unwrap_or_default();
+        let strategy_id = arg_value("--strategy-id").unwrap_or_default();
+        let session_id = arg_value("--session-id").unwrap_or_default();
+
+        if session_secret.is_empty() || strategy_id.is_empty() || session_id.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            access_method: arg_value("--access-method").unwrap_or_else(|| "aqe_live".to_string()),
+            session_id,
+            session_secret,
+            strategy_id,
+            user_id: arg_value("--user-id").unwrap_or_default(),
+            node_id: arg_value("--node-id"),
+            live_session_id: arg_value("--live-session-id"),
+            url: arg_value("--aqs-url"),
+        })
+    }
+
+    pub fn from_process_args() -> Option<Self> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self::from_args(std::env::args())
+        }
+    }
+
     pub fn url(&self) -> &str {
         self.url.as_deref().unwrap_or(Self::DEFAULT_URL)
     }
@@ -149,6 +194,59 @@ pub struct StrategyLiveMetricsRecord {
     pub executed_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_complete_live_auth_args() {
+        let auth = AqsAuth::from_args([
+            "strategy-bin",
+            "--live",
+            "--session-secret",
+            "secret",
+            "--access-method",
+            "aqe_live",
+            "--strategy-id",
+            "strategy_123",
+            "--user-id",
+            "users:isaac",
+            "--session-id",
+            "session-key",
+            "--node-id",
+            "local",
+            "--live-session-id",
+            "live_strategy_session:abc",
+        ])
+        .expect("complete args should parse");
+
+        assert_eq!(auth.session_secret, "secret");
+        assert_eq!(auth.strategy_id, "strategy_123");
+        assert_eq!(auth.user_id, "users:isaac");
+        assert_eq!(auth.session_id, "session-key");
+        assert_eq!(auth.node_id.as_deref(), Some("local"));
+        assert_eq!(
+            auth.live_session_id.as_deref(),
+            Some("live_strategy_session:abc")
+        );
+    }
+
+    #[test]
+    fn missing_required_live_auth_args_returns_none() {
+        assert!(AqsAuth::from_args(["strategy-bin", "--live"]).is_none());
+        assert!(
+            AqsAuth::from_args([
+                "strategy-bin",
+                "--session-secret",
+                "secret",
+                "--strategy-id",
+                "strategy_123",
+            ])
+            .is_none()
+        );
+    }
 }
 
 impl From<LiveMetricsSnapshot> for StrategyLiveMetricsRecord {

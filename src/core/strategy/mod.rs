@@ -58,6 +58,24 @@ const LIVE_SYNC_QUERY_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_RECONCILE_SECS: u64 = 60;
 const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 40;
 
+pub fn set_logging_level(level: impl AsRef<str>) -> Result<(), log::SetLoggerError> {
+    let log_level = level.as_ref().trim().to_lowercase();
+    let log_level = if log_level.is_empty() {
+        "info".to_string()
+    } else {
+        log_level
+    };
+    let default_log_filter = format!("{log_level},tracing::span=warn,turso=warn,libsql=warn");
+    let env = env_logger::Env::default().default_filter_or(default_log_filter);
+    let result = env_logger::Builder::from_env(env)
+        .format_timestamp_millis()
+        .try_init();
+    if result.is_ok() {
+        info!("Logger initialised with level {}", log_level);
+    }
+    result
+}
+
 #[derive(Clone)]
 enum PendingAqsSyncOp {
     StrategyStarted {
@@ -120,6 +138,7 @@ where
     pub variables: DashMap<String, Value>,
     pub max_history_rows: usize,
     live_metrics: LivePerformanceTracker,
+    default_live_auth: Option<AqsAuth>,
 
     // Insight Pipeline
     pub insight_pipeline: InsightPipeline,
@@ -727,6 +746,7 @@ where
             variables: DashMap::new(),
             max_history_rows: 2000,
             live_metrics: LivePerformanceTracker::default(),
+            default_live_auth: AqsAuth::from_process_args(),
             insight_pipeline: Default::default(),
             timeframe,
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -2168,6 +2188,36 @@ where
     S: Strategy,
     D: DataFeed + DataProvider,
 {
+    fn finalize_backtest_results(&self, results: &BacktestResults) {
+        info!("═══════════════════ Backtest Results ═══════════════════");
+        results.print_metrics();
+        info!("Insights generated: {}", self.insights.len());
+        info!("Insights: {:#?}", self.insights.get_state_count());
+
+        let run_id = Uuid::new_v4().to_string();
+        let out_dir = std::env::current_dir()
+            .unwrap_or_default()
+            .join("backtests")
+            .join(&run_id);
+
+        let Some(backtest_state) = self.broker.backtest_state.as_ref() else {
+            warn!("Backtest completed but no backtest state was available for result persistence");
+            return;
+        };
+
+        let state = backtest_state.read();
+        if let Err(error) = results.save_to_disk(&out_dir, &*state) {
+            eprintln!("Failed to save results to disk: {}", error);
+            return;
+        }
+
+        if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {
+            println!("RESULTS_SAVED_TO: {}", abs_path.display());
+        } else {
+            println!("RESULTS_SAVED_TO: {}", out_dir.display());
+        }
+    }
+
     /// Run a full backtest.
     ///
     /// Flow (mirrors Python's `_run` + `_run_backtest_loop`):
@@ -2269,6 +2319,7 @@ where
 
         // ── 8. Results ──
         let results = self.broker.get_results();
+        self.finalize_backtest_results(&results);
         Ok(results)
     }
 }
@@ -2286,6 +2337,7 @@ where
     /// This will register callbacks for trade events & bar streams,
     /// then loop via `tokio::select!` block listening on channels to drive the pipeline.
     pub async fn run_live(&mut self, auth: Option<AqsAuth>) -> Result<(), BrokerError> {
+        let auth = auth.or_else(|| self.default_live_auth.clone());
         let mut db = if let Some(ref a) = auth {
             Some(Self::connect_live_sync_db(a).await?)
         } else {

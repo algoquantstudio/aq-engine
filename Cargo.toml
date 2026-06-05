@@ -1,6 +1,6 @@
 [package]
 name = "aq-engine"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Moustapha Diaby <contact@isaacdiaby.tech>"]
 description = "AlgoQuant Engine"
 documentation = "https://algoquantstudio.com"
@@ -23,6 +23,7 @@ futures = { version = "0.3.32", features = ["executor"], optional = true }
 surrealdb = { version = "3.0.2", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"], optional = true }
 turso = { version = "0.5.1", optional = true }
 axum = { version = "0.8", optional = true }
+env_logger = { version = "0.11", optional = true }
 
 
 [features]
@@ -39,6 +40,7 @@ runtime = [
     "dep:turso",
     "dep:log",
     "dep:axum",
+    "dep:env_logger",
 ]
 
 [dev-dependencies]
