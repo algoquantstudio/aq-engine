@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use polars::prelude::*;
 use turso::{Builder, Connection, params, transaction::Transaction};
 
 mod types;
@@ -163,6 +164,20 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             payload_json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS strategy_regime_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_type TEXT NOT NULL,
+            vol_regime TEXT NOT NULL,
+            trend_regime TEXT NOT NULL,
+            trade_count INT NOT NULL,
+            win_rate REAL NOT NULL,
+            total_pnl REAL NOT NULL,
+            avg_return_pct REAL NOT NULL,
+            profit_factor REAL NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_strategy_regime_performance_key ON strategy_regime_performance(strategy_type, vol_regime, trend_regime);
+
         CREATE TABLE IF NOT EXISTS factor_exposure (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
@@ -274,13 +289,68 @@ fn format_backtest_timestamp(value: DateTime<Utc>) -> String {
     value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn normalized_strategy_type(strategy_type: Option<&str>) -> Option<String> {
+    strategy_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .strip_suffix("-CHILD")
+                .unwrap_or(value)
+                .trim()
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn strategy_label(strategy_type: Option<&str>, fallback: &str) -> String {
+    normalized_strategy_type(strategy_type).unwrap_or_else(|| fallback.to_string())
+}
+
+#[derive(Clone, Debug)]
+struct TradeRowMetadata {
+    strategy_type: Option<String>,
+    parent_id: Option<String>,
+    is_child: bool,
+    base_strategy_type: Option<String>,
+}
+
+fn trade_row_metadata(
+    insight_id: Option<&str>,
+    strategy_type: Option<&str>,
+    insight_lookup: &HashMap<String, &InsightSnapshot>,
+) -> TradeRowMetadata {
+    let insight = insight_id.and_then(|id| insight_lookup.get(id).copied());
+    let effective_strategy_type = strategy_type
+        .map(str::to_string)
+        .or_else(|| insight.map(|snapshot| snapshot.strategy_type.clone()));
+    let parent_id = insight.and_then(|snapshot| snapshot.parent_id.clone());
+    let strategy_marks_child = effective_strategy_type
+        .as_deref()
+        .map(|value| value.trim().ends_with("-CHILD"))
+        .unwrap_or(false);
+    let is_child = parent_id.is_some() || strategy_marks_child;
+    let base_strategy_type = normalized_strategy_type(effective_strategy_type.as_deref());
+
+    TradeRowMetadata {
+        strategy_type: effective_strategy_type,
+        parent_id,
+        is_child,
+        base_strategy_type,
+    }
+}
+
 fn build_trade_log_rows(
-    _round_trips: &[RoundTripTrade],
     trade_events: &[TradeRecord],
+    insights: &[InsightSnapshot],
 ) -> Vec<BacktestTradeLogRow> {
     let mut rows = Vec::new();
     let mut entry_remaining_by_order: std::collections::HashMap<String, (TradeRecord, f64)> =
         std::collections::HashMap::new();
+    let insight_lookup: HashMap<String, &InsightSnapshot> = insights
+        .iter()
+        .map(|insight| (insight.insight_id.clone(), insight))
+        .collect();
 
     for trade in trade_events {
         match trade.trade_type {
@@ -307,13 +377,27 @@ fn build_trade_log_rows(
                     } else {
                         0.0
                     };
+                    let metadata = trade_row_metadata(
+                        trade.insight_id.as_deref().or(entry.insight_id.as_deref()),
+                        trade
+                            .strategy_type
+                            .as_deref()
+                            .or(entry.strategy_type.as_deref()),
+                        &insight_lookup,
+                    );
 
                     rows.push(BacktestTradeLogRow {
                         id: 0,
                         symbol: trade.symbol.clone(),
                         side: format!("{:?}", trade.side).to_uppercase(),
-                        strategy_type: trade.strategy_type.clone(),
-                        insight_id: trade.insight_id.clone(),
+                        strategy_type: metadata.strategy_type,
+                        parent_id: metadata.parent_id,
+                        is_child: metadata.is_child,
+                        base_strategy_type: metadata.base_strategy_type,
+                        insight_id: trade
+                            .insight_id
+                            .clone()
+                            .or_else(|| entry.insight_id.clone()),
                         entry_time: format_backtest_timestamp(entry.date),
                         exit_time: Some(format_backtest_timestamp(trade.date)),
                         qty: exit_qty,
@@ -332,11 +416,19 @@ fn build_trade_log_rows(
                         entry_remaining_by_order.remove(&trade.order_id);
                     }
                 } else {
+                    let metadata = trade_row_metadata(
+                        trade.insight_id.as_deref(),
+                        trade.strategy_type.as_deref(),
+                        &insight_lookup,
+                    );
                     rows.push(BacktestTradeLogRow {
                         id: 0,
                         symbol: trade.symbol.clone(),
                         side: format!("{:?}", trade.side).to_uppercase(),
-                        strategy_type: trade.strategy_type.clone(),
+                        strategy_type: metadata.strategy_type,
+                        parent_id: metadata.parent_id,
+                        is_child: metadata.is_child,
+                        base_strategy_type: metadata.base_strategy_type,
                         insight_id: trade.insight_id.clone(),
                         entry_time: format_backtest_timestamp(trade.date),
                         exit_time: None,
@@ -358,11 +450,19 @@ fn build_trade_log_rows(
         if remaining_qty <= f64::EPSILON {
             continue;
         }
+        let metadata = trade_row_metadata(
+            trade.insight_id.as_deref(),
+            trade.strategy_type.as_deref(),
+            &insight_lookup,
+        );
         rows.push(BacktestTradeLogRow {
             id: next_id,
             symbol: trade.symbol.clone(),
             side: format!("{:?}", trade.side).to_uppercase(),
-            strategy_type: trade.strategy_type.clone(),
+            strategy_type: metadata.strategy_type,
+            parent_id: metadata.parent_id,
+            is_child: metadata.is_child,
+            base_strategy_type: metadata.base_strategy_type,
             insight_id: trade.insight_id.clone(),
             entry_time: format_backtest_timestamp(trade.date),
             exit_time: None,
@@ -389,10 +489,10 @@ fn build_trade_log_rows(
 
 async fn insert_trade_log_rows(
     tx: &Transaction<'_>,
-    round_trips: &[RoundTripTrade],
     trade_events: &[TradeRecord],
+    insights: &[InsightSnapshot],
 ) -> Result<(), String> {
-    let rows = build_trade_log_rows(round_trips, trade_events);
+    let rows = build_trade_log_rows(trade_events, insights);
     let mut stmt = tx
         .prepare(
             "INSERT INTO trade_log_rows (symbol, entry_time, insight_id, status, payload_json)
@@ -545,11 +645,16 @@ struct TimePerformanceRow {
     trade_count: usize,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct DrawdownSeriesRow {
     strategy_name: String,
     period: String,
     drawdown_pct: f64,
+    series_type: String,
+    basis: String,
+    cumulative_pnl: Option<f64>,
+    cumulative_return_pct: Option<f64>,
+    drawdown_pnl: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -558,6 +663,18 @@ struct RegimePerformanceRow {
     trend_regime: String,
     avg_return_pct: f64,
     bar_count: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StrategyRegimePerformanceRow {
+    strategy_type: String,
+    vol_regime: String,
+    trend_regime: String,
+    trade_count: usize,
+    win_rate: f64,
+    total_pnl: f64,
+    avg_return_pct: f64,
+    profit_factor: f64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -596,6 +713,7 @@ struct StrategyCorrelationRow {
     strategy_a: String,
     strategy_b: String,
     correlation: f64,
+    sample_count: usize,
 }
 
 fn month_period(timestamp: DateTime<Utc>) -> String {
@@ -610,15 +728,9 @@ fn quarter_period(timestamp: DateTime<Utc>) -> String {
     )
 }
 
-fn primary_strategy_name(trips: &[RoundTripTrade]) -> String {
-    trips
-        .iter()
-        .find_map(|trip| trip.strategy_type.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "Strategy".to_string())
-}
-
-fn build_monthly_returns(account_history: &[(DateTime<Utc>, Account)]) -> Vec<MonthlyReturnRow> {
+fn build_monthly_returns_iter(
+    account_history: &[(DateTime<Utc>, Account)],
+) -> Vec<MonthlyReturnRow> {
     let mut buckets: BTreeMap<(i32, u32), (f64, f64)> = BTreeMap::new();
     for (timestamp, account) in account_history {
         buckets
@@ -641,7 +753,71 @@ fn build_monthly_returns(account_history: &[(DateTime<Utc>, Account)]) -> Vec<Mo
         .collect()
 }
 
-fn build_time_performance(trips: &[RoundTripTrade]) -> Vec<TimePerformanceRow> {
+fn build_monthly_returns_polars(
+    account_history: &[(DateTime<Utc>, Account)],
+) -> PolarsResult<Vec<MonthlyReturnRow>> {
+    if account_history.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let years = account_history
+        .iter()
+        .map(|(timestamp, _)| timestamp.year())
+        .collect::<Vec<_>>();
+    let months = account_history
+        .iter()
+        .map(|(timestamp, _)| timestamp.month() as i32)
+        .collect::<Vec<_>>();
+    let equities = account_history
+        .iter()
+        .map(|(_, account)| account.equity)
+        .collect::<Vec<_>>();
+
+    let df = DataFrame::new(vec![
+        Column::new("year".into(), years.as_slice()),
+        Column::new("month".into(), months.as_slice()),
+        Column::new("equity".into(), equities.as_slice()),
+    ])?;
+
+    let out = df
+        .lazy()
+        .group_by([col("year"), col("month")])
+        .agg([
+            col("equity").first().alias("first_equity"),
+            col("equity").last().alias("last_equity"),
+        ])
+        .sort(["year", "month"], Default::default())
+        .collect()?;
+
+    let year_col = out.column("year")?.i32()?;
+    let month_col = out.column("month")?.i32()?;
+    let first_col = out.column("first_equity")?.f64()?;
+    let last_col = out.column("last_equity")?.f64()?;
+
+    let mut rows = Vec::with_capacity(out.height());
+    for index in 0..out.height() {
+        let first = first_col.get(index).unwrap_or(0.0);
+        let last = last_col.get(index).unwrap_or(first);
+        rows.push(MonthlyReturnRow {
+            year: year_col.get(index).unwrap_or_default(),
+            month: month_col.get(index).unwrap_or_default().max(0) as u32,
+            return_pct: if first.abs() > f64::EPSILON {
+                ((last - first) / first) * 100.0
+            } else {
+                0.0
+            },
+        });
+    }
+
+    Ok(rows)
+}
+
+fn build_monthly_returns(account_history: &[(DateTime<Utc>, Account)]) -> Vec<MonthlyReturnRow> {
+    build_monthly_returns_polars(account_history)
+        .unwrap_or_else(|_| build_monthly_returns_iter(account_history))
+}
+
+fn build_time_performance_iter(trips: &[RoundTripTrade]) -> Vec<TimePerformanceRow> {
     let mut buckets: BTreeMap<(u32, u32), (f64, usize)> = BTreeMap::new();
     for trip in trips {
         let key = (
@@ -669,9 +845,69 @@ fn build_time_performance(trips: &[RoundTripTrade]) -> Vec<TimePerformanceRow> {
         .collect()
 }
 
-fn build_drawdown_series(
+fn build_time_performance_polars(
+    trips: &[RoundTripTrade],
+) -> PolarsResult<Vec<TimePerformanceRow>> {
+    if trips.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let day_of_week = trips
+        .iter()
+        .map(|trip| trip.entry_time.weekday().number_from_monday() as i32)
+        .collect::<Vec<_>>();
+    let hour = trips
+        .iter()
+        .map(|trip| trip.entry_time.hour() as i32)
+        .collect::<Vec<_>>();
+    let return_bps = trips
+        .iter()
+        .map(|trip| trip.return_pct * 100.0)
+        .collect::<Vec<_>>();
+
+    let df = DataFrame::new(vec![
+        Column::new("day_of_week".into(), day_of_week.as_slice()),
+        Column::new("hour".into(), hour.as_slice()),
+        Column::new("return_bps".into(), return_bps.as_slice()),
+    ])?;
+
+    let out = df
+        .lazy()
+        .group_by([col("day_of_week"), col("hour")])
+        .agg([
+            col("return_bps").mean().alias("avg_return_bps"),
+            col("return_bps")
+                .count()
+                .cast(DataType::Int64)
+                .alias("trade_count"),
+        ])
+        .sort(["day_of_week", "hour"], Default::default())
+        .collect()?;
+
+    let day_col = out.column("day_of_week")?.i32()?;
+    let hour_col = out.column("hour")?.i32()?;
+    let avg_col = out.column("avg_return_bps")?.f64()?;
+    let count_col = out.column("trade_count")?.i64()?;
+
+    let mut rows = Vec::with_capacity(out.height());
+    for index in 0..out.height() {
+        rows.push(TimePerformanceRow {
+            day_of_week: day_col.get(index).unwrap_or_default().max(0) as u32,
+            hour: hour_col.get(index).unwrap_or_default().max(0) as u32,
+            avg_return_bps: avg_col.get(index).unwrap_or(0.0),
+            trade_count: count_col.get(index).unwrap_or_default().max(0) as usize,
+        });
+    }
+
+    Ok(rows)
+}
+
+fn build_time_performance(trips: &[RoundTripTrade]) -> Vec<TimePerformanceRow> {
+    build_time_performance_polars(trips).unwrap_or_else(|_| build_time_performance_iter(trips))
+}
+
+fn build_account_drawdown_series_iter(
     account_history: &[(DateTime<Utc>, Account)],
-    strategy_name: String,
 ) -> Vec<DrawdownSeriesRow> {
     let mut peak = account_history
         .first()
@@ -696,11 +932,138 @@ fn build_drawdown_series(
     buckets
         .into_iter()
         .map(|(period, drawdown_pct)| DrawdownSeriesRow {
-            strategy_name: strategy_name.clone(),
+            strategy_name: "Portfolio Equity".to_string(),
             period,
             drawdown_pct,
+            series_type: "portfolio_equity".to_string(),
+            basis: "account_equity".to_string(),
+            cumulative_pnl: None,
+            cumulative_return_pct: None,
+            drawdown_pnl: None,
         })
         .collect()
+}
+
+fn build_account_drawdown_series_polars(
+    account_history: &[(DateTime<Utc>, Account)],
+) -> PolarsResult<Vec<DrawdownSeriesRow>> {
+    if account_history.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut peak = account_history
+        .first()
+        .map(|(_, account)| account.equity)
+        .unwrap_or(0.0);
+    let mut periods = Vec::with_capacity(account_history.len());
+    let mut drawdowns = Vec::with_capacity(account_history.len());
+
+    for (timestamp, account) in account_history {
+        peak = peak.max(account.equity);
+        let drawdown_pct = if peak.abs() > f64::EPSILON {
+            ((account.equity - peak) / peak) * 100.0
+        } else {
+            0.0
+        };
+        periods.push(month_period(*timestamp));
+        drawdowns.push(drawdown_pct);
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("period".into(), periods.as_slice()),
+        Column::new("drawdown_pct".into(), drawdowns.as_slice()),
+    ])?;
+    let out = df
+        .lazy()
+        .group_by([col("period")])
+        .agg([col("drawdown_pct").min().alias("drawdown_pct")])
+        .sort(["period"], Default::default())
+        .collect()?;
+
+    let period_col = out.column("period")?.str()?;
+    let drawdown_col = out.column("drawdown_pct")?.f64()?;
+
+    let mut rows = Vec::with_capacity(out.height());
+    for index in 0..out.height() {
+        rows.push(DrawdownSeriesRow {
+            strategy_name: "Portfolio Equity".to_string(),
+            period: period_col.get(index).unwrap_or_default().to_string(),
+            drawdown_pct: drawdown_col.get(index).unwrap_or(0.0),
+            series_type: "portfolio_equity".to_string(),
+            basis: "account_equity".to_string(),
+            cumulative_pnl: None,
+            cumulative_return_pct: None,
+            drawdown_pnl: None,
+        });
+    }
+
+    Ok(rows)
+}
+
+fn build_account_drawdown_series(
+    account_history: &[(DateTime<Utc>, Account)],
+) -> Vec<DrawdownSeriesRow> {
+    build_account_drawdown_series_polars(account_history)
+        .unwrap_or_else(|_| build_account_drawdown_series_iter(account_history))
+}
+
+fn build_strategy_drawdown_series(trips: &[RoundTripTrade]) -> Vec<DrawdownSeriesRow> {
+    let mut by_strategy: BTreeMap<String, Vec<&RoundTripTrade>> = BTreeMap::new();
+    for trip in trips {
+        let strategy = strategy_label(trip.strategy_type.as_deref(), "Unknown");
+        by_strategy.entry(strategy).or_default().push(trip);
+    }
+
+    let mut rows = Vec::new();
+    for (strategy, mut strategy_trips) in by_strategy {
+        strategy_trips.sort_by(|a, b| a.exit_time.cmp(&b.exit_time));
+        let mut cumulative_return_pct = 0.0_f64;
+        let mut cumulative_pnl = 0.0_f64;
+        let mut peak_return_pct = 0.0_f64;
+        let mut peak_pnl = 0.0_f64;
+        let mut by_period: BTreeMap<String, DrawdownSeriesRow> = BTreeMap::new();
+
+        for trip in strategy_trips {
+            cumulative_return_pct += trip.return_pct;
+            cumulative_pnl += trip.pnl;
+            peak_return_pct = peak_return_pct.max(cumulative_return_pct);
+            peak_pnl = peak_pnl.max(cumulative_pnl);
+            let drawdown_pct = cumulative_return_pct - peak_return_pct;
+            let drawdown_pnl = cumulative_pnl - peak_pnl;
+            let period = month_period(trip.exit_time);
+            let row = DrawdownSeriesRow {
+                strategy_name: strategy.clone(),
+                period: period.clone(),
+                drawdown_pct,
+                series_type: "strategy_realized".to_string(),
+                basis: "cumulative_realized_return_pct".to_string(),
+                cumulative_pnl: Some(cumulative_pnl),
+                cumulative_return_pct: Some(cumulative_return_pct),
+                drawdown_pnl: Some(drawdown_pnl),
+            };
+            by_period
+                .entry(period)
+                .and_modify(|current| {
+                    if row.drawdown_pct < current.drawdown_pct {
+                        *current = row.clone();
+                    }
+                })
+                .or_insert(row);
+        }
+
+        rows.extend(by_period.into_values());
+    }
+
+    rows
+}
+
+fn build_drawdown_series(
+    account_history: &[(DateTime<Utc>, Account)],
+    trips: &[RoundTripTrade],
+) -> Vec<DrawdownSeriesRow> {
+    let mut rows = build_account_drawdown_series(account_history);
+    rows.extend(build_strategy_drawdown_series(trips));
+    rows
 }
 
 fn equity_returns(account_history: &[(DateTime<Utc>, Account)]) -> Vec<(DateTime<Utc>, f64)> {
@@ -816,13 +1179,41 @@ fn std_dev(values: &[f64]) -> f64 {
         .sqrt()
 }
 
-fn build_regime_performance(
-    account_history: &[(DateTime<Utc>, Account)],
-    bars_by_symbol: &HashMap<String, Vec<Bar>>,
-) -> Vec<RegimePerformanceRow> {
-    let Some((_, bars)) = bars_by_symbol.iter().next() else {
-        return Vec::new();
-    };
+#[derive(Clone, Debug)]
+struct RegimePoint {
+    timestamp: DateTime<Utc>,
+    vol_regime: String,
+    trend_regime: String,
+    market_return_pct: f64,
+}
+
+fn volatility_regime(vol: f64, q1: f64, q2: f64, q3: f64) -> &'static str {
+    if vol <= q1 {
+        "Low Vol"
+    } else if vol <= q2 {
+        "Med Vol"
+    } else if vol <= q3 {
+        "High Vol"
+    } else {
+        "Crisis"
+    }
+}
+
+fn trend_regime(slope: f64) -> &'static str {
+    if slope <= -0.02 {
+        "Strong Down"
+    } else if slope <= -0.005 {
+        "Mild Down"
+    } else if slope < 0.005 {
+        "Flat"
+    } else if slope < 0.02 {
+        "Mild Up"
+    } else {
+        "Strong Up"
+    }
+}
+
+fn build_regime_points(bars: &[Bar]) -> Vec<RegimePoint> {
     if bars.len() < 51 {
         return Vec::new();
     }
@@ -830,33 +1221,28 @@ fn build_regime_performance(
     let mut bar_returns = Vec::with_capacity(bars.len().saturating_sub(1));
     for window in bars.windows(2) {
         if window[0].close.abs() > f64::EPSILON {
-            bar_returns.push((
-                window[1].timestamp,
-                (window[1].close - window[0].close) / window[0].close,
-            ));
+            bar_returns.push((window[1].close - window[0].close) / window[0].close);
+        } else {
+            bar_returns.push(0.0);
         }
     }
 
     let mut vol_by_index: HashMap<usize, f64> = HashMap::new();
     let mut vol_values = Vec::new();
     for index in 20..bar_returns.len() {
-        let returns: Vec<f64> = bar_returns[index - 20..index]
-            .iter()
-            .map(|(_, value)| *value)
-            .collect();
-        let vol = std_dev(&returns);
+        let vol = std_dev(&bar_returns[index - 20..index]);
         vol_by_index.insert(index + 1, vol);
         vol_values.push(vol);
+    }
+    if vol_values.is_empty() {
+        return Vec::new();
     }
     vol_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let q1 = percentile(&vol_values, 0.25);
     let q2 = percentile(&vol_values, 0.50);
     let q3 = percentile(&vol_values, 0.75);
 
-    let equity_return_by_time: HashMap<DateTime<Utc>, f64> =
-        equity_returns(account_history).into_iter().collect();
-    let mut buckets: BTreeMap<(String, String), (f64, usize)> = BTreeMap::new();
-
+    let mut points = Vec::new();
     for index in 50..bars.len() {
         let Some(vol) = vol_by_index.get(&index).copied() else {
             continue;
@@ -870,41 +1256,45 @@ fn build_regime_performance(
             continue;
         }
         let slope = (bars[index].close - sma50) / sma50;
-        let vol_regime = if vol <= q1 {
-            "Low Vol"
-        } else if vol <= q2 {
-            "Med Vol"
-        } else if vol <= q3 {
-            "High Vol"
+        let market_return_pct = if index > 0 && bars[index - 1].close.abs() > f64::EPSILON {
+            (bars[index].close - bars[index - 1].close) / bars[index - 1].close * 100.0
         } else {
-            "Crisis"
+            0.0
         };
-        let trend_regime = if slope <= -0.02 {
-            "Strong Down"
-        } else if slope <= -0.005 {
-            "Mild Down"
-        } else if slope < 0.005 {
-            "Flat"
-        } else if slope < 0.02 {
-            "Mild Up"
-        } else {
-            "Strong Up"
-        };
-        let strategy_return = equity_return_by_time
-            .get(&bars[index].timestamp)
-            .copied()
-            .or_else(|| {
-                if index > 0 && bars[index - 1].close.abs() > f64::EPSILON {
-                    Some((bars[index].close - bars[index - 1].close) / bars[index - 1].close)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0.0)
-            * 100.0;
+        points.push(RegimePoint {
+            timestamp: bars[index].timestamp,
+            vol_regime: volatility_regime(vol, q1, q2, q3).to_string(),
+            trend_regime: trend_regime(slope).to_string(),
+            market_return_pct,
+        });
+    }
 
+    points
+}
+
+fn build_regime_performance_iter(
+    account_history: &[(DateTime<Utc>, Account)],
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+) -> Vec<RegimePerformanceRow> {
+    let Some((_, bars)) = bars_by_symbol.iter().next() else {
+        return Vec::new();
+    };
+    let regime_points = build_regime_points(bars);
+    if regime_points.is_empty() {
+        return Vec::new();
+    }
+
+    let equity_return_by_time: HashMap<DateTime<Utc>, f64> =
+        equity_returns(account_history).into_iter().collect();
+    let mut buckets: BTreeMap<(String, String), (f64, usize)> = BTreeMap::new();
+
+    for point in regime_points {
+        let strategy_return = equity_return_by_time
+            .get(&point.timestamp)
+            .map(|value| *value * 100.0)
+            .unwrap_or(point.market_return_pct);
         buckets
-            .entry((vol_regime.to_string(), trend_regime.to_string()))
+            .entry((point.vol_regime, point.trend_regime))
             .and_modify(|(sum, count)| {
                 *sum += strategy_return;
                 *count += 1;
@@ -923,6 +1313,287 @@ fn build_regime_performance(
             },
         )
         .collect()
+}
+
+fn build_regime_performance_polars(
+    account_history: &[(DateTime<Utc>, Account)],
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+) -> PolarsResult<Vec<RegimePerformanceRow>> {
+    let Some((_, bars)) = bars_by_symbol.iter().next() else {
+        return Ok(Vec::new());
+    };
+    let regime_points = build_regime_points(bars);
+    if regime_points.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let equity_return_by_time: HashMap<DateTime<Utc>, f64> =
+        equity_returns(account_history).into_iter().collect();
+    let mut vol_regimes = Vec::with_capacity(regime_points.len());
+    let mut trend_regimes = Vec::with_capacity(regime_points.len());
+    let mut returns = Vec::with_capacity(regime_points.len());
+
+    for point in regime_points {
+        vol_regimes.push(point.vol_regime);
+        trend_regimes.push(point.trend_regime);
+        returns.push(
+            equity_return_by_time
+                .get(&point.timestamp)
+                .map(|value| *value * 100.0)
+                .unwrap_or(point.market_return_pct),
+        );
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("vol_regime".into(), vol_regimes.as_slice()),
+        Column::new("trend_regime".into(), trend_regimes.as_slice()),
+        Column::new("strategy_return".into(), returns.as_slice()),
+    ])?;
+    let out = df
+        .lazy()
+        .group_by([col("vol_regime"), col("trend_regime")])
+        .agg([
+            col("strategy_return").mean().alias("avg_return_pct"),
+            col("strategy_return")
+                .count()
+                .cast(DataType::Int64)
+                .alias("bar_count"),
+        ])
+        .sort(["vol_regime", "trend_regime"], Default::default())
+        .collect()?;
+
+    let vol_col = out.column("vol_regime")?.str()?;
+    let trend_col = out.column("trend_regime")?.str()?;
+    let avg_col = out.column("avg_return_pct")?.f64()?;
+    let count_col = out.column("bar_count")?.i64()?;
+
+    let mut rows = Vec::with_capacity(out.height());
+    for index in 0..out.height() {
+        rows.push(RegimePerformanceRow {
+            vol_regime: vol_col.get(index).unwrap_or_default().to_string(),
+            trend_regime: trend_col.get(index).unwrap_or_default().to_string(),
+            avg_return_pct: avg_col.get(index).unwrap_or(0.0),
+            bar_count: count_col.get(index).unwrap_or_default().max(0) as usize,
+        });
+    }
+
+    Ok(rows)
+}
+
+fn build_regime_performance(
+    account_history: &[(DateTime<Utc>, Account)],
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+) -> Vec<RegimePerformanceRow> {
+    build_regime_performance_polars(account_history, bars_by_symbol)
+        .unwrap_or_else(|_| build_regime_performance_iter(account_history, bars_by_symbol))
+}
+
+fn regime_at_entry<'a>(
+    regime_points: &'a [RegimePoint],
+    entry_time: DateTime<Utc>,
+) -> Option<&'a RegimePoint> {
+    regime_points
+        .iter()
+        .take_while(|point| point.timestamp <= entry_time)
+        .last()
+        .or_else(|| regime_points.first())
+}
+
+fn build_strategy_regime_performance_iter(
+    trips: &[RoundTripTrade],
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+) -> Vec<StrategyRegimePerformanceRow> {
+    let regime_points_by_symbol: HashMap<String, Vec<RegimePoint>> = bars_by_symbol
+        .iter()
+        .map(|(symbol, bars)| (symbol.clone(), build_regime_points(bars)))
+        .filter(|(_, points)| !points.is_empty())
+        .collect();
+    if regime_points_by_symbol.is_empty() {
+        return Vec::new();
+    }
+
+    let mut buckets: BTreeMap<(String, String, String), Vec<&RoundTripTrade>> = BTreeMap::new();
+    for trip in trips {
+        let Some(points) = regime_points_by_symbol.get(&trip.symbol) else {
+            continue;
+        };
+        let Some(point) = regime_at_entry(points, trip.entry_time) else {
+            continue;
+        };
+        let strategy = strategy_label(trip.strategy_type.as_deref(), "Unknown");
+        buckets
+            .entry((
+                strategy,
+                point.vol_regime.clone(),
+                point.trend_regime.clone(),
+            ))
+            .or_default()
+            .push(trip);
+    }
+
+    buckets
+        .into_iter()
+        .map(|((strategy_type, vol_regime, trend_regime), trades)| {
+            let trade_count = trades.len();
+            let winners = trades.iter().filter(|trip| trip.pnl > 0.0).count();
+            let gross_profit: f64 = trades
+                .iter()
+                .filter(|trip| trip.pnl > 0.0)
+                .map(|trip| trip.pnl)
+                .sum();
+            let gross_loss: f64 = trades
+                .iter()
+                .filter(|trip| trip.pnl < 0.0)
+                .map(|trip| trip.pnl)
+                .sum::<f64>()
+                .abs();
+            StrategyRegimePerformanceRow {
+                strategy_type,
+                vol_regime,
+                trend_regime,
+                trade_count,
+                win_rate: if trade_count > 0 {
+                    winners as f64 / trade_count as f64 * 100.0
+                } else {
+                    0.0
+                },
+                total_pnl: trades.iter().map(|trip| trip.pnl).sum(),
+                avg_return_pct: if trade_count > 0 {
+                    trades.iter().map(|trip| trip.return_pct).sum::<f64>() / trade_count as f64
+                } else {
+                    0.0
+                },
+                profit_factor: if gross_loss > f64::EPSILON {
+                    gross_profit / gross_loss
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
+}
+
+fn build_strategy_regime_performance_polars(
+    trips: &[RoundTripTrade],
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+) -> PolarsResult<Vec<StrategyRegimePerformanceRow>> {
+    let regime_points_by_symbol: HashMap<String, Vec<RegimePoint>> = bars_by_symbol
+        .iter()
+        .map(|(symbol, bars)| (symbol.clone(), build_regime_points(bars)))
+        .filter(|(_, points)| !points.is_empty())
+        .collect();
+    if trips.is_empty() || regime_points_by_symbol.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut strategy_types = Vec::new();
+    let mut vol_regimes = Vec::new();
+    let mut trend_regimes = Vec::new();
+    let mut pnl_values = Vec::new();
+    let mut return_values = Vec::new();
+    let mut is_win_values = Vec::new();
+    let mut gross_profit_values = Vec::new();
+    let mut gross_loss_values = Vec::new();
+
+    for trip in trips {
+        let Some(points) = regime_points_by_symbol.get(&trip.symbol) else {
+            continue;
+        };
+        let Some(point) = regime_at_entry(points, trip.entry_time) else {
+            continue;
+        };
+        strategy_types.push(strategy_label(trip.strategy_type.as_deref(), "Unknown"));
+        vol_regimes.push(point.vol_regime.clone());
+        trend_regimes.push(point.trend_regime.clone());
+        pnl_values.push(trip.pnl);
+        return_values.push(trip.return_pct);
+        is_win_values.push(if trip.pnl > 0.0 { 1_i32 } else { 0_i32 });
+        gross_profit_values.push(if trip.pnl > 0.0 { trip.pnl } else { 0.0 });
+        gross_loss_values.push(if trip.pnl < 0.0 { trip.pnl.abs() } else { 0.0 });
+    }
+
+    if strategy_types.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("strategy_type".into(), strategy_types.as_slice()),
+        Column::new("vol_regime".into(), vol_regimes.as_slice()),
+        Column::new("trend_regime".into(), trend_regimes.as_slice()),
+        Column::new("pnl".into(), pnl_values.as_slice()),
+        Column::new("return_pct".into(), return_values.as_slice()),
+        Column::new("is_win".into(), is_win_values.as_slice()),
+        Column::new("gross_profit".into(), gross_profit_values.as_slice()),
+        Column::new("gross_loss".into(), gross_loss_values.as_slice()),
+    ])?;
+    let out = df
+        .lazy()
+        .group_by([col("strategy_type"), col("vol_regime"), col("trend_regime")])
+        .agg([
+            col("pnl").sum().alias("total_pnl"),
+            col("return_pct").mean().alias("avg_return_pct"),
+            col("pnl")
+                .count()
+                .cast(DataType::Int64)
+                .alias("trade_count"),
+            col("is_win")
+                .sum()
+                .cast(DataType::Int64)
+                .alias("winning_trades"),
+            col("gross_profit").sum().alias("gross_profit"),
+            col("gross_loss").sum().alias("gross_loss"),
+        ])
+        .sort(
+            ["strategy_type", "vol_regime", "trend_regime"],
+            Default::default(),
+        )
+        .collect()?;
+
+    let strategy_col = out.column("strategy_type")?.str()?;
+    let vol_col = out.column("vol_regime")?.str()?;
+    let trend_col = out.column("trend_regime")?.str()?;
+    let total_pnl_col = out.column("total_pnl")?.f64()?;
+    let avg_return_col = out.column("avg_return_pct")?.f64()?;
+    let trade_count_col = out.column("trade_count")?.i64()?;
+    let winning_col = out.column("winning_trades")?.i64()?;
+    let gross_profit_col = out.column("gross_profit")?.f64()?;
+    let gross_loss_col = out.column("gross_loss")?.f64()?;
+
+    let mut rows = Vec::with_capacity(out.height());
+    for index in 0..out.height() {
+        let trade_count = trade_count_col.get(index).unwrap_or_default().max(0) as usize;
+        let winners = winning_col.get(index).unwrap_or_default().max(0) as usize;
+        let gross_profit = gross_profit_col.get(index).unwrap_or(0.0);
+        let gross_loss = gross_loss_col.get(index).unwrap_or(0.0);
+        rows.push(StrategyRegimePerformanceRow {
+            strategy_type: strategy_col.get(index).unwrap_or_default().to_string(),
+            vol_regime: vol_col.get(index).unwrap_or_default().to_string(),
+            trend_regime: trend_col.get(index).unwrap_or_default().to_string(),
+            trade_count,
+            win_rate: if trade_count > 0 {
+                winners as f64 / trade_count as f64 * 100.0
+            } else {
+                0.0
+            },
+            total_pnl: total_pnl_col.get(index).unwrap_or(0.0),
+            avg_return_pct: avg_return_col.get(index).unwrap_or(0.0),
+            profit_factor: if gross_loss > f64::EPSILON {
+                gross_profit / gross_loss
+            } else {
+                0.0
+            },
+        });
+    }
+
+    Ok(rows)
+}
+
+fn build_strategy_regime_performance(
+    trips: &[RoundTripTrade],
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+) -> Vec<StrategyRegimePerformanceRow> {
+    build_strategy_regime_performance_polars(trips, bars_by_symbol)
+        .unwrap_or_else(|_| build_strategy_regime_performance_iter(trips, bars_by_symbol))
 }
 
 fn build_trade_mae(
@@ -982,14 +1653,10 @@ fn build_trade_mae(
     rows
 }
 
-fn build_setup_performance(trips: &[RoundTripTrade]) -> Vec<SetupPerformanceRow> {
+fn build_setup_performance_iter(trips: &[RoundTripTrade]) -> Vec<SetupPerformanceRow> {
     let mut buckets: BTreeMap<String, Vec<&RoundTripTrade>> = BTreeMap::new();
     for trip in trips {
-        let strategy = trip
-            .strategy_type
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "All Trades".to_string());
+        let strategy = strategy_label(trip.strategy_type.as_deref(), "All Trades");
         let side = format!("{:?}", trip.side);
         let symbol = trip.symbol.clone();
 
@@ -1046,6 +1713,119 @@ fn build_setup_performance(trips: &[RoundTripTrade]) -> Vec<SetupPerformanceRow>
             }
         })
         .collect()
+}
+
+fn build_setup_performance_polars(
+    trips: &[RoundTripTrade],
+) -> PolarsResult<Vec<SetupPerformanceRow>> {
+    if trips.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut setup_names = Vec::with_capacity(trips.len() * 3);
+    let mut pnl_values = Vec::with_capacity(trips.len() * 3);
+    let mut is_win_values = Vec::with_capacity(trips.len() * 3);
+    let mut is_loss_values = Vec::with_capacity(trips.len() * 3);
+    let mut gross_profit_values = Vec::with_capacity(trips.len() * 3);
+    let mut gross_loss_values = Vec::with_capacity(trips.len() * 3);
+
+    for trip in trips {
+        let strategy = strategy_label(trip.strategy_type.as_deref(), "All Trades");
+        let side = format!("{:?}", trip.side);
+        let labels = [
+            strategy.clone(),
+            format!("{strategy} / {side}"),
+            format!("{strategy} / {}", trip.symbol),
+        ];
+        for label in labels {
+            setup_names.push(label);
+            pnl_values.push(trip.pnl);
+            is_win_values.push(if trip.pnl > 0.0 { 1_i32 } else { 0_i32 });
+            is_loss_values.push(if trip.pnl < 0.0 { 1_i32 } else { 0_i32 });
+            gross_profit_values.push(if trip.pnl > 0.0 { trip.pnl } else { 0.0 });
+            gross_loss_values.push(if trip.pnl < 0.0 { trip.pnl.abs() } else { 0.0 });
+        }
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("setup_name".into(), setup_names.as_slice()),
+        Column::new("pnl".into(), pnl_values.as_slice()),
+        Column::new("is_win".into(), is_win_values.as_slice()),
+        Column::new("is_loss".into(), is_loss_values.as_slice()),
+        Column::new("gross_profit".into(), gross_profit_values.as_slice()),
+        Column::new("gross_loss".into(), gross_loss_values.as_slice()),
+    ])?;
+    let out = df
+        .lazy()
+        .group_by([col("setup_name")])
+        .agg([
+            col("pnl").sum().alias("total_pnl"),
+            col("pnl")
+                .count()
+                .cast(DataType::Int64)
+                .alias("trade_count"),
+            col("is_win")
+                .sum()
+                .cast(DataType::Int64)
+                .alias("winning_trades"),
+            col("is_loss")
+                .sum()
+                .cast(DataType::Int64)
+                .alias("losing_trades"),
+            col("gross_profit").sum().alias("gross_profit"),
+            col("gross_loss").sum().alias("gross_loss"),
+        ])
+        .sort(["setup_name"], Default::default())
+        .collect()?;
+
+    let setup_col = out.column("setup_name")?.str()?;
+    let total_pnl_col = out.column("total_pnl")?.f64()?;
+    let trade_count_col = out.column("trade_count")?.i64()?;
+    let winning_col = out.column("winning_trades")?.i64()?;
+    let losing_col = out.column("losing_trades")?.i64()?;
+    let gross_profit_col = out.column("gross_profit")?.f64()?;
+    let gross_loss_col = out.column("gross_loss")?.f64()?;
+
+    let mut rows = Vec::with_capacity(out.height());
+    for index in 0..out.height() {
+        let trade_count = trade_count_col.get(index).unwrap_or_default().max(0) as usize;
+        let winners = winning_col.get(index).unwrap_or_default().max(0) as usize;
+        let losers = losing_col.get(index).unwrap_or_default().max(0) as usize;
+        let gross_profit = gross_profit_col.get(index).unwrap_or(0.0);
+        let gross_loss = gross_loss_col.get(index).unwrap_or(0.0);
+        let avg_win = if winners > 0 {
+            gross_profit / winners as f64
+        } else {
+            0.0
+        };
+        let avg_loss = if losers > 0 {
+            gross_loss / losers as f64
+        } else {
+            0.0
+        };
+
+        rows.push(SetupPerformanceRow {
+            setup_name: setup_col.get(index).unwrap_or_default().to_string(),
+            win_rate: if trade_count > 0 {
+                winners as f64 / trade_count as f64 * 100.0
+            } else {
+                0.0
+            },
+            payoff_ratio: if avg_loss > f64::EPSILON {
+                avg_win / avg_loss
+            } else {
+                0.0
+            },
+            trade_count,
+            total_pnl: total_pnl_col.get(index).unwrap_or(0.0),
+        });
+    }
+
+    Ok(rows)
+}
+
+fn build_setup_performance(trips: &[RoundTripTrade]) -> Vec<SetupPerformanceRow> {
+    build_setup_performance_polars(trips).unwrap_or_else(|_| build_setup_performance_iter(trips))
 }
 
 fn build_position_concentration(trade_log: &[TradeRecord]) -> Vec<PositionConcentrationRow> {
@@ -1119,11 +1899,7 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelationRow> {
     let mut by_strategy: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     for trip in trips {
-        let strategy = trip
-            .strategy_type
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "Strategy".to_string());
+        let strategy = strategy_label(trip.strategy_type.as_deref(), "Strategy");
         by_strategy
             .entry(strategy)
             .or_default()
@@ -1146,22 +1922,33 @@ fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelat
     let mut rows = Vec::new();
     for strategy_a in &strategies {
         for strategy_b in &strategies {
-            let values_a: Vec<f64> = dates
+            let common_dates = dates
                 .iter()
-                .map(|date| by_strategy[strategy_a].get(date).copied().unwrap_or(0.0))
-                .collect();
-            let values_b: Vec<f64> = dates
+                .filter(|date| {
+                    by_strategy[strategy_a].contains_key(*date)
+                        && by_strategy[strategy_b].contains_key(*date)
+                })
+                .collect::<Vec<_>>();
+            let values_a: Vec<f64> = common_dates
                 .iter()
-                .map(|date| by_strategy[strategy_b].get(date).copied().unwrap_or(0.0))
+                .map(|date| by_strategy[strategy_a].get(*date).copied().unwrap_or(0.0))
                 .collect();
+            let values_b: Vec<f64> = common_dates
+                .iter()
+                .map(|date| by_strategy[strategy_b].get(*date).copied().unwrap_or(0.0))
+                .collect();
+            let sample_count = common_dates.len();
             rows.push(StrategyCorrelationRow {
                 strategy_a: strategy_a.clone(),
                 strategy_b: strategy_b.clone(),
                 correlation: if strategy_a == strategy_b {
                     1.0
+                } else if sample_count < 2 {
+                    0.0
                 } else {
                     pearson(&values_a, &values_b)
                 },
+                sample_count,
             });
         }
     }
@@ -1217,7 +2004,7 @@ async fn insert_analysis_tables(
         )
         .await
         .map_err(to_storage_err)?;
-    for row in build_drawdown_series(&results.account_history, primary_strategy_name(trips)) {
+    for row in build_drawdown_series(&results.account_history, trips) {
         drawdown_series_stmt
             .execute(params![
                 row.strategy_name.clone(),
@@ -1242,6 +2029,29 @@ async fn insert_analysis_tables(
                 row.trend_regime.clone(),
                 row.avg_return_pct,
                 row.bar_count as i64,
+                serde_json::to_string(&row).map_err(to_storage_err)?
+            ])
+            .await
+            .map_err(to_storage_err)?;
+    }
+
+    let mut strategy_regime_performance_stmt = tx
+        .prepare(
+            "INSERT INTO strategy_regime_performance (strategy_type, vol_regime, trend_regime, trade_count, win_rate, total_pnl, avg_return_pct, profit_factor, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .await
+        .map_err(to_storage_err)?;
+    for row in build_strategy_regime_performance(trips, &state.historical_bars) {
+        strategy_regime_performance_stmt
+            .execute(params![
+                row.strategy_type.clone(),
+                row.vol_regime.clone(),
+                row.trend_regime.clone(),
+                row.trade_count as i64,
+                row.win_rate,
+                row.total_pnl,
+                row.avg_return_pct,
+                row.profit_factor,
                 serde_json::to_string(&row).map_err(to_storage_err)?
             ])
             .await
@@ -1353,15 +2163,212 @@ pub async fn write_backtest_db(
     let mut conn = connect_database(dir_path).await?;
     init_schema(&conn).await?;
     let tx = conn.transaction().await.map_err(to_storage_err)?;
+    let insights: Vec<InsightSnapshot> = state.insight_snapshots.values().cloned().collect();
     insert_trade_log(&tx, &results.trade_log).await?;
     let round_trips = results.round_trip_trades();
     insert_round_trips(&tx, &round_trips).await?;
-    insert_trade_log_rows(&tx, &round_trips, &results.trade_log).await?;
+    insert_trade_log_rows(&tx, &results.trade_log, &insights).await?;
     insert_account_history(&tx, &results.account_history).await?;
-    let insights: Vec<InsightSnapshot> = state.insight_snapshots.values().cloned().collect();
     insert_insights(&tx, &insights).await?;
     insert_bars(&tx, &state.historical_bars).await?;
     insert_analysis_tables(&tx, results, state, &round_trips).await?;
     tx.commit().await.map_err(to_storage_err)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::broker::types::{AccountType, OrderSide, TradeRecordType};
+    use crate::core::insight::snapshot::InsightLegsSnapshot;
+    use chrono::TimeZone;
+
+    fn test_account(equity: f64) -> Account {
+        Account {
+            account_id: "test".to_string(),
+            account_type: AccountType::Paper,
+            equity,
+            cash: equity,
+            currency: "USD".to_string(),
+            buying_power: equity,
+            shorting_enabled: true,
+            leverage: 1,
+        }
+    }
+
+    fn test_snapshot(
+        insight_id: &str,
+        parent_id: Option<&str>,
+        strategy_type: &str,
+    ) -> InsightSnapshot {
+        let timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        InsightSnapshot {
+            insight_id: insight_id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            state: "Closed".to_string(),
+            children: Vec::new(),
+            order_id: Some("order-1".to_string()),
+            side: "Buy".to_string(),
+            symbol: "AAPL".to_string(),
+            quantity: Some(1.0),
+            contracts: None,
+            order_type: "Market".to_string(),
+            order_class: "Simple".to_string(),
+            limit_price: None,
+            stop_price: None,
+            take_profit_levels: None,
+            stop_loss_levels: None,
+            trailing_stop_price: None,
+            strategy_type: strategy_type.to_string(),
+            confidence: 100,
+            timeframe: serde_json::json!({ "amount": 1, "unit": "Day" }),
+            period_unfilled: None,
+            period_till_tp: None,
+            execution_depends: Vec::new(),
+            filled_price: Some(100.0),
+            close_order_id: None,
+            close_price: Some(110.0),
+            broker_realized_pnl: None,
+            partial_closes: Vec::new(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            filled_at: Some(timestamp),
+            closed_at: Some(timestamp),
+            legs: InsightLegsSnapshot {
+                take_profit: None,
+                stop_loss: None,
+                trailing_stop: None,
+            },
+            market_changed: false,
+            submitted: true,
+            cancelling: false,
+            closing: false,
+            first_on_fill: false,
+            partial_filled_quantity: None,
+            state_history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn old_trade_log_rows_default_parent_child_fields() {
+        let row: BacktestTradeLogRow = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "symbol": "AAPL",
+            "side": "BUY",
+            "strategyType": "MeanReversion",
+            "insightId": "insight-1",
+            "entryTime": "2026-01-01 00:00:00",
+            "exitTime": null,
+            "qty": 1.0,
+            "entryPrice": 100.0,
+            "exitPrice": null,
+            "returnPct": null,
+            "pnl": null,
+            "status": "OPEN"
+        }))
+        .unwrap();
+
+        assert_eq!(row.parent_id, None);
+        assert!(!row.is_child);
+        assert_eq!(row.base_strategy_type, None);
+    }
+
+    #[test]
+    fn child_trade_log_rows_include_parent_and_base_strategy_type() {
+        let entry_time = Utc.with_ymd_and_hms(2026, 1, 1, 9, 30, 0).unwrap();
+        let exit_time = Utc.with_ymd_and_hms(2026, 1, 1, 10, 30, 0).unwrap();
+        let trades = vec![
+            TradeRecord {
+                date: entry_time,
+                symbol: "AAPL".to_string(),
+                side: OrderSide::Buy,
+                qty: 1.0,
+                price: 100.0,
+                order_id: "order-1".to_string(),
+                insight_id: Some("child-1".to_string()),
+                strategy_type: Some("MeanReversion-CHILD".to_string()),
+                trade_type: TradeRecordType::Entry,
+            },
+            TradeRecord {
+                date: exit_time,
+                symbol: "AAPL".to_string(),
+                side: OrderSide::Buy,
+                qty: 1.0,
+                price: 110.0,
+                order_id: "order-1".to_string(),
+                insight_id: Some("child-1".to_string()),
+                strategy_type: Some("MeanReversion-CHILD".to_string()),
+                trade_type: TradeRecordType::Exit,
+            },
+        ];
+        let insights = vec![test_snapshot(
+            "child-1",
+            Some("parent-1"),
+            "MeanReversion-CHILD",
+        )];
+
+        let rows = build_trade_log_rows(&trades, &insights);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parent_id.as_deref(), Some("parent-1"));
+        assert!(rows[0].is_child);
+        assert_eq!(rows[0].base_strategy_type.as_deref(), Some("MeanReversion"));
+    }
+
+    #[test]
+    fn drawdown_series_contains_portfolio_and_realized_strategy_rows() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+        let account_history = vec![
+            (t0, test_account(10_000.0)),
+            (t1, test_account(9_500.0)),
+            (t2, test_account(10_250.0)),
+        ];
+        let trips = vec![
+            RoundTripTrade {
+                order_id: "alpha-1".to_string(),
+                symbol: "AAPL".to_string(),
+                side: OrderSide::Buy,
+                insight_id: Some("alpha-insight".to_string()),
+                strategy_type: Some("Alpha".to_string()),
+                entry_time: t0,
+                exit_time: t1,
+                entry_price: 100.0,
+                exit_price: 95.0,
+                qty: 1.0,
+                pnl: -5.0,
+                return_pct: -5.0,
+                hold_secs: 86_400,
+            },
+            RoundTripTrade {
+                order_id: "beta-1".to_string(),
+                symbol: "MSFT".to_string(),
+                side: OrderSide::Buy,
+                insight_id: Some("beta-insight".to_string()),
+                strategy_type: Some("Beta-CHILD".to_string()),
+                entry_time: t0,
+                exit_time: t2,
+                entry_price: 100.0,
+                exit_price: 105.0,
+                qty: 1.0,
+                pnl: 5.0,
+                return_pct: 5.0,
+                hold_secs: 172_800,
+            },
+        ];
+
+        let rows = build_drawdown_series(&account_history, &trips);
+        let names = rows
+            .iter()
+            .map(|row| row.strategy_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(names.contains("Portfolio Equity"));
+        assert!(names.contains("Alpha"));
+        assert!(names.contains("Beta"));
+        assert!(
+            rows.iter()
+                .any(|row| row.series_type == "strategy_realized")
+        );
+    }
 }

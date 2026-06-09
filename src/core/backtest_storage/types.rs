@@ -8,6 +8,12 @@ pub struct BacktestTradeLogRow {
     pub side: String,
     #[serde(alias = "strategy_type")]
     pub strategy_type: Option<String>,
+    #[serde(default, alias = "parent_id")]
+    pub parent_id: Option<String>,
+    #[serde(default, alias = "is_child")]
+    pub is_child: bool,
+    #[serde(default, alias = "base_strategy_type")]
+    pub base_strategy_type: Option<String>,
     #[serde(alias = "insight_id")]
     pub insight_id: Option<String>,
     #[serde(alias = "entry_time")]
