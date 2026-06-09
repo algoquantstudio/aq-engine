@@ -4,9 +4,17 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
-/// Cancels all insights on the opposite side for the same symbol.
-/// Port of Python's `CancelAllOppositeSideExecutor`.
-/// Targets `InsightState::New`.
+/// Reports active insights on the opposite side for the same symbol.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Reads the strategy insight collection for the current symbol, counts insights whose side is
+/// opposite to the incoming insight, and returns that count in the result message. The current
+/// implementation is informational and does not cancel or mutate the matching insights.
 pub struct CancelOppositePipe;
 
 impl CancelOppositePipe {

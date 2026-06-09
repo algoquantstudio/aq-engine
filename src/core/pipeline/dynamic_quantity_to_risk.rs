@@ -1,9 +1,29 @@
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
+use crate::core::pipeline::quantity_sizing::{
+    AssetQuantityLimits, apply_max_order_size_with_child_legs, entry_price,
+    round_whole_or_fractional_quantity, split_summary,
+};
 use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Sizes an insight from the strategy's configured execution risk.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `maximum_cost_basis`: Upper bound on the working capital used for the position.
+/// - `minimum_cost_basis`: Minimum working capital required before the insight can be sized.
+///
+/// Behaviour:
+/// Requires an unset quantity, entry price, stop loss, asset definition, and account snapshot.
+/// Working capital comes from buying power for marginable assets or cash for non-marginable
+/// assets, scaled by insight confidence, bounded by the configured cost-basis limits, and then
+/// multiplied by `ctx.execution_risk()`. The pipe calculates quantity from stop-loss distance,
+/// caps it by what working capital can buy, applies asset rounding/contract-size rules, sets the
+/// parent insight quantity, and creates child insights when the target size exceeds the asset
+/// maximum single-entry quantity.
 pub struct DynamicQuantityToRiskPipe {
     maximum_cost_basis: f64,
     minimum_cost_basis: f64,
@@ -24,22 +44,23 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
-        let entry = if let Some(entry) = insight.limit_price.or(insight.stop_price) {
-            entry
-        } else {
-            match self.get_latest_quote(ctx, &insight.symbol) {
-                Ok(quote) => match insight.side {
-                    crate::core::broker::types::OrderSide::Buy => quote.ask,
-                    crate::core::broker::types::OrderSide::Sell => quote.bid,
-                },
-                Err(_) => {
-                    return InsightPipeResult::new(
-                        false,
-                        false,
-                        Some("Insight does not have an entry price set.".to_string()),
-                        self.name().to_string(),
-                    );
-                }
+        let entry = match entry_price(ctx, insight) {
+            Ok(value) if value > 0.0 => value,
+            Ok(_) => {
+                return InsightPipeResult::new(
+                    false,
+                    false,
+                    Some("Entry price must be positive".to_string()),
+                    self.name().to_string(),
+                );
+            }
+            Err(_) => {
+                return InsightPipeResult::new(
+                    false,
+                    false,
+                    Some("Insight does not have an entry price set.".to_string()),
+                    self.name().to_string(),
+                );
             }
         };
         let Some(stop_loss) = insight.stop_loss() else {
@@ -67,6 +88,8 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
                 self.name().to_string(),
             );
         };
+        let limits = AssetQuantityLimits::from_asset(asset);
+        let fractional = asset.fractional;
         let Ok(account) = ctx.account() else {
             return InsightPipeResult::new(
                 false,
@@ -113,22 +136,18 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
         let maximum_can_buy = working_capital / entry;
         let mut size_should_buy = (account_size_at_risk / risk_per_share).min(maximum_can_buy);
 
-        if size_should_buy > 1.0 {
-            size_should_buy = size_should_buy.floor();
-        } else if asset.fractional {
-            size_should_buy = ctx.tools().quantity_round(size_should_buy, &insight.symbol);
-        } else {
-            insight.order_rejected(&format!(
-                "Asset {} is not fractionable for quantity {:.4}",
-                insight.symbol, size_should_buy
-            ));
-            return InsightPipeResult::new(
-                false,
-                true,
-                Some("Asset is not fractionable".to_string()),
-                self.name().to_string(),
-            );
-        }
+        size_should_buy = match round_whole_or_fractional_quantity(
+            ctx,
+            &insight.symbol,
+            size_should_buy,
+            fractional,
+        ) {
+            Ok(quantity) => quantity,
+            Err(message) => {
+                insight.order_rejected(&message);
+                return InsightPipeResult::new(false, true, Some(message), self.name().to_string());
+            }
+        };
 
         if let Some(contract_size) = asset.contract_size {
             if contract_size > 0 {
@@ -136,30 +155,29 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
             }
         }
 
-        if let Some(min_order_size) = asset.min_order_size {
-            if size_should_buy < min_order_size {
-                insight.order_rejected(&format!(
-                    "Quantity {:.4} is below minimum order size {:.4}",
-                    size_should_buy, min_order_size
-                ));
-                return InsightPipeResult::new(
-                    false,
-                    true,
-                    Some("Quantity below minimum order size".to_string()),
-                    self.name().to_string(),
-                );
-            }
-        }
+        let split =
+            match apply_max_order_size_with_child_legs(ctx, insight, size_should_buy, limits) {
+                Ok(result) => result,
+                Err(message) => {
+                    insight.order_rejected(&message);
+                    return InsightPipeResult::new(
+                        false,
+                        true,
+                        Some(message),
+                        self.name().to_string(),
+                    );
+                }
+            };
 
-        if let Some(max_order_size) = asset.max_order_size {
-            size_should_buy = size_should_buy.min(max_order_size);
-        }
-
-        insight.set_quantity(Some(size_should_buy));
+        insight.set_quantity(Some(split.parent_quantity));
         InsightPipeResult::new(
             true,
             true,
-            Some(format!("Quantity set to {:.4}", size_should_buy)),
+            Some(format!(
+                "Quantity set to {:.4}{}",
+                split.total_quantity(),
+                split_summary(&split)
+            )),
             self.name().to_string(),
         )
     }

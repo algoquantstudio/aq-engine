@@ -4,6 +4,16 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Closes an insight when its market-change flag has been set.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Checks `insight.market_changed` and calls `insight.close(ctx)` when the flag is true. Insights
+/// already in a closing state return `passed=false`; otherwise unchanged insights pass through.
 pub struct CloseMarketChangedPipe;
 
 impl CloseMarketChangedPipe {

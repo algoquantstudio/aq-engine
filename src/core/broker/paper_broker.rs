@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -113,15 +113,11 @@ impl PaperBroker {
 
         // 1. Process pending orders (market/limit/stop fills)
         debug!("PaperBroker::process_step pending_orders phase");
-        for (_symbol, bar) in bars {
-            self.process_pending_orders(bar);
-        }
+        self.process_pending_orders(bars);
 
         // 2. Process active orders (bracket legs: TP/SL checks)
         debug!("PaperBroker::process_step active_orders phase");
-        for (_symbol, bar) in bars {
-            self.process_active_orders(bar);
-        }
+        self.process_active_orders(bars);
 
         // 3. Process deferred close/update queues
         debug!("PaperBroker::process_step close_queue phase");
@@ -139,7 +135,7 @@ impl PaperBroker {
 
     /// Process pending orders against the current bar.
     /// Market orders fill at open, Limit/Stop fill if bar range crosses the trigger price.
-    fn process_pending_orders(&self, bar: &Bar) {
+    fn process_pending_orders(&self, bars: &HashMap<String, Bar>) {
         let mut pending = self.pending_orders.lock();
         let mut remaining = VecDeque::new();
 
@@ -150,11 +146,10 @@ impl PaperBroker {
                     continue;
                 }
 
-                // Only process orders matching this bar's symbol
-                if order.asset.symbol != bar.symbol {
+                let Some(bar) = bars.get(&order.asset.symbol) else {
                     remaining.push_back(order_id);
                     continue;
-                }
+                };
 
                 let fill_result = self.try_fill_order(&order, bar);
 
@@ -313,7 +308,7 @@ impl PaperBroker {
     // ─────────────────────── Active Orders (Bracket Legs) ───────────────────────
 
     /// Check active orders' bracket legs (TP/SL) against the current bar.
-    fn process_active_orders(&self, bar: &Bar) {
+    fn process_active_orders(&self, bars: &HashMap<String, Bar>) {
         let mut to_remove = Vec::new();
         // Deferred closes: (order_id, fill_price) to process after releasing the mutable guard
         let mut deferred_closes: Vec<(String, f64)> = Vec::new();
@@ -322,9 +317,9 @@ impl PaperBroker {
             let order_id = entry.key();
 
             if let Some(mut order) = self.orders.get_mut(order_id) {
-                if order.asset.symbol != bar.symbol {
+                let Some(bar) = bars.get(&order.asset.symbol) else {
                     continue;
-                }
+                };
 
                 // Read side before mutably borrowing legs
                 let side = order.side.clone();
@@ -864,22 +859,19 @@ impl PaperBroker {
         if release_ids.is_empty() {
             return;
         }
+        let release_set = release_ids.iter().cloned().collect::<HashSet<_>>();
 
         {
             let mut pending_orders = self.pending_orders.lock();
-            pending_orders
-                .retain(|order_id| !release_ids.iter().any(|released| released == order_id));
+            pending_orders.retain(|order_id| !release_set.contains(order_id));
         }
         {
             let mut close_queue = self.close_orders_queue.lock();
-            close_queue.retain(|(order_id, _, _)| {
-                !release_ids.iter().any(|released| released == order_id)
-            });
+            close_queue.retain(|(order_id, _, _)| !release_set.contains(order_id));
         }
         {
             let mut update_queue = self.update_orders_queue.lock();
-            update_queue
-                .retain(|(order_id, _)| !release_ids.iter().any(|released| released == order_id));
+            update_queue.retain(|(order_id, _)| !release_set.contains(order_id));
         }
 
         for order_id in release_ids {

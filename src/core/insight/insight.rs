@@ -1,6 +1,8 @@
 use uuid::Uuid;
 
-use crate::core::broker::types::{OrderClass, OrderLegs, OrderSide, OrderType, TradeUpdateEvent};
+use crate::core::broker::types::{
+    OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, TradeUpdateEvent,
+};
 use crate::core::utils::timeframe::TimeFrame;
 
 use super::types::{
@@ -8,10 +10,143 @@ use super::types::{
     StrategyType,
 };
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::core::strategy::StrategyContext;
 use log::{debug, info, warn};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct InsightOrderLegFingerprint<'a> {
+    order_id: Option<&'a str>,
+    limit_price: Option<f64>,
+    trail_price: Option<f64>,
+    side: &'a OrderSide,
+    filled_price: Option<f64>,
+    order_type: &'a OrderType,
+    status: &'a TradeUpdateEvent,
+    order_class: &'a OrderClass,
+    created_at: u64,
+    updated_at: u64,
+    submitted_at: u64,
+    filled_at: Option<u64>,
+}
+
+impl<'a> InsightOrderLegFingerprint<'a> {
+    fn new(leg: &'a OrderLeg) -> Self {
+        Self {
+            order_id: leg.order_id.as_deref(),
+            limit_price: leg.limit_price,
+            trail_price: leg.trail_price,
+            side: &leg.side,
+            filled_price: leg.filled_price,
+            order_type: &leg.order_type,
+            status: &leg.status,
+            order_class: &leg.order_class,
+            created_at: leg.created_at,
+            updated_at: leg.updated_at,
+            submitted_at: leg.submitted_at,
+            filled_at: leg.filled_at,
+        }
+    }
+}
+
+fn hash_f64<H: Hasher>(state: &mut H, value: f64) {
+    value.to_bits().hash(state);
+}
+
+fn hash_option_f64<H: Hasher>(state: &mut H, value: Option<f64>) {
+    value.map(f64::to_bits).hash(state);
+}
+
+fn hash_datetime<H: Hasher>(state: &mut H, value: DateTime<Utc>) {
+    value.timestamp().hash(state);
+    value.timestamp_subsec_nanos().hash(state);
+}
+
+fn hash_option_datetime<H: Hasher>(state: &mut H, value: Option<DateTime<Utc>>) {
+    value.is_some().hash(state);
+    if let Some(value) = value {
+        hash_datetime(state, value);
+    }
+}
+
+fn hash_levels<H: Hasher>(state: &mut H, levels: Option<&[f64]>) {
+    levels.is_some().hash(state);
+    if let Some(levels) = levels {
+        levels.len().hash(state);
+        for level in levels {
+            hash_f64(state, *level);
+        }
+    }
+}
+
+fn hash_order_leg<H: Hasher>(state: &mut H, leg: Option<InsightOrderLegFingerprint<'_>>) {
+    leg.is_some().hash(state);
+    if let Some(leg) = leg {
+        leg.order_id.hash(state);
+        hash_option_f64(state, leg.limit_price);
+        hash_option_f64(state, leg.trail_price);
+        std::mem::discriminant(leg.side).hash(state);
+        hash_option_f64(state, leg.filled_price);
+        std::mem::discriminant(leg.order_type).hash(state);
+        std::mem::discriminant(leg.status).hash(state);
+        std::mem::discriminant(leg.order_class).hash(state);
+        leg.created_at.hash(state);
+        leg.updated_at.hash(state);
+        leg.submitted_at.hash(state);
+        leg.filled_at.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct InsightSnapshotFingerprint<'a> {
+    insight_id: Uuid,
+    parent_id: Option<Uuid>,
+    state: &'a InsightState,
+    children_len: usize,
+    order_id: Option<&'a str>,
+    side: &'a OrderSide,
+    symbol: &'a str,
+    quantity: Option<f64>,
+    contracts: Option<f64>,
+    order_type: &'a OrderType,
+    order_class: &'a OrderClass,
+    limit_price: Option<f64>,
+    stop_price: Option<f64>,
+    take_profit_levels: Option<&'a [f64]>,
+    stop_loss_levels: Option<&'a [f64]>,
+    trailing_stop_price: Option<f64>,
+    strategy_type: &'a StrategyType,
+    confidence: u8,
+    timeframe_amount: u8,
+    timeframe_unit: crate::core::utils::timeframe::TimeFrameUnit,
+    period_unfilled: Option<u32>,
+    period_till_tp: Option<u32>,
+    execution_depends: &'a [StrategyDependentConfirmation],
+    filled_price: Option<f64>,
+    close_order_id: Option<&'a str>,
+    close_price: Option<f64>,
+    broker_realized_pnl: Option<f64>,
+    partial_closes_len: usize,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    filled_at: Option<DateTime<Utc>>,
+    closed_at: Option<DateTime<Utc>>,
+    take_profit_leg: Option<InsightOrderLegFingerprint<'a>>,
+    stop_loss_leg: Option<InsightOrderLegFingerprint<'a>>,
+    trailing_stop_leg: Option<InsightOrderLegFingerprint<'a>>,
+    market_changed: bool,
+    submitted: bool,
+    cancelling: bool,
+    closing: bool,
+    first_on_fill: bool,
+    partial_filled_quantity: Option<f64>,
+    state_history_len: usize,
+}
 
 #[derive(Clone)]
 pub struct InsightStrategyContext {
@@ -202,6 +337,127 @@ impl Insight {
         } else {
             Some(unique)
         }
+    }
+
+    pub fn snapshot_fingerprint(&self) -> InsightSnapshotFingerprint<'_> {
+        InsightSnapshotFingerprint {
+            insight_id: self.insight_id,
+            parent_id: self.parent_id,
+            state: &self.state,
+            children_len: self.children.len(),
+            order_id: self.order_id.as_deref(),
+            side: &self.side,
+            symbol: &self.symbol,
+            quantity: self.quantity,
+            contracts: self.contracts,
+            order_type: &self.order_type,
+            order_class: &self.order_class,
+            limit_price: self.limit_price,
+            stop_price: self.stop_price,
+            take_profit_levels: self.take_profit_levels.as_deref(),
+            stop_loss_levels: self.stop_loss_levels.as_deref(),
+            trailing_stop_price: self.trailing_stop_price,
+            strategy_type: &self.strategy_type,
+            confidence: self.confidence,
+            timeframe_amount: self.timeframe.get_amount(),
+            timeframe_unit: self.timeframe.get_unit(),
+            period_unfilled: self.period_unfilled,
+            period_till_tp: self.period_till_tp,
+            execution_depends: self.execution_depends.as_slice(),
+            filled_price: self.filled_price,
+            close_order_id: self.close_order_id.as_deref(),
+            close_price: self.close_price,
+            broker_realized_pnl: self.broker_realized_pnl,
+            partial_closes_len: self.partial_closes.len(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            filled_at: self.filled_at,
+            closed_at: self.closed_at,
+            take_profit_leg: self
+                .legs
+                .take_profit
+                .as_ref()
+                .map(InsightOrderLegFingerprint::new),
+            stop_loss_leg: self
+                .legs
+                .stop_loss
+                .as_ref()
+                .map(InsightOrderLegFingerprint::new),
+            trailing_stop_leg: self
+                .legs
+                .trailing_stop
+                .as_ref()
+                .map(InsightOrderLegFingerprint::new),
+            market_changed: self.market_changed,
+            submitted: self.submitted,
+            cancelling: self.cancelling,
+            closing: self.closing,
+            first_on_fill: self.first_on_fill,
+            partial_filled_quantity: self.partial_filled_quantity,
+            state_history_len: self.state_history.len(),
+        }
+    }
+
+    pub fn snapshot_fingerprint_hash(&self) -> u64 {
+        let fingerprint = self.snapshot_fingerprint();
+        let mut state = DefaultHasher::new();
+
+        fingerprint.insight_id.hash(&mut state);
+        fingerprint.parent_id.hash(&mut state);
+        fingerprint.state.hash(&mut state);
+        fingerprint.children_len.hash(&mut state);
+        fingerprint.order_id.hash(&mut state);
+        std::mem::discriminant(fingerprint.side).hash(&mut state);
+        fingerprint.symbol.hash(&mut state);
+        hash_option_f64(&mut state, fingerprint.quantity);
+        hash_option_f64(&mut state, fingerprint.contracts);
+        std::mem::discriminant(fingerprint.order_type).hash(&mut state);
+        std::mem::discriminant(fingerprint.order_class).hash(&mut state);
+        hash_option_f64(&mut state, fingerprint.limit_price);
+        hash_option_f64(&mut state, fingerprint.stop_price);
+        hash_levels(&mut state, fingerprint.take_profit_levels);
+        hash_levels(&mut state, fingerprint.stop_loss_levels);
+        hash_option_f64(&mut state, fingerprint.trailing_stop_price);
+        fingerprint.strategy_type.hash(&mut state);
+        fingerprint.confidence.hash(&mut state);
+        fingerprint.timeframe_amount.hash(&mut state);
+        std::mem::discriminant(&fingerprint.timeframe_unit).hash(&mut state);
+        fingerprint.period_unfilled.hash(&mut state);
+        fingerprint.period_till_tp.hash(&mut state);
+        fingerprint.execution_depends.hash(&mut state);
+        hash_option_f64(&mut state, fingerprint.filled_price);
+        fingerprint.close_order_id.hash(&mut state);
+        hash_option_f64(&mut state, fingerprint.close_price);
+        hash_option_f64(&mut state, fingerprint.broker_realized_pnl);
+        fingerprint.partial_closes_len.hash(&mut state);
+        for partial in &self.partial_closes {
+            partial.order_id.hash(&mut state);
+            std::mem::discriminant(&partial.side).hash(&mut state);
+            hash_f64(&mut state, partial.quantity);
+            hash_f64(&mut state, partial.entry_price);
+            hash_option_f64(&mut state, partial.filled_price);
+        }
+        hash_datetime(&mut state, fingerprint.created_at);
+        hash_datetime(&mut state, fingerprint.updated_at);
+        hash_option_datetime(&mut state, fingerprint.filled_at);
+        hash_option_datetime(&mut state, fingerprint.closed_at);
+        hash_order_leg(&mut state, fingerprint.take_profit_leg);
+        hash_order_leg(&mut state, fingerprint.stop_loss_leg);
+        hash_order_leg(&mut state, fingerprint.trailing_stop_leg);
+        fingerprint.market_changed.hash(&mut state);
+        fingerprint.submitted.hash(&mut state);
+        fingerprint.cancelling.hash(&mut state);
+        fingerprint.closing.hash(&mut state);
+        fingerprint.first_on_fill.hash(&mut state);
+        hash_option_f64(&mut state, fingerprint.partial_filled_quantity);
+        fingerprint.state_history_len.hash(&mut state);
+        if let Some((at, state_value, message)) = self.state_history.last() {
+            hash_datetime(&mut state, *at);
+            state_value.hash(&mut state);
+            message.hash(&mut state);
+        }
+
+        state.finish()
     }
 
     pub fn remaining_quantity(&self) -> f64 {
@@ -648,13 +904,7 @@ impl Insight {
             child_insight.quantity = self.quantity;
         }
 
-        let child_id = child_insight.insight_id;
         self.children.push(child_insight);
-
-        self.update_state(
-            self.state.clone(),
-            Some(format!("Added child insight: {:?}", child_id)),
-        );
         self
     }
     pub fn update_market_changed(
@@ -860,6 +1110,9 @@ impl Insight {
         self.quantity
     }
     pub fn set_quantity(&mut self, quantity: Option<f64>) -> &mut Self {
+        if self.quantity == quantity {
+            return self;
+        }
         self.quantity = quantity;
         self.update_state(
             self.state.clone(),
@@ -871,6 +1124,9 @@ impl Insight {
         self.limit_price
     }
     pub fn set_limit_price(&mut self, limit_price: Option<f64>) -> &mut Self {
+        if self.limit_price == limit_price {
+            return self;
+        }
         self.limit_price = limit_price;
         self.update_order_type();
         self.update_state(
@@ -883,6 +1139,9 @@ impl Insight {
         self.stop_price
     }
     pub fn set_stop_price(&mut self, stop_price: Option<f64>) -> &mut Self {
+        if self.stop_price == stop_price {
+            return self;
+        }
         self.stop_price = stop_price;
         self.update_order_type();
         self.update_state(
@@ -895,7 +1154,11 @@ impl Insight {
         self.take_profit_levels.clone()
     }
     pub fn set_take_profit_levels(&mut self, take_profit_levels: Option<Vec<f64>>) -> &mut Self {
-        self.take_profit_levels = Self::normalize_levels(take_profit_levels);
+        let normalized_levels = Self::normalize_levels(take_profit_levels);
+        if self.take_profit_levels == normalized_levels {
+            return self;
+        }
+        self.take_profit_levels = normalized_levels;
         self.update_order_class();
         self.update_state(
             self.state.clone(),
@@ -915,7 +1178,11 @@ impl Insight {
         self.stop_loss_levels.clone()
     }
     pub fn set_stop_loss_levels(&mut self, stop_loss_levels: Option<Vec<f64>>) -> &mut Self {
-        self.stop_loss_levels = Self::normalize_levels(stop_loss_levels);
+        let normalized_levels = Self::normalize_levels(stop_loss_levels);
+        if self.stop_loss_levels == normalized_levels {
+            return self;
+        }
+        self.stop_loss_levels = normalized_levels;
         self.update_order_class();
         self.update_state(
             self.state.clone(),
@@ -943,6 +1210,9 @@ impl Insight {
         self.trailing_stop_price
     }
     pub fn set_trailing_stop_price(&mut self, trailing_stop_price: Option<f64>) -> &mut Self {
+        if self.trailing_stop_price == trailing_stop_price {
+            return self;
+        }
         self.trailing_stop_price = trailing_stop_price;
         self.update_order_class();
         self.update_state(
@@ -961,7 +1231,7 @@ impl Insight {
         &self.order_class
     }
     fn update_order_class(&mut self) -> &mut Self {
-        match (
+        let order_class = match (
             self.take_profit_levels
                 .as_ref()
                 .map(|v| !v.is_empty())
@@ -972,12 +1242,16 @@ impl Insight {
                 .unwrap_or(false),
             self.trailing_stop_price.is_some(),
         ) {
-            (true, true, _) => self.order_class = OrderClass::Bracket,
-            (true, false, _) => self.order_class = OrderClass::Bracket,
-            (false, true, _) => self.order_class = OrderClass::Bracket,
-            (false, false, true) => self.order_class = OrderClass::Bracket,
-            (false, false, false) => self.order_class = OrderClass::Simple,
+            (true, true, _) => OrderClass::Bracket,
+            (true, false, _) => OrderClass::Bracket,
+            (false, true, _) => OrderClass::Bracket,
+            (false, false, true) => OrderClass::Bracket,
+            (false, false, false) => OrderClass::Simple,
+        };
+        if self.order_class == order_class {
+            return self;
         }
+        self.order_class = order_class;
         self.update_state(
             self.state.clone(),
             Some(format!("Order class set to {:?}", self.order_class)),
@@ -988,12 +1262,16 @@ impl Insight {
         &self.order_type
     }
     fn update_order_type(&mut self) -> &mut Self {
-        match (self.limit_price, self.stop_price) {
-            (Some(_), Some(_)) => self.order_type = OrderType::StopLimit,
-            (Some(_), None) => self.order_type = OrderType::Limit,
-            (None, Some(_)) => self.order_type = OrderType::Stop,
-            (None, None) => self.order_type = OrderType::Market,
+        let order_type = match (self.limit_price, self.stop_price) {
+            (Some(_), Some(_)) => OrderType::StopLimit,
+            (Some(_), None) => OrderType::Limit,
+            (None, Some(_)) => OrderType::Stop,
+            (None, None) => OrderType::Market,
+        };
+        if self.order_type == order_type {
+            return self;
         }
+        self.order_type = order_type;
         self.update_state(
             self.state.clone(),
             Some(format!("Order type set to {:?}", self.order_type)),
@@ -1008,6 +1286,9 @@ impl Insight {
         self.parent_id.as_ref()
     }
     pub fn set_parent_id(&mut self, parent_id: Uuid) -> &mut Self {
+        if self.parent_id == Some(parent_id) {
+            return self;
+        }
         self.parent_id = Some(parent_id);
         self.update_state(
             self.state.clone(),
@@ -1044,6 +1325,9 @@ impl Insight {
         self.period_unfilled
     }
     pub fn set_period_unfilled(&mut self, period_unfilled: Option<u32>) -> &mut Self {
+        if self.period_unfilled == period_unfilled {
+            return self;
+        }
         self.period_unfilled = period_unfilled;
         self.update_state(
             self.state.clone(),
@@ -1060,6 +1344,9 @@ impl Insight {
         self.period_till_tp
     }
     pub fn set_period_till_tp(&mut self, period_till_tp: Option<u32>) -> &mut Self {
+        if self.period_till_tp == period_till_tp {
+            return self;
+        }
         self.period_till_tp = period_till_tp;
         self.update_state(
             self.state.clone(),
@@ -1079,6 +1366,9 @@ impl Insight {
         &mut self,
         execution_depends: Vec<StrategyDependentConfirmation>,
     ) -> &mut Self {
+        if self.execution_depends == execution_depends {
+            return self;
+        }
         self.execution_depends = execution_depends;
         self.update_state(
             self.state.clone(),
@@ -1093,6 +1383,9 @@ impl Insight {
         self.first_on_fill
     }
     pub fn set_first_on_fill(&mut self, first_on_fill: bool) -> &mut Self {
+        if self.first_on_fill == first_on_fill {
+            return self;
+        }
         self.first_on_fill = first_on_fill;
         self.update_state(
             self.state.clone(),
@@ -1126,6 +1419,14 @@ impl Insight {
             self.state = new_state.clone();
         }
         self.state_history.push((at, new_state, message));
+    }
+
+    pub fn state_log(&mut self, message: Option<String>) -> &mut Self {
+        self.update_state(
+            self.state.clone(),
+            Some(message.unwrap_or_else(|| "State log entry".to_string())),
+        );
+        self
     }
 
     pub fn align_time_to(&mut self, at: DateTime<Utc>) -> &mut Self {
@@ -1448,6 +1749,77 @@ mod tests {
         insight.set_quantity(Some(1.0));
         insight.align_time_to(now);
         insight
+    }
+
+    #[test]
+    fn state_log_records_message_without_changing_state() {
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let log_time = created_at + Duration::minutes(1);
+        let mut insight = sample_insight(created_at);
+        insight.state = InsightState::Filled;
+        insight.closing = true;
+        insight.bind_context(InsightStrategyContext::new(move || log_time));
+        let history_len = insight.state_history.len();
+
+        insight.state_log(Some("Risk check passed".to_string()));
+
+        assert_eq!(insight.state, InsightState::Filled);
+        assert!(insight.closing);
+        assert_eq!(insight.updated_at, log_time);
+        assert_eq!(insight.state_history.len(), history_len + 1);
+        let (at, state, message) = insight.state_history.last().unwrap();
+        assert_eq!(*at, log_time);
+        assert_eq!(*state, InsightState::Filled);
+        assert_eq!(message.as_deref(), Some("Risk check passed"));
+    }
+
+    #[test]
+    fn add_child_insight_does_not_append_parent_history_entry() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let mut ctx = MockStrategyContext::new(now);
+        let mut parent = sample_insight(now);
+        let parent_id = *parent.insight_id();
+        let parent_history_len = parent.state_history.len();
+        let child = Insight::new(
+            OrderSide::Buy,
+            "EURUSD=X".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            80,
+            None,
+        );
+
+        parent.add_child_insight(child, &mut ctx);
+
+        assert_eq!(parent.children.len(), 1);
+        assert_eq!(parent.children[0].parent_id, Some(parent_id));
+        assert_eq!(parent.children[0].quantity, parent.quantity);
+        assert!(matches!(
+            parent.children[0].strategy_type,
+            StrategyType::Custom(ref value) if value == "Testing-CHILD"
+        ));
+        assert_eq!(parent.state_history.len(), parent_history_len);
+    }
+
+    #[test]
+    fn no_op_insight_setters_do_not_append_history_entries() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let mut insight = sample_insight(now);
+        let history_len = insight.state_history.len();
+
+        insight
+            .set_quantity(Some(1.0))
+            .set_limit_price(None)
+            .set_stop_price(None)
+            .set_take_profit_levels(None)
+            .set_stop_loss_levels(None)
+            .set_trailing_stop_price(None)
+            .set_period_unfilled(None)
+            .set_period_till_tp(None)
+            .set_execution_depends(Vec::new())
+            .set_first_on_fill(false);
+
+        assert_eq!(insight.state_history.len(), history_len);
     }
 
     #[test]

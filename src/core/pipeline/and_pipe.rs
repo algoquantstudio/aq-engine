@@ -5,8 +5,18 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
-/// All sub-pipes must pass (port of Python's `AllExecutor`).
-/// If any sub-pipe fails, the insight is rejected.
+/// Runs a sequence of child pipes and requires every executed child pipe to pass.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `pipes`: Non-empty list of wrapped insight pipes to evaluate in order.
+///
+/// Behaviour:
+/// Skips child pipes whose wrapper says they should not run for the current insight. Each
+/// remaining child pipe can mutate the insight before the next child pipe executes. The first
+/// failed or non-passing child stops the sequence and returns `passed=false`; otherwise the
+/// pipe passes after collecting the child messages.
 pub struct AndPipe {
     pipes: Vec<WrappedInsightPipe>,
 }

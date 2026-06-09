@@ -4,6 +4,23 @@ use crate::core::indicators::{atr::AverageTrueRange, ema::ExponentialMovingAvera
 use crate::core::insight::{Insight, types::StrategyDependentConfirmation, types::StrategyType};
 use crate::core::strategy::StrategyContext;
 
+/// Generates limit-entry insights when price crosses back through an EMA near ATR support.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `atr_period`: Number of bars used by the registered ATR indicator.
+/// - `ema_period`: Number of bars used by the registered EMA indicator on `close`.
+/// - `base_confidence_modifier_field`: Optional history column whose latest absolute value
+///   scales `ctx.base_confidence()` before it is converted to insight confidence.
+///
+/// Behaviour:
+/// Registers ATR and EMA indicators during `start`, sets warm-up to the larger indicator
+/// period, then reads the latest and previous OHLC, ATR, and EMA values from strategy history.
+/// A buy insight is emitted when price is above EMA after the previous high was above the EMA;
+/// a sell insight is emitted only for shortable assets under the inverse condition. Entry,
+/// stop loss, take profit, and expiry periods are rounded with strategy tools before the
+/// insight is returned.
 pub struct EmaPriceCrossover {
     atr_period: usize,
     ema_period: usize,

@@ -4,6 +4,17 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Rejects insights whose configured lifetime has expired.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Calls `insight.has_expired(ctx)` using the strategy clock/context. Expired insights are marked
+/// rejected with `insight.order_rejected(...)` and return `passed=false`; non-expired insights
+/// pass through unchanged.
 pub struct RejectExpiredInsightPipe;
 
 impl RejectExpiredInsightPipe {

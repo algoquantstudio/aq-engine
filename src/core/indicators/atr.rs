@@ -3,7 +3,18 @@ use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use std::collections::HashMap;
 
-/// Average True Range using Wilder's true range and a simple rolling mean.
+/// Computes average true range from high, low, and close columns.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `period`: Number of true-range values required in the rolling average window.
+///
+/// Behaviour:
+/// Produces an output column named `ATRr_{period}`. Full-history runs calculate true range from
+/// `high`, `low`, and previous `close`, then write a simple rolling average once `period` valid
+/// true-range values are available. `run_bar` recalculates on the supplied slice and returns the
+/// latest ATR value.
 pub struct AverageTrueRange {
     period: usize,
     last_run_time: Option<DateTime<Utc>>,

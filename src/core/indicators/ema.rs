@@ -3,6 +3,19 @@ use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use std::collections::HashMap;
 
+/// Computes an exponential moving average over a configured numeric column.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `period`: Number of rows used to seed the first EMA value.
+/// - `target_column`: Name of the Float64 input column to smooth.
+///
+/// Behaviour:
+/// Produces an output column named `EMA_{period}`. Full-history runs seed the EMA with a simple
+/// average after `period` valid values, then apply the standard multiplier `2 / (period + 1)`.
+/// Null values after seeding carry forward the previous EMA. `run_bar` recalculates on the
+/// supplied slice and returns the latest EMA value.
 pub struct ExponentialMovingAverage {
     period: usize,
     target_column: String,

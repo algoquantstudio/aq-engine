@@ -52,6 +52,14 @@ fn push_state_component_registrations(
         String,
         String,
     )],
+    built_in_lifecycle_logic: &[(
+        LifecyclePhase,
+        LifecycleTiming,
+        bool,
+        String,
+        String,
+        String,
+    )],
 ) {
     for (phase, timing, can_fail, mod_name, struct_name, args, _) in custom_lifecycle_logic {
         src.push_str(&format!(
@@ -65,7 +73,18 @@ fn push_state_component_registrations(
             can_fail
         ));
     }
-    if !custom_lifecycle_logic.is_empty() {
+    for (phase, timing, can_fail, _mod_name, struct_name, args) in built_in_lifecycle_logic {
+        src.push_str(&format!(
+            "        state.{}({}::new(Box::new({}::new({}))).timing({}).can_fail({}).build());\n",
+            lifecycle_add_method(*phase),
+            lifecycle_builder_name(*phase),
+            struct_name,
+            args,
+            lifecycle_timing_expr(*timing),
+            can_fail
+        ));
+    }
+    if !custom_lifecycle_logic.is_empty() || !built_in_lifecycle_logic.is_empty() {
         src.push('\n');
     }
 }
@@ -120,6 +139,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     let mut built_in_pipes = Vec::new(); // (mod_name, struct_name, args_string, allowed_alphas, target_state)
     let mut ordered_pipes = Vec::new(); // ordered pipe registration strings
     let mut custom_lifecycle_logic = Vec::new(); // (phase, timing, can_fail, mod_name, struct_name, args_string, source_file)
+    let mut built_in_lifecycle_logic = Vec::new(); // (phase, timing, can_fail, mod_name, struct_name, args_string)
     let mut custom_universe_models = Vec::new(); // (can_fail, mod_name, struct_name, args_string, source_file)
 
     let mut universe_symbols: Vec<String> = Vec::new();
@@ -366,18 +386,31 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
             NodeType::LogicBlock => {
                 let struct_name = to_pascal_case(&node.label);
                 if let (Some(src), Some(phase)) = (&node.source_file, node.lifecycle_phase) {
-                    let mod_name = source_file_to_mod_name(src);
                     let timing = node.lifecycle_timing.unwrap_or_default();
                     let default_can_fail = phase == LifecyclePhase::OnTeardown;
-                    custom_lifecycle_logic.push((
-                        phase,
-                        timing,
-                        node.can_fail.unwrap_or(default_can_fail),
-                        mod_name,
-                        struct_name,
-                        args_str,
-                        src.clone(),
-                    ));
+                    if let Some((mod_name, builtin_struct)) =
+                        get_builtin_lifecycle_info(src, &struct_name)
+                    {
+                        built_in_lifecycle_logic.push((
+                            phase,
+                            timing,
+                            node.can_fail.unwrap_or(default_can_fail),
+                            mod_name,
+                            builtin_struct,
+                            args_str,
+                        ));
+                    } else {
+                        let mod_name = source_file_to_mod_name(src);
+                        custom_lifecycle_logic.push((
+                            phase,
+                            timing,
+                            node.can_fail.unwrap_or(default_can_fail),
+                            mod_name,
+                            struct_name,
+                            args_str,
+                            src.clone(),
+                        ));
+                    }
                 }
             }
             NodeType::Universe => {
@@ -475,6 +508,15 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
             src.push_str(&import);
         }
     }
+    for (_, _, _, mod_name, struct_name, _) in &built_in_lifecycle_logic {
+        let import = format!(
+            "use aq_engine::core::lifecycle::{}::{};\n",
+            mod_name, struct_name
+        );
+        if emitted_uses.insert(import.clone()) {
+            src.push_str(&import);
+        }
+    }
 
     if !custom_alphas.is_empty()
         || !custom_pipes.is_empty()
@@ -482,6 +524,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         || !custom_universe_models.is_empty()
         || !built_in_pipes.is_empty()
         || !built_in_alphas.is_empty()
+        || !built_in_lifecycle_logic.is_empty()
     {
         src.push('\n');
     }
@@ -653,7 +696,11 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str(&data_feed_init);
     src.push_str(&live_execution_init);
     src.push_str(&live_state_init);
-    push_state_component_registrations(&mut src, &custom_lifecycle_logic);
+    push_state_component_registrations(
+        &mut src,
+        &custom_lifecycle_logic,
+        &built_in_lifecycle_logic,
+    );
     src.push_str("        if let Err(e) = state.run_live(None).await {\n");
     src.push_str("            eprintln!(\"Live execution failed: {:?}\", e);\n");
     src.push_str("            std::process::exit(1);\n");
@@ -662,7 +709,11 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str(&data_feed_init);
     src.push_str(&backtest_execution_init);
     src.push_str(&backtest_state_init);
-    push_state_component_registrations(&mut src, &custom_lifecycle_logic);
+    push_state_component_registrations(
+        &mut src,
+        &custom_lifecycle_logic,
+        &built_in_lifecycle_logic,
+    );
     if meta.broker != crate::node::types::ExecutionBrokerType::Paper {
         src.push_str(&format!(
             "        info!(\"Backtest mode uses Paper Broker execution. Selected live broker '{}' is ignored for this run.\");\n",
@@ -856,9 +907,17 @@ fn get_builtin_pipe_info(src: &str, parsed_struct_name: &str) -> Option<(String,
             "market_order_entry".to_string(),
             "MarketOrderEntryPipe".to_string(),
         )),
+        "insight_ttl_config" => Some((
+            "insight_ttl_config".to_string(),
+            "InsightTtlConfigPipe".to_string(),
+        )),
         "dynamic_quantity_to_risk" => Some((
             "dynamic_quantity_to_risk".to_string(),
             "DynamicQuantityToRiskPipe".to_string(),
+        )),
+        "percentage_risk_to_quantity" => Some((
+            "percentage_risk_to_quantity".to_string(),
+            "PercentageRiskToQuantityPipe".to_string(),
         )),
         "full_account_quantity_to_risk" => Some((
             "full_account_quantity_to_risk".to_string(),
@@ -889,6 +948,29 @@ fn get_builtin_pipe_info(src: &str, parsed_struct_name: &str) -> Option<(String,
             "close_market_changed".to_string(),
             "CloseMarketChangedPipe".to_string(),
         )),
+        "end_of_day_close" => Some((
+            "end_of_day_close".to_string(),
+            "EndOfDayClosePipe".to_string(),
+        )),
+        _ if src.starts_with("built_in") => {
+            Some((source_file_to_mod_name(src), parsed_struct_name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Identifies if a source file corresponds to a built-in lifecycle logic block and returns
+/// `(mod_name, struct_name)`.
+fn get_builtin_lifecycle_info(src: &str, parsed_struct_name: &str) -> Option<(String, String)> {
+    match src {
+        "close_all_filled_positions" => Some((
+            "close_all_filled_positions".to_string(),
+            "CloseAllFilledPositions".to_string(),
+        )),
+        "preseed_warmup_history" => Some((
+            "preseed_warmup_history".to_string(),
+            "PreseedWarmupHistory".to_string(),
+        )),
         _ if src.starts_with("built_in") => {
             Some((source_file_to_mod_name(src), parsed_struct_name.to_string()))
         }
@@ -900,7 +982,8 @@ fn get_builtin_pipe_info(src: &str, parsed_struct_name: &str) -> Option<(String,
 mod tests {
     use super::*;
     use crate::node::{
-        ConnectionEndpoint, InputType, NodeInput, NodeOutput, OutputType, StrategyMeta,
+        ConnectionEndpoint, InputType, InsightState, NodeInput, NodeOutput, OutputType,
+        StrategyMeta,
     };
 
     fn custom_node(
@@ -945,6 +1028,305 @@ mod tests {
         assert!(!src.contains("aqmeta_copied"));
         assert!(!src.contains("strategy.aqmeta"));
         assert!(!src.contains("\"run_config\""));
+    }
+
+    #[test]
+    fn generated_percentage_risk_to_quantity_uses_builtin_pipe() {
+        let mut meta = StrategyMeta::new("Percentage Risk Pipe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        meta.nodes.push(custom_node(
+            "percentage-risk",
+            NodeType::Pipe,
+            "percentage_risk_to_quantity",
+            "percentage_risk_to_quantity",
+            vec![
+                NodeInput {
+                    name: "insights".to_string(),
+                    input_type: InputType::Insights,
+                    value: None,
+                    is_public: true,
+                    insight_state: Some(InsightState::New),
+                },
+                NodeInput {
+                    name: "risk_percent".to_string(),
+                    input_type: InputType::Int,
+                    value: Some(serde_json::json!(2)),
+                    is_public: true,
+                    insight_state: None,
+                },
+            ],
+            vec![
+                NodeOutput {
+                    name: "insights_out".to_string(),
+                    output_type: OutputType::Insights,
+                    insight_state: Some(InsightState::New),
+                },
+                NodeOutput {
+                    name: "pipe_result".to_string(),
+                    output_type: OutputType::InsightPipeResult,
+                    insight_state: None,
+                },
+                NodeOutput {
+                    name: "pipe_instance".to_string(),
+                    output_type: OutputType::InsightPipeInstance,
+                    insight_state: None,
+                },
+            ],
+        ));
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "insight_pipeline".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "percentage-risk".to_string(),
+                port: "insights".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains(
+            "use aq_engine::core::pipeline::percentage_risk_to_quantity::PercentageRiskToQuantityPipe;"
+        ));
+        assert!(src.contains("PercentageRiskToQuantityPipe::new(2)"));
+        assert!(src.contains(".target_state(InsightState::New)"));
+    }
+
+    #[test]
+    fn generated_end_of_day_close_uses_builtin_pipe() {
+        let mut meta = StrategyMeta::new("End Of Day Close Pipe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        meta.nodes.push(custom_node(
+            "eod-close",
+            NodeType::Pipe,
+            "end_of_day_close",
+            "end_of_day_close",
+            vec![
+                NodeInput {
+                    name: "insights".to_string(),
+                    input_type: InputType::Insights,
+                    value: None,
+                    is_public: true,
+                    insight_state: Some(InsightState::Filled),
+                },
+                NodeInput {
+                    name: "minutes_before_end_of_day".to_string(),
+                    input_type: InputType::Int,
+                    value: Some(serde_json::json!(20)),
+                    is_public: true,
+                    insight_state: None,
+                },
+                NodeInput {
+                    name: "end_of_day_time_utc".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("23:30")),
+                    is_public: true,
+                    insight_state: None,
+                },
+            ],
+            vec![
+                NodeOutput {
+                    name: "insights_out".to_string(),
+                    output_type: OutputType::Insights,
+                    insight_state: Some(InsightState::Filled),
+                },
+                NodeOutput {
+                    name: "pipe_result".to_string(),
+                    output_type: OutputType::InsightPipeResult,
+                    insight_state: None,
+                },
+                NodeOutput {
+                    name: "pipe_instance".to_string(),
+                    output_type: OutputType::InsightPipeInstance,
+                    insight_state: None,
+                },
+            ],
+        ));
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "insight_pipeline".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "eod-close".to_string(),
+                port: "insights".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(
+            src.contains("use aq_engine::core::pipeline::end_of_day_close::EndOfDayClosePipe;")
+        );
+        assert!(src.contains("EndOfDayClosePipe::new(20, \"23:30\".to_string())"));
+        assert!(src.contains(".target_state(InsightState::Filled)"));
+    }
+
+    #[test]
+    fn generated_insight_ttl_config_uses_builtin_pipe() {
+        let mut meta = StrategyMeta::new("Insight TTL Config Pipe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        meta.nodes.push(custom_node(
+            "ttl-config",
+            NodeType::Pipe,
+            "insight_ttl_config",
+            "insight_ttl_config",
+            vec![
+                NodeInput {
+                    name: "insights".to_string(),
+                    input_type: InputType::Insights,
+                    value: None,
+                    is_public: true,
+                    insight_state: Some(InsightState::New),
+                },
+                NodeInput {
+                    name: "period_unfilled".to_string(),
+                    input_type: InputType::Int,
+                    value: Some(serde_json::json!(5)),
+                    is_public: true,
+                    insight_state: None,
+                },
+                NodeInput {
+                    name: "period_till_tp".to_string(),
+                    input_type: InputType::Int,
+                    value: Some(serde_json::json!(10)),
+                    is_public: true,
+                    insight_state: None,
+                },
+            ],
+            vec![
+                NodeOutput {
+                    name: "insights_out".to_string(),
+                    output_type: OutputType::Insights,
+                    insight_state: Some(InsightState::New),
+                },
+                NodeOutput {
+                    name: "pipe_result".to_string(),
+                    output_type: OutputType::InsightPipeResult,
+                    insight_state: None,
+                },
+                NodeOutput {
+                    name: "pipe_instance".to_string(),
+                    output_type: OutputType::InsightPipeInstance,
+                    insight_state: None,
+                },
+            ],
+        ));
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "insight_pipeline".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "ttl-config".to_string(),
+                port: "insights".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(
+            src.contains(
+                "use aq_engine::core::pipeline::insight_ttl_config::InsightTtlConfigPipe;"
+            )
+        );
+        assert!(src.contains("InsightTtlConfigPipe::new(5, 10)"));
+        assert!(src.contains(".target_state(InsightState::New)"));
+    }
+
+    #[test]
+    fn generated_builtin_lifecycle_logic_uses_engine_imports() {
+        let mut meta = StrategyMeta::new("Built In Lifecycle Logic Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+
+        let mut preseed = custom_node(
+            "preseed",
+            NodeType::LogicBlock,
+            "preseed_warmup_history",
+            "preseed_warmup_history",
+            vec![NodeInput {
+                name: "init".to_string(),
+                input_type: InputType::Init,
+                value: None,
+                is_public: true,
+                insight_state: None,
+            }],
+            vec![NodeOutput {
+                name: "init".to_string(),
+                output_type: OutputType::Init,
+                insight_state: None,
+            }],
+        );
+        preseed.lifecycle_phase = Some(LifecyclePhase::OnInit);
+        preseed.lifecycle_timing = Some(LifecycleTiming::BeforeGenerated);
+        preseed.can_fail = Some(false);
+
+        let mut cleanup = custom_node(
+            "cleanup",
+            NodeType::LogicBlock,
+            "close_all_filled_positions",
+            "close_all_filled_positions",
+            vec![NodeInput {
+                name: "on_teardown".to_string(),
+                input_type: InputType::OnTeardown,
+                value: None,
+                is_public: true,
+                insight_state: None,
+            }],
+            vec![NodeOutput {
+                name: "on_teardown".to_string(),
+                output_type: OutputType::OnTeardown,
+                insight_state: None,
+            }],
+        );
+        cleanup.lifecycle_phase = Some(LifecyclePhase::OnTeardown);
+        cleanup.lifecycle_timing = Some(LifecycleTiming::BeforeGenerated);
+        cleanup.can_fail = Some(true);
+
+        meta.nodes.push(preseed);
+        meta.nodes.push(cleanup);
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "init".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "preseed".to_string(),
+                port: "init".to_string(),
+            },
+        });
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "on_teardown".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "cleanup".to_string(),
+                port: "on_teardown".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains(
+            "use aq_engine::core::lifecycle::preseed_warmup_history::PreseedWarmupHistory;"
+        ));
+        assert!(src.contains(
+            "use aq_engine::core::lifecycle::close_all_filled_positions::CloseAllFilledPositions;"
+        ));
+        assert!(src.contains(
+            "state.add_on_init_logic(OnInitLogicBuilder::new(Box::new(PreseedWarmupHistory::new())).timing(LifecycleTiming::BeforeGenerated).can_fail(false).build());"
+        ));
+        assert!(src.contains(
+            "state.add_on_teardown_logic(OnTeardownLogicBuilder::new(Box::new(CloseAllFilledPositions::new())).timing(LifecycleTiming::BeforeGenerated).can_fail(true).build());"
+        ));
+        assert!(!src.contains("mod preseed_warmup_history;"));
+        assert!(!src.contains("mod close_all_filled_positions;"));
     }
 
     #[test]

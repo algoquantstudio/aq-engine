@@ -6,9 +6,20 @@ use std::collections::HashSet;
 
 use super::InsightPipe;
 
-/// Restricts trading to a specific time window.
-/// Port of Python's `AllowedTradingWindow`.
-/// Targets `InsightState::New`.
+/// Allows an insight to continue only inside a configured UTC trading window.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `start`: Inclusive start time in `HH:MM` UTC format.
+/// - `end`: Inclusive end time in `HH:MM` UTC format.
+/// - `days`: Optional weekday numbers as strings, where `0` is Monday and `6` is Sunday.
+///
+/// Behaviour:
+/// Parses the configured time window once in `new`, then checks the current UTC weekday and
+/// minute during `run`. If `days` is empty, all weekdays are allowed. The pipe returns
+/// `passed=false` when the current day or time is outside the configured window, without
+/// mutating the insight.
 pub struct AllowTradingWindowPipe {
     /// Start hour (0-23)
     start_hour: u32,

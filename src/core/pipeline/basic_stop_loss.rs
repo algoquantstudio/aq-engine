@@ -5,6 +5,18 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Closes an active insight when the latest candle breaches its stop loss.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Passes through insights without a stop loss. For open insights, it reads the latest `low` and
+/// `high` from strategy history: buy insights close when low is at or below stop loss, and sell
+/// insights close when high is at or above stop loss. Insights already being closed return
+/// `passed=false` without another close request.
 pub struct BasicStopLossPipe;
 
 impl BasicStopLossPipe {

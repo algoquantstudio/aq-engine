@@ -5,8 +5,18 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
-/// Any sub-pipe passes (port of Python's `AnyExecutor`).
-/// If no sub-pipe passes, the insight is rejected.
+/// Runs a sequence of child pipes and passes when any executed child pipe passes.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `pipes`: Non-empty list of wrapped insight pipes to evaluate in order.
+///
+/// Behaviour:
+/// Skips child pipes whose wrapper says they should not run for the current insight. Each
+/// remaining child pipe can mutate the insight before the next child pipe executes. The first
+/// successful passing child returns `passed=true`; failed children contribute messages, and the
+/// pipe returns `passed=false` when no child pipe passes.
 pub struct OrPipe {
     pipes: Vec<WrappedInsightPipe>,
 }

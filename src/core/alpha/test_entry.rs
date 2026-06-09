@@ -4,6 +4,23 @@ use crate::core::indicators::atr::AverageTrueRange;
 use crate::core::insight::{Insight, types::StrategyType};
 use crate::core::strategy::StrategyContext;
 
+/// Generates deterministic test insights from the latest candle direction.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `atr_period`: Number of bars used by the registered ATR indicator.
+/// - `limit_entries`: Whether generated insights should use a limit price at the latest close.
+/// - `max_spawn`: Maximum number of active testing insights allowed per symbol.
+/// - `base_confidence_modifier_field`: Optional history column whose latest absolute value
+///   scales `ctx.base_confidence()` before it is converted to insight confidence.
+///
+/// Behaviour:
+/// Registers ATR during `start`, initialises a per-symbol spawn counter in strategy variables,
+/// and keeps that counter synchronised with active testing insights. A bullish latest candle
+/// creates a buy insight; a bearish candle creates a sell insight only when the asset is
+/// shortable. ATR is used to place basic stop-loss and take-profit levels, and successful
+/// generation increments the stored spawn counter.
 pub struct TestEntry {
     atr_period: usize,
     atr_column: String,

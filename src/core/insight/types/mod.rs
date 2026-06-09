@@ -26,7 +26,7 @@ impl InsightState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum StrategyType {
     Manual,
     Testing,
@@ -45,7 +45,7 @@ impl std::fmt::Display for StrategyType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StrategyDependentConfirmation {
     None,
     HighRelativeVolumeConfirmationModel,

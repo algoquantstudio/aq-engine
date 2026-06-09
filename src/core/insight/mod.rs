@@ -22,6 +22,7 @@ pub struct InsightCollection {
     lifetime_state_counts: HashMap<InsightState, usize>,
     last_known_insight_state: HashMap<Uuid, InsightState>,
     order_id_to_insight_id: HashMap<String, Uuid>,
+    insight_id_to_order_ids: HashMap<Uuid, Vec<String>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +35,7 @@ impl InsightCollection {
             lifetime_state_counts: HashMap::new(),
             last_known_insight_state: HashMap::new(),
             order_id_to_insight_id: HashMap::new(),
+            insight_id_to_order_ids: HashMap::new(),
         }
     }
     pub fn add_insight(&mut self, insight: Insight) -> Uuid {
@@ -44,8 +46,11 @@ impl InsightCollection {
     }
 
     fn index_order_ids_for_insight(&mut self, insight_id: &Uuid) {
-        self.order_id_to_insight_id
-            .retain(|_, existing_id| existing_id != insight_id);
+        if let Some(previous_order_ids) = self.insight_id_to_order_ids.remove(insight_id) {
+            for order_id in previous_order_ids {
+                self.order_id_to_insight_id.remove(&order_id);
+            }
+        }
 
         let Some(insight) = self.insights.get(insight_id) else {
             return;
@@ -76,8 +81,12 @@ impl InsightCollection {
             order_ids.push(leg_order_id.clone());
         }
 
-        for order_id in order_ids {
-            self.order_id_to_insight_id.insert(order_id, *insight_id);
+        for order_id in &order_ids {
+            self.order_id_to_insight_id
+                .insert(order_id.clone(), *insight_id);
+        }
+        if !order_ids.is_empty() {
+            self.insight_id_to_order_ids.insert(*insight_id, order_ids);
         }
     }
 
@@ -131,8 +140,11 @@ impl InsightCollection {
         self.dirty_insight_ids.remove(insight_id);
         self.terminal_pending_prune.remove(insight_id);
         self.last_known_insight_state.remove(insight_id);
-        self.order_id_to_insight_id
-            .retain(|_, existing_id| existing_id != insight_id);
+        if let Some(order_ids) = self.insight_id_to_order_ids.remove(insight_id) {
+            for order_id in order_ids {
+                self.order_id_to_insight_id.remove(&order_id);
+            }
+        }
     }
 
     pub fn prune_terminal_insights_without_aqs(&mut self) -> Vec<Uuid> {
@@ -155,7 +167,23 @@ impl InsightCollection {
                 .into_iter()
                 .collect()
         };
-        ids.sort_by_key(|id: &Uuid| id.to_string());
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn dirty_insight_ids(&self) -> Vec<Uuid> {
+        let mut ids = self.dirty_insight_ids.iter().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn active_insight_ids(&self) -> Vec<Uuid> {
+        let mut ids = self
+            .insights
+            .iter()
+            .filter_map(|(id, insight)| insight.state().is_active().then_some(*id))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
         ids
     }
 
@@ -248,6 +276,79 @@ impl InsightCollection {
             *counts.entry(insight.state().clone()).or_insert(0) += 1;
         }
         counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::broker::types::OrderSide;
+    use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
+
+    fn test_insight(symbol: &str) -> Insight {
+        Insight::new(
+            OrderSide::Buy,
+            symbol.to_string(),
+            types::StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            80,
+            None,
+        )
+    }
+
+    #[test]
+    fn refresh_runtime_tracking_replaces_previous_order_id_index_entries() {
+        let mut collection = InsightCollection::new();
+        let mut insight = test_insight("AAPL");
+        let insight_id = *insight.insight_id();
+        insight.order_id = Some("order-a".to_string());
+        collection.add_insight(insight);
+
+        assert_eq!(
+            collection.order_id_to_insight_id.get("order-a"),
+            Some(&insight_id)
+        );
+
+        collection
+            .insights
+            .get_mut(&insight_id)
+            .expect("insight should exist")
+            .order_id = Some("order-b".to_string());
+        collection.refresh_runtime_tracking(&insight_id);
+
+        assert!(!collection.order_id_to_insight_id.contains_key("order-a"));
+        assert_eq!(
+            collection.order_id_to_insight_id.get("order-b"),
+            Some(&insight_id)
+        );
+    }
+
+    #[test]
+    fn prune_terminal_insight_removes_order_id_index_entries() {
+        let mut collection = InsightCollection::new();
+        let mut insight = test_insight("AAPL");
+        let insight_id = *insight.insight_id();
+        insight.order_id = Some("order-a".to_string());
+        collection.add_insight(insight);
+
+        collection.prune_terminal_insight(&insight_id);
+
+        assert!(!collection.order_id_to_insight_id.contains_key("order-a"));
+        assert!(!collection.insight_id_to_order_ids.contains_key(&insight_id));
+    }
+
+    #[test]
+    fn active_insight_ids_excludes_terminal_insights() {
+        let mut collection = InsightCollection::new();
+        let active_id = collection.add_insight(test_insight("AAPL"));
+        let mut closed = test_insight("MSFT");
+        closed.state = InsightState::Closed;
+        let closed_id = collection.add_insight(closed);
+
+        let active_ids = collection.active_insight_ids();
+
+        assert_eq!(active_ids, vec![active_id]);
+        assert!(!active_ids.contains(&closed_id));
     }
 }
 

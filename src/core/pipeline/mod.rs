@@ -13,12 +13,16 @@ pub mod basic_take_profit;
 pub mod cancel_opposite;
 pub mod close_market_changed;
 pub mod dynamic_quantity_to_risk;
+pub mod end_of_day_close;
 pub mod full_account_quantity_to_risk;
 pub mod insight_submit;
+pub mod insight_ttl_config;
 pub mod market_order_entry;
 pub mod minimum_risk_to_reward;
 pub mod or_pipe;
 pub mod percentage_dca_levels;
+pub mod percentage_risk_to_quantity;
+pub mod quantity_sizing;
 pub mod reject_expired_insight;
 pub mod scale_out;
 

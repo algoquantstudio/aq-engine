@@ -6,6 +6,20 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Splits a parent insight into percentage-spaced DCA child entries.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `dca_percentage`: Fractional distance between each DCA price level and the original entry.
+/// - `dca_levels`: Number of child DCA levels to create. Values below `1` are clamped to `1`.
+///
+/// Behaviour:
+/// Requires a parent insight with quantity, an entry price, and a stop loss. The pipe builds DCA
+/// price levels below entry for buys and above entry for sells, redistributes quantity across the
+/// parent and children, adjusts the stop loss beyond the final DCA level, and adds child insights
+/// with side-specific confirmation dependencies. Existing child insights are not used as DCA
+/// parents.
 pub struct PercentageDcaLevelsPipe {
     dca_percentage: f64,
     dca_levels: usize,

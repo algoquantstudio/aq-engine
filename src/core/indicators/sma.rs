@@ -3,7 +3,19 @@ use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use std::collections::HashMap;
 
-/// Simple Moving Average
+/// Computes a simple moving average over a configured numeric column.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `period`: Number of valid rows required in the rolling average window.
+/// - `target_column`: Name of the Float64 input column to average.
+///
+/// Behaviour:
+/// Produces an output column named `SMA_{period}_{target_column}`. Full-history runs maintain a
+/// rolling sum and write `None` until the window contains `period` valid values. `run_bar`
+/// expects at least `period` rows in the provided slice and returns the latest average for the
+/// indicator output column.
 pub struct SimpleMovingAverage {
     period: usize,
     target_column: String,

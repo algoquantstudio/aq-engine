@@ -5,6 +5,19 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Scales out filled insights as quote price reaches stop-loss or take-profit levels.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `sell_off_percentage`: Fraction of remaining quantity to close at each non-final level,
+///   clamped to `0.0..=1.0`.
+///
+/// Behaviour:
+/// Runs only on filled insights with remaining quantity. It resolves the latest quote price,
+/// checks the first stop-loss and take-profit levels, and issues a partial close at the hit
+/// level. Final stop-loss or take-profit levels close the full remaining quantity; non-final
+/// levels close the configured fraction and remove the consumed level from the insight.
 pub struct ScaleOutPipe {
     sell_off_percentage: f64,
 }

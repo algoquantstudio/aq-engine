@@ -15,6 +15,31 @@ use dashmap::DashMap;
 use polars::prelude::DataFrame;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Debug, Default)]
+pub struct TeardownCleanupReport {
+    pub rejected_new: usize,
+    pub cancelled_executed: usize,
+    pub closed_filled: usize,
+    pub failures: Vec<String>,
+}
+
+impl TeardownCleanupReport {
+    pub fn total_actions(&self) -> usize {
+        self.rejected_new + self.cancelled_executed + self.closed_filled
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "rejected_new={}, cancelled_executed={}, closed_filled={}",
+            self.rejected_new, self.cancelled_executed, self.closed_filled
+        )
+    }
+}
 // ─────────────────────── Object-safe Strategy Context ───────────────────────
 
 /// Core context available to **all** components (Strategy, AlphaModel, InsightPipe).
@@ -53,6 +78,19 @@ pub trait StrategyContext {
     fn current_time(&self) -> DateTime<Utc>;
     fn bind_insight_context(&self, insight: &mut Insight);
     fn latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError>;
+    fn preseed_warmup_history(
+        &mut self,
+        symbol: &str,
+        warmup_bars: i32,
+    ) -> Result<usize, BrokerError> {
+        let _ = (symbol, warmup_bars);
+        Err(BrokerError::DataFeedError(
+            "preseed_warmup_history is not supported by this strategy context".to_string(),
+        ))
+    }
+    fn cleanup_active_insights_for_teardown(&mut self) -> TeardownCleanupReport {
+        TeardownCleanupReport::default()
+    }
 
     // Order operations (delegated to broker internally)
     fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError>;

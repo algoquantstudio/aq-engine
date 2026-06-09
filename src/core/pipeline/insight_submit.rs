@@ -5,8 +5,17 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
-/// Submits the insight as an order via `ctx.submit_insight()`.
-/// Targets `InsightState::New`.
+/// Submits new insights to the broker through the strategy context.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Targets insights in `InsightState::New`. When an insight is new, it calls
+/// `insight.submit(ctx)`, allowing the broker/runtime implementation behind the strategy
+/// context to place the order. Insights in other states pass through unchanged.
 pub struct InsightSubmitPipe;
 
 impl InsightSubmitPipe {

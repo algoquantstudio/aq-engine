@@ -3,6 +3,19 @@ use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use std::collections::HashMap;
 
+/// Computes a relative strength index over a configured numeric column.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `period`: Number of price deltas used for the RSI smoothing window.
+/// - `target_column`: Name of the Float64 input column to analyse.
+///
+/// Behaviour:
+/// Produces an output column named `RSI_{period}`. Full-history runs require `period + 1` rows
+/// before the first value, seed average gain/loss from the initial window, and then apply Wilder
+/// smoothing for each following row. `run_bar` recalculates on the supplied slice and returns the
+/// latest RSI value.
 pub struct RelativeStrengthIndex {
     period: usize,
     target_column: String,

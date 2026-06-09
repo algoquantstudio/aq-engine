@@ -4,6 +4,19 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Rejects insights whose latest reward-to-risk ratio is below the configured minimum.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - `minimum_rr`: Optional minimum reward-to-risk ratio to write into the strategy context
+///   before evaluating the insight. When `None`, the current context value is used.
+///
+/// Behaviour:
+/// Resolves entry from limit/stop price or the latest quote, then requires stop-loss and
+/// take-profit levels to be present. The final take-profit level is compared with stop-loss
+/// distance to calculate reward-to-risk. Insights below `ctx.min_reward_risk_ratio()` are marked
+/// rejected; passing insights are left unchanged.
 pub struct MinimumRiskToRewardPipe {
     minimum_rr: Option<f64>,
 }

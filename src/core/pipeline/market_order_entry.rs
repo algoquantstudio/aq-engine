@@ -4,10 +4,17 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
-/// Sets the limit price for market orders to the current close price.
-/// Port of Python's `MarketOrderEntryPriceExecutor`.
-/// Only applies to market orders without a limit price set.
-/// Targets `InsightState::New`.
+/// Converts a market-style insight into a close-priced limit entry when no entry is set.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Passes through insights that already have a limit price. Otherwise it reads the latest
+/// `close` value from the symbol history and writes it to `insight.limit_price`. The pipe
+/// fails when history is missing, empty, or the close column cannot be read as a finite value.
 pub struct MarketOrderEntryPipe;
 
 impl MarketOrderEntryPipe {

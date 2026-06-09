@@ -2,6 +2,9 @@ use crate::core::broker::types::Asset;
 use crate::core::strategy::StrategyContext;
 use log::{error, warn};
 
+pub mod close_all_filled_positions;
+pub mod preseed_warmup_history;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecyclePhase {
     OnStart,

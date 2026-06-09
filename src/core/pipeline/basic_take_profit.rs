@@ -5,6 +5,18 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
+/// Closes or partially closes an active insight when the latest candle reaches take profit.
+///
+/// Author: @isaac-diaby
+///
+/// Inputs:
+/// - None.
+///
+/// Behaviour:
+/// Passes through insights without take-profit levels. For open insights, it reads the latest
+/// `low` and `high` from strategy history: buy insights trigger on high at or above the first
+/// take-profit level, and sell insights trigger on low at or below it. Multiple take-profit
+/// levels close half the current quantity; a final level closes the remaining insight.
 pub struct BasicTakeProfitPipe;
 
 impl BasicTakeProfitPipe {

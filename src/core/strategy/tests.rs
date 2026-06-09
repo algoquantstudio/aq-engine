@@ -1209,6 +1209,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_preseed_warmup_history_runs_after_alpha_start_before_strategy_init() {
+        struct WarmupAlpha;
+
+        impl AlphaModel for WarmupAlpha {
+            fn version(&self) -> &str {
+                "1.0"
+            }
+
+            fn start(&mut self, ctx: &mut dyn StrategyContext) {
+                ctx.set_warm_up_bars(5);
+            }
+
+            fn init(&mut self, ctx: &mut dyn StrategyContext, asset: &Asset) {
+                let seeded_rows = ctx
+                    .history()
+                    .get(&asset.symbol)
+                    .map(|history| history.height())
+                    .unwrap_or_default();
+                ctx.variables()
+                    .insert("alpha_init_seeded_rows".to_string(), json!(seeded_rows));
+            }
+
+            fn generate_insights(
+                &mut self,
+                _ctx: &mut dyn StrategyContext,
+                _symbol: &str,
+            ) -> AlphaResult {
+                AlphaResult::new(None, true, None, self.name().to_string())
+            }
+        }
+
+        struct InitHistoryProbeStrategy;
+
+        impl Strategy for InitHistoryProbeStrategy {
+            fn on_start(&mut self, _ctx: &mut dyn StrategyContext) {}
+
+            fn init(&mut self, ctx: &mut dyn StrategyContext, asset: &Asset) {
+                let seeded_rows = ctx
+                    .history()
+                    .get(&asset.symbol)
+                    .map(|history| history.height())
+                    .unwrap_or_default();
+                ctx.variables()
+                    .insert("strategy_init_seeded_rows".to_string(), json!(seeded_rows));
+                ctx.variables().insert(
+                    "strategy_init_warmup".to_string(),
+                    json!(ctx.warm_up_bars()),
+                );
+            }
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                ["AAPL".to_string()].into_iter().collect()
+            }
+
+            fn on_bar(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str, _bar: &BarData) {}
+
+            fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+        }
+
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = FixedScaleOutDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "PreseedWarmupHistoryTest".to_string(),
+            "1.0".to_string(),
+            InitHistoryProbeStrategy,
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+        state.add_alpha(WrappedAlphaModel::builder(Box::new(WarmupAlpha)).build());
+        state.add_on_init_logic(
+            OnInitLogicBuilder::new(Box::new(
+                crate::core::lifecycle::preseed_warmup_history::PreseedWarmupHistory::new(),
+            ))
+            .timing(LifecycleTiming::BeforeGenerated)
+            .build(),
+        );
+
+        let start = Utc.with_ymd_and_hms(2025, 9, 15, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 9, 17, 0, 0, 0).unwrap();
+        let result = state.run_backtest(start, end, state.timeframe()).await;
+        if assert_backtest_or_skip(result, "Warm-up preseed backtest should complete").is_none() {
+            return;
+        }
+
+        let strategy_rows = state
+            .variables
+            .get("strategy_init_seeded_rows")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let alpha_rows = state
+            .variables
+            .get("alpha_init_seeded_rows")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let warmup = state
+            .variables
+            .get("strategy_init_warmup")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+
+        assert_eq!(warmup, 5);
+        assert!(
+            strategy_rows > 0,
+            "strategy init should see preseeded warm-up history"
+        );
+        assert_eq!(
+            alpha_rows, strategy_rows,
+            "alpha init should run after strategy init without losing seeded history"
+        );
+    }
+
+    #[tokio::test]
     async fn test_strategy_lifecycle_logic_and_universe_models_run() {
         struct VariableOnStartLogic {
             key: &'static str,
