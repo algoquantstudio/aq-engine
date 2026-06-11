@@ -433,10 +433,30 @@ where
                 _ => {}
             }
 
-            self.add_insight(insight);
+            self.add_insight_internal(insight, true);
         }
 
         report
+    }
+
+    fn begin_teardown(&mut self) {
+        if !self.status.is_finished() {
+            self.status = StrategyStatus::Stopping;
+        }
+    }
+
+    fn add_insight_internal(&mut self, insight: Insight, allow_during_teardown: bool) {
+        if !self.status.is_running() && !allow_during_teardown {
+            warn!(
+                "Ignoring new insight while strategy status is {}: {}",
+                self.status,
+                insight.log_summary(),
+            );
+            return;
+        }
+        let mut insight = insight;
+        self.bind_insight_context(&mut insight);
+        self.insights.add_insight(insight);
     }
 
     /// Register a pipe into the correct `InsightState` bucket (Python's `add_executor`).
@@ -620,7 +640,8 @@ where
                         .insert(asset.symbol.clone(), DataFrame::default());
                     self.universe.insert(asset.symbol.clone(), asset);
                 }
-                Err(_e) => {
+                Err(error) => {
+                    warn!("Failed to load asset metadata for {}: {}", symbol, error);
                     continue;
                 }
             }
@@ -1214,9 +1235,7 @@ where
     }
 
     fn add_insight(&mut self, insight: Insight) {
-        let mut insight = insight;
-        self.bind_insight_context(&mut insight);
-        self.insights.add_insight(insight);
+        self.add_insight_internal(insight, false);
     }
 
     fn submit_insight(&mut self, insight: &mut Insight) {
@@ -1236,7 +1255,40 @@ where
                     Self::order_log_summary(&order)
                 );
             } else {
-                insight.order_id = Some(order.order_id.clone());
+                match order.status {
+                    TradeUpdateEvent::Accepted
+                    | TradeUpdateEvent::PendingNew
+                    | TradeUpdateEvent::New
+                    | TradeUpdateEvent::Pending => {
+                        insight.order_accepted(&order.order_id);
+                    }
+                    TradeUpdateEvent::Filled => {
+                        insight.order_accepted(&order.order_id);
+                        let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
+                        insight.position_filled(price, order.filled_qty, &order.order_id);
+                        Self::sync_broker_managed_levels(insight, &order);
+                    }
+                    TradeUpdateEvent::PartialFilled => {
+                        insight.order_accepted(&order.order_id);
+                        let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
+                        insight.partial_filled(order.filled_qty, price, &order.order_id);
+                        Self::sync_broker_managed_levels(insight, &order);
+                    }
+                    TradeUpdateEvent::Rejected => {
+                        insight.order_rejected(
+                            order
+                                .rejection_reason
+                                .as_deref()
+                                .unwrap_or("Order rejected"),
+                        );
+                    }
+                    TradeUpdateEvent::Canceled | TradeUpdateEvent::Expired => {
+                        insight.order_canceled("Order canceled before acknowledgement");
+                    }
+                    TradeUpdateEvent::Closed | TradeUpdateEvent::Replaced => {
+                        insight.order_id = Some(order.order_id.clone());
+                    }
+                }
             }
         } else if let Err(error) = result {
             error!(
@@ -1480,6 +1532,7 @@ where
         self.timeframe = time_frame.clone();
         self.history_seed_anchor = Some(start);
         self.broker.connect().await?;
+        self.status = StrategyStatus::Running;
 
         // ── 1. Strategy lifecycle: on_start ──
         debug!("Invoking strategy on_start");
@@ -1490,10 +1543,12 @@ where
         // ── 2. Load universe assets ──
         self.load_universe(&mut strategy).await;
 
-        assert!(
-            !self.universe.is_empty(),
-            "Universe is empty — strategy.universe() must return at least one symbol"
-        );
+        if self.universe.is_empty() {
+            return Err(BrokerError::DataFeedError(
+                "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
+                    .to_string(),
+            ));
+        }
 
         // ── 3. Start alpha models so indicators and warm-up are configured ──
         self.start_alpha_models();
@@ -1545,6 +1600,7 @@ where
 
         // ── 8. Teardown ──
         debug!("Invoking strategy on_teardown");
+        self.begin_teardown();
         self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_teardown(self);
         self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
@@ -1560,6 +1616,7 @@ where
         // ── 9. Results ──
         let results = self.broker.get_results();
         self.finalize_backtest_results(&results);
+        self.status = StrategyStatus::Completed;
         Ok(results)
     }
 }

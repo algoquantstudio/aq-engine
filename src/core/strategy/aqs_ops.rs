@@ -1525,6 +1525,7 @@ where
 
         // Teardown
         debug!("Invoking strategy on_teardown");
+        self.begin_teardown();
         self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_teardown(self);
         self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
@@ -1618,10 +1619,12 @@ where
         self.run_on_start_logic(LifecycleTiming::AfterGenerated);
         self.load_universe(strategy).await;
 
-        assert!(
-            !self.universe.is_empty(),
-            "Universe is empty — strategy.universe() must return at least one symbol"
-        );
+        if self.universe.is_empty() {
+            return Err(BrokerError::DataFeedError(
+                "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
+                    .to_string(),
+            ));
+        }
 
         self.history_seed_anchor = Some(self.broker.get_current_time());
         self.start_alpha_models();

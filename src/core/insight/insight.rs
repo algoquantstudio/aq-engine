@@ -536,6 +536,16 @@ impl Insight {
     }
 
     pub fn submit(&mut self, ctx: &mut dyn StrategyContext) -> &mut Self {
+        if self.submitted || self.order_id.is_some() || self.state != InsightState::New {
+            debug!(
+                "Skipping duplicate submit for insight: {} submitted={} order_id={:?} state={:?}",
+                self.log_summary(),
+                self.submitted,
+                self.order_id,
+                self.state
+            );
+            return self;
+        }
         if let Err(validation) = self.validate(ctx) {
             let message = match validation {
                 InsightValidation::Invalid(message) => message,
@@ -720,6 +730,9 @@ impl Insight {
     }
 
     pub fn cancel(&mut self, ctx: &mut dyn StrategyContext) -> &mut Self {
+        if self.cancelling {
+            return self;
+        }
         self.cancelling = true;
 
         if let Some(order_id) = &self.order_id {
@@ -760,6 +773,9 @@ impl Insight {
         self
     }
     pub fn close(&mut self, ctx: &mut dyn StrategyContext) -> &mut Self {
+        if self.closing {
+            return self;
+        }
         self.closing = true;
         let qty = self.remaining_quantity();
         let Some(order_id) = self.order_id.clone() else {
@@ -1034,11 +1050,16 @@ impl Insight {
                     .add_time_increment(self.created_at, period_unfilled as i64)
                     .unwrap_or(self.created_at);
                 if now >= expiry {
+                    let was_cancelling = self.cancelling;
                     self.cancel(ctx);
-                    self.update_state(
-                        self.state.clone(),
-                        Some("Expired before fill window elapsed; cancel requested".to_string()),
-                    );
+                    if !was_cancelling && self.cancelling {
+                        self.update_state(
+                            self.state.clone(),
+                            Some(
+                                "Expired before fill window elapsed; cancel requested".to_string(),
+                            ),
+                        );
+                    }
                     return true;
                 }
                 false
@@ -1053,11 +1074,14 @@ impl Insight {
                     .add_time_increment(anchor, period_till_tp as i64)
                     .unwrap_or(anchor);
                 if now >= expiry {
+                    let was_closing = self.closing;
                     self.close(ctx);
-                    self.update_state(
-                        self.state.clone(),
-                        Some("Take-profit time window expired; closing position".to_string()),
-                    );
+                    if !was_closing && self.closing {
+                        self.update_state(
+                            self.state.clone(),
+                            Some("Take-profit time window expired; closing position".to_string()),
+                        );
+                    }
                     return true;
                 }
                 false
@@ -1306,6 +1330,21 @@ impl Insight {
     pub fn side(&self) -> &OrderSide {
         &self.side
     }
+    pub fn set_side(&mut self, side: OrderSide) -> &mut Self {
+        if (self.side == side && self.state != InsightState::New)
+            || self.state == InsightState::Filled
+            || self.state == InsightState::Executed
+        {
+            return self;
+        }
+        self.side = side;
+        self.update_state(
+            self.state.clone(),
+            Some(format!("Order side set to {:?}", self.side)),
+        );
+        self
+    }
+
     pub fn opposite_side(&self) -> OrderSide {
         match self.side {
             OrderSide::Buy => OrderSide::Sell,
@@ -1900,5 +1939,43 @@ mod tests {
                     .as_deref()
                     .is_some_and(|value| value.contains("Take-profit time window expired"))
         }));
+    }
+
+    #[test]
+    fn filled_insight_expiry_does_not_duplicate_close_while_pending() {
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let fill_time = created_at + Duration::minutes(1);
+        let now = fill_time + Duration::minutes(3);
+        let mut ctx = MockStrategyContext::new(now);
+        let mut insight = sample_insight(created_at);
+        insight.set_period_till_tp(Some(1));
+        insight.order_accepted("order-456");
+        insight.filled_at = Some(fill_time);
+        insight.filled_price = Some(1.1542);
+        insight.state = InsightState::Filled;
+        insight.order_id = Some("order-456".to_string());
+
+        assert!(insight.has_expired(&mut ctx));
+        let history_len_after_first_expiry = insight.state_history.len();
+        assert!(insight.has_expired(&mut ctx));
+
+        assert_eq!(insight.state, InsightState::Filled);
+        assert!(insight.closing);
+        assert_eq!(
+            ctx.closed_positions.borrow().as_slice(),
+            [("order-456".to_string(), 1.0, None)]
+        );
+        assert_eq!(insight.state_history.len(), history_len_after_first_expiry);
+        let expiry_entries = insight
+            .state_history
+            .iter()
+            .filter(|(_, state, message)| {
+                *state == InsightState::Filled
+                    && message
+                        .as_deref()
+                        .is_some_and(|value| value.contains("Take-profit time window expired"))
+            })
+            .count();
+        assert_eq!(expiry_entries, 1);
     }
 }

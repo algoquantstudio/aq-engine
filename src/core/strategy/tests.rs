@@ -1533,6 +1533,109 @@ mod tests {
         assert_eq!(init_symbols, vec!["AAPL", "GOOG", "MSFT", "STATIC_ONLY"]);
     }
 
+    #[test]
+    fn teardown_blocks_new_insights_from_strategy_context() {
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = FixedScaleOutDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "TeardownBlocksInsights".to_string(),
+            "1.0".to_string(),
+            SmaStrategy::new(vec!["AAPL"]),
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+        state.status = crate::core::strategy::StrategyStatus::Running;
+
+        state.begin_teardown();
+        let insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+            90,
+            None,
+        );
+        StrategyContext::add_insight(&mut state, insight);
+
+        assert_eq!(
+            state.status,
+            crate::core::strategy::StrategyStatus::Stopping
+        );
+        assert_eq!(state.insights.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn submit_insight_is_idempotent_after_broker_acknowledgement() {
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = FixedScaleOutDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "SubmitIdempotence".to_string(),
+            "1.0".to_string(),
+            SmaStrategy::new(vec!["AAPL"]),
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        state.universe.insert(
+            "AAPL".to_string(),
+            Asset {
+                id: "fixture-AAPL".to_string(),
+                symbol: "AAPL".to_string(),
+                name: "AAPL".to_string(),
+                asset_type: AssetType::Stock,
+                status: AssetStatus::Active,
+                exchange: AssetExchange::NASDAQ,
+                tradable: true,
+                marginable: true,
+                shortable: true,
+                fractional: true,
+                min_order_size: None,
+                quantity_base: None,
+                max_order_size: None,
+                min_price_increment: Some(0.01),
+                price_base: None,
+                contract_size: None,
+            },
+        );
+
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(1.0));
+
+        insight.submit(&mut state);
+        let first_order_id = insight.order_id.clone();
+        assert!(insight.submitted);
+        assert_eq!(insight.state, InsightState::Executed);
+        assert!(
+            first_order_id.is_some(),
+            "broker acknowledgement should attach an order id immediately"
+        );
+
+        insight.submit(&mut state);
+
+        assert_eq!(insight.order_id, first_order_id);
+        let orders = state
+            .broker
+            .get_orders()
+            .await
+            .expect("paper broker orders should be readable");
+        assert_eq!(
+            orders.len(),
+            1,
+            "a second submit call for the same acknowledged insight must not create another order"
+        );
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //  Trade Event Tests
     // ═══════════════════════════════════════════════════════════════════
@@ -2307,14 +2410,16 @@ mod tests {
         let data = FixedScaleOutDataFeed::new();
         let broker = UnifiedBroker::new_backtest(execution, data);
 
-        StrategyState::new(
+        let mut state = StrategyState::new(
             "PipelineHarness".to_string(),
             "1.0".to_string(),
             PipelineHarnessStrategy,
             broker,
             StrategyMode::Backtest,
             TimeFrame::new(1, TimeFrameUnit::Minute),
-        )
+        );
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        state
     }
 
     #[test]

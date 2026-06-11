@@ -136,11 +136,12 @@ impl Mt5Broker {
 
 impl Broker for Mt5Broker {
     async fn connect(&self) -> Result<bool, BrokerError> {
-        self.bridge.start().await
+        self.bridge.start().await?;
+        self.bridge.wait_for_rpc_poll().await
     }
 
     async fn disconnect(&self) -> Result<bool, BrokerError> {
-        self.bridge.stop();
+        self.bridge.shutdown().await;
         Ok(true)
     }
 

@@ -18,12 +18,15 @@ Set these before running an AQE live strategy that uses MT5:
 ```bash
 export AQE_MT5_BRIDGE_BIND_ADDR="127.0.0.1:18080"
 export AQE_MT5_BRIDGE_TOKEN="replace-with-a-long-random-secret"
-export AQE_MT5_REQUEST_TIMEOUT_MS="5000"
+export AQE_MT5_CONNECT_TIMEOUT_MS="15000"
+export AQE_MT5_REQUEST_TIMEOUT_MS="15000"
 export AQE_MT5_POLL_INTERVAL_MS="250"
 export AQE_MT5_SYMBOL_MAP="GBPUSD=X=GBPUSD,EURUSD=X=EURUSD"
 ```
 
 `AQE_MT5_BRIDGE_TOKEN` must match the EA input.
+
+`AQE_MT5_CONNECT_TIMEOUT_MS` controls how long AQE waits for the EA to poll the bridge before loading the strategy universe. This is useful when restarting a live strategy while MT5 is still finishing an old WebRequest attempt.
 
 `AQE_MT5_SYMBOL_MAP` is optional. Use it when the AQE symbol differs from the MT5 broker symbol, for example broker suffixes like `EURUSD.a` or `GBPUSDm`.
 
@@ -58,9 +61,28 @@ export AQE_MT5_BRIDGE_BIND_ADDR="0.0.0.0:18080"
 ```text
 InpBridgeUrl        = http://127.0.0.1:18080
 InpBridgeToken      = same value as AQE_MT5_BRIDGE_TOKEN
+InpBridgeConnections = optional extra bridge URLs separated by commas
+InpProbeInactiveConnections = false
+InpInactiveProbeIntervalMs = 2000
+InpInactiveProbeTimeoutMs = 150
+InpInactiveProbeMaxCooldownMs = 5000
 InpPollIntervalMs   = 250
 InpRequestTimeoutMs = 5000
 ```
+
+For multiple AQE live strategies from one MT5 terminal, either attach one EA per bridge URL or set extra bridge endpoints in `InpBridgeConnections`, for example:
+
+```text
+InpBridgeConnections = http://127.0.0.1:18081,http://127.0.0.1:18082
+```
+
+Leave `InpProbeInactiveConnections` as `false` for normal single-EA multi-port use. With the default setting, the EA always services active bridge sessions first and then probes at most one inactive URL with a short timeout and cooldown. Set it to `true` only when every configured endpoint is expected to be online and faster inactive probing is preferred.
+
+All configured bridge URLs use `InpBridgeToken`; per-endpoint tokens are not supported. Add every URL in `InpBridgeUrl` and `InpBridgeConnections` to the MT5 WebRequest allow-list.
+
+AQE and AQS use UTC internally. The EA converts incoming UTC history request windows to MT5 broker-server time before calling `CopyRates`, then converts MT5 quote and bar timestamps back to UTC before sending data to AQE.
+
+The EA keeps data subscriptions and trade events scoped to each AQE runtime session. Trade events are routed back to the bridge that submitted the order; manual MT5 trades are not broadcast to every strategy. Multi-strategy trade routing is reliable for hedging accounts with separate order/position tickets. MT5 netting accounts can merge same-symbol positions, so same-symbol strategy attribution is limited there.
 
 8. Keep MT5 logged in and running before starting the AQE live strategy.
 

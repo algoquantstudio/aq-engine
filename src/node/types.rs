@@ -107,8 +107,14 @@ pub struct Mt5BridgeConfig {
     pub bind_addr: String,
     pub token_env: String,
     pub request_timeout_ms: u64,
+    #[serde(default = "default_mt5_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
     pub poll_interval_ms: u64,
     pub symbol_map: Option<String>,
+}
+
+fn default_mt5_connect_timeout_ms() -> u64 {
+    15_000
 }
 
 impl Default for Mt5BridgeConfig {
@@ -116,7 +122,8 @@ impl Default for Mt5BridgeConfig {
         Self {
             bind_addr: "127.0.0.1:18080".to_string(),
             token_env: "AQE_MT5_BRIDGE_TOKEN".to_string(),
-            request_timeout_ms: 5_000,
+            request_timeout_ms: 15_000,
+            connect_timeout_ms: default_mt5_connect_timeout_ms(),
             poll_interval_ms: 250,
             symbol_map: None,
         }

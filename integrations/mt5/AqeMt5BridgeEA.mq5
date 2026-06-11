@@ -3,22 +3,54 @@
 //| Local RPC bridge EA for AlgoQuant Engine MT5 runtime integration.|
 //+------------------------------------------------------------------+
 #property strict
-#property version "0.2"
+#property version "1.300"
 
 #include <Trade/Trade.mqh>
 
 input string InpBridgeUrl = "http://127.0.0.1:18080";
 input string InpBridgeToken = "";
+input string InpBridgeConnections = "";
+input bool InpProbeInactiveConnections = false;
+input int InpInactiveProbeIntervalMs = 2000;
+input int InpInactiveProbeTimeoutMs = 150;
+input int InpInactiveProbeMaxCooldownMs = 5000;
 input int InpPollIntervalMs = 250;
 input int InpRequestTimeoutMs = 5000;
 
 CTrade trade;
-ulong g_event_seq = 0;
-string g_session_id = "";
-string g_subscription_symbols[];
-string g_subscription_timeframes[];
-datetime g_last_bar_time[];
-datetime g_last_snapshot = 0;
+
+struct BridgeConnection
+{
+   string url;
+   string session_id;
+   ulong event_seq;
+   datetime last_snapshot;
+   int consecutive_failures;
+   uint next_poll_after_ms;
+   uint last_heartbeat_ms;
+   uint last_market_data_ms;
+   bool session_logged;
+};
+
+struct BridgeSubscription
+{
+   int bridge_index;
+   string symbol;
+   string timeframe_code;
+   datetime last_bar_time;
+};
+
+struct OrderRoute
+{
+   string key;
+   int bridge_index;
+   string session_id;
+};
+
+BridgeConnection g_bridges[];
+BridgeSubscription g_subscriptions[];
+OrderRoute g_order_routes[];
+int g_next_probe_bridge_index = 0;
 
 string JsonEscape(string value)
 {
@@ -49,6 +81,46 @@ datetime ParseIsoTime(string value)
    return StringToTime(value);
 }
 
+int RoundOffsetToMinute(int seconds)
+{
+   if(seconds >= 0)
+      return ((seconds + 30) / 60) * 60;
+   return -(((-seconds + 30) / 60) * 60);
+}
+
+int BrokerUtcOffsetSeconds()
+{
+   datetime utc_time = TimeGMT();
+   datetime broker_time = TimeTradeServer();
+   if(broker_time <= 0)
+      broker_time = TimeCurrent();
+   if(utc_time <= 0 || broker_time <= 0)
+      return 0;
+   return RoundOffsetToMinute((int)(broker_time - utc_time));
+}
+
+datetime UtcToBrokerTimeWithOffset(datetime utc_time, int offset_seconds)
+{
+   if(utc_time <= 0) return 0;
+   return (datetime)(utc_time + offset_seconds);
+}
+
+datetime BrokerToUtcTimeWithOffset(datetime broker_time, int offset_seconds)
+{
+   if(broker_time <= 0) return 0;
+   return (datetime)(broker_time - offset_seconds);
+}
+
+datetime BrokerToUtcTime(datetime broker_time)
+{
+   return BrokerToUtcTimeWithOffset(broker_time, BrokerUtcOffsetSeconds());
+}
+
+datetime BrokerNowUtc()
+{
+   return BrokerToUtcTime(TimeCurrent());
+}
+
 string RequestId()
 {
    return IntegerToString((int)GetTickCount()) + "-" + IntegerToString((int)MathRand());
@@ -63,28 +135,248 @@ string NormalizeOrderComment(string comment)
    return comment;
 }
 
-string Envelope(string request_id, string payload)
+string NormalizeBridgeUrl(string bridge_url)
 {
-   g_event_seq++;
+   StringTrimLeft(bridge_url);
+   StringTrimRight(bridge_url);
+   while(StringLen(bridge_url) > 0 && StringSubstr(bridge_url, StringLen(bridge_url) - 1) == "/")
+      bridge_url = StringSubstr(bridge_url, 0, StringLen(bridge_url) - 1);
+   return bridge_url;
+}
+
+string BridgeToken()
+{
+   string token = InpBridgeToken;
+   StringTrimLeft(token);
+   StringTrimRight(token);
+   return token;
+}
+
+bool IsValidBridgeIndex(int bridge_index)
+{
+   return bridge_index >= 0 && bridge_index < ArraySize(g_bridges);
+}
+
+int ActivePollDelayMs()
+{
+   int delay_ms = InpPollIntervalMs;
+   if(delay_ms < 100) delay_ms = 100;
+   return delay_ms;
+}
+
+int ClampInt(int value, int min_value, int max_value)
+{
+   if(value < min_value) return min_value;
+   if(value > max_value) return max_value;
+   return value;
+}
+
+int FailedPollDelayMs(int consecutive_failures)
+{
+   if(consecutive_failures <= 1) return 500;
+   if(consecutive_failures <= 3) return 1000;
+   return 2000;
+}
+
+int InactiveProbeTimeoutMs()
+{
+   return ClampInt(InpInactiveProbeTimeoutMs, 100, 500);
+}
+
+int InactiveProbeBaseIntervalMs()
+{
+   return ClampInt(InpInactiveProbeIntervalMs, 250, 60000);
+}
+
+int InactiveProbeMaxCooldownMs()
+{
+   return ClampInt(InpInactiveProbeMaxCooldownMs, InactiveProbeBaseIntervalMs(), 300000);
+}
+
+int InactiveProbeFailureDelayMs(int consecutive_failures, uint duration_ms)
+{
+   int delay_ms = InpProbeInactiveConnections ? FailedPollDelayMs(consecutive_failures)
+                                              : InactiveProbeBaseIntervalMs();
+   int multiplier = 1;
+   int exponent = ClampInt(consecutive_failures - 1, 0, 4);
+   for(int i = 0; i < exponent; i++)
+      multiplier *= 2;
+   delay_ms *= multiplier;
+   if(duration_ms > (uint)InactiveProbeTimeoutMs())
+      delay_ms = delay_ms < 5000 ? 5000 : delay_ms;
+   return ClampInt(delay_ms, 250, InactiveProbeMaxCooldownMs());
+}
+
+bool HasElapsedMs(uint last_ms, int interval_ms)
+{
+   if(last_ms == 0)
+      return true;
+   int interval = MathMax(0, interval_ms);
+   return GetTickCount() - last_ms >= (uint)interval;
+}
+
+int BridgePostTimeoutMs(string path)
+{
+   int timeout_ms = InpRequestTimeoutMs;
+   int max_timeout_ms = 500;
+   if(path == "/v1/rpc/response")
+      max_timeout_ms = 1000;
+   if(timeout_ms > max_timeout_ms)
+      timeout_ms = max_timeout_ms;
+   if(timeout_ms < 100)
+      timeout_ms = 100;
+   return timeout_ms;
+}
+
+bool IsBridgePollDue(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return false;
+   uint next_poll_after_ms = g_bridges[bridge_index].next_poll_after_ms;
+   return next_poll_after_ms == 0 || GetTickCount() >= next_poll_after_ms;
+}
+
+bool IsBridgeSessionActive(int bridge_index)
+{
+   return IsValidBridgeIndex(bridge_index) && g_bridges[bridge_index].session_id != "";
+}
+
+bool HasBridgeSubscriptions(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return false;
+   for(int i = 0; i < ArraySize(g_subscriptions); i++)
+   {
+      if(g_subscriptions[i].bridge_index == bridge_index)
+         return true;
+   }
+   return false;
+}
+
+bool HasBridgeOrderRoutes(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return false;
+   for(int i = 0; i < ArraySize(g_order_routes); i++)
+   {
+      if(g_order_routes[i].bridge_index == bridge_index)
+         return true;
+   }
+   return false;
+}
+
+void MarkBridgePollSuccess(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return;
+   int previous_failures = g_bridges[bridge_index].consecutive_failures;
+   g_bridges[bridge_index].consecutive_failures = 0;
+   g_bridges[bridge_index].next_poll_after_ms = GetTickCount() + (uint)ActivePollDelayMs();
+   if(previous_failures > 0)
+      Print("AQE bridge[", bridge_index, "] poll recovered url=", g_bridges[bridge_index].url);
+}
+
+void MarkBridgePollFailure(int bridge_index, bool inactive_probe = false, uint duration_ms = 0)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return;
+   g_bridges[bridge_index].consecutive_failures++;
+   int delay_ms = inactive_probe
+      ? InactiveProbeFailureDelayMs(g_bridges[bridge_index].consecutive_failures, duration_ms)
+      : FailedPollDelayMs(g_bridges[bridge_index].consecutive_failures);
+   g_bridges[bridge_index].next_poll_after_ms = GetTickCount() + (uint)delay_ms;
+   int failures = g_bridges[bridge_index].consecutive_failures;
+   if(inactive_probe && (failures <= 3 || failures % 10 == 0))
+      Print("AQE bridge[", bridge_index, "] inactive probe failed url=", g_bridges[bridge_index].url,
+            " failures=", failures,
+            " elapsed_ms=", (int)duration_ms,
+            " next_probe_ms=", delay_ms);
+}
+
+string BridgeSessionShort(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return "";
+   string session_id = g_bridges[bridge_index].session_id;
+   if(StringLen(session_id) <= 8) return session_id;
+   return StringSubstr(session_id, 0, 8);
+}
+
+string RoutedOrderComment(int bridge_index, string comment)
+{
+   comment = NormalizeOrderComment(comment);
+   string session_short = BridgeSessionShort(bridge_index);
+   if(session_short == "") return comment;
+   string prefix = "AQE:" + session_short + ":";
+   int remaining = 31 - StringLen(prefix);
+   if(remaining <= 0) return NormalizeOrderComment(prefix);
+   return NormalizeOrderComment(prefix + StringSubstr(comment, 0, remaining));
+}
+
+int FindBridgeByComment(string comment)
+{
+   if(StringFind(comment, "AQE:") != 0) return -1;
+   string session_short = StringSubstr(comment, 4, 8);
+   for(int i = 0; i < ArraySize(g_bridges); i++)
+   {
+      if(BridgeSessionShort(i) == session_short)
+         return i;
+   }
+   return -1;
+}
+
+int FindOrderRouteIndex(string key)
+{
+   if(key == "" || key == "0") return -1;
+   for(int i = ArraySize(g_order_routes) - 1; i >= 0; i--)
+   {
+      if(g_order_routes[i].key == key)
+         return i;
+   }
+   return -1;
+}
+
+int FindOrderBridgeIndex(string key)
+{
+   int index = FindOrderRouteIndex(key);
+   return index >= 0 ? g_order_routes[index].bridge_index : -1;
+}
+
+void RememberOrderRoute(int bridge_index, string key)
+{
+   if(!IsValidBridgeIndex(bridge_index) || key == "" || key == "0") return;
+   int existing = FindOrderRouteIndex(key);
+   if(existing >= 0)
+   {
+      g_order_routes[existing].bridge_index = bridge_index;
+      g_order_routes[existing].session_id = g_bridges[bridge_index].session_id;
+      return;
+   }
+   int index = ArraySize(g_order_routes);
+   ArrayResize(g_order_routes, index + 1);
+   g_order_routes[index].key = key;
+   g_order_routes[index].bridge_index = bridge_index;
+   g_order_routes[index].session_id = g_bridges[bridge_index].session_id;
+}
+
+string Envelope(int bridge_index, string request_id, string payload)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return "";
+   g_bridges[bridge_index].event_seq++;
    return "{"
       "\"protocolVersion\":1,"
-      "\"sessionId\":\"" + JsonEscape(g_session_id) + "\","
+      "\"sessionId\":\"" + JsonEscape(g_bridges[bridge_index].session_id) + "\","
       "\"requestId\":\"" + JsonEscape(request_id) + "\","
-      "\"eventSeq\":" + IntegerToString((int)g_event_seq) + ","
+      "\"eventSeq\":" + IntegerToString((int)g_bridges[bridge_index].event_seq) + ","
       "\"serverTime\":null,"
       "\"payload\":" + payload +
    "}";
 }
 
-bool PostJson(string path, string payload, string &response)
+bool PostJsonWithTimeout(int bridge_index, string path, string payload, int timeout_ms, string &response, bool quiet_transport_error = false)
 {
+   if(!IsValidBridgeIndex(bridge_index)) return false;
    string request_id = RequestId();
-   string body = Envelope(request_id, payload);
+   string body = Envelope(bridge_index, request_id, payload);
    string headers =
       "Content-Type: application/json\r\n"
-      "X-AQE-MT5-Session: " + g_session_id + "\r\n"
-      "X-AQE-MT5-Token: " + InpBridgeToken + "\r\n"
-      "X-AQE-MT5-Seq: " + IntegerToString((int)g_event_seq) + "\r\n";
+      "X-AQE-MT5-Session: " + g_bridges[bridge_index].session_id + "\r\n"
+      "X-AQE-MT5-Token: " + BridgeToken() + "\r\n"
+      "X-AQE-MT5-Seq: " + IntegerToString((int)g_bridges[bridge_index].event_seq) + "\r\n";
 
    char data[];
    char result[];
@@ -93,30 +385,68 @@ bool PostJson(string path, string payload, string &response)
 
    int status = WebRequest(
       "POST",
-      InpBridgeUrl + path,
+      g_bridges[bridge_index].url + path,
       headers,
-      InpRequestTimeoutMs,
+      timeout_ms,
       data,
       result,
       result_headers
    );
 
    response = CharArrayToString(result, 0, -1, CP_UTF8);
+   string previous_session_id = g_bridges[bridge_index].session_id;
    string response_session_id = ExtractString(response, "sessionId");
-   if(response_session_id != "") g_session_id = response_session_id;
+   bool session_changed = false;
+   if(response_session_id != "")
+   {
+      session_changed = response_session_id != previous_session_id;
+      if(session_changed && previous_session_id != "")
+         ClearBridgeSessionRuntime(bridge_index);
+      g_bridges[bridge_index].session_id = response_session_id;
+      if(session_changed)
+      {
+         g_bridges[bridge_index].session_logged = false;
+         g_bridges[bridge_index].next_poll_after_ms = 0;
+      }
+   }
 
    if(status == -1)
    {
-      Print("AQE bridge WebRequest failed. Error=", GetLastError(),
-            ". Check Tools > Options > Expert Advisors > Allow WebRequest URL: ", InpBridgeUrl);
+      if(!quiet_transport_error)
+         Print("AQE bridge[", bridge_index, "] WebRequest failed. Error=", GetLastError(),
+               ". Check Tools > Options > Expert Advisors > Allow WebRequest URL: ", g_bridges[bridge_index].url);
+      ClearBridgeSessionRuntime(bridge_index);
+      g_bridges[bridge_index].session_id = "";
+      g_bridges[bridge_index].session_logged = false;
       return false;
    }
    if(status < 200 || status >= 300)
    {
-      Print("AQE bridge returned HTTP ", status, " path=", path, " response=", response);
+      Print("AQE bridge[", bridge_index, "] returned HTTP ", status,
+            " url=", g_bridges[bridge_index].url,
+            " path=", path,
+            " response=", response);
+      if(response_session_id == "")
+      {
+         ClearBridgeSessionRuntime(bridge_index);
+         g_bridges[bridge_index].session_id = "";
+         g_bridges[bridge_index].session_logged = false;
+      }
       return false;
    }
+   if(session_changed && !g_bridges[bridge_index].session_logged)
+   {
+      Print("AQE bridge[", bridge_index, "] session established url=", g_bridges[bridge_index].url,
+            " path=", path,
+            " session=", BridgeSessionShort(bridge_index));
+      g_bridges[bridge_index].session_logged = true;
+   }
    return true;
+}
+
+bool PostJson(int bridge_index, string path, string payload, string &response)
+{
+   return PostJsonWithTimeout(bridge_index, path, payload, BridgePostTimeoutMs(path), response);
 }
 
 double NormalizeToDigits(string symbol, double price)
@@ -292,17 +622,19 @@ bool ClosePositionWithComment(ulong position_ticket, string symbol, double qty, 
    return ok && IsTradeRetcodeSuccess(result.retcode);
 }
 
-string ExtractFirstRpcRequest(string json)
+int ExtractRpcRequests(string json, string &requests[])
 {
+   ArrayResize(requests, 0);
    int requests_start = StringFind(json, "\"requests\":[");
-   if(requests_start < 0) return "";
-   int object_start = StringFind(json, "{", requests_start);
-   if(object_start < 0) return "";
+   if(requests_start < 0) return 0;
+   int array_start = StringFind(json, "[", requests_start);
+   if(array_start < 0) return 0;
 
    int depth = 0;
+   int object_start = -1;
    bool in_string = false;
    bool escaped = false;
-   for(int i = object_start; i < StringLen(json); i++)
+   for(int i = array_start + 1; i < StringLen(json); i++)
    {
       int ch = StringGetCharacter(json, i);
       if(escaped)
@@ -321,15 +653,29 @@ string ExtractFirstRpcRequest(string json)
          continue;
       }
       if(in_string) continue;
-      if(ch == '{') depth++;
+      if(ch == '{')
+      {
+         if(depth == 0)
+            object_start = i;
+         depth++;
+         continue;
+      }
       if(ch == '}')
       {
          depth--;
-         if(depth == 0)
-            return StringSubstr(json, object_start, i - object_start + 1);
+         if(depth == 0 && object_start >= 0)
+         {
+            int index = ArraySize(requests);
+            ArrayResize(requests, index + 1);
+            requests[index] = StringSubstr(json, object_start, i - object_start + 1);
+            object_start = -1;
+         }
+         continue;
       }
+      if(ch == ']' && depth == 0)
+         break;
    }
-   return "";
+   return ArraySize(requests);
 }
 
 ENUM_TIMEFRAMES TimeframeFromCode(string code)
@@ -503,12 +849,13 @@ string AssetJson(string symbol)
    "}";
 }
 
-string QuoteJson(string symbol)
+string QuoteJsonWithOffset(string symbol, int broker_offset_seconds)
 {
    MqlTick tick;
    SymbolInfoTick(symbol, tick);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double last = tick.last > 0.0 ? tick.last : (tick.bid + tick.ask) / 2.0;
+   datetime quote_time = tick.time > 0 ? (datetime)tick.time : TimeCurrent();
    return "{"
       "\"symbol\":\"" + JsonEscape(symbol) + "\","
       "\"bid\":" + DoubleToString(tick.bid, digits) + ","
@@ -517,13 +864,18 @@ string QuoteJson(string symbol)
       "\"ask_size\":0.0,"
       "\"last\":" + DoubleToString(last, digits) + ","
       "\"last_size\":null,"
-      "\"timestamp\":\"" + IsoTime(TimeCurrent()) + "\""
+      "\"timestamp\":\"" + IsoTime(BrokerToUtcTimeWithOffset(quote_time, broker_offset_seconds)) + "\""
    "}";
 }
 
-string BarJson(string symbol, ENUM_TIMEFRAMES timeframe, int shift)
+string QuoteJson(string symbol)
 {
-   datetime ts = iTime(symbol, timeframe, shift);
+   return QuoteJsonWithOffset(symbol, BrokerUtcOffsetSeconds());
+}
+
+string BarJsonWithOffset(string symbol, ENUM_TIMEFRAMES timeframe, int shift, int broker_offset_seconds)
+{
+   datetime broker_ts = iTime(symbol, timeframe, shift);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    return "{"
       "\"symbol\":\"" + JsonEscape(symbol) + "\","
@@ -532,11 +884,16 @@ string BarJson(string symbol, ENUM_TIMEFRAMES timeframe, int shift)
       "\"low\":" + DoubleToString(iLow(symbol, timeframe, shift), digits) + ","
       "\"close\":" + DoubleToString(iClose(symbol, timeframe, shift), digits) + ","
       "\"volume\":" + DoubleToString((double)iVolume(symbol, timeframe, shift), 0) + ","
-      "\"timestamp\":\"" + IsoTime(ts) + "\""
+      "\"timestamp\":\"" + IsoTime(BrokerToUtcTimeWithOffset(broker_ts, broker_offset_seconds)) + "\""
    "}";
 }
 
-string RateBarJson(string symbol, MqlRates &rate)
+string BarJson(string symbol, ENUM_TIMEFRAMES timeframe, int shift)
+{
+   return BarJsonWithOffset(symbol, timeframe, shift, BrokerUtcOffsetSeconds());
+}
+
+string RateBarJsonWithOffset(string symbol, MqlRates &rate, int broker_offset_seconds)
 {
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    return "{"
@@ -546,22 +903,28 @@ string RateBarJson(string symbol, MqlRates &rate)
       "\"low\":" + DoubleToString(rate.low, digits) + ","
       "\"close\":" + DoubleToString(rate.close, digits) + ","
       "\"volume\":" + DoubleToString((double)rate.tick_volume, 0) + ","
-      "\"timestamp\":\"" + IsoTime(rate.time) + "\""
+      "\"timestamp\":\"" + IsoTime(BrokerToUtcTimeWithOffset(rate.time, broker_offset_seconds)) + "\""
    "}";
 }
 
-string HistoryJson(string symbol, ENUM_TIMEFRAMES timeframe, datetime start_time, datetime end_time)
+string HistoryJson(string symbol, ENUM_TIMEFRAMES timeframe, datetime start_utc, datetime end_utc)
 {
    string bars = "";
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
+   int broker_offset_seconds = BrokerUtcOffsetSeconds();
+   datetime start_time = UtcToBrokerTimeWithOffset(start_utc, broker_offset_seconds);
+   datetime end_time = UtcToBrokerTimeWithOffset(end_utc, broker_offset_seconds);
    int copied = CopyRates(symbol, timeframe, start_time, end_time, rates);
    if(copied <= 0)
    {
       Print("AQE bridge history request returned no rates symbol=", symbol,
             " timeframe=", EnumToString(timeframe),
-            " start=", IsoTime(start_time),
-            " end=", IsoTime(end_time),
+            " utc_start=", IsoTime(start_utc),
+            " utc_end=", IsoTime(end_utc),
+            " broker_start=", IsoTime(start_time),
+            " broker_end=", IsoTime(end_time),
+            " broker_utc_offset_seconds=", broker_offset_seconds,
             " copied=", copied,
             " last_error=", GetLastError());
       return "[]";
@@ -571,7 +934,7 @@ string HistoryJson(string symbol, ENUM_TIMEFRAMES timeframe, datetime start_time
    {
       if(rates[i].time <= 0) continue;
       if(i > 0) bars += ",";
-      bars += RateBarJson(symbol, rates[i]);
+      bars += RateBarJsonWithOffset(symbol, rates[i], broker_offset_seconds);
    }
 
    return "[" + bars + "]";
@@ -580,6 +943,7 @@ string HistoryJson(string symbol, ENUM_TIMEFRAMES timeframe, datetime start_time
 string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false)
 {
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   datetime now_utc = BrokerNowUtc();
    return "{"
       "\"order_id\":\"" + JsonEscape(order_id) + "\","
       "\"insight_id\":null,"
@@ -595,10 +959,10 @@ string OrderJson(string order_id, string symbol, double qty, string side, string
       "\"time_in_force\":\"GTC\","
       "\"status\":\"" + status + "\","
       "\"order_class\":\"Simple\","
-      "\"created_at\":" + IntegerToString((int)TimeCurrent()) + ","
-      "\"updated_at\":" + IntegerToString((int)TimeCurrent()) + ","
-      "\"submitted_at\":" + IntegerToString((int)TimeCurrent()) + ","
-      "\"filled_at\":" + (status == "Filled" ? IntegerToString((int)TimeCurrent()) : "null") + ","
+      "\"created_at\":" + IntegerToString((int)now_utc) + ","
+      "\"updated_at\":" + IntegerToString((int)now_utc) + ","
+      "\"submitted_at\":" + IntegerToString((int)now_utc) + ","
+      "\"filled_at\":" + (status == "Filled" ? IntegerToString((int)now_utc) : "null") + ","
       "\"realized_pnl\":" + (has_realized_pnl ? DoubleToString(realized_pnl, 8) : "null") + ","
       "\"rejection_reason\":" + (rejection_reason == "" ? "null" : "\"" + JsonEscape(rejection_reason) + "\"") + ","
       "\"legs\":null"
@@ -699,38 +1063,55 @@ string OrdersJson()
    return "[" + orders + "]";
 }
 
-void SendRpcResponse(string request_id, bool ok, string message, string payload)
+void SendRpcResponse(int bridge_index, string request_id, bool ok, string message, string payload, string action = "")
 {
-   string response;
    string body = "{"
       "\"requestId\":\"" + JsonEscape(request_id) + "\","
       "\"ok\":" + (ok ? "true" : "false") + ","
       "\"message\":" + (message == "" ? "null" : "\"" + JsonEscape(message) + "\"") + ","
       "\"payload\":" + (payload == "" ? "null" : payload) +
    "}";
-   PostJson("/v1/rpc/response", body, response);
+   for(int attempt = 1; attempt <= 3; attempt++)
+   {
+      string response;
+      if(PostJson(bridge_index, "/v1/rpc/response", body, response))
+      {
+         if(attempt > 1)
+            Print("AQE bridge[", bridge_index, "] sent RPC response after retry action=", action,
+                  " request_id=", request_id,
+                  " attempt=", attempt);
+         return;
+      }
+      Print("AQE bridge[", bridge_index, "] failed to send RPC response action=", action,
+            " request_id=", request_id,
+            " attempt=", attempt, "/3");
+      if(!IsValidBridgeIndex(bridge_index) || g_bridges[bridge_index].session_id == "")
+         break;
+      Sleep(25);
+   }
 }
 
-void SendHeartbeat()
+void SendHeartbeat(int bridge_index)
 {
-   if(g_session_id == "") return;
+   if(!IsValidBridgeIndex(bridge_index) || g_bridges[bridge_index].session_id == "") return;
    string response;
    string payload = "{"
       "\"terminalName\":\"" + JsonEscape(TerminalInfoString(TERMINAL_NAME)) + "\","
       "\"accountId\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\","
-      "\"serverTime\":\"" + IsoTime(TimeCurrent()) + "\""
+      "\"serverTime\":\"" + IsoTime(BrokerNowUtc()) + "\""
    "}";
-   PostJson("/v1/heartbeat", payload, response);
+   PostJson(bridge_index, "/v1/heartbeat", payload, response);
 }
 
-void SendSnapshot()
+void SendSnapshot(int bridge_index)
 {
-   if(g_session_id == "") return;
+   if(!IsValidBridgeIndex(bridge_index) || g_bridges[bridge_index].session_id == "") return;
    string assets = "";
    string emitted_symbols[];
-   for(int i = 0; i < ArraySize(g_subscription_symbols); i++)
+   for(int i = 0; i < ArraySize(g_subscriptions); i++)
    {
-      string symbol = g_subscription_symbols[i];
+      if(g_subscriptions[i].bridge_index != bridge_index) continue;
+      string symbol = g_subscriptions[i].symbol;
       if(StringArrayContains(emitted_symbols, symbol)) continue;
       int next_index = ArraySize(emitted_symbols);
       ArrayResize(emitted_symbols, next_index + 1);
@@ -745,30 +1126,32 @@ void SendSnapshot()
       "\"positions\":" + PositionsJson() + ","
       "\"orders\":[]"
    "}";
-   if(PostJson("/v1/snapshot", payload, response))
-      g_last_snapshot = TimeCurrent();
+   PostJson(bridge_index, "/v1/snapshot", payload, response);
+   g_bridges[bridge_index].last_snapshot = TimeCurrent();
 }
 
-void SendMarketData()
+void SendMarketData(int bridge_index)
 {
-   if(g_session_id == "" || ArraySize(g_subscription_symbols) == 0) return;
+   if(!IsValidBridgeIndex(bridge_index) || g_bridges[bridge_index].session_id == "") return;
    string bars = "";
    string quotes = "";
    string emitted_quotes[];
-   for(int i = 0; i < ArraySize(g_subscription_symbols); i++)
+   int broker_offset_seconds = BrokerUtcOffsetSeconds();
+   for(int i = 0; i < ArraySize(g_subscriptions); i++)
    {
-      string symbol = g_subscription_symbols[i];
-      string timeframe_code = g_subscription_timeframes[i];
+      if(g_subscriptions[i].bridge_index != bridge_index) continue;
+      string symbol = g_subscriptions[i].symbol;
+      string timeframe_code = g_subscriptions[i].timeframe_code;
       ENUM_TIMEFRAMES timeframe = TimeframeFromCode(timeframe_code);
       SymbolSelect(symbol, true);
       datetime completed = iTime(symbol, timeframe, 1);
-      if(completed > 0 && completed != g_last_bar_time[i])
+      if(completed > 0 && completed != g_subscriptions[i].last_bar_time)
       {
-         string bar_json = BarJson(symbol, timeframe, 1);
+         string bar_json = BarJsonWithOffset(symbol, timeframe, 1, broker_offset_seconds);
          if(StringLen(bars) > 0) bars += ",";
          bars += StringSubstr(bar_json, 0, StringLen(bar_json) - 1)
             + ",\"timeframe\":\"" + JsonEscape(timeframe_code) + "\"}";
-         g_last_bar_time[i] = completed;
+         g_subscriptions[i].last_bar_time = completed;
       }
       if(!StringArrayContains(emitted_quotes, symbol))
       {
@@ -776,7 +1159,7 @@ void SendMarketData()
          ArrayResize(emitted_quotes, next_index + 1);
          emitted_quotes[next_index] = symbol;
          if(StringLen(quotes) > 0) quotes += ",";
-         quotes += QuoteJson(symbol);
+         quotes += QuoteJsonWithOffset(symbol, broker_offset_seconds);
       }
    }
    if(StringLen(bars) == 0 && StringLen(quotes) == 0) return;
@@ -787,16 +1170,51 @@ void SendMarketData()
       "\"bars\":[" + bars + "],"
       "\"history\":[]"
    "}";
-   PostJson("/v1/market-data", payload, response);
+   PostJson(bridge_index, "/v1/market-data", payload, response);
 }
 
-void ConfigureSubscriptions(string symbols_csv)
+void ClearSubscriptions(int bridge_index)
 {
+   int write = 0;
+   for(int read = 0; read < ArraySize(g_subscriptions); read++)
+   {
+      if(g_subscriptions[read].bridge_index == bridge_index) continue;
+      if(write != read)
+         g_subscriptions[write] = g_subscriptions[read];
+      write++;
+   }
+   ArrayResize(g_subscriptions, write);
+}
+
+void ClearOrderRoutesForBridge(int bridge_index)
+{
+   int write = 0;
+   for(int read = 0; read < ArraySize(g_order_routes); read++)
+   {
+      if(g_order_routes[read].bridge_index == bridge_index) continue;
+      if(write != read)
+         g_order_routes[write] = g_order_routes[read];
+      write++;
+   }
+   ArrayResize(g_order_routes, write);
+}
+
+void ClearBridgeSessionRuntime(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return;
+   ClearSubscriptions(bridge_index);
+   ClearOrderRoutesForBridge(bridge_index);
+   g_bridges[bridge_index].last_snapshot = 0;
+   g_bridges[bridge_index].last_heartbeat_ms = 0;
+   g_bridges[bridge_index].last_market_data_ms = 0;
+}
+
+void ConfigureSubscriptions(int bridge_index, string symbols_csv)
+{
+   if(!IsValidBridgeIndex(bridge_index)) return;
+   ClearSubscriptions(bridge_index);
    string entries[];
    int count = StringSplit(symbols_csv, ',', entries);
-   ArrayResize(g_subscription_symbols, count);
-   ArrayResize(g_subscription_timeframes, count);
-   ArrayResize(g_last_bar_time, count);
    for(int i = 0; i < count; i++)
    {
       string entry = entries[i];
@@ -809,14 +1227,18 @@ void ConfigureSubscriptions(string symbols_csv)
       StringTrimRight(symbol);
       StringTrimLeft(timeframe_code);
       StringTrimRight(timeframe_code);
-      g_subscription_symbols[i] = symbol;
-      g_subscription_timeframes[i] = timeframe_code;
+      if(symbol == "") continue;
+      int index = ArraySize(g_subscriptions);
+      ArrayResize(g_subscriptions, index + 1);
+      g_subscriptions[index].bridge_index = bridge_index;
+      g_subscriptions[index].symbol = symbol;
+      g_subscriptions[index].timeframe_code = timeframe_code;
+      g_subscriptions[index].last_bar_time = 0;
       SymbolSelect(symbol, true);
-      g_last_bar_time[i] = 0;
    }
 }
 
-void ExecuteRpcRequest(string json)
+void ExecuteRpcRequest(int bridge_index, string json)
 {
    string request_id = ExtractString(json, "requestId");
    string action = ExtractString(json, "action");
@@ -824,27 +1246,30 @@ void ExecuteRpcRequest(string json)
    string timeframe_code = ExtractString(json, "timeframe");
 
    if(request_id == "" || action == "")
+   {
+      Print("AQE bridge[", bridge_index, "] ignored malformed RPC request: ", StringSubstr(json, 0, 240));
       return;
+   }
 
    if(action == "GET_ACCOUNT")
    {
-      SendRpcResponse(request_id, true, "", AccountJson());
+      SendRpcResponse(bridge_index, request_id, true, "", AccountJson(), action);
       return;
    }
    if(action == "GET_TICKER_INFO")
    {
-      SendRpcResponse(request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : AssetJson(symbol));
+      SendRpcResponse(bridge_index, request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : AssetJson(symbol), action);
       return;
    }
    if(action == "GET_LATEST_QUOTE")
    {
-      SendRpcResponse(request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : QuoteJson(symbol));
+      SendRpcResponse(bridge_index, request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : QuoteJson(symbol), action);
       return;
    }
    if(action == "GET_LATEST_BAR")
    {
       ENUM_TIMEFRAMES tf = timeframe_code == "" ? PERIOD_M1 : TimeframeFromCode(timeframe_code);
-      SendRpcResponse(request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : BarJson(symbol, tf, 1));
+      SendRpcResponse(bridge_index, request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : BarJson(symbol, tf, 1), action);
       return;
    }
    if(action == "GET_HISTORY")
@@ -856,32 +1281,30 @@ void ExecuteRpcRequest(string json)
          start_time = ParseIsoTime(ExtractString(json, "start"));
       if(end_time <= 0)
          end_time = ParseIsoTime(ExtractString(json, "end"));
-      SendRpcResponse(request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : HistoryJson(symbol, tf, start_time, end_time));
+      SendRpcResponse(bridge_index, request_id, symbol != "", symbol == "" ? "symbol is required" : "", symbol == "" ? "" : HistoryJson(symbol, tf, start_time, end_time), action);
       return;
    }
    if(action == "GET_POSITIONS")
    {
-      SendRpcResponse(request_id, true, "", PositionsJson());
+      SendRpcResponse(bridge_index, request_id, true, "", PositionsJson(), action);
       return;
    }
    if(action == "GET_ORDERS")
    {
-      SendRpcResponse(request_id, true, "", OrdersJson());
+      SendRpcResponse(bridge_index, request_id, true, "", OrdersJson(), action);
       return;
    }
    if(action == "SUBSCRIBE_BARS")
    {
-      ConfigureSubscriptions(ExtractStringArray(json, "symbols"));
-      SendRpcResponse(request_id, true, "", "{\"subscribed\":true}");
-      SendSnapshot();
+      ConfigureSubscriptions(bridge_index, ExtractStringArray(json, "symbols"));
+      SendRpcResponse(bridge_index, request_id, true, "", "{\"subscribed\":true}", action);
+      SendSnapshot(bridge_index);
       return;
    }
    if(action == "UNSUBSCRIBE_BARS")
    {
-      ArrayResize(g_subscription_symbols, 0);
-      ArrayResize(g_subscription_timeframes, 0);
-      ArrayResize(g_last_bar_time, 0);
-      SendRpcResponse(request_id, true, "", "{\"subscribed\":false}");
+      ClearSubscriptions(bridge_index);
+      SendRpcResponse(bridge_index, request_id, true, "", "{\"subscribed\":false}", action);
       return;
    }
 
@@ -897,7 +1320,7 @@ void ExecuteRpcRequest(string json)
    {
       if(symbol == "" || qty <= 0.0)
       {
-         SendRpcResponse(request_id, false, "invalid submit order request", "");
+         SendRpcResponse(bridge_index, request_id, false, "invalid submit order request", "", action);
          return;
       }
       bool ok = false;
@@ -930,15 +1353,22 @@ void ExecuteRpcRequest(string json)
       trade.SetExpertMagicNumber(27042026);
       if(order_type == "Market")
       {
-         ok = (side == "Sell") ? trade.Sell(qty, symbol, 0.0, 0.0, 0.0, comment)
-                               : trade.Buy(qty, symbol, 0.0, 0.0, 0.0, comment);
+         string routed_comment = RoutedOrderComment(bridge_index, comment);
+         ok = (side == "Sell") ? trade.Sell(qty, symbol, 0.0, 0.0, 0.0, routed_comment)
+                               : trade.Buy(qty, symbol, 0.0, 0.0, 0.0, routed_comment);
       }
       else if(order_type == "Limit")
-         ok = (side == "Sell") ? trade.SellLimit(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, comment)
-                               : trade.BuyLimit(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, comment);
+      {
+         string routed_comment = RoutedOrderComment(bridge_index, comment);
+         ok = (side == "Sell") ? trade.SellLimit(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, routed_comment)
+                               : trade.BuyLimit(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, routed_comment);
+      }
       else if(order_type == "Stop" || order_type == "StopLimit")
-         ok = (side == "Sell") ? trade.SellStop(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, comment)
-                               : trade.BuyStop(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, comment);
+      {
+         string routed_comment = RoutedOrderComment(bridge_index, comment);
+         ok = (side == "Sell") ? trade.SellStop(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, routed_comment)
+                               : trade.BuyStop(qty, price, symbol, normalized_sl, normalized_tp, ORDER_TIME_GTC, 0, routed_comment);
+      }
 
       uint result_retcode = trade.ResultRetcode();
       ok = ok && IsTradeRetcodeSuccess(result_retcode);
@@ -995,25 +1425,34 @@ void ExecuteRpcRequest(string json)
       }
       else if(ok)
          broker_id = IntegerToString((long)result_order);
+      RememberOrderRoute(bridge_index, client_order_id);
+      RememberOrderRoute(bridge_index, broker_id);
+      if(result_order > 0) RememberOrderRoute(bridge_index, IntegerToString((long)result_order));
+      if(result_deal > 0) RememberOrderRoute(bridge_index, IntegerToString((long)result_deal));
       string status = ok ? (order_type == "Market" ? "Filled" : "Accepted") : "Rejected";
       string reason = ok ? "" : IntegerToString((int)result_retcode);
       string payload = OrderJson(broker_id == "0" ? client_order_id : broker_id, symbol, qty, side, order_type, status, result_price, reason);
-      SendRpcResponse(request_id, true, reason, payload);
+      SendRpcResponse(bridge_index, request_id, true, reason, payload, action);
       return;
    }
    if(action == "CANCEL_ORDER")
    {
       bool ok = trade.OrderDelete((ulong)StringToInteger(order_id));
-      SendRpcResponse(request_id, ok, ok ? "" : IntegerToString((int)GetLastError()), "{\"cancelled\":true}");
+      SendRpcResponse(bridge_index, request_id, ok, ok ? "" : IntegerToString((int)GetLastError()), "{\"cancelled\":true}", action);
       return;
    }
    if(action == "CLOSE_POSITION")
    {
       ulong position_ticket = FindPositionTicketById(order_id);
+      if(position_ticket > 0)
+      {
+         RememberOrderRoute(bridge_index, order_id);
+         RememberOrderRoute(bridge_index, IntegerToString((long)position_ticket));
+      }
       uint retcode = 0;
       bool ok = position_ticket > 0 && ClosePositionWithComment(position_ticket, symbol, qty, comment, retcode);
       string reason = position_ticket == 0 ? "position ticket not found" : (ok ? "" : IntegerToString((int)retcode));
-      SendRpcResponse(request_id, ok, reason, "{\"closed\":true}");
+      SendRpcResponse(bridge_index, request_id, ok, reason, "{\"closed\":true}", action);
       return;
    }
    if(action == "CLOSE_ALL_POSITIONS")
@@ -1028,42 +1467,153 @@ void ExecuteRpcRequest(string json)
          uint retcode = 0;
          if(sym != "") ok = ClosePositionWithComment(position_ticket, sym, 0.0, comment, retcode) && ok;
       }
-      SendRpcResponse(request_id, ok, ok ? "" : IntegerToString((int)GetLastError()), "{\"closed\":true}");
+      SendRpcResponse(bridge_index, request_id, ok, ok ? "" : IntegerToString((int)GetLastError()), "{\"closed\":true}", action);
       return;
    }
 
-   SendRpcResponse(request_id, false, "unknown RPC action: " + action, "");
+   SendRpcResponse(bridge_index, request_id, false, "unknown RPC action: " + action, "", action);
 }
 
-void PollRpc()
+void ClearRuntimeState()
 {
+   ArrayResize(g_bridges, 0);
+   ArrayResize(g_subscriptions, 0);
+   ArrayResize(g_order_routes, 0);
+   g_next_probe_bridge_index = 0;
+}
+
+bool AddBridgeConnection(string bridge_url)
+{
+   bridge_url = NormalizeBridgeUrl(bridge_url);
+   if(bridge_url == "")
+      return false;
+   if(StringFind(bridge_url, "|") >= 0)
+   {
+      Print("AqeMt5BridgeEA ignored legacy bridge connection entry: ", bridge_url,
+            ". Use comma-separated URLs only; all endpoints use InpBridgeToken.");
+      return false;
+   }
+
+   for(int i = 0; i < ArraySize(g_bridges); i++)
+   {
+      if(g_bridges[i].url != bridge_url) continue;
+      Print("AqeMt5BridgeEA ignored duplicate bridge URL: ", bridge_url);
+      return true;
+   }
+
+   int index = ArraySize(g_bridges);
+   ArrayResize(g_bridges, index + 1);
+   g_bridges[index].url = bridge_url;
+   g_bridges[index].session_id = "";
+   g_bridges[index].event_seq = 0;
+   g_bridges[index].last_snapshot = 0;
+   g_bridges[index].consecutive_failures = 0;
+   g_bridges[index].next_poll_after_ms = 0;
+   g_bridges[index].last_heartbeat_ms = 0;
+   g_bridges[index].last_market_data_ms = 0;
+   g_bridges[index].session_logged = false;
+   return true;
+}
+
+int ConfigureBridgeConnections()
+{
+   ClearRuntimeState();
+   AddBridgeConnection(InpBridgeUrl);
+
+   string entries[];
+   int count = StringSplit(InpBridgeConnections, ',', entries);
+   for(int i = 0; i < count; i++)
+   {
+      string entry = entries[i];
+      StringTrimLeft(entry);
+      StringTrimRight(entry);
+      if(entry == "") continue;
+      if(!AddBridgeConnection(entry))
+         Print("AqeMt5BridgeEA ignored invalid bridge connection: ", entry);
+   }
+
+   return ArraySize(g_bridges);
+}
+
+int ActivePollTimeoutMs()
+{
+   int poll_timeout_ms = InpRequestTimeoutMs;
+   int max_poll_timeout_ms = ActivePollDelayMs();
+   if(max_poll_timeout_ms < 250) max_poll_timeout_ms = 250;
+   if(max_poll_timeout_ms > 500) max_poll_timeout_ms = 500;
+   if(poll_timeout_ms > max_poll_timeout_ms) poll_timeout_ms = max_poll_timeout_ms;
+   if(poll_timeout_ms < 100) poll_timeout_ms = 100;
+   return poll_timeout_ms;
+}
+
+bool PollRpc(int bridge_index, bool inactive_probe = false)
+{
+   if(!IsBridgePollDue(bridge_index)) return false;
    string response;
-   string payload = "{\"maxRequests\":1}";
-   if(!PostJson("/v1/rpc/poll", payload, response)) return;
+   string payload = "{\"maxRequests\":16}";
+   int poll_timeout_ms = inactive_probe ? InactiveProbeTimeoutMs() : ActivePollTimeoutMs();
+   uint started_ms = GetTickCount();
+   if(!PostJsonWithTimeout(bridge_index, "/v1/rpc/poll", payload, poll_timeout_ms, response, inactive_probe))
+   {
+      uint elapsed_ms = GetTickCount() - started_ms;
+      MarkBridgePollFailure(bridge_index, inactive_probe, elapsed_ms);
+      return false;
+   }
+   MarkBridgePollSuccess(bridge_index);
    string session_id = ExtractString(response, "sessionId");
-   if(session_id != "") g_session_id = session_id;
-   string request_json = ExtractFirstRpcRequest(response);
-   if(request_json == "") return;
-   ExecuteRpcRequest(request_json);
+   if(session_id != "") g_bridges[bridge_index].session_id = session_id;
+   string request_jsons[];
+   int request_count = ExtractRpcRequests(response, request_jsons);
+   if(request_count > 0)
+      Print("AQE bridge[", bridge_index, "] executing ", request_count, " RPC request(s)");
+   for(int i = 0; i < request_count; i++)
+      ExecuteRpcRequest(bridge_index, request_jsons[i]);
+   return true;
+}
+
+void PollConnectedBridges()
+{
+   for(int i = 0; i < ArraySize(g_bridges); i++)
+   {
+      if(!IsBridgeSessionActive(i))
+         continue;
+      PollRpc(i, false);
+   }
+}
+
+void ProbeOneDisconnectedBridge()
+{
+   int bridge_count = ArraySize(g_bridges);
+   if(bridge_count <= 0)
+      return;
+   if(g_next_probe_bridge_index < 0 || g_next_probe_bridge_index >= bridge_count)
+      g_next_probe_bridge_index = 0;
+
+   for(int offset = 0; offset < bridge_count; offset++)
+   {
+      int bridge_index = (g_next_probe_bridge_index + offset) % bridge_count;
+      if(IsBridgeSessionActive(bridge_index) || !IsBridgePollDue(bridge_index))
+         continue;
+
+      g_next_probe_bridge_index = (bridge_index + 1) % bridge_count;
+      PollRpc(bridge_index, true);
+      return;
+   }
 }
 
 int OnInit()
 {
-   string bridge_url = InpBridgeUrl;
-   string bridge_token = InpBridgeToken;
-   StringTrimLeft(bridge_url);
-   StringTrimRight(bridge_url);
-   StringTrimLeft(bridge_token);
-   StringTrimRight(bridge_token);
-
-   if(bridge_url == "")
-   {
-      Print("AqeMt5BridgeEA parameter error: InpBridgeUrl is required.");
-      return INIT_PARAMETERS_INCORRECT;
-   }
+   string bridge_token = BridgeToken();
    if(bridge_token == "")
    {
-      Print("AqeMt5BridgeEA parameter error: InpBridgeToken is required and must match AQE_MT5_BRIDGE_TOKEN.");
+      Print("AqeMt5BridgeEA parameter error: InpBridgeToken is required and is shared by all bridge endpoints.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   int bridge_count = ConfigureBridgeConnections();
+   if(bridge_count <= 0)
+   {
+      Print("AqeMt5BridgeEA parameter error: at least one bridge URL is required. Use InpBridgeUrl and optional comma-separated InpBridgeConnections.");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpPollIntervalMs < 100)
@@ -1078,21 +1628,48 @@ int OnInit()
    }
 
    EventSetMillisecondTimer(MathMax(100, InpPollIntervalMs));
-   Print("AqeMt5BridgeEA started. bridge_url=", bridge_url, " poll_ms=", InpPollIntervalMs, " timeout_ms=", InpRequestTimeoutMs);
+   Print("AqeMt5BridgeEA started. bridge_count=", bridge_count,
+         " poll_ms=", InpPollIntervalMs,
+         " timeout_ms=", InpRequestTimeoutMs,
+         " probe_inactive=", (InpProbeInactiveConnections ? "aggressive" : "rate-limited"),
+         " inactive_probe_ms=", InactiveProbeTimeoutMs(),
+         " inactive_interval_ms=", InactiveProbeBaseIntervalMs(),
+         " broker_utc_offset_seconds=", BrokerUtcOffsetSeconds());
+   for(int i = 0; i < bridge_count; i++)
+      Print("AqeMt5BridgeEA bridge[", i, "] url=", g_bridges[i].url);
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   ClearRuntimeState();
 }
 
 void OnTimer()
 {
-   PollRpc();
-   SendHeartbeat();
-   if(TimeCurrent() - g_last_snapshot > 30) SendSnapshot();
-   SendMarketData();
+   PollConnectedBridges();
+
+   uint now_ms = GetTickCount();
+   for(int i = 0; i < ArraySize(g_bridges); i++)
+   {
+      if(!IsValidBridgeIndex(i) || g_bridges[i].session_id == "")
+         continue;
+      if(HasElapsedMs(g_bridges[i].last_heartbeat_ms, 2000))
+      {
+         g_bridges[i].last_heartbeat_ms = now_ms;
+         SendHeartbeat(i);
+      }
+      if((HasBridgeSubscriptions(i) || HasBridgeOrderRoutes(i)) && TimeCurrent() - g_bridges[i].last_snapshot > 30)
+         SendSnapshot(i);
+      if(HasBridgeSubscriptions(i) && HasElapsedMs(g_bridges[i].last_market_data_ms, ActivePollDelayMs()))
+      {
+         g_bridges[i].last_market_data_ms = now_ms;
+         SendMarketData(i);
+      }
+   }
+
+   ProbeOneDisconnectedBridge();
 }
 
 void OnTradeTransaction(
@@ -1101,7 +1678,13 @@ void OnTradeTransaction(
    const MqlTradeResult &result
 )
 {
-   if(g_session_id == "" || trans.order == 0) return;
+   if(trans.order == 0) return;
+   int route_bridge = FindOrderBridgeIndex(IntegerToString((long)trans.order));
+   if(route_bridge < 0 && trans.deal > 0)
+      route_bridge = FindOrderBridgeIndex(IntegerToString((long)trans.deal));
+   if(route_bridge < 0)
+      route_bridge = FindBridgeByComment(request.comment);
+
    string event_name = "Accepted";
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD) event_name = "Filled";
    if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
@@ -1125,11 +1708,12 @@ void OnTradeTransaction(
    double realized_pnl = 0.0;
    bool has_realized_pnl = false;
    string event_order_id = IntegerToString((long)trans.order);
+   ulong deal_position_id = 0;
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
    {
       ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
       ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
-      ulong deal_position_id = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      deal_position_id = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
       string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
       double deal_volume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
       double deal_price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
@@ -1153,6 +1737,18 @@ void OnTradeTransaction(
       else if(deal_position_id > 0)
          event_order_id = IntegerToString((long)deal_position_id);
    }
+   if(route_bridge < 0)
+      route_bridge = FindOrderBridgeIndex(event_order_id);
+   if(route_bridge < 0 && deal_position_id > 0)
+      route_bridge = FindOrderBridgeIndex(IntegerToString((long)deal_position_id));
+   if(route_bridge < 0 || !IsValidBridgeIndex(route_bridge) || g_bridges[route_bridge].session_id == "")
+      return;
+
+   RememberOrderRoute(route_bridge, event_order_id);
+   if(deal_position_id > 0) RememberOrderRoute(route_bridge, IntegerToString((long)deal_position_id));
+   if(trans.order > 0) RememberOrderRoute(route_bridge, IntegerToString((long)trans.order));
+   if(trans.deal > 0) RememberOrderRoute(route_bridge, IntegerToString((long)trans.deal));
+
    string native_id = IntegerToString((int)trans.type) + ":" + IntegerToString((long)trans.order) + ":" + IntegerToString((long)trans.deal);
    string response;
    string payload = "{"
@@ -1160,5 +1756,5 @@ void OnTradeTransaction(
       "\"event\":\"" + event_name + "\","
       "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl) +
    "}";
-   PostJson("/v1/trade-event", payload, response);
+   PostJson(route_bridge, "/v1/trade-event", payload, response);
 }

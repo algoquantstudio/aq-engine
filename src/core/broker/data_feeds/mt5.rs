@@ -30,15 +30,20 @@ impl Mt5DataFeed {
     pub fn stop_bridge(&self) {
         self.bridge.stop();
     }
+
+    pub async fn shutdown_bridge(&self) {
+        self.bridge.shutdown().await;
+    }
 }
 
 impl DataFeed for Mt5DataFeed {
     async fn connect(&self) -> Result<bool, BrokerError> {
-        self.bridge.start().await
+        self.bridge.start().await?;
+        self.bridge.wait_for_rpc_poll().await
     }
 
     async fn disconnect(&self) -> Result<bool, BrokerError> {
-        self.bridge.stop();
+        self.bridge.shutdown().await;
         Ok(true)
     }
 
