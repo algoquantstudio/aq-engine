@@ -241,7 +241,7 @@ pub enum TradeUpdateEvent {
     Pending,
     PartialFilled,
     Filled,
-    Canceled,
+    Cancelled,
     Rejected,
     Expired,
     Closed,

@@ -45,6 +45,51 @@ impl Mt5Broker {
         Some(format!("{}:{}", strategy_type, insight_id))
     }
 
+    fn order_leg_limit_price(order: Option<&Order>, stop_loss: bool) -> Option<f64> {
+        let legs = order?.legs.as_ref()?;
+        let leg = if stop_loss {
+            legs.stop_loss.as_ref()
+        } else {
+            legs.take_profit.as_ref()
+        }?;
+        leg.limit_price
+            .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
+    fn update_order_payload(
+        order_id: &str,
+        price: f64,
+        qty: f64,
+        existing_order: Option<&Order>,
+        update_stop_loss: bool,
+    ) -> serde_json::Value {
+        let symbol = existing_order.map(|order| order.asset.symbol.clone());
+        let comment = existing_order.and_then(Self::order_comment);
+        let mut payload = serde_json::json!({
+            "orderId": order_id,
+            "symbol": symbol,
+            "qty": qty,
+            "price": price,
+            "comment": comment,
+            "insightId": existing_order.and_then(|order| order.insight_id.clone()),
+            "strategyType": existing_order.and_then(|order| order.strategy_type.clone())
+        });
+
+        if update_stop_loss {
+            payload["stopLoss"] = serde_json::json!(price);
+            if let Some(take_profit) = Self::order_leg_limit_price(existing_order, false) {
+                payload["takeProfit"] = serde_json::json!(take_profit);
+            }
+        } else {
+            payload["takeProfit"] = serde_json::json!(price);
+            if let Some(stop_loss) = Self::order_leg_limit_price(existing_order, true) {
+                payload["stopLoss"] = serde_json::json!(stop_loss);
+            }
+        }
+
+        payload
+    }
+
     fn order_from_insight(&self, insight: Insight) -> Result<Order, BrokerError> {
         let qty = insight.quantity.ok_or_else(|| {
             BrokerError::OrderError(format!(
@@ -195,6 +240,8 @@ impl OrderManagementProvider for Mt5Broker {
         };
         let mut payload = serde_json::json!({
             "clientOrderId": order.order_id.clone(),
+            "insightId": order.insight_id.clone(),
+            "strategyType": order.strategy_type.clone(),
             "symbol": order.asset.symbol.clone(),
             "qty": order.qty,
             "price": order.limit_price.or(order.stop_price),
@@ -226,7 +273,7 @@ impl OrderManagementProvider for Mt5Broker {
                 .find(|order| order.order_id == order_id),
         };
 
-        let Some(existing_order) = existing_order else {
+        let Some(mut existing_order) = existing_order else {
             return Err(BrokerError::OrderCancellationError(format!(
                 "MT5 order {} was not found for cancellation",
                 order_id
@@ -237,7 +284,7 @@ impl OrderManagementProvider for Mt5Broker {
             existing_order.status,
             TradeUpdateEvent::Filled
                 | TradeUpdateEvent::Closed
-                | TradeUpdateEvent::Canceled
+                | TradeUpdateEvent::Cancelled
                 | TradeUpdateEvent::Rejected
                 | TradeUpdateEvent::Expired
         ) {
@@ -250,7 +297,11 @@ impl OrderManagementProvider for Mt5Broker {
         self.bridge
             .request_rpc(
                 Mt5RpcAction::CancelOrder,
-                serde_json::json!({ "orderId": order_id }),
+                serde_json::json!({
+                    "orderId": order_id,
+                    "insightId": existing_order.insight_id.clone(),
+                    "strategyType": existing_order.strategy_type.clone()
+                }),
             )
             .await?;
 
@@ -268,18 +319,44 @@ impl OrderManagementProvider for Mt5Broker {
             )));
         }
 
+        existing_order.status = TradeUpdateEvent::Cancelled;
+        existing_order.updated_at = Self::now_ts();
+        self.bridge
+            .emit_order_event(existing_order, TradeUpdateEvent::Cancelled);
+
         Ok(true)
     }
 
     async fn update_order(
         &self,
-        _order_id: &str,
-        _price: f64,
-        _qty: f64,
+        order_id: &str,
+        price: f64,
+        qty: f64,
     ) -> Result<bool, BrokerError> {
-        Err(BrokerError::OrderError(
-            "MT5 order replacement is not supported in v1; cancel and resubmit".to_string(),
-        ))
+        let existing_order = self.bridge.order(order_id).ok();
+        self.bridge
+            .request_rpc(
+                Mt5RpcAction::UpdateOrder,
+                Self::update_order_payload(order_id, price, qty, existing_order.as_ref(), false),
+            )
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_stop_loss(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError> {
+        let existing_order = self.bridge.order(order_id).ok();
+        self.bridge
+            .request_rpc(
+                Mt5RpcAction::UpdateOrder,
+                Self::update_order_payload(order_id, price, qty, existing_order.as_ref(), true),
+            )
+            .await?;
+        Ok(true)
     }
 
     async fn close_position(
@@ -293,7 +370,8 @@ impl OrderManagementProvider for Mt5Broker {
             .as_ref()
             .map(|order| order.asset.symbol.clone());
         let comment = existing_order.as_ref().and_then(Self::order_comment);
-        self.bridge
+        let response = self
+            .bridge
             .request_rpc(
                 Mt5RpcAction::ClosePosition,
                 serde_json::json!({
@@ -301,10 +379,26 @@ impl OrderManagementProvider for Mt5Broker {
                     "symbol": symbol,
                     "qty": qty,
                     "price": price,
-                    "comment": comment
+                    "comment": comment,
+                    "insightId": existing_order.as_ref().and_then(|order| order.insight_id.clone()),
+                    "strategyType": existing_order.as_ref().and_then(|order| order.strategy_type.clone())
                 }),
             )
             .await?;
+        if let Ok(mut close_order) = serde_json::from_value::<Order>(response) {
+            close_order.asset.symbol = self.bridge.config().aqe_symbol(&close_order.asset.symbol);
+            self.bridge
+                .emit_order_event(close_order, TradeUpdateEvent::Closed);
+        } else if let Some(mut close_order) = existing_order {
+            close_order.status = TradeUpdateEvent::Closed;
+            close_order.filled_qty = if qty > 0.0 { qty } else { close_order.qty };
+            if price.is_some() {
+                close_order.filled_price = price;
+            }
+            close_order.updated_at = Self::now_ts();
+            self.bridge
+                .emit_order_event(close_order, TradeUpdateEvent::Closed);
+        }
         Ok(true)
     }
 
@@ -360,5 +454,110 @@ impl OrderManagementProvider for Mt5Broker {
     async fn unsubscribe_from_trade_stream(&self) -> Result<(), BrokerError> {
         self.bridge.clear_trade_subscribers();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::broker::types::{Asset, AssetExchange, AssetStatus, AssetType};
+
+    fn sample_asset() -> Asset {
+        Asset {
+            id: "EURUSD".to_string(),
+            symbol: "EURUSD".to_string(),
+            name: "EURUSD".to_string(),
+            asset_type: AssetType::Forex,
+            status: AssetStatus::Active,
+            exchange: AssetExchange::UNKNOWN("MT5".to_string()),
+            tradable: true,
+            marginable: true,
+            shortable: true,
+            fractional: true,
+            min_order_size: Some(0.01),
+            quantity_base: Some(2),
+            max_order_size: None,
+            min_price_increment: Some(0.0001),
+            price_base: Some(5),
+            contract_size: None,
+        }
+    }
+
+    fn sample_order() -> Order {
+        Order {
+            order_id: "order-1".to_string(),
+            insight_id: Some("insight-1".to_string()),
+            strategy_type: Some("Strategy".to_string()),
+            asset: sample_asset(),
+            qty: 1.0,
+            filled_qty: 1.0,
+            limit_price: None,
+            filled_price: Some(100.0),
+            stop_price: None,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::GTC,
+            status: TradeUpdateEvent::Filled,
+            order_class: OrderClass::Bracket,
+            created_at: 0,
+            updated_at: 0,
+            submitted_at: 0,
+            filled_at: Some(0),
+            realized_pnl: None,
+            rejection_reason: None,
+            legs: Some(OrderLegs {
+                take_profit: Some(OrderLeg {
+                    order_id: None,
+                    limit_price: Some(120.0),
+                    trail_price: None,
+                    side: OrderSide::Sell,
+                    filled_price: None,
+                    order_type: OrderType::Limit,
+                    status: TradeUpdateEvent::Pending,
+                    order_class: OrderClass::Bracket,
+                    created_at: 0,
+                    updated_at: 0,
+                    submitted_at: 0,
+                    filled_at: None,
+                }),
+                stop_loss: Some(OrderLeg {
+                    order_id: None,
+                    limit_price: Some(95.0),
+                    trail_price: None,
+                    side: OrderSide::Sell,
+                    filled_price: None,
+                    order_type: OrderType::Stop,
+                    status: TradeUpdateEvent::Pending,
+                    order_class: OrderClass::Bracket,
+                    created_at: 0,
+                    updated_at: 0,
+                    submitted_at: 0,
+                    filled_at: None,
+                }),
+                trailing_stop: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn update_order_payload_sets_take_profit_and_preserves_stop_loss() {
+        let order = sample_order();
+        let payload = Mt5Broker::update_order_payload("order-1", 121.5, 1.0, Some(&order), false);
+
+        assert_eq!(payload["orderId"], serde_json::json!("order-1"));
+        assert_eq!(payload["symbol"], serde_json::json!("EURUSD"));
+        assert_eq!(payload["takeProfit"], serde_json::json!(121.5));
+        assert_eq!(payload["stopLoss"], serde_json::json!(95.0));
+    }
+
+    #[test]
+    fn update_order_payload_sets_stop_loss_and_preserves_take_profit() {
+        let order = sample_order();
+        let payload = Mt5Broker::update_order_payload("order-1", 94.0, 1.0, Some(&order), true);
+
+        assert_eq!(payload["orderId"], serde_json::json!("order-1"));
+        assert_eq!(payload["symbol"], serde_json::json!("EURUSD"));
+        assert_eq!(payload["stopLoss"], serde_json::json!(94.0));
+        assert_eq!(payload["takeProfit"], serde_json::json!(120.0));
     }
 }

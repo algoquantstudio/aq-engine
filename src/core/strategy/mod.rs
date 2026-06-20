@@ -11,12 +11,20 @@ use crate::core::lifecycle::{
     LifecycleTiming, WrappedOnInitLogic, WrappedOnStartLogic, WrappedOnTeardownLogic,
 };
 use crate::core::pipeline::WrappedInsightPipe;
+use crate::core::tui::{
+    BacktestProgressSnapshot, RuntimeInsightSnapshot, RuntimeInsightStateSnapshot,
+    RuntimeMetricsSnapshot, RuntimeTelemetry, TuiConfig, summarise_value,
+};
 use crate::core::universe::WrappedUniverseModel;
 use crate::core::utils::tools::{StrategyTools, TradingTools};
 use dashmap::DashMap;
 use polars::prelude::*;
+#[cfg(feature = "runtime")]
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+#[cfg(not(feature = "runtime"))]
+type FxHashSet<T> = HashSet<T>;
 use std::vec;
 use uuid::Uuid;
 mod aqs_ops;
@@ -28,6 +36,10 @@ pub use types::{InsightPipeline, StrategyMode, StrategyStatus};
 pub mod traits;
 use crate::core::broker::UnifiedBroker;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
+pub use crate::core::events::{
+    EventStreamOptions, EventStreamRequest, EventStreamType, MarketStreamKey, StrategyEventContext,
+};
+use crate::core::events::{MarketDataEvent, ResolvedEventStream};
 use crate::core::utils::timeframe::TimeFrame;
 pub use traits::{BrokerAccess, Strategy, StrategyContext, TeardownCleanupReport};
 
@@ -44,9 +56,12 @@ pub fn set_logging_level(level: impl AsRef<str>) -> Result<(), log::SetLoggerErr
     };
     let default_log_filter = format!("{log_level},tracing::span=warn,turso=warn,libsql=warn");
     let env = env_logger::Env::default().default_filter_or(default_log_filter);
-    let result = env_logger::Builder::from_env(env)
-        .format_timestamp_millis()
-        .try_init();
+    let mut builder = env_logger::Builder::from_env(env);
+    builder.format_timestamp_millis();
+    if TuiConfig::from_process_args().enabled {
+        builder.target(env_logger::Target::Pipe(crate::core::tui::tui_log_writer()));
+    }
+    let result = builder.try_init();
     if result.is_ok() {
         info!("Logger initialised with level {}", log_level);
     }
@@ -89,6 +104,10 @@ where
     // Universe models
     universe_models: Vec<WrappedUniverseModel>,
 
+    // Market event streams
+    event_stream_requests: Vec<EventStreamRequest>,
+    event_context_stack: Vec<StrategyEventContext>,
+
     // Indicators
     pub indicators: HashMap<String, Box<dyn Indicator>>,
 
@@ -103,6 +122,7 @@ where
     history_seed_anchor: Option<chrono::DateTime<chrono::Utc>>,
     live_metrics: LivePerformanceTracker,
     default_live_auth: Option<AqsAuth>,
+    runtime_telemetry: RuntimeTelemetry,
 
     // Insight Pipeline
     pub insight_pipeline: InsightPipeline,
@@ -196,10 +216,20 @@ where
     fn sync_broker_managed_levels(insight: &mut Insight, order: &Order) {
         if let Some(legs) = &order.legs {
             if let Some(tp) = legs.take_profit.as_ref().and_then(|leg| leg.limit_price) {
-                insight.add_take_profit_levels(vec![tp]);
+                let should_sync_tp = insight
+                    .take_profit_levels()
+                    .is_none_or(|levels| levels.len() <= 1);
+                if should_sync_tp {
+                    insight.set_take_profit_levels(Some(vec![tp]));
+                }
             }
             if let Some(sl) = legs.stop_loss.as_ref().and_then(|leg| leg.limit_price) {
-                insight.add_stop_loss_levels(vec![sl]);
+                let should_sync_sl = insight
+                    .stop_loss_levels()
+                    .is_none_or(|levels| levels.len() <= 1);
+                if should_sync_sl {
+                    insight.set_stop_loss_levels(Some(vec![sl]));
+                }
             }
             if let Some(trailing_gap) = legs.trailing_stop.as_ref().and_then(|leg| leg.trail_price)
             {
@@ -225,7 +255,8 @@ where
             mode,
             status: StrategyStatus::Initialised,
             strategy_id: Uuid::new_v4(),
-            insights: Default::default(),
+            insights: InsightCollection::new()
+                .with_order_id_index_enabled(matches!(mode, StrategyMode::Live)),
             history: Default::default(),
             universe: Default::default(),
             alpha_models: Vec::new(),
@@ -233,6 +264,8 @@ where
             on_init_logic: Vec::new(),
             on_teardown_logic: Vec::new(),
             universe_models: Vec::new(),
+            event_stream_requests: Vec::new(),
+            event_context_stack: Vec::new(),
             indicators: HashMap::new(),
             warm_up_bars: 0,
             warm_up_progress: HashMap::new(),
@@ -244,6 +277,7 @@ where
             history_seed_anchor: None,
             live_metrics: LivePerformanceTracker::default(),
             default_live_auth: AqsAuth::from_process_args(),
+            runtime_telemetry: RuntimeTelemetry::default(),
             insight_pipeline: Default::default(),
             timeframe,
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -279,7 +313,7 @@ where
             for (_, df) in self.history.iter_mut() {
                 if df.height() > 0 {
                     if let Err(e) = indicator.run(df) {
-                        eprintln!(
+                        warn!(
                             "Failed to run indicator {} on existing history: {}",
                             name, e
                         );
@@ -310,6 +344,10 @@ where
         }
     }
 
+    fn min_history_rows(&self) -> usize {
+        self.warm_up_bars.max(0) as usize + 1
+    }
+
     fn filter_history_before_anchor(
         df: DataFrame,
         anchor: chrono::DateTime<chrono::Utc>,
@@ -318,22 +356,15 @@ where
             return Ok(df);
         }
 
-        let timestamp_col = match df.column("timestamp") {
-            Ok(column) => column,
-            Err(_) => return Ok(df),
-        };
-        let timestamp_i64 = timestamp_col.cast(&DataType::Int64).map_err(|error| {
-            BrokerError::DataFeedError(format!("Failed to cast timestamp column: {}", error))
-        })?;
-        let timestamps = timestamp_i64.i64().map_err(|error| {
-            BrokerError::DataFeedError(format!("Timestamp column is not Int64: {}", error))
-        })?;
+        if df.column("timestamp").is_err() {
+            return Ok(df);
+        }
+
         let anchor_ms = anchor.timestamp_millis();
-        let mask: BooleanChunked = timestamps
-            .into_iter()
-            .map(|value| value.map(|millis| millis < anchor_ms))
-            .collect();
-        df.filter(&mask)
+
+        df.lazy()
+            .filter(col("timestamp").cast(DataType::Int64).lt(lit(anchor_ms)))
+            .collect()
             .map_err(|error| BrokerError::DataFeedError(error.to_string()))
     }
 
@@ -346,46 +377,62 @@ where
             return Ok(0);
         }
 
+        let streams = self.event_streams_for_symbol(symbol);
+        let mut total_rows = 0;
+        for stream in streams {
+            total_rows += self.preseed_warmup_history_for_stream(&stream, warmup_bars)?;
+        }
+
+        Ok(total_rows)
+    }
+
+    fn preseed_warmup_history_for_stream(
+        &mut self,
+        stream: &ResolvedEventStream,
+        warmup_bars: i32,
+    ) -> Result<usize, BrokerError> {
         let anchor = self
             .history_seed_anchor
             .unwrap_or_else(|| self.broker.get_current_time());
-        let start = self
+        let start = stream
+            .key
             .timeframe
             .add_time_increment(anchor, -(warmup_bars as i64))
             .map_err(|error| {
                 BrokerError::DataFeedError(format!(
                     "Failed to calculate warm-up start for {}: {:?}",
-                    symbol, error
+                    stream.history_key, error
                 ))
             })?;
 
         let mut seeded = futures::executor::block_on(self.broker.get_history(
-            symbol,
+            &stream.key.symbol,
             start,
             anchor,
-            self.timeframe.clone(),
+            stream.key.timeframe,
         ))?;
         seeded = Self::filter_history_before_anchor(seeded, anchor)?;
 
-        if seeded.height() > self.max_history_rows {
-            seeded = seeded.tail(Some(self.max_history_rows));
+        let max_history_rows = self.max_history_rows();
+        if seeded.height() > max_history_rows {
+            seeded = seeded.tail(Some(max_history_rows));
         }
 
         let rows = seeded.height();
-        self.history.insert(symbol.to_string(), seeded);
-        self.apply_indicators_to_history(symbol);
+        self.history.insert(stream.history_key.clone(), seeded);
+        self.apply_indicators_to_history(&stream.history_key);
         if rows >= warmup_bars as usize {
-            self.warm_up_progress.remove(symbol);
+            self.warm_up_progress.remove(&stream.history_key);
         } else {
             self.warm_up_progress
-                .insert(symbol.to_string(), rows as i32);
+                .insert(stream.history_key.clone(), rows as i32);
         }
         Ok(rows)
     }
 
     fn cleanup_active_insights_for_teardown_internal(&mut self) -> TeardownCleanupReport {
         let mut report = TeardownCleanupReport::default();
-        let insight_ids: Vec<Uuid> = self.insights.keys().copied().collect();
+        let insight_ids = self.insights.ids();
 
         for id in insight_ids {
             let Some(mut insight) = self.insights.remove_insight(&id) else {
@@ -400,7 +447,7 @@ where
                 InsightState::Executed => match insight.order_id.clone() {
                     Some(order_id) => match self.broker.cancel_order_sync(&order_id) {
                         Ok(true) => {
-                            insight.order_canceled("Teardown cleanup cancelled executed insight");
+                            insight.order_cancelled("Teardown cleanup cancelled executed insight");
                             report.cancelled_executed += 1;
                         }
                         Ok(false) => report.failures.push(format!(
@@ -456,7 +503,18 @@ where
         }
         let mut insight = insight;
         self.bind_insight_context(&mut insight);
+        let children_to_submit = (!allow_during_teardown
+            && insight.state == InsightState::Filled
+            && !insight.children.is_empty())
+        .then(|| insight.children.clone());
         self.insights.add_insight(insight);
+
+        if let Some(children) = children_to_submit {
+            for mut child in children {
+                child.submit(self);
+                self.add_insight_internal(child, false);
+            }
+        }
     }
 
     /// Register a pipe into the correct `InsightState` bucket (Python's `add_executor`).
@@ -525,6 +583,75 @@ where
         self.universe_models.push(model);
     }
 
+    pub fn add_events(&mut self, event_type: EventStreamType, timeframe: Option<TimeFrame>) {
+        self.add_events_with_options(EventStreamRequest::new(event_type, timeframe));
+    }
+
+    pub fn add_events_with_options(&mut self, request: EventStreamRequest) {
+        self.event_stream_requests.push(request);
+    }
+
+    fn current_event_context(&self) -> Option<StrategyEventContext> {
+        self.event_context_stack.last().cloned()
+    }
+
+    fn resolve_event_streams(&mut self) -> Vec<ResolvedEventStream> {
+        let mut streams = Vec::new();
+        let mut seen = HashSet::new();
+        let mut symbols: Vec<String> = self.universe.keys().cloned().collect();
+        symbols.sort();
+
+        for symbol in symbols {
+            for stream in self.event_streams_for_symbol(&symbol) {
+                if seen.insert(stream.key.clone()) {
+                    self.history
+                        .entry(stream.history_key.clone())
+                        .or_insert_with(DataFrame::default);
+                    streams.push(stream);
+                }
+            }
+        }
+
+        streams
+    }
+
+    fn event_streams_for_symbol(&self, symbol: &str) -> Vec<ResolvedEventStream> {
+        let mut streams = Vec::new();
+        let mut seen = HashSet::new();
+
+        let main_stream = ResolvedEventStream::new(
+            EventStreamType::Bar,
+            symbol.to_string(),
+            self.timeframe,
+            self.timeframe,
+            true,
+        );
+        if seen.insert(main_stream.key.clone()) {
+            streams.push(main_stream);
+        }
+
+        for request in &self.event_stream_requests {
+            let timeframe = request.timeframe.unwrap_or(self.timeframe);
+            let allow_trading = if timeframe == self.timeframe {
+                true
+            } else {
+                request.options.allow_trading
+            };
+            let stream = ResolvedEventStream::new(
+                request.event_type,
+                symbol.to_string(),
+                timeframe,
+                self.timeframe,
+                allow_trading,
+            );
+            if seen.insert(stream.key.clone()) {
+                streams.push(stream);
+            }
+        }
+
+        streams
+    }
+
     fn run_universe_models(&mut self) -> Option<HashSet<String>> {
         if self.universe_models.is_empty() {
             return None;
@@ -587,12 +714,177 @@ where
         }
     }
 
+    fn runtime_variable_snapshot(&self) -> Vec<crate::core::tui::RuntimeVariableSnapshot> {
+        let mut variables = self
+            .variables
+            .iter()
+            .map(|entry| {
+                let mut snapshot = summarise_value(entry.value());
+                snapshot.key = entry.key().clone();
+                snapshot
+            })
+            .collect::<Vec<_>>();
+        variables.sort_by(|left, right| left.key.cmp(&right.key));
+        variables.truncate(64);
+        variables
+    }
+
+    fn runtime_insight_counts(&self) -> HashMap<String, usize> {
+        self.insights
+            .get_state_count()
+            .into_iter()
+            .map(|(state, count)| (format!("{:?}", state), count))
+            .collect()
+    }
+
+    fn runtime_active_insights(&self) -> Vec<RuntimeInsightSnapshot> {
+        let mut insights = self
+            .insights
+            .active_insight_ids_unsorted()
+            .into_iter()
+            .filter_map(|id| {
+                let insight = self.insights.get(&id)?;
+                Some(RuntimeInsightSnapshot {
+                    insight_id: insight.insight_id.to_string(),
+                    parent_id: insight.parent_id.map(|id| id.to_string()),
+                    symbol: insight.symbol.clone(),
+                    state: InsightSnapshot::insight_state_label(insight.state()).to_string(),
+                    side: InsightSnapshot::order_side_label(insight.side()).to_string(),
+                    strategy_type: InsightSnapshot::strategy_type_label(insight.strategy_type())
+                        .into_owned(),
+                    order_id: insight.order_id.clone(),
+                    close_order_id: insight.close_order_id.clone(),
+                    quantity: insight.quantity(),
+                    contracts: insight.contracts,
+                    order_type: InsightSnapshot::order_type_label(insight.order_type()).to_string(),
+                    order_class: InsightSnapshot::order_class_label(insight.order_class())
+                        .to_string(),
+                    limit_price: insight.limit_price(),
+                    stop_price: insight.stop_price(),
+                    take_profit_levels: insight.take_profit_levels(),
+                    stop_loss_levels: insight.stop_loss_levels(),
+                    filled_price: insight.filled_price,
+                    close_price: insight.close_price,
+                    confidence: insight.confidence(),
+                    created_at: Some(insight.created_at),
+                    updated_at: Some(insight.updated_at),
+                    filled_at: insight.filled_at,
+                    closed_at: insight.closed_at,
+                    state_history: insight
+                        .state_history
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .map(|(at, state, message)| RuntimeInsightStateSnapshot {
+                            at: *at,
+                            state: InsightSnapshot::insight_state_label(state).to_string(),
+                            message: message.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Vec<_>>();
+        insights.sort_by(|left, right| {
+            left.symbol
+                .cmp(&right.symbol)
+                .then(left.updated_at.cmp(&right.updated_at))
+                .then(left.insight_id.cmp(&right.insight_id))
+        });
+        insights.truncate(128);
+        insights
+    }
+
+    fn runtime_live_metrics(&self) -> Option<RuntimeMetricsSnapshot> {
+        self.live_metrics
+            .snapshot()
+            .map(|snapshot| RuntimeMetricsSnapshot {
+                final_equity: snapshot.final_equity,
+                total_return_pct: snapshot.total_return_pct,
+                total_trades: snapshot.total_trades,
+                open_positions_count: snapshot.open_positions_count,
+                open_insights_count: snapshot.open_insights_count,
+                updated_at: Some(snapshot.updated_at),
+                summary_lines: Vec::new(),
+            })
+    }
+
+    fn runtime_backtest_progress(&self) -> Option<BacktestProgressSnapshot> {
+        self.broker
+            .backtest_state
+            .as_ref()
+            .map(|state| state.read().progress_snapshot())
+    }
+
+    fn publish_runtime_snapshot(
+        &mut self,
+        aqs_sync_status: impl Into<String>,
+        saved_result_path: Option<String>,
+    ) {
+        let mode = self.mode;
+        let strategy_name = self.name.clone();
+        let strategy_id = self.strategy_id.to_string();
+        let status = self.status.to_string();
+        let current_time = Some(self.broker.get_current_time());
+        let mut universe = self.universe.keys().cloned().collect::<Vec<_>>();
+        universe.sort();
+        let variables = self.runtime_variable_snapshot();
+        let insight_counts = self.runtime_insight_counts();
+        let active_insights = self.runtime_active_insights();
+        let metrics = self.runtime_live_metrics();
+        let backtest_progress = self.runtime_backtest_progress();
+        let broker_status = if self.broker.is_broker_connected() {
+            "connected"
+        } else {
+            "disconnected"
+        }
+        .to_string();
+        let datafeed_status = if self.broker.is_datafeed_connected() {
+            "connected"
+        } else {
+            "disconnected"
+        }
+        .to_string();
+        let aqs_sync_status = aqs_sync_status.into();
+
+        self.runtime_telemetry.update_snapshot(|snapshot| {
+            snapshot.mode = mode;
+            snapshot.strategy_name = strategy_name;
+            snapshot.strategy_id = strategy_id;
+            snapshot.status = status;
+            snapshot.current_time = current_time;
+            snapshot.universe = universe;
+            snapshot.variables = variables;
+            snapshot.insight_counts = insight_counts;
+            snapshot.active_insights = active_insights;
+            if metrics.is_some() {
+                snapshot.metrics = metrics;
+            }
+            snapshot.backtest_progress = backtest_progress;
+            snapshot.aqs_sync_status = aqs_sync_status;
+            snapshot.broker_status = broker_status;
+            snapshot.datafeed_status = datafeed_status;
+            if saved_result_path.is_some() {
+                snapshot.saved_result_path = saved_result_path;
+            }
+        });
+    }
+
+    fn publish_runtime_event(
+        &mut self,
+        level: impl Into<String>,
+        message: impl Into<String>,
+        aqs_sync_status: impl Into<String>,
+    ) {
+        self.runtime_telemetry.push_event(level, message);
+        self.publish_runtime_snapshot(aqs_sync_status, None);
+    }
+
     pub fn max_history_rows(&self) -> usize {
-        self.max_history_rows
+        self.max_history_rows.max(self.min_history_rows())
     }
 
     pub fn update_max_history_rows(&mut self, rows: usize) {
-        self.max_history_rows = rows.max(100);
+        self.max_history_rows = rows;
     }
 
     /// Trigger strategy shutdown gracefully.
@@ -696,15 +988,70 @@ where
 
     // ─────────────────── Bar Processing ───────────────────
 
+    #[cfg(test)]
+    fn bar_data_timestamp(&self, bar: &BarData) -> chrono::DateTime<chrono::Utc> {
+        match bar {
+            BarData::Bars(bars) => bars
+                .last()
+                .map(|bar| bar.timestamp)
+                .unwrap_or_else(|| self.broker.get_current_time()),
+            BarData::Frame(frame) => frame
+                .column("timestamp")
+                .ok()
+                .and_then(|column| column.cast(&DataType::Int64).ok())
+                .and_then(|column| column.i64().ok().and_then(|values| values.get(0)))
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .unwrap_or_else(|| self.broker.get_current_time()),
+        }
+    }
+
+    #[cfg(test)]
+    fn main_event_context(&self, symbol: &str, bar: &BarData) -> StrategyEventContext {
+        StrategyEventContext {
+            event_type: EventStreamType::Bar,
+            symbol: symbol.to_string(),
+            timeframe: self.timeframe,
+            history_key: symbol.to_string(),
+            is_feature: false,
+            allow_trading: true,
+            timestamp: self.bar_data_timestamp(bar),
+        }
+    }
+
+    fn _on_market_data_event(&mut self, strategy: &mut S, event: MarketDataEvent) {
+        let symbol = event.context.symbol.clone();
+        self._on_bar_with_context(
+            strategy,
+            &symbol,
+            &BarData::Bars(vec![event.bar]),
+            event.context,
+        );
+    }
+
     /// Process a bar callback: append to HISTORY, warm-up check, on_bar → generate insights.
     /// Mirrors Python's `_on_bar()`.
+    #[cfg(test)]
     fn _on_bar(&mut self, strategy: &mut S, symbol: &str, bar: &BarData) {
+        let context = self.main_event_context(symbol, bar);
+        self._on_bar_with_context(strategy, symbol, bar, context);
+    }
+
+    fn _on_bar_with_context(
+        &mut self,
+        strategy: &mut S,
+        symbol: &str,
+        bar: &BarData,
+        context: StrategyEventContext,
+    ) {
         match bar {
             BarData::Bars(bars) => {
                 if let Some(last_bar) = bars.last() {
                     debug!(
-                        "on_bar symbol={} o={:.4} h={:.4} l={:.4} c={:.4} v={:.0}",
+                        "on_bar symbol={} history_key={} timeframe={} feature={} o={:.4} h={:.4} l={:.4} c={:.4} v={:.0}",
                         symbol,
+                        context.history_key,
+                        context.timeframe,
+                        context.is_feature,
                         last_bar.open,
                         last_bar.high,
                         last_bar.low,
@@ -716,12 +1063,27 @@ where
                 }
             }
             BarData::Frame(frame) => {
-                debug!("on_bar symbol={} frame_shape={:?}", symbol, frame.shape());
+                debug!(
+                    "on_bar symbol={} history_key={} timeframe={} feature={} frame_shape={:?}",
+                    symbol,
+                    context.history_key,
+                    context.timeframe,
+                    context.is_feature,
+                    frame.shape()
+                );
             }
         }
         let max_history_rows = self.max_history_rows();
+        let history_key = context.history_key.clone();
+        let allow_trading = context.allow_trading;
+        self.event_context_stack.push(context);
+
         // Append to history DataFrame
-        if let Some(history_df) = self.history.get_mut(symbol) {
+        {
+            let history_df = self
+                .history
+                .entry(history_key.clone())
+                .or_insert_with(DataFrame::default);
             let bar_df_res = self.broker.data.format_on_bar(bar.clone());
 
             if let Ok(mut bar_df) = bar_df_res {
@@ -755,8 +1117,8 @@ where
                                         let mut vec: Vec<Option<f64>> = ca.into_iter().collect();
                                         if !vec.is_empty() {
                                             let last_idx = vec.len().saturating_sub(appended_rows);
-                                            for i in last_idx..vec.len() {
-                                                vec[i] = Some(val);
+                                            for slot in &mut vec[last_idx..] {
+                                                *slot = Some(val);
                                             }
                                             let new_s = Series::new(col_name.into(), &vec);
                                             let _ = history_df.with_column(new_s);
@@ -773,28 +1135,33 @@ where
 
         // Warm-up check: skip strategy callbacks until enough bars accumulated
         if self.warm_up_bars > 0 {
-            if let Some(history_df) = self.history.get(symbol) {
+            if let Some(history_df) = self.history.get(&history_key) {
                 let loaded = history_df.height() as i32;
                 if loaded < self.warm_up_bars {
-                    let should_log =
-                        self.warm_up_progress.get(symbol).copied().unwrap_or(-1) != loaded;
-                    self.warm_up_progress.insert(symbol.to_string(), loaded);
+                    let should_log = self
+                        .warm_up_progress
+                        .get(&history_key)
+                        .copied()
+                        .unwrap_or(-1)
+                        != loaded;
+                    self.warm_up_progress.insert(history_key.clone(), loaded);
                     if should_log {
                         info!(
                             "[warm up] {} {}/{} candles",
-                            symbol, loaded, self.warm_up_bars
+                            history_key, loaded, self.warm_up_bars
                         );
                     }
                     debug!(
                         "Warm-up active for {}: {}/{} bars loaded, skipping strategy callbacks",
-                        symbol, loaded, self.warm_up_bars
+                        history_key, loaded, self.warm_up_bars
                     );
+                    self.event_context_stack.pop();
                     return;
                 }
-                if self.warm_up_progress.remove(symbol).is_some() {
+                if self.warm_up_progress.remove(&history_key).is_some() {
                     info!(
                         "[warm up] {} complete ({}/{})",
-                        symbol, loaded, self.warm_up_bars
+                        history_key, loaded, self.warm_up_bars
                     );
                 }
             }
@@ -803,12 +1170,15 @@ where
         // Call strategy callbacks
         debug!(
             "Warm-up complete for {}, invoking strategy callbacks",
-            symbol
+            history_key
         );
         strategy.on_bar(self, symbol, bar);
 
         // Generate insights from alpha models then strategy
-        self._generate_insights(strategy, symbol);
+        if allow_trading {
+            self._generate_insights(strategy, symbol);
+        }
+        self.event_context_stack.pop();
     }
 
     // ─────────────────── Insight Generation ───────────────────
@@ -859,38 +1229,49 @@ where
         // Take pipeline and insights out to avoid borrow conflicts
         let mut pipeline = std::mem::take(&mut self.insight_pipeline);
         let mut insights = std::mem::take(&mut self.insights);
-        let mut touched_insight_ids = HashSet::new();
+        let mut touched_insight_ids = FxHashSet::default();
 
-        let insight_ids = insights.active_insight_ids();
+        let insight_ids = insights.active_insight_ids_unsorted();
 
         for id in insight_ids {
-            let insight = match insights.get_mut(&id) {
+            let mut insight = match insights.get_mut(&id) {
                 Some(ins) => ins,
                 None => continue,
             };
-            let before_fingerprint = insight.snapshot_fingerprint_hash();
 
-            if insight.has_expired(self) {
+            let state = insight.state.clone();
+            let can_expire = insight.can_expire();
+            let should_clear_first_on_fill =
+                state == InsightState::Filled && insight.first_on_fill();
+            let mut before_fingerprint = if can_expire || should_clear_first_on_fill {
+                Some(insight.snapshot_fingerprint_hash())
+            } else {
+                None
+            };
+
+            if can_expire && insight.has_expired(self) {
                 debug!(
                     "Skipping expired insight {} in state {:?}",
                     insight.insight_id(),
                     insight.state()
                 );
-                if before_fingerprint != insight.snapshot_fingerprint_hash() {
+                if before_fingerprint
+                    .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
+                {
                     touched_insight_ids.insert(id);
                 }
                 continue;
             }
 
-            let state = insight.state.clone();
-            let should_clear_first_on_fill =
-                state == InsightState::Filled && insight.first_on_fill();
-
             if let Some(pipes) = pipeline.get_pipes_for_state(&state) {
-                let mut passed = true;
+                let should_run_any_pipe = pipes.iter().any(|pipe| pipe.should_run(&insight));
+                if should_run_any_pipe && before_fingerprint.is_none() {
+                    before_fingerprint = Some(insight.snapshot_fingerprint_hash());
+                }
+                let mut failed = false;
                 let mut rejection_reason: Option<String> = None;
                 for pipe in pipes.iter_mut() {
-                    if !pipe.should_run(insight) {
+                    if !pipe.should_run(&insight) {
                         continue;
                     }
                     debug!(
@@ -899,7 +1280,7 @@ where
                         insight.insight_id(),
                         state
                     );
-                    let result = pipe.run(self, insight);
+                    let result = pipe.run(self, &mut insight);
                     debug!(
                         "Insight pipe {} result for insight {}: success={} passed={} message={:?}",
                         pipe.name(),
@@ -909,21 +1290,24 @@ where
                         result.message
                     );
                     if !result.success {
-                        passed = false;
+                        failed = true;
                         rejection_reason = Some(result.message.unwrap_or_else(|| {
                             format!("Insight pipe {} failed", result.pipe_name)
                         }));
                         break;
                     }
                     if !result.passed {
-                        passed = false;
+                        if insight.closing || insight.cancelling || insight.state.is_inactive() {
+                            break;
+                        }
+                        failed = true;
                         rejection_reason = Some(result.message.unwrap_or_else(|| {
                             format!("Insight pipe {} did not pass", result.pipe_name)
                         }));
                         break;
                     }
                 }
-                if !passed {
+                if failed {
                     if !insight.state.is_inactive() {
                         insight.order_rejected(
                             rejection_reason
@@ -931,7 +1315,9 @@ where
                                 .unwrap_or("Insight pipeline failed"),
                         );
                     }
-                    if before_fingerprint != insight.snapshot_fingerprint_hash() {
+                    if before_fingerprint
+                        .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
+                    {
                         touched_insight_ids.insert(id);
                     }
                     continue;
@@ -945,7 +1331,9 @@ where
                 );
                 insight.set_first_on_fill(false);
             }
-            if before_fingerprint != insight.snapshot_fingerprint_hash() {
+            if before_fingerprint
+                .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
+            {
                 touched_insight_ids.insert(id);
             }
         }
@@ -963,25 +1351,23 @@ where
             return;
         };
 
-        let dirty_insight_ids = self.insights.dirty_insight_ids();
+        let dirty_insight_ids = self.insights.take_dirty_insight_ids();
         if dirty_insight_ids.is_empty() {
             return;
         }
 
-        let mut state = backtest_state.write();
         let strategy_id = self.strategy_id.to_string();
-        let mut synced_ids = Vec::with_capacity(dirty_insight_ids.len());
-        for insight_id in dirty_insight_ids {
-            let Some(insight) = self.insights.get(&insight_id) else {
-                continue;
-            };
-            state.record_insight_snapshot(InsightSnapshot::from_insight(insight, &strategy_id));
-            synced_ids.push(insight_id);
-        }
-        drop(state);
+        let snapshots = dirty_insight_ids
+            .into_iter()
+            .filter_map(|insight_id| {
+                self.insights
+                    .get(&insight_id)
+                    .map(|insight| InsightSnapshot::from_insight(&insight, &strategy_id))
+            })
+            .collect::<Vec<_>>();
 
-        for insight_id in synced_ids {
-            self.insights.remove_dirty(&insight_id);
+        if !snapshots.is_empty() {
+            backtest_state.write().record_insight_snapshots(snapshots);
         }
     }
 
@@ -989,13 +1375,13 @@ where
 
     /// Process trade events from the broker. Mirrors Python's `_on_trade_update`.
     /// Handles all event types: New, PendingNew, Filled, PartialFilled,
-    /// Canceled, Rejected, Closed, Replaced.
+    /// Cancelled, Rejected, Closed, Replaced.
     /// Works with any broker implementing `OrderManagementProvider`.
     fn on_trade_update(&mut self) {
         let events = self.broker.drain_trade_events();
         let mut children_to_submit = Vec::new();
-        let mut parents_to_close = Vec::new();
-        let mut touched_insight_ids = HashSet::new();
+        let mut parents_to_reconcile = Vec::new();
+        let mut touched_insight_ids = FxHashSet::default();
 
         for (order, event) in events {
             debug!(
@@ -1008,17 +1394,17 @@ where
             }
             let mut insight_ids = self.insights.candidate_insight_ids_for_trade_event(&order);
             if insight_ids.is_empty() {
-                insight_ids = self.insights.keys().cloned().collect();
+                insight_ids = self.insights.ids();
             }
             for id in insight_ids {
-                let insight = match self.insights.get_mut(&id) {
+                let mut insight = match self.insights.get_mut(&id) {
                     Some(i) => i,
                     None => continue,
                 };
                 if insight.symbol != order.asset.symbol {
                     continue;
                 }
-                let matched = Self::trade_event_matches_insight(insight, &order);
+                let matched = Self::trade_event_matches_insight(&insight, &order);
 
                 match (&insight.state, &event) {
                     // NEW → EXECUTED on accept
@@ -1040,8 +1426,11 @@ where
                             insight.order_accepted(&order.order_id);
                             let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
                             insight.position_filled(price, order.filled_qty, &order.order_id);
-                            Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
+                            if let Some(parent_id) = insight.parent_id {
+                                parents_to_reconcile.push(parent_id);
+                            }
                             if !insight.children.is_empty() {
                                 children_to_submit.extend(insight.children.clone());
                             }
@@ -1054,7 +1443,7 @@ where
                             insight.order_accepted(&order.order_id);
                             let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
                             insight.partial_filled(order.filled_qty, price, &order.order_id);
-                            Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             break;
                         }
@@ -1064,8 +1453,11 @@ where
                         if matched {
                             let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
                             insight.position_filled(price, order.filled_qty, &order.order_id);
-                            Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
+                            if let Some(parent_id) = insight.parent_id {
+                                parents_to_reconcile.push(parent_id);
+                            }
 
                             // If this insight has children, queue them for submission
                             if !insight.children.is_empty() {
@@ -1079,7 +1471,7 @@ where
                         if matched {
                             let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
                             insight.partial_filled(order.filled_qty, price, &order.order_id);
-                            Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             break;
                         }
@@ -1097,20 +1489,20 @@ where
                         }
                     }
                     // EXECUTED → CANCELED
-                    (InsightState::Executed | InsightState::New, TradeUpdateEvent::Canceled) => {
+                    (InsightState::Executed | InsightState::New, TradeUpdateEvent::Cancelled) => {
                         if matched {
-                            Self::sync_broker_managed_levels(insight, &order);
-                            insight.order_canceled("Order canceled");
+                            Self::sync_broker_managed_levels(&mut insight, &order);
+                            insight.order_cancelled("Order cancelled");
                             touched_insight_ids.insert(id);
                             // Cancel any open children
-                            parents_to_close.push(insight.insight_id);
+                            parents_to_reconcile.push(insight.insight_id);
                             break;
                         }
                     }
                     // EXECUTED → REJECTED
                     (InsightState::Executed | InsightState::New, TradeUpdateEvent::Rejected) => {
                         if matched {
-                            Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             insight.order_rejected(
                                 order
                                     .rejection_reason
@@ -1119,7 +1511,7 @@ where
                             );
                             touched_insight_ids.insert(id);
                             // Cancel any open children
-                            parents_to_close.push(insight.insight_id);
+                            parents_to_reconcile.push(insight.insight_id);
                             break;
                         }
                     }
@@ -1132,7 +1524,7 @@ where
                             if insight.quantity != Some(order.qty) {
                                 insight.quantity = Some(order.qty);
                             }
-                            Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             break;
                         }
@@ -1156,7 +1548,24 @@ where
                             touched_insight_ids.insert(id);
 
                             // Close/Cancel any open children
-                            parents_to_close.push(insight.insight_id);
+                            parents_to_reconcile.push(insight.insight_id);
+                            break;
+                        }
+                    }
+                    // MT5 can deliver terminal messages out of order. If a real fill arrives
+                    // after a stale cancel/reject, the broker fill is authoritative.
+                    (
+                        InsightState::Cancelled | InsightState::Rejected,
+                        TradeUpdateEvent::Filled,
+                    ) => {
+                        if matched {
+                            let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
+                            insight.position_filled(price, order.filled_qty, &order.order_id);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
+                            touched_insight_ids.insert(id);
+                            if let Some(parent_id) = insight.parent_id {
+                                parents_to_reconcile.push(parent_id);
+                            }
                             break;
                         }
                     }
@@ -1171,22 +1580,16 @@ where
             self.add_insight(child);
         }
 
-        // Process orphaned children cleanup
-        if !parents_to_close.is_empty() {
-            let mut children_to_process = Vec::new();
-            let parents_to_close = parents_to_close.into_iter().collect::<HashSet<_>>();
-
-            // First pass: identify which children need which action (needs immutable/short mutable borrow)
-            let insight_ids: Vec<Uuid> = self.insights.keys().cloned().collect();
-            for id in &insight_ids {
-                if let Some(child) = self.insights.get(id) {
-                    if let Some(parent_id) = child.parent_id {
-                        if parents_to_close.contains(&parent_id) {
-                            children_to_process.push(*id);
-                        }
-                    }
-                }
-            }
+        if !parents_to_reconcile.is_empty() {
+            let parents_to_reconcile = parents_to_reconcile
+                .into_iter()
+                .filter(|parent_id| {
+                    self.insights
+                        .get(parent_id)
+                        .is_some_and(|parent| parent.state.is_inactive())
+                })
+                .collect::<FxHashSet<_>>();
+            let children_to_process = self.insights.child_ids_for_parents(&parents_to_reconcile);
 
             // Second pass: apply closures (requires mutable self)
             for id in children_to_process {
@@ -1194,14 +1597,23 @@ where
                     match child.state {
                         InsightState::Filled => {
                             child.close(self);
-                            self.add_insight(child);
+                            touched_insight_ids.insert(id);
+                            self.add_insight_internal(child, true);
+                        }
+                        InsightState::New if child.order_id.is_none() => {
+                            child.order_cancelled(
+                                "Parent insight is terminal before child submission",
+                            );
+                            touched_insight_ids.insert(id);
+                            self.add_insight_internal(child, true);
                         }
                         InsightState::New | InsightState::Executed => {
                             child.cancel(self);
-                            self.add_insight(child);
+                            touched_insight_ids.insert(id);
+                            self.add_insight_internal(child, true);
                         }
                         _ => {
-                            self.add_insight(child);
+                            self.add_insight_internal(child, true);
                         }
                     }
                 }
@@ -1282,8 +1694,8 @@ where
                                 .unwrap_or("Order rejected"),
                         );
                     }
-                    TradeUpdateEvent::Canceled | TradeUpdateEvent::Expired => {
-                        insight.order_canceled("Order canceled before acknowledgement");
+                    TradeUpdateEvent::Cancelled | TradeUpdateEvent::Expired => {
+                        insight.order_cancelled("Order cancelled before acknowledgement");
                     }
                     TradeUpdateEvent::Closed | TradeUpdateEvent::Replaced => {
                         insight.order_id = Some(order.order_id.clone());
@@ -1317,6 +1729,18 @@ where
         self.add_universe_model(model);
     }
 
+    fn add_events(&mut self, event_type: EventStreamType, timeframe: Option<TimeFrame>) {
+        StrategyState::add_events(self, event_type, timeframe);
+    }
+
+    fn add_events_with_options(&mut self, request: EventStreamRequest) {
+        StrategyState::add_events_with_options(self, request);
+    }
+
+    fn current_event(&self) -> Option<StrategyEventContext> {
+        self.current_event_context()
+    }
+
     fn set_execution_risk(&mut self, risk: f64) {
         self.set_execution_risk(risk);
     }
@@ -1346,7 +1770,7 @@ where
     }
 
     fn max_history_rows(&self) -> usize {
-        self.max_history_rows
+        StrategyState::max_history_rows(self)
     }
 
     fn set_max_history_rows(&mut self, rows: usize) {
@@ -1382,6 +1806,14 @@ where
     }
 
     fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
+        if matches!(self.mode, StrategyMode::Backtest) {
+            if let Some(state) = &self.broker.backtest_state {
+                return state.read().current_time;
+            }
+            if let Some(anchor) = self.history_seed_anchor {
+                return anchor;
+            }
+        }
         self.broker.get_current_time()
     }
 
@@ -1432,6 +1864,19 @@ where
         self.broker.cancel_order_sync(order_id)
     }
 
+    fn update_order(&self, order_id: &str, price: f64, qty: f64) -> Result<bool, BrokerError> {
+        self.broker.update_order_sync(order_id, price, qty)
+    }
+
+    fn update_stop_loss_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError> {
+        self.broker.update_stop_loss_sync(order_id, price, qty)
+    }
+
     fn close_position(
         &self,
         order_id: &str,
@@ -1470,9 +1915,12 @@ where
     S: Strategy,
     D: DataFeed + DataProvider,
 {
-    fn finalize_backtest_results(&self, results: &BacktestResults) {
+    fn finalize_backtest_results(&self, results: &BacktestResults) -> Option<String> {
         info!("═══════════════════ Backtest Results ═══════════════════");
-        results.print_metrics();
+        let terminal_output_suspended = crate::core::tui::terminal_output_suspended();
+        if !terminal_output_suspended {
+            results.print_metrics();
+        }
         info!("Insights generated: {}", self.insights.len());
         info!("Insights: {:#?}", self.insights.get_state_count());
 
@@ -1484,19 +1932,28 @@ where
 
         let Some(backtest_state) = self.broker.backtest_state.as_ref() else {
             warn!("Backtest completed but no backtest state was available for result persistence");
-            return;
+            return None;
         };
 
         let state = backtest_state.read();
         if let Err(error) = results.save_to_disk(&out_dir, &*state) {
-            eprintln!("Failed to save results to disk: {}", error);
-            return;
+            error!("Failed to save results to disk: {}", error);
+            if !terminal_output_suspended {
+                eprintln!("Failed to save results to disk: {}", error);
+            }
+            return None;
         }
 
         if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {
-            println!("RESULTS_SAVED_TO: {}", abs_path.display());
+            if !terminal_output_suspended {
+                println!("RESULTS_SAVED_TO: {}", abs_path.display());
+            }
+            Some(abs_path.display().to_string())
         } else {
-            println!("RESULTS_SAVED_TO: {}", out_dir.display());
+            if !terminal_output_suspended {
+                println!("RESULTS_SAVED_TO: {}", out_dir.display());
+            }
+            Some(out_dir.display().to_string())
         }
     }
 
@@ -1524,6 +1981,10 @@ where
             .take()
             .expect("strategy must be Some before run_backtest");
 
+        self.runtime_telemetry
+            .start_tui(TuiConfig::from_process_args());
+        self.publish_runtime_snapshot("not configured", None);
+
         // ── 0. Connect broker (execution + data feed) ──
         info!(
             "Starting backtest strategy={} timeframe={:?} start={} end={}",
@@ -1531,19 +1992,29 @@ where
         );
         self.timeframe = time_frame.clone();
         self.history_seed_anchor = Some(start);
-        self.broker.connect().await?;
+        if let Err(error) = self.broker.connect().await {
+            error!("Backtest failed while connecting broker: {}", error);
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
         self.status = StrategyStatus::Running;
+        self.publish_runtime_snapshot("not configured", None);
 
         // ── 1. Strategy lifecycle: on_start ──
         debug!("Invoking strategy on_start");
         self.run_on_start_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_start(self);
         self.run_on_start_logic(LifecycleTiming::AfterGenerated);
+        self.publish_runtime_snapshot("not configured", None);
 
         // ── 2. Load universe assets ──
         self.load_universe(&mut strategy).await;
 
         if self.universe.is_empty() {
+            error!(
+                "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
+            );
+            self.runtime_telemetry.stop_tui();
             return Err(BrokerError::DataFeedError(
                 "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
                     .to_string(),
@@ -1559,25 +2030,67 @@ where
         // ── 5. Init alpha models per asset ──
         self.init_alpha_models();
 
-        // ── 6. Load historical data into BacktestState ──
-        let symbols: Vec<String> = self.universe.keys().cloned().collect();
-        info!("Loading backtest history for symbols: {:?}", symbols);
-        self.broker
-            .load_backtest_data(&symbols, start, end, time_frame)
-            .await?;
-        info!("Backtest history loaded successfully");
+        // ── 6. Load historical event streams into BacktestState ──
+        let event_streams = self.resolve_event_streams();
+        use std::fmt::Write as _;
+        let mut event_stream_summary = String::new();
+        for stream in &event_streams {
+            if !event_stream_summary.is_empty() {
+                event_stream_summary.push_str(", ");
+            }
+            let _ = write!(
+                event_stream_summary,
+                "{} {} feature={} trading={}",
+                stream.history_key, stream.key.timeframe, stream.is_feature, stream.allow_trading
+            );
+        }
+        info!("Loading backtest event streams: [{}]", event_stream_summary);
+        if let Err(error) = self
+            .broker
+            .load_backtest_event_streams(&event_streams, start, end)
+            .await
+        {
+            error!("Backtest failed while loading event streams: {}", error);
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
+        info!("Backtest event streams loaded successfully");
+        self.publish_runtime_event("info", "Backtest started", "not configured");
 
         // ── 7. Main backtest loop ──
+        let mut last_runtime_publish = std::time::Instant::now();
         loop {
-            // Advance one step: process orders → get current bars
-            let step_result = self.broker.step()?;
+            if self.runtime_telemetry.shutdown_requested() {
+                warn!("Backtest stop requested from AQE TUI");
+                self.publish_runtime_event(
+                    "warn",
+                    "Backtest stop requested from TUI",
+                    "not configured",
+                );
+                break;
+            }
+            // Advance one market step: process orders → get current stream events
+            let step_result = match self.broker.step_market_streams() {
+                Ok(step) => step,
+                Err(error) => {
+                    self.publish_runtime_event(
+                        "error",
+                        format!("Backtest failed: {}", error),
+                        "not configured",
+                    );
+                    self.runtime_telemetry.stop_tui();
+                    return Err(error);
+                }
+            };
 
             match step_result {
                 None => break, // Backtest complete
-                Some(current_bars) => {
+                Some(step) => {
                     debug!(
-                        "Backtest step bars received for {} symbols",
-                        current_bars.len()
+                        "Backtest step events received timestamp={} events={} execution_bars={}",
+                        step.timestamp,
+                        step.events.len(),
+                        step.execution_bars.len()
                     );
                     // Process trade events from the broker (fills, closes, cancels, etc.)
                     debug!("Backtest loop calling on_trade_update");
@@ -1585,15 +2098,21 @@ where
                     debug!("Backtest loop on_trade_update returned");
                     self.sync_backtest_insight_snapshots();
 
-                    // Call _on_bar for each symbol's bar
-                    for (symbol, bar) in &current_bars {
-                        self._on_bar(&mut strategy, symbol, &BarData::Bars(vec![bar.clone()]));
+                    // Call _on_bar for each market data event
+                    for event in step.events {
+                        self._on_market_data_event(&mut strategy, event);
                     }
-                    // Run insight pipeline after processing all bars for this step
-                    debug!("Backtest loop calling run_insight_pipeline");
-                    self.run_insight_pipeline();
-                    debug!("Backtest loop run_insight_pipeline returned");
-                    self.sync_backtest_insight_snapshots();
+                    // Run insight pipeline after processing tradable events for this step
+                    if step.has_tradable_events {
+                        debug!("Backtest loop calling run_insight_pipeline");
+                        self.run_insight_pipeline();
+                        debug!("Backtest loop run_insight_pipeline returned");
+                        self.sync_backtest_insight_snapshots();
+                    }
+                    if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
+                        self.publish_runtime_snapshot("not configured", None);
+                        last_runtime_publish = std::time::Instant::now();
+                    }
                 }
             }
         }
@@ -1604,6 +2123,30 @@ where
         self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
         strategy.on_teardown(self);
         self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
+        loop {
+            let final_close_requests = match self.broker.flush_backtest_close_queue_at_last_bars() {
+                Ok(requests) => requests,
+                Err(error) => {
+                    self.publish_runtime_event(
+                        "error",
+                        format!("Backtest teardown failed: {}", error),
+                        "not configured",
+                    );
+                    self.runtime_telemetry.stop_tui();
+                    return Err(error);
+                }
+            };
+            if final_close_requests == 0 {
+                break;
+            }
+
+            debug!(
+                "Backtest teardown flushed {} final close request(s); draining trade events",
+                final_close_requests
+            );
+            self.on_trade_update();
+            self.sync_backtest_insight_snapshots();
+        }
         self.sync_backtest_insight_snapshots();
 
         // Disconnect data feed
@@ -1615,8 +2158,33 @@ where
 
         // ── 9. Results ──
         let results = self.broker.get_results();
-        self.finalize_backtest_results(&results);
+        let saved_result_path = self.finalize_backtest_results(&results);
         self.status = StrategyStatus::Completed;
+        let open_insights_count = self.insights.active_insight_ids_unsorted().len();
+        let mut summary_lines = results.metric_summary_lines();
+        summary_lines.push(format!("Insights generated: {}", self.insights.len()));
+        summary_lines.extend(
+            format!("Insights: {:#?}", self.insights.get_state_count())
+                .lines()
+                .map(str::to_string),
+        );
+        if let Some(path) = saved_result_path.as_ref() {
+            summary_lines.push(format!("RESULTS_SAVED_TO: {path}"));
+        }
+        self.runtime_telemetry.update_snapshot(|snapshot| {
+            snapshot.metrics = Some(RuntimeMetricsSnapshot {
+                final_equity: results.final_equity,
+                total_return_pct: results.total_return_pct,
+                total_trades: results.total_trades,
+                open_positions_count: 0,
+                open_insights_count,
+                updated_at: Some(results.finished_at),
+                summary_lines,
+            });
+        });
+        self.publish_runtime_event("info", "Backtest completed", "not configured");
+        self.publish_runtime_snapshot("not configured", saved_result_path);
+        self.runtime_telemetry.wait_for_tui_close();
         Ok(results)
     }
 }

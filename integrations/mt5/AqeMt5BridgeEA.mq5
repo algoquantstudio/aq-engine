@@ -3,7 +3,7 @@
 //| Local RPC bridge EA for AlgoQuant Engine MT5 runtime integration.|
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.300"
+#property version "1.303"
 
 #include <Trade/Trade.mqh>
 
@@ -11,11 +11,15 @@ input string InpBridgeUrl = "http://127.0.0.1:18080";
 input string InpBridgeToken = "";
 input string InpBridgeConnections = "";
 input bool InpProbeInactiveConnections = false;
-input int InpInactiveProbeIntervalMs = 2000;
-input int InpInactiveProbeTimeoutMs = 150;
-input int InpInactiveProbeMaxCooldownMs = 5000;
-input int InpPollIntervalMs = 250;
+input int InpInactiveProbeIntervalMs = 500;
+input int InpInactiveProbeTimeoutMs = 100;
+input int InpInactiveProbeMaxCooldownMs = 2000;
+input int InpPollIntervalMs = 100;
 input int InpRequestTimeoutMs = 5000;
+input int InpTradeEventFlushIntervalMs = 100;
+input int InpTradeEventPostTimeoutMs = 750;
+input int InpTradeEventBatchSize = 32;
+input int InpTradeEventQueueCapacity = 2048;
 
 CTrade trade;
 
@@ -29,6 +33,7 @@ struct BridgeConnection
    uint next_poll_after_ms;
    uint last_heartbeat_ms;
    uint last_market_data_ms;
+   uint last_trade_event_flush_ms;
    bool session_logged;
 };
 
@@ -45,12 +50,25 @@ struct OrderRoute
    string key;
    int bridge_index;
    string session_id;
+   string client_order_id;
+   string insight_id;
+   string strategy_type;
+};
+
+struct PendingTradeEvent
+{
+   int bridge_index;
+   ulong event_seq;
+   string payload;
 };
 
 BridgeConnection g_bridges[];
 BridgeSubscription g_subscriptions[];
 OrderRoute g_order_routes[];
+PendingTradeEvent g_pending_trade_events[];
 int g_next_probe_bridge_index = 0;
+ulong g_trade_event_seq = 0;
+ulong g_trade_event_drop_count = 0;
 
 string JsonEscape(string value)
 {
@@ -161,6 +179,7 @@ int ActivePollDelayMs()
 {
    int delay_ms = InpPollIntervalMs;
    if(delay_ms < 100) delay_ms = 100;
+   if(delay_ms > 1000) delay_ms = 1000;
    return delay_ms;
 }
 
@@ -203,7 +222,7 @@ int InactiveProbeFailureDelayMs(int consecutive_failures, uint duration_ms)
       multiplier *= 2;
    delay_ms *= multiplier;
    if(duration_ms > (uint)InactiveProbeTimeoutMs())
-      delay_ms = delay_ms < 5000 ? 5000 : delay_ms;
+      delay_ms = delay_ms < 1000 ? 1000 : delay_ms;
    return ClampInt(delay_ms, 250, InactiveProbeMaxCooldownMs());
 }
 
@@ -221,6 +240,8 @@ int BridgePostTimeoutMs(string path)
    int max_timeout_ms = 500;
    if(path == "/v1/rpc/response")
       max_timeout_ms = 1000;
+   if(path == "/v1/trade-events" || path == "/v1/trade-event")
+      max_timeout_ms = MathMax(100, InpTradeEventPostTimeoutMs);
    if(timeout_ms > max_timeout_ms)
       timeout_ms = max_timeout_ms;
    if(timeout_ms < 100)
@@ -286,6 +307,11 @@ void MarkBridgePollFailure(int bridge_index, bool inactive_probe = false, uint d
             " failures=", failures,
             " elapsed_ms=", (int)duration_ms,
             " next_probe_ms=", delay_ms);
+   if(!inactive_probe && (failures <= 3 || failures % 10 == 0))
+      Print("AQE bridge[", bridge_index, "] active poll failed url=", g_bridges[bridge_index].url,
+            " failures=", failures,
+            " elapsed_ms=", (int)duration_ms,
+            " next_poll_ms=", delay_ms);
 }
 
 string BridgeSessionShort(int bridge_index)
@@ -336,7 +362,7 @@ int FindOrderBridgeIndex(string key)
    return index >= 0 ? g_order_routes[index].bridge_index : -1;
 }
 
-void RememberOrderRoute(int bridge_index, string key)
+void RememberOrderRouteMetadata(int bridge_index, string key, string client_order_id, string insight_id, string strategy_type)
 {
    if(!IsValidBridgeIndex(bridge_index) || key == "" || key == "0") return;
    int existing = FindOrderRouteIndex(key);
@@ -344,6 +370,9 @@ void RememberOrderRoute(int bridge_index, string key)
    {
       g_order_routes[existing].bridge_index = bridge_index;
       g_order_routes[existing].session_id = g_bridges[bridge_index].session_id;
+      if(client_order_id != "") g_order_routes[existing].client_order_id = client_order_id;
+      if(insight_id != "") g_order_routes[existing].insight_id = insight_id;
+      if(strategy_type != "") g_order_routes[existing].strategy_type = strategy_type;
       return;
    }
    int index = ArraySize(g_order_routes);
@@ -351,6 +380,30 @@ void RememberOrderRoute(int bridge_index, string key)
    g_order_routes[index].key = key;
    g_order_routes[index].bridge_index = bridge_index;
    g_order_routes[index].session_id = g_bridges[bridge_index].session_id;
+   g_order_routes[index].client_order_id = client_order_id;
+   g_order_routes[index].insight_id = insight_id;
+   g_order_routes[index].strategy_type = strategy_type;
+}
+
+void RememberOrderRoute(int bridge_index, string key)
+{
+   RememberOrderRouteMetadata(bridge_index, key, "", "", "");
+}
+
+int FindOrderRouteIndexByAliases(string key_a, string key_b, string key_c, string key_d)
+{
+   int index = FindOrderRouteIndex(key_a);
+   if(index >= 0) return index;
+   index = FindOrderRouteIndex(key_b);
+   if(index >= 0) return index;
+   index = FindOrderRouteIndex(key_c);
+   if(index >= 0) return index;
+   return FindOrderRouteIndex(key_d);
+}
+
+void RememberOrderRouteFromMetadata(int bridge_index, string key, string client_order_id, string insight_id, string strategy_type)
+{
+   RememberOrderRouteMetadata(bridge_index, key, client_order_id, insight_id, strategy_type);
 }
 
 string Envelope(int bridge_index, string request_id, string payload)
@@ -361,7 +414,7 @@ string Envelope(int bridge_index, string request_id, string payload)
       "\"protocolVersion\":1,"
       "\"sessionId\":\"" + JsonEscape(g_bridges[bridge_index].session_id) + "\","
       "\"requestId\":\"" + JsonEscape(request_id) + "\","
-      "\"eventSeq\":" + IntegerToString((int)g_bridges[bridge_index].event_seq) + ","
+      "\"eventSeq\":" + IntegerToString((long)g_bridges[bridge_index].event_seq) + ","
       "\"serverTime\":null,"
       "\"payload\":" + payload +
    "}";
@@ -376,7 +429,7 @@ bool PostJsonWithTimeout(int bridge_index, string path, string payload, int time
       "Content-Type: application/json\r\n"
       "X-AQE-MT5-Session: " + g_bridges[bridge_index].session_id + "\r\n"
       "X-AQE-MT5-Token: " + BridgeToken() + "\r\n"
-      "X-AQE-MT5-Seq: " + IntegerToString((int)g_bridges[bridge_index].event_seq) + "\r\n";
+      "X-AQE-MT5-Seq: " + IntegerToString((long)g_bridges[bridge_index].event_seq) + "\r\n";
 
    char data[];
    char result[];
@@ -447,6 +500,94 @@ bool PostJsonWithTimeout(int bridge_index, string path, string payload, int time
 bool PostJson(int bridge_index, string path, string payload, string &response)
 {
    return PostJsonWithTimeout(bridge_index, path, payload, BridgePostTimeoutMs(path), response);
+}
+
+int TradeEventQueueCapacity()
+{
+   return ClampInt(InpTradeEventQueueCapacity, 128, 50000);
+}
+
+int TradeEventBatchSize()
+{
+   return ClampInt(InpTradeEventBatchSize, 1, 256);
+}
+
+int TradeEventFlushIntervalMs()
+{
+   return ClampInt(InpTradeEventFlushIntervalMs, 10, 5000);
+}
+
+void DropOldestTradeEvent()
+{
+   int total = ArraySize(g_pending_trade_events);
+   if(total <= 0) return;
+   for(int i = 1; i < total; i++)
+      g_pending_trade_events[i - 1] = g_pending_trade_events[i];
+   ArrayResize(g_pending_trade_events, total - 1);
+   g_trade_event_drop_count++;
+}
+
+void QueueTradeEvent(int bridge_index, string payload)
+{
+   if(!IsValidBridgeIndex(bridge_index) || payload == "") return;
+   while(ArraySize(g_pending_trade_events) >= TradeEventQueueCapacity())
+      DropOldestTradeEvent();
+   int index = ArraySize(g_pending_trade_events);
+   ArrayResize(g_pending_trade_events, index + 1);
+   g_trade_event_seq++;
+   g_pending_trade_events[index].bridge_index = bridge_index;
+   g_pending_trade_events[index].event_seq = g_trade_event_seq;
+   g_pending_trade_events[index].payload = payload;
+}
+
+void RemoveQueuedTradeEventsForBridge(int bridge_index, int remove_count)
+{
+   if(remove_count <= 0) return;
+   int write = 0;
+   int removed = 0;
+   int total = ArraySize(g_pending_trade_events);
+   for(int read = 0; read < total; read++)
+   {
+      if(g_pending_trade_events[read].bridge_index == bridge_index && removed < remove_count)
+      {
+         removed++;
+         continue;
+      }
+      if(write != read)
+         g_pending_trade_events[write] = g_pending_trade_events[read];
+      write++;
+   }
+   ArrayResize(g_pending_trade_events, write);
+}
+
+void FlushTradeEvents(int bridge_index)
+{
+   if(!IsValidBridgeIndex(bridge_index) || g_bridges[bridge_index].session_id == "") return;
+   int batch_size = TradeEventBatchSize();
+   string events = "";
+   int emitted = 0;
+   for(int i = 0; i < ArraySize(g_pending_trade_events) && emitted < batch_size; i++)
+   {
+      if(g_pending_trade_events[i].bridge_index != bridge_index) continue;
+      string event_payload = g_pending_trade_events[i].payload;
+      if(StringLen(event_payload) <= 1) continue;
+      if(emitted > 0) events += ",";
+      events += StringSubstr(event_payload, 0, StringLen(event_payload) - 1)
+         + ",\"eventSeq\":" + IntegerToString((long)g_pending_trade_events[i].event_seq) + "}";
+      emitted++;
+   }
+   if(emitted <= 0) return;
+
+   string response;
+   string payload = "{"
+      "\"events\":[" + events + "],"
+      "\"droppedCount\":" + IntegerToString((long)g_trade_event_drop_count) +
+   "}";
+   if(PostJson(bridge_index, "/v1/trade-events", payload, response))
+   {
+      g_trade_event_drop_count = 0;
+      RemoveQueuedTradeEventsForBridge(bridge_index, emitted);
+   }
 }
 
 double NormalizeToDigits(string symbol, double price)
@@ -940,17 +1081,17 @@ string HistoryJson(string symbol, ENUM_TIMEFRAMES timeframe, datetime start_utc,
    return "[" + bars + "]";
 }
 
-string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false)
+string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false, string insight_id = "", string strategy_type = "")
 {
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    datetime now_utc = BrokerNowUtc();
    return "{"
       "\"order_id\":\"" + JsonEscape(order_id) + "\","
-      "\"insight_id\":null,"
-      "\"strategy_type\":null,"
+      "\"insight_id\":" + (insight_id == "" ? "null" : "\"" + JsonEscape(insight_id) + "\"") + ","
+      "\"strategy_type\":" + (strategy_type == "" ? "null" : "\"" + JsonEscape(strategy_type) + "\"") + ","
       "\"asset\":" + AssetJson(symbol) + ","
       "\"qty\":" + DoubleToString(qty, 8) + ","
-      "\"filled_qty\":" + (status == "Filled" ? DoubleToString(qty, 8) : "0.0") + ","
+      "\"filled_qty\":" + ((status == "Filled" || status == "Closed") ? DoubleToString(qty, 8) : "0.0") + ","
       "\"limit_price\":null,"
       "\"filled_price\":" + (price > 0.0 ? DoubleToString(price, digits) : "null") + ","
       "\"stop_price\":null,"
@@ -962,7 +1103,7 @@ string OrderJson(string order_id, string symbol, double qty, string side, string
       "\"created_at\":" + IntegerToString((int)now_utc) + ","
       "\"updated_at\":" + IntegerToString((int)now_utc) + ","
       "\"submitted_at\":" + IntegerToString((int)now_utc) + ","
-      "\"filled_at\":" + (status == "Filled" ? IntegerToString((int)now_utc) : "null") + ","
+      "\"filled_at\":" + ((status == "Filled" || status == "Closed") ? IntegerToString((int)now_utc) : "null") + ","
       "\"realized_pnl\":" + (has_realized_pnl ? DoubleToString(realized_pnl, 8) : "null") + ","
       "\"rejection_reason\":" + (rejection_reason == "" ? "null" : "\"" + JsonEscape(rejection_reason) + "\"") + ","
       "\"legs\":null"
@@ -1098,7 +1239,9 @@ void SendHeartbeat(int bridge_index)
    string payload = "{"
       "\"terminalName\":\"" + JsonEscape(TerminalInfoString(TERMINAL_NAME)) + "\","
       "\"accountId\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\","
-      "\"serverTime\":\"" + IsoTime(BrokerNowUtc()) + "\""
+      "\"serverTime\":\"" + IsoTime(BrokerNowUtc()) + "\","
+      "\"queuedTradeEvents\":" + IntegerToString(ArraySize(g_pending_trade_events)) + ","
+      "\"droppedTradeEvents\":" + IntegerToString((long)g_trade_event_drop_count) +
    "}";
    PostJson(bridge_index, "/v1/heartbeat", payload, response);
 }
@@ -1314,6 +1457,8 @@ void ExecuteRpcRequest(int bridge_index, string json)
    string order_type = ExtractString(json, "orderType");
    string order_id = ExtractString(json, "orderId");
    string client_order_id = ExtractString(json, "clientOrderId");
+   string insight_id = ExtractString(json, "insightId");
+   string strategy_type = ExtractString(json, "strategyType");
    string comment = NormalizeOrderComment(ExtractString(json, "comment"));
 
    if(action == "SUBMIT_ORDER")
@@ -1425,34 +1570,136 @@ void ExecuteRpcRequest(int bridge_index, string json)
       }
       else if(ok)
          broker_id = IntegerToString((long)result_order);
-      RememberOrderRoute(bridge_index, client_order_id);
-      RememberOrderRoute(bridge_index, broker_id);
-      if(result_order > 0) RememberOrderRoute(bridge_index, IntegerToString((long)result_order));
-      if(result_deal > 0) RememberOrderRoute(bridge_index, IntegerToString((long)result_deal));
+      RememberOrderRouteMetadata(bridge_index, client_order_id, client_order_id, insight_id, strategy_type);
+      RememberOrderRouteMetadata(bridge_index, broker_id, client_order_id, insight_id, strategy_type);
+      if(result_order > 0) RememberOrderRouteMetadata(bridge_index, IntegerToString((long)result_order), client_order_id, insight_id, strategy_type);
+      if(result_deal > 0) RememberOrderRouteMetadata(bridge_index, IntegerToString((long)result_deal), client_order_id, insight_id, strategy_type);
       string status = ok ? (order_type == "Market" ? "Filled" : "Accepted") : "Rejected";
       string reason = ok ? "" : IntegerToString((int)result_retcode);
-      string payload = OrderJson(broker_id == "0" ? client_order_id : broker_id, symbol, qty, side, order_type, status, result_price, reason);
+      string payload = OrderJson(broker_id == "0" ? client_order_id : broker_id, symbol, qty, side, order_type, status, result_price, reason, 0.0, false, insight_id, strategy_type);
       SendRpcResponse(bridge_index, request_id, true, reason, payload, action);
       return;
    }
    if(action == "CANCEL_ORDER")
    {
       bool ok = trade.OrderDelete((ulong)StringToInteger(order_id));
+      RememberOrderRouteMetadata(bridge_index, order_id, order_id, insight_id, strategy_type);
       SendRpcResponse(bridge_index, request_id, ok, ok ? "" : IntegerToString((int)GetLastError()), "{\"cancelled\":true}", action);
+      return;
+   }
+   if(action == "UPDATE_ORDER")
+   {
+      ulong position_ticket = FindPositionTicketById(order_id);
+      if(position_ticket > 0)
+      {
+         RememberOrderRouteMetadata(bridge_index, order_id, order_id, insight_id, strategy_type);
+         RememberOrderRouteMetadata(bridge_index, IntegerToString((long)position_ticket), order_id, insight_id, strategy_type);
+      }
+
+      bool ok = false;
+      string reason = "";
+      double take_profit = ExtractNumber(json, "takeProfit", price);
+      double stop_loss = ExtractNumber(json, "stopLoss", -1.0);
+      if(position_ticket == 0 || !PositionSelectByTicket(position_ticket))
+      {
+         reason = "position ticket not found";
+      }
+      else
+      {
+         string position_symbol = PositionGetString(POSITION_SYMBOL);
+         long position_type = PositionGetInteger(POSITION_TYPE);
+         double current_sl = PositionGetDouble(POSITION_SL);
+         double current_tp = PositionGetDouble(POSITION_TP);
+         MqlTick tick;
+         SymbolInfoTick(position_symbol, tick);
+         double bid = tick.bid > 0.0 ? tick.bid : SymbolInfoDouble(position_symbol, SYMBOL_BID);
+         double ask = tick.ask > 0.0 ? tick.ask : SymbolInfoDouble(position_symbol, SYMBOL_ASK);
+         double modify_sl = current_sl;
+         double modify_tp = current_tp;
+
+         if(take_profit > 0.0)
+         {
+            modify_tp = position_type == POSITION_TYPE_SELL
+               ? ClampSellTakeProfit(position_symbol, take_profit, bid)
+               : ClampBuyTakeProfit(position_symbol, take_profit, ask);
+            if(modify_tp <= 0.0)
+               reason = "invalid take profit";
+         }
+         else if(take_profit == 0.0)
+         {
+            modify_tp = 0.0;
+         }
+
+         if(reason == "" && stop_loss >= 0.0)
+         {
+            if(stop_loss > 0.0)
+            {
+               modify_sl = position_type == POSITION_TYPE_SELL
+                  ? ClampSellStopLoss(position_symbol, stop_loss, ask)
+                  : ClampBuyStopLoss(position_symbol, stop_loss, bid);
+               if(modify_sl <= 0.0)
+                  reason = "invalid stop loss";
+            }
+            else
+            {
+               modify_sl = 0.0;
+            }
+         }
+
+         if(reason == "")
+         {
+            trade.SetExpertMagicNumber(27042026);
+            ok = trade.PositionModify(position_ticket, modify_sl, modify_tp);
+            uint result_retcode = trade.ResultRetcode();
+            ok = ok && IsTradeRetcodeSuccess(result_retcode);
+            if(!ok)
+               reason = IntegerToString((int)result_retcode);
+         }
+      }
+
+      SendRpcResponse(bridge_index, request_id, ok, reason, "{\"updated\":true}", action);
       return;
    }
    if(action == "CLOSE_POSITION")
    {
       ulong position_ticket = FindPositionTicketById(order_id);
+      string close_symbol = symbol;
+      string close_side = "Sell";
+      double close_qty = qty;
+      double close_price = price;
       if(position_ticket > 0)
       {
-         RememberOrderRoute(bridge_index, order_id);
-         RememberOrderRoute(bridge_index, IntegerToString((long)position_ticket));
+         RememberOrderRouteMetadata(bridge_index, order_id, order_id, insight_id, strategy_type);
+         RememberOrderRouteMetadata(bridge_index, IntegerToString((long)position_ticket), order_id, insight_id, strategy_type);
+         if(PositionSelectByTicket(position_ticket))
+         {
+            close_symbol = PositionGetString(POSITION_SYMBOL);
+            long position_type = PositionGetInteger(POSITION_TYPE);
+            close_side = position_type == POSITION_TYPE_BUY ? "Sell" : "Buy";
+            if(close_qty <= 0.0)
+               close_qty = PositionGetDouble(POSITION_VOLUME);
+         }
       }
       uint retcode = 0;
-      bool ok = position_ticket > 0 && ClosePositionWithComment(position_ticket, symbol, qty, comment, retcode);
+      bool ok = position_ticket > 0 && ClosePositionWithComment(position_ticket, close_symbol, close_qty, comment, retcode);
       string reason = position_ticket == 0 ? "position ticket not found" : (ok ? "" : IntegerToString((int)retcode));
-      SendRpcResponse(bridge_index, request_id, ok, reason, "{\"closed\":true}", action);
+      if(ok)
+      {
+         double result_price = trade.ResultPrice();
+         if(result_price > 0.0)
+            close_price = result_price;
+         if(close_price <= 0.0)
+         {
+            MqlTick tick;
+            SymbolInfoTick(close_symbol, tick);
+            close_price = close_side == "Sell" ? (tick.bid > 0.0 ? tick.bid : SymbolInfoDouble(close_symbol, SYMBOL_BID))
+                                               : (tick.ask > 0.0 ? tick.ask : SymbolInfoDouble(close_symbol, SYMBOL_ASK));
+         }
+      }
+      string payload = ok
+         ? OrderJson(IntegerToString((long)position_ticket), close_symbol, close_qty, close_side, "Market", "Closed", close_price, "", 0.0, false, insight_id, strategy_type)
+         : "{\"closed\":false}";
+      SendRpcResponse(bridge_index, request_id, ok, reason, payload, action);
       return;
    }
    if(action == "CLOSE_ALL_POSITIONS")
@@ -1479,7 +1726,10 @@ void ClearRuntimeState()
    ArrayResize(g_bridges, 0);
    ArrayResize(g_subscriptions, 0);
    ArrayResize(g_order_routes, 0);
+   ArrayResize(g_pending_trade_events, 0);
    g_next_probe_bridge_index = 0;
+   g_trade_event_seq = 0;
+   g_trade_event_drop_count = 0;
 }
 
 bool AddBridgeConnection(string bridge_url)
@@ -1538,9 +1788,9 @@ int ConfigureBridgeConnections()
 int ActivePollTimeoutMs()
 {
    int poll_timeout_ms = InpRequestTimeoutMs;
-   int max_poll_timeout_ms = ActivePollDelayMs();
-   if(max_poll_timeout_ms < 250) max_poll_timeout_ms = 250;
-   if(max_poll_timeout_ms > 500) max_poll_timeout_ms = 500;
+   int max_poll_timeout_ms = ActivePollDelayMs() * 2;
+   if(max_poll_timeout_ms < 150) max_poll_timeout_ms = 150;
+   if(max_poll_timeout_ms > 250) max_poll_timeout_ms = 250;
    if(poll_timeout_ms > max_poll_timeout_ms) poll_timeout_ms = max_poll_timeout_ms;
    if(poll_timeout_ms < 100) poll_timeout_ms = 100;
    return poll_timeout_ms;
@@ -1549,26 +1799,42 @@ int ActivePollTimeoutMs()
 bool PollRpc(int bridge_index, bool inactive_probe = false)
 {
    if(!IsBridgePollDue(bridge_index)) return false;
-   string response;
-   string payload = "{\"maxRequests\":16}";
-   int poll_timeout_ms = inactive_probe ? InactiveProbeTimeoutMs() : ActivePollTimeoutMs();
-   uint started_ms = GetTickCount();
-   if(!PostJsonWithTimeout(bridge_index, "/v1/rpc/poll", payload, poll_timeout_ms, response, inactive_probe))
+
+   bool polled = false;
+   int max_cycles = inactive_probe ? 1 : 8;
+   for(int cycle = 0; cycle < max_cycles; cycle++)
    {
-      uint elapsed_ms = GetTickCount() - started_ms;
-      MarkBridgePollFailure(bridge_index, inactive_probe, elapsed_ms);
-      return false;
+      if(!IsValidBridgeIndex(bridge_index)) return polled;
+      string response;
+      string payload = "{\"maxRequests\":16}";
+      int poll_timeout_ms = inactive_probe ? InactiveProbeTimeoutMs() : ActivePollTimeoutMs();
+      uint started_ms = GetTickCount();
+      if(!PostJsonWithTimeout(bridge_index, "/v1/rpc/poll", payload, poll_timeout_ms, response, inactive_probe))
+      {
+         uint elapsed_ms = GetTickCount() - started_ms;
+         MarkBridgePollFailure(bridge_index, inactive_probe, elapsed_ms);
+         return polled;
+      }
+
+      polled = true;
+      MarkBridgePollSuccess(bridge_index);
+      string session_id = ExtractString(response, "sessionId");
+      if(session_id != "") g_bridges[bridge_index].session_id = session_id;
+      string request_jsons[];
+      int request_count = ExtractRpcRequests(response, request_jsons);
+      if(request_count > 0)
+         Print("AQE bridge[", bridge_index, "] executing ", request_count, " RPC request(s)");
+      for(int i = 0; i < request_count; i++)
+         ExecuteRpcRequest(bridge_index, request_jsons[i]);
+      if(request_count <= 0)
+         return true;
+      if(IsValidBridgeIndex(bridge_index))
+         g_bridges[bridge_index].next_poll_after_ms = 0;
    }
-   MarkBridgePollSuccess(bridge_index);
-   string session_id = ExtractString(response, "sessionId");
-   if(session_id != "") g_bridges[bridge_index].session_id = session_id;
-   string request_jsons[];
-   int request_count = ExtractRpcRequests(response, request_jsons);
-   if(request_count > 0)
-      Print("AQE bridge[", bridge_index, "] executing ", request_count, " RPC request(s)");
-   for(int i = 0; i < request_count; i++)
-      ExecuteRpcRequest(bridge_index, request_jsons[i]);
-   return true;
+
+   if(IsValidBridgeIndex(bridge_index))
+      g_bridges[bridge_index].next_poll_after_ms = 0;
+   return polled;
 }
 
 void PollConnectedBridges()
@@ -1655,6 +1921,11 @@ void OnTimer()
    {
       if(!IsValidBridgeIndex(i) || g_bridges[i].session_id == "")
          continue;
+      if(HasElapsedMs(g_bridges[i].last_trade_event_flush_ms, TradeEventFlushIntervalMs()))
+      {
+         g_bridges[i].last_trade_event_flush_ms = now_ms;
+         FlushTradeEvents(i);
+      }
       if(HasElapsedMs(g_bridges[i].last_heartbeat_ms, 2000))
       {
          g_bridges[i].last_heartbeat_ms = now_ms;
@@ -1693,7 +1964,7 @@ void OnTradeTransaction(
          return;
       ENUM_ORDER_STATE order_state = (ENUM_ORDER_STATE)HistoryOrderGetInteger(trans.order, ORDER_STATE);
       if(order_state == ORDER_STATE_CANCELED)
-         event_name = "Canceled";
+         event_name = "Cancelled";
       else if(order_state == ORDER_STATE_EXPIRED)
          event_name = "Expired";
       else
@@ -1741,20 +2012,29 @@ void OnTradeTransaction(
       route_bridge = FindOrderBridgeIndex(event_order_id);
    if(route_bridge < 0 && deal_position_id > 0)
       route_bridge = FindOrderBridgeIndex(IntegerToString((long)deal_position_id));
+   string order_key = IntegerToString((long)trans.order);
+   string deal_key = trans.deal > 0 ? IntegerToString((long)trans.deal) : "";
+   string position_key = deal_position_id > 0 ? IntegerToString((long)deal_position_id) : "";
+   int route_index = FindOrderRouteIndexByAliases(event_order_id, order_key, deal_key, position_key);
+   if(route_bridge < 0 && route_index >= 0)
+      route_bridge = g_order_routes[route_index].bridge_index;
    if(route_bridge < 0 || !IsValidBridgeIndex(route_bridge) || g_bridges[route_bridge].session_id == "")
       return;
 
-   RememberOrderRoute(route_bridge, event_order_id);
-   if(deal_position_id > 0) RememberOrderRoute(route_bridge, IntegerToString((long)deal_position_id));
-   if(trans.order > 0) RememberOrderRoute(route_bridge, IntegerToString((long)trans.order));
-   if(trans.deal > 0) RememberOrderRoute(route_bridge, IntegerToString((long)trans.deal));
+   string route_client_order_id = route_index >= 0 ? g_order_routes[route_index].client_order_id : "";
+   string route_insight_id = route_index >= 0 ? g_order_routes[route_index].insight_id : "";
+   string route_strategy_type = route_index >= 0 ? g_order_routes[route_index].strategy_type : "";
+
+   RememberOrderRouteMetadata(route_bridge, event_order_id, route_client_order_id, route_insight_id, route_strategy_type);
+   if(deal_position_id > 0) RememberOrderRouteMetadata(route_bridge, IntegerToString((long)deal_position_id), route_client_order_id, route_insight_id, route_strategy_type);
+   if(trans.order > 0) RememberOrderRouteMetadata(route_bridge, IntegerToString((long)trans.order), route_client_order_id, route_insight_id, route_strategy_type);
+   if(trans.deal > 0) RememberOrderRouteMetadata(route_bridge, IntegerToString((long)trans.deal), route_client_order_id, route_insight_id, route_strategy_type);
 
    string native_id = IntegerToString((int)trans.type) + ":" + IntegerToString((long)trans.order) + ":" + IntegerToString((long)trans.deal);
-   string response;
    string payload = "{"
       "\"nativeEventId\":\"" + JsonEscape(native_id) + "\","
       "\"event\":\"" + event_name + "\","
-      "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl) +
+      "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl, route_insight_id, route_strategy_type) +
    "}";
-   PostJson(route_bridge, "/v1/trade-event", payload, response);
+   QueueTradeEvent(route_bridge, payload);
 }

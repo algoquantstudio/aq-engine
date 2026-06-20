@@ -2,6 +2,7 @@ use crate::core::broker::DataStreamMode;
 use crate::core::broker::types::{Bar, BarData, BrokerError};
 use crate::core::utils::timeframe::TimeFrame;
 use chrono::{DateTime, Utc};
+use log::warn;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -27,8 +28,15 @@ pub type FetchBarsFn = Arc<
 /// uses `TimeFrame` utilities (`get_next_time_increment`, `add_time_increment`)
 /// for smart interval scheduling.
 pub struct DataStreamManager {
-    /// Active subscription handles, keyed by symbol
-    subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Active subscription handles, keyed by symbol, timeframe, and mode.
+    subscriptions: Arc<Mutex<HashMap<DataStreamSubscriptionKey, tokio::task::JoinHandle<()>>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DataStreamSubscriptionKey {
+    symbol: String,
+    time_frame: TimeFrame,
+    mode: DataStreamMode,
 }
 
 impl DataStreamManager {
@@ -52,8 +60,14 @@ impl DataStreamManager {
         on_bar: Arc<dyn Fn(Bar) + Send + Sync>,
         fetch_fn: FetchBarsFn,
     ) {
-        // If already subscribed for this symbol, unsubscribe first
-        self.unsubscribe(&symbol);
+        let key = DataStreamSubscriptionKey {
+            symbol: symbol.clone(),
+            time_frame,
+            mode,
+        };
+        if let Some(handle) = self.subscriptions.lock().unwrap().remove(&key) {
+            handle.abort();
+        }
 
         let symbol_clone = symbol.clone();
         let _subscriptions = self.subscriptions.clone();
@@ -106,7 +120,7 @@ impl DataStreamManager {
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        warn!(
                             "[DataStreamManager] Error fetching bars for {}: {:?}",
                             symbol_clone, e
                         );
@@ -119,14 +133,21 @@ impl DataStreamManager {
 
         // Store the handle
         let mut subs = self.subscriptions.lock().unwrap();
-        subs.insert(symbol, handle);
+        subs.insert(key, handle);
     }
 
-    /// Cancel the subscription for a symbol.
+    /// Cancel all subscriptions for a symbol.
     pub fn unsubscribe(&self, symbol: &str) {
         let mut subs = self.subscriptions.lock().unwrap();
-        if let Some(handle) = subs.remove(symbol) {
-            handle.abort();
+        let keys: Vec<DataStreamSubscriptionKey> = subs
+            .keys()
+            .filter(|key| key.symbol == symbol)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(handle) = subs.remove(&key) {
+                handle.abort();
+            }
         }
     }
 
@@ -141,7 +162,7 @@ impl DataStreamManager {
     /// Check if a symbol is currently subscribed.
     pub fn is_subscribed(&self, symbol: &str) -> bool {
         let subs = self.subscriptions.lock().unwrap();
-        subs.contains_key(symbol)
+        subs.keys().any(|key| key.symbol == symbol)
     }
 
     /// Get count of active subscriptions.
@@ -160,5 +181,40 @@ impl Default for DataStreamManager {
 impl Drop for DataStreamManager {
     fn drop(&mut self) {
         self.unsubscribe_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::utils::timeframe::TimeFrameUnit;
+
+    #[tokio::test]
+    async fn keeps_multiple_timeframes_for_same_symbol() {
+        let manager = DataStreamManager::new();
+        let fetch_fn: FetchBarsFn = Arc::new(|_symbol, _start, _end, _timeframe| {
+            Box::pin(async { Ok(BarData::Bars(Vec::new())) })
+        });
+        let callback: Arc<dyn Fn(Bar) + Send + Sync> = Arc::new(|_bar| {});
+
+        manager.subscribe(
+            "BTC".to_string(),
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            DataStreamMode::CompletedBar,
+            callback.clone(),
+            fetch_fn.clone(),
+        );
+        manager.subscribe(
+            "BTC".to_string(),
+            TimeFrame::new(15, TimeFrameUnit::Minute),
+            DataStreamMode::CompletedBar,
+            callback,
+            fetch_fn,
+        );
+
+        assert_eq!(manager.active_count(), 2);
+        assert!(manager.is_subscribed("BTC"));
+        manager.unsubscribe("BTC");
+        assert_eq!(manager.active_count(), 0);
     }
 }

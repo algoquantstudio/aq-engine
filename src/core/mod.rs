@@ -5,6 +5,8 @@ pub mod backtest_storage;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod broker;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod events;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod indicators;
 pub mod insight;
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,6 +19,8 @@ mod portfolio;
 mod risk;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod strategy;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tui;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod universe;
 pub mod utils;

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use polars::lazy::dsl::pearson_corr;
 use polars::prelude::*;
 use turso::{Builder, Connection, params, transaction::Transaction};
 
@@ -105,6 +106,10 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS bars (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
+            history_key TEXT NOT NULL DEFAULT '',
+            timeframe_label TEXT NOT NULL DEFAULT '',
+            is_feature INTEGER NOT NULL DEFAULT 0,
+            allow_trading INTEGER NOT NULL DEFAULT 1,
             event_at TEXT NOT NULL,
             open REAL NOT NULL,
             high REAL NOT NULL,
@@ -114,6 +119,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             payload_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_bars_symbol_event_at ON bars(symbol, event_at);
+        CREATE INDEX IF NOT EXISTS idx_bars_history_key_event_at ON bars(history_key, event_at);
 
         CREATE TABLE IF NOT EXISTS monthly_returns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -600,28 +606,126 @@ async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> 
     Ok(())
 }
 
-async fn insert_bars(
-    tx: &Transaction<'_>,
-    bars_by_symbol: &std::collections::HashMap<String, Vec<Bar>>,
-) -> Result<(), String> {
+#[derive(Debug, serde::Serialize)]
+struct PersistedBarPayload {
+    symbol: String,
+    asset_symbol: String,
+    history_key: String,
+    timeframe_label: String,
+    is_feature: bool,
+    allow_trading: bool,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    timestamp: DateTime<Utc>,
+}
+
+impl PersistedBarPayload {
+    fn from_stream(bar: &Bar, stream: &crate::core::events::ResolvedEventStream) -> Self {
+        let history_key = stream.history_key.clone();
+        Self {
+            // Keep `symbol` as the stream identifier for consumers that only inspect
+            // payload_json, and keep `asset_symbol` for the tradable base asset.
+            symbol: history_key.clone(),
+            asset_symbol: stream.key.symbol.clone(),
+            history_key,
+            timeframe_label: stream.key.timeframe.compact_label(),
+            is_feature: stream.is_feature,
+            allow_trading: stream.allow_trading,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            timestamp: bar.timestamp,
+        }
+    }
+
+    fn from_main(bar: &Bar, symbol: &str) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            asset_symbol: symbol.to_string(),
+            history_key: symbol.to_string(),
+            timeframe_label: String::new(),
+            is_feature: false,
+            allow_trading: true,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            timestamp: bar.timestamp,
+        }
+    }
+}
+
+async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT INTO bars (symbol, event_at, open, high, low, close, volume, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO bars (symbol, history_key, timeframe_label, is_feature, allow_trading, event_at, open, high, low, close, volume, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .await
         .map_err(to_storage_err)?;
-    for bars in bars_by_symbol.values() {
+
+    if !state.event_stream_bars.is_empty() {
+        let mut keys = state.event_stream_bars.keys().cloned().collect::<Vec<_>>();
+        keys.sort_by(|left, right| {
+            left.symbol.cmp(&right.symbol).then(
+                left.timeframe
+                    .compact_label()
+                    .cmp(&right.timeframe.compact_label()),
+            )
+        });
+
+        for key in keys {
+            let Some(bars) = state.event_stream_bars.get(&key) else {
+                continue;
+            };
+            let Some(stream) = state.event_streams.get(&key) else {
+                continue;
+            };
+            for bar in bars {
+                let payload = PersistedBarPayload::from_stream(bar, stream);
+                stmt.execute(params![
+                    bar.symbol.clone(),
+                    stream.history_key.clone(),
+                    key.timeframe.compact_label(),
+                    if stream.is_feature { 1_i64 } else { 0_i64 },
+                    if stream.allow_trading { 1_i64 } else { 0_i64 },
+                    bar.timestamp.to_rfc3339(),
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.volume,
+                    serde_json::to_string(&payload).map_err(to_storage_err)?
+                ])
+                .await
+                .map_err(to_storage_err)?;
+            }
+        }
+        return Ok(());
+    }
+
+    for (symbol, bars) in &state.historical_bars {
         for bar in bars {
+            let payload = PersistedBarPayload::from_main(bar, symbol);
             stmt.execute(params![
-                bar.symbol.clone(),
+                symbol.clone(),
+                symbol.clone(),
+                String::new(),
+                0_i64,
+                1_i64,
                 bar.timestamp.to_rfc3339(),
                 bar.open,
                 bar.high,
                 bar.low,
                 bar.close,
                 bar.volume,
-                serde_json::to_string(bar).map_err(to_storage_err)?
+                serde_json::to_string(&payload).map_err(to_storage_err)?
             ])
             .await
             .map_err(to_storage_err)?;
@@ -716,6 +820,87 @@ struct StrategyCorrelationRow {
     sample_count: usize,
 }
 
+fn account_history_frame(account_history: &[(DateTime<Utc>, Account)]) -> PolarsResult<DataFrame> {
+    let mut timestamp_ms = Vec::with_capacity(account_history.len());
+    let mut years = Vec::with_capacity(account_history.len());
+    let mut months = Vec::with_capacity(account_history.len());
+    let mut periods = Vec::with_capacity(account_history.len());
+    let mut equities = Vec::with_capacity(account_history.len());
+
+    for (timestamp, account) in account_history {
+        timestamp_ms.push(timestamp.timestamp_millis());
+        years.push(timestamp.year());
+        months.push(timestamp.month() as i32);
+        periods.push(month_period(*timestamp));
+        equities.push(account.equity);
+    }
+
+    DataFrame::new(vec![
+        Column::new("timestamp_ms".into(), timestamp_ms.as_slice()),
+        Column::new("year".into(), years.as_slice()),
+        Column::new("month".into(), months.as_slice()),
+        Column::new("period".into(), periods.as_slice()),
+        Column::new("equity".into(), equities.as_slice()),
+    ])
+}
+
+fn round_trips_frame(trips: &[RoundTripTrade]) -> PolarsResult<DataFrame> {
+    let mut symbols = Vec::with_capacity(trips.len());
+    let mut sides = Vec::with_capacity(trips.len());
+    let mut strategy_types = Vec::with_capacity(trips.len());
+    let mut entry_day_of_week = Vec::with_capacity(trips.len());
+    let mut entry_hour = Vec::with_capacity(trips.len());
+    let mut entry_ms = Vec::with_capacity(trips.len());
+    let mut exit_ms = Vec::with_capacity(trips.len());
+    let mut exit_dates = Vec::with_capacity(trips.len());
+    let mut periods = Vec::with_capacity(trips.len());
+    let mut pnl_values = Vec::with_capacity(trips.len());
+    let mut return_pct_values = Vec::with_capacity(trips.len());
+    let mut return_bps_values = Vec::with_capacity(trips.len());
+    let mut is_win_values = Vec::with_capacity(trips.len());
+    let mut is_loss_values = Vec::with_capacity(trips.len());
+    let mut gross_profit_values = Vec::with_capacity(trips.len());
+    let mut gross_loss_values = Vec::with_capacity(trips.len());
+
+    for trip in trips {
+        symbols.push(trip.symbol.clone());
+        sides.push(format!("{:?}", trip.side));
+        strategy_types.push(strategy_label(trip.strategy_type.as_deref(), "Unknown"));
+        entry_day_of_week.push(trip.entry_time.weekday().number_from_monday() as i32);
+        entry_hour.push(trip.entry_time.hour() as i32);
+        entry_ms.push(trip.entry_time.timestamp_millis());
+        exit_ms.push(trip.exit_time.timestamp_millis());
+        exit_dates.push(trip.exit_time.date_naive().to_string());
+        periods.push(month_period(trip.exit_time));
+        pnl_values.push(trip.pnl);
+        return_pct_values.push(trip.return_pct);
+        return_bps_values.push(trip.return_pct * 100.0);
+        is_win_values.push(if trip.pnl > 0.0 { 1_i32 } else { 0_i32 });
+        is_loss_values.push(if trip.pnl < 0.0 { 1_i32 } else { 0_i32 });
+        gross_profit_values.push(if trip.pnl > 0.0 { trip.pnl } else { 0.0 });
+        gross_loss_values.push(if trip.pnl < 0.0 { trip.pnl.abs() } else { 0.0 });
+    }
+
+    DataFrame::new(vec![
+        Column::new("symbol".into(), symbols.as_slice()),
+        Column::new("side".into(), sides.as_slice()),
+        Column::new("strategy_type".into(), strategy_types.as_slice()),
+        Column::new("entry_day_of_week".into(), entry_day_of_week.as_slice()),
+        Column::new("entry_hour".into(), entry_hour.as_slice()),
+        Column::new("entry_ms".into(), entry_ms.as_slice()),
+        Column::new("exit_ms".into(), exit_ms.as_slice()),
+        Column::new("exit_date".into(), exit_dates.as_slice()),
+        Column::new("period".into(), periods.as_slice()),
+        Column::new("pnl".into(), pnl_values.as_slice()),
+        Column::new("return_pct".into(), return_pct_values.as_slice()),
+        Column::new("return_bps".into(), return_bps_values.as_slice()),
+        Column::new("is_win".into(), is_win_values.as_slice()),
+        Column::new("is_loss".into(), is_loss_values.as_slice()),
+        Column::new("gross_profit".into(), gross_profit_values.as_slice()),
+        Column::new("gross_loss".into(), gross_loss_values.as_slice()),
+    ])
+}
+
 fn month_period(timestamp: DateTime<Utc>) -> String {
     format!("{:04}-{:02}", timestamp.year(), timestamp.month())
 }
@@ -726,6 +911,16 @@ fn quarter_period(timestamp: DateTime<Utc>) -> String {
         timestamp.year(),
         ((timestamp.month() - 1) / 3) + 1
     )
+}
+
+fn rolling_period(timestamp: DateTime<Utc>, duration_days: f64) -> String {
+    if duration_days <= 2.0 {
+        timestamp.format("%Y-%m-%d %H:00").to_string()
+    } else if duration_days <= 14.0 {
+        timestamp.format("%Y-%m-%d").to_string()
+    } else {
+        quarter_period(timestamp)
+    }
 }
 
 fn build_monthly_returns_iter(
@@ -760,54 +955,38 @@ fn build_monthly_returns_polars(
         return Ok(Vec::new());
     }
 
-    let years = account_history
-        .iter()
-        .map(|(timestamp, _)| timestamp.year())
-        .collect::<Vec<_>>();
-    let months = account_history
-        .iter()
-        .map(|(timestamp, _)| timestamp.month() as i32)
-        .collect::<Vec<_>>();
-    let equities = account_history
-        .iter()
-        .map(|(_, account)| account.equity)
-        .collect::<Vec<_>>();
-
-    let df = DataFrame::new(vec![
-        Column::new("year".into(), years.as_slice()),
-        Column::new("month".into(), months.as_slice()),
-        Column::new("equity".into(), equities.as_slice()),
-    ])?;
+    let df = account_history_frame(account_history)?;
 
     let out = df
         .lazy()
+        .select([col("year"), col("month"), col("equity")])
         .group_by([col("year"), col("month")])
         .agg([
             col("equity").first().alias("first_equity"),
             col("equity").last().alias("last_equity"),
         ])
+        .with_columns([when(col("first_equity").abs().gt(lit(f64::EPSILON)))
+            .then(((col("last_equity") - col("first_equity")) / col("first_equity")) * lit(100.0))
+            .otherwise(lit(0.0))
+            .alias("return_pct")])
+        .select([col("year"), col("month"), col("return_pct")])
         .sort(["year", "month"], Default::default())
         .collect()?;
 
     let year_col = out.column("year")?.i32()?;
     let month_col = out.column("month")?.i32()?;
-    let first_col = out.column("first_equity")?.f64()?;
-    let last_col = out.column("last_equity")?.f64()?;
+    let return_col = out.column("return_pct")?.f64()?;
 
-    let mut rows = Vec::with_capacity(out.height());
-    for index in 0..out.height() {
-        let first = first_col.get(index).unwrap_or(0.0);
-        let last = last_col.get(index).unwrap_or(first);
-        rows.push(MonthlyReturnRow {
-            year: year_col.get(index).unwrap_or_default(),
-            month: month_col.get(index).unwrap_or_default().max(0) as u32,
-            return_pct: if first.abs() > f64::EPSILON {
-                ((last - first) / first) * 100.0
-            } else {
-                0.0
-            },
-        });
-    }
+    let rows = year_col
+        .into_iter()
+        .zip(month_col.into_iter())
+        .zip(return_col.into_iter())
+        .map(|((year, month), return_pct)| MonthlyReturnRow {
+            year: year.unwrap_or_default(),
+            month: month.unwrap_or_default().max(0) as u32,
+            return_pct: return_pct.unwrap_or(0.0),
+        })
+        .collect();
 
     Ok(rows)
 }
@@ -852,27 +1031,15 @@ fn build_time_performance_polars(
         return Ok(Vec::new());
     }
 
-    let day_of_week = trips
-        .iter()
-        .map(|trip| trip.entry_time.weekday().number_from_monday() as i32)
-        .collect::<Vec<_>>();
-    let hour = trips
-        .iter()
-        .map(|trip| trip.entry_time.hour() as i32)
-        .collect::<Vec<_>>();
-    let return_bps = trips
-        .iter()
-        .map(|trip| trip.return_pct * 100.0)
-        .collect::<Vec<_>>();
-
-    let df = DataFrame::new(vec![
-        Column::new("day_of_week".into(), day_of_week.as_slice()),
-        Column::new("hour".into(), hour.as_slice()),
-        Column::new("return_bps".into(), return_bps.as_slice()),
-    ])?;
+    let df = round_trips_frame(trips)?;
 
     let out = df
         .lazy()
+        .select([
+            col("entry_day_of_week").alias("day_of_week"),
+            col("entry_hour").alias("hour"),
+            col("return_bps"),
+        ])
         .group_by([col("day_of_week"), col("hour")])
         .agg([
             col("return_bps").mean().alias("avg_return_bps"),
@@ -889,15 +1056,20 @@ fn build_time_performance_polars(
     let avg_col = out.column("avg_return_bps")?.f64()?;
     let count_col = out.column("trade_count")?.i64()?;
 
-    let mut rows = Vec::with_capacity(out.height());
-    for index in 0..out.height() {
-        rows.push(TimePerformanceRow {
-            day_of_week: day_col.get(index).unwrap_or_default().max(0) as u32,
-            hour: hour_col.get(index).unwrap_or_default().max(0) as u32,
-            avg_return_bps: avg_col.get(index).unwrap_or(0.0),
-            trade_count: count_col.get(index).unwrap_or_default().max(0) as usize,
-        });
-    }
+    let rows = day_col
+        .into_iter()
+        .zip(hour_col.into_iter())
+        .zip(avg_col.into_iter())
+        .zip(count_col.into_iter())
+        .map(
+            |(((day_of_week, hour), avg_return_bps), trade_count)| TimePerformanceRow {
+                day_of_week: day_of_week.unwrap_or_default().max(0) as u32,
+                hour: hour.unwrap_or_default().max(0) as u32,
+                avg_return_bps: avg_return_bps.unwrap_or(0.0),
+                trade_count: trade_count.unwrap_or_default().max(0) as usize,
+            },
+        )
+        .collect();
 
     Ok(rows)
 }
@@ -951,30 +1123,18 @@ fn build_account_drawdown_series_polars(
         return Ok(Vec::new());
     }
 
-    let mut peak = account_history
-        .first()
-        .map(|(_, account)| account.equity)
-        .unwrap_or(0.0);
-    let mut periods = Vec::with_capacity(account_history.len());
-    let mut drawdowns = Vec::with_capacity(account_history.len());
-
-    for (timestamp, account) in account_history {
-        peak = peak.max(account.equity);
-        let drawdown_pct = if peak.abs() > f64::EPSILON {
-            ((account.equity - peak) / peak) * 100.0
-        } else {
-            0.0
-        };
-        periods.push(month_period(*timestamp));
-        drawdowns.push(drawdown_pct);
-    }
-
-    let df = DataFrame::new(vec![
-        Column::new("period".into(), periods.as_slice()),
-        Column::new("drawdown_pct".into(), drawdowns.as_slice()),
-    ])?;
+    let df = account_history_frame(account_history)?;
     let out = df
         .lazy()
+        .select([col("timestamp_ms"), col("period"), col("equity")])
+        .sort(["timestamp_ms"], Default::default())
+        .with_column(col("equity").cum_max(false).alias("peak_equity"))
+        .with_column(
+            when(col("peak_equity").abs().gt(lit(f64::EPSILON)))
+                .then(((col("equity") - col("peak_equity")) / col("peak_equity")) * lit(100.0))
+                .otherwise(lit(0.0))
+                .alias("drawdown_pct"),
+        )
         .group_by([col("period")])
         .agg([col("drawdown_pct").min().alias("drawdown_pct")])
         .sort(["period"], Default::default())
@@ -983,19 +1143,20 @@ fn build_account_drawdown_series_polars(
     let period_col = out.column("period")?.str()?;
     let drawdown_col = out.column("drawdown_pct")?.f64()?;
 
-    let mut rows = Vec::with_capacity(out.height());
-    for index in 0..out.height() {
-        rows.push(DrawdownSeriesRow {
+    let rows = period_col
+        .into_iter()
+        .zip(drawdown_col.into_iter())
+        .map(|(period, drawdown_pct)| DrawdownSeriesRow {
             strategy_name: "Portfolio Equity".to_string(),
-            period: period_col.get(index).unwrap_or_default().to_string(),
-            drawdown_pct: drawdown_col.get(index).unwrap_or(0.0),
+            period: period.unwrap_or_default().to_string(),
+            drawdown_pct: drawdown_pct.unwrap_or(0.0),
             series_type: "portfolio_equity".to_string(),
             basis: "account_equity".to_string(),
             cumulative_pnl: None,
             cumulative_return_pct: None,
             drawdown_pnl: None,
-        });
-    }
+        })
+        .collect();
 
     Ok(rows)
 }
@@ -1008,6 +1169,11 @@ fn build_account_drawdown_series(
 }
 
 fn build_strategy_drawdown_series(trips: &[RoundTripTrade]) -> Vec<DrawdownSeriesRow> {
+    build_strategy_drawdown_series_polars(trips)
+        .unwrap_or_else(|_| build_strategy_drawdown_series_iter(trips))
+}
+
+fn build_strategy_drawdown_series_iter(trips: &[RoundTripTrade]) -> Vec<DrawdownSeriesRow> {
     let mut by_strategy: BTreeMap<String, Vec<&RoundTripTrade>> = BTreeMap::new();
     for trip in trips {
         let strategy = strategy_label(trip.strategy_type.as_deref(), "Unknown");
@@ -1057,6 +1223,103 @@ fn build_strategy_drawdown_series(trips: &[RoundTripTrade]) -> Vec<DrawdownSerie
     rows
 }
 
+fn build_strategy_drawdown_series_polars(
+    trips: &[RoundTripTrade],
+) -> PolarsResult<Vec<DrawdownSeriesRow>> {
+    if trips.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let df = round_trips_frame(trips)?;
+    let out = df
+        .lazy()
+        .select([
+            col("strategy_type").alias("strategy_name"),
+            col("period"),
+            col("exit_ms"),
+            col("pnl"),
+            col("return_pct"),
+        ])
+        .sort(
+            ["strategy_name", "exit_ms"],
+            SortMultipleOptions::new().with_maintain_order(true),
+        )
+        .with_columns([
+            col("return_pct")
+                .cum_sum(false)
+                .over([col("strategy_name")])
+                .alias("cumulative_return_pct"),
+            col("pnl")
+                .cum_sum(false)
+                .over([col("strategy_name")])
+                .alias("cumulative_pnl"),
+        ])
+        .with_columns([
+            col("cumulative_return_pct")
+                .cum_max(false)
+                .over([col("strategy_name")])
+                .alias("peak_return_pct"),
+            col("cumulative_pnl")
+                .cum_max(false)
+                .over([col("strategy_name")])
+                .alias("peak_pnl"),
+        ])
+        .with_columns([
+            (col("cumulative_return_pct") - col("peak_return_pct")).alias("drawdown_pct"),
+            (col("cumulative_pnl") - col("peak_pnl")).alias("drawdown_pnl"),
+        ])
+        .sort(
+            ["strategy_name", "period", "drawdown_pct"],
+            SortMultipleOptions::new().with_maintain_order(true),
+        )
+        .group_by([col("strategy_name"), col("period")])
+        .agg([
+            col("drawdown_pct").first().alias("drawdown_pct"),
+            col("cumulative_pnl").first().alias("cumulative_pnl"),
+            col("cumulative_return_pct")
+                .first()
+                .alias("cumulative_return_pct"),
+            col("drawdown_pnl").first().alias("drawdown_pnl"),
+        ])
+        .sort(["strategy_name", "period"], Default::default())
+        .collect()?;
+
+    let strategy_col = out.column("strategy_name")?.str()?;
+    let period_col = out.column("period")?.str()?;
+    let drawdown_col = out.column("drawdown_pct")?.f64()?;
+    let cumulative_pnl_col = out.column("cumulative_pnl")?.f64()?;
+    let cumulative_return_col = out.column("cumulative_return_pct")?.f64()?;
+    let drawdown_pnl_col = out.column("drawdown_pnl")?.f64()?;
+
+    let rows = strategy_col
+        .into_iter()
+        .zip(period_col.into_iter())
+        .zip(drawdown_col.into_iter())
+        .zip(cumulative_pnl_col.into_iter())
+        .zip(cumulative_return_col.into_iter())
+        .zip(drawdown_pnl_col.into_iter())
+        .map(
+            |(
+                ((((strategy_name, period), drawdown_pct), cumulative_pnl), cumulative_return_pct),
+                drawdown_pnl,
+            )| {
+                DrawdownSeriesRow {
+                    strategy_name: strategy_name.unwrap_or_default().to_string(),
+                    period: period.unwrap_or_default().to_string(),
+                    drawdown_pct: drawdown_pct.unwrap_or(0.0),
+                    series_type: "strategy_realized".to_string(),
+                    basis: "cumulative_realized_return_pct".to_string(),
+                    cumulative_pnl,
+                    cumulative_return_pct,
+                    drawdown_pnl,
+                }
+            },
+        )
+        .collect();
+
+    Ok(rows)
+}
+
 fn build_drawdown_series(
     account_history: &[(DateTime<Utc>, Account)],
     trips: &[RoundTripTrade],
@@ -1079,17 +1342,25 @@ fn equity_returns(account_history: &[(DateTime<Utc>, Account)]) -> Vec<(DateTime
         .collect()
 }
 
-fn sharpe_from_returns(returns: &[f64]) -> f64 {
-    if returns.len() < 2 {
+fn sharpe_from_returns<I>(returns: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut count = 0usize;
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+
+    for value in returns {
+        count += 1;
+        let delta = value - mean;
+        mean += delta / count as f64;
+        m2 += delta * (value - mean);
+    }
+
+    if count < 2 {
         return 0.0;
     }
-    let n = returns.len() as f64;
-    let mean = returns.iter().sum::<f64>() / n;
-    let variance = returns
-        .iter()
-        .map(|value| (value - mean).powi(2))
-        .sum::<f64>()
-        / n;
+    let variance = m2 / count as f64;
     let std_dev = variance.sqrt();
     if std_dev <= f64::EPSILON {
         return 0.0;
@@ -1097,7 +1368,9 @@ fn sharpe_from_returns(returns: &[f64]) -> f64 {
     (mean / std_dev) * (252.0_f64).sqrt()
 }
 
-fn build_rolling_sharpe(account_history: &[(DateTime<Utc>, Account)]) -> Vec<RollingSharpeRow> {
+fn build_rolling_sharpe_iter(
+    account_history: &[(DateTime<Utc>, Account)],
+) -> Vec<RollingSharpeRow> {
     let returns = equity_returns(account_history);
     if returns.len() < 2 {
         return Vec::new();
@@ -1126,23 +1399,15 @@ fn build_rolling_sharpe(account_history: &[(DateTime<Utc>, Account)]) -> Vec<Rol
         let window_len = ((window_days as f64) * samples_per_day).round() as usize;
         let window_len = window_len.clamp(2, returns.len());
         let mut latest_by_period: BTreeMap<String, f64> = BTreeMap::new();
-        for index in 0..returns.len() {
-            if index + 1 < window_len {
+        for window in returns.windows(window_len) {
+            let Some((timestamp, _)) = window.last() else {
                 continue;
-            }
-            let start = index + 1 - window_len;
-            let slice: Vec<f64> = returns[start..=index]
-                .iter()
-                .map(|(_, value)| *value)
-                .collect();
-            let period = if duration_days <= 2.0 {
-                returns[index].0.format("%Y-%m-%d %H:00").to_string()
-            } else if duration_days <= 14.0 {
-                returns[index].0.format("%Y-%m-%d").to_string()
-            } else {
-                quarter_period(returns[index].0)
             };
-            latest_by_period.insert(period, sharpe_from_returns(&slice));
+            let period = rolling_period(*timestamp, duration_days);
+            latest_by_period.insert(
+                period,
+                sharpe_from_returns(window.iter().map(|(_, value)| *value)),
+            );
         }
         rows.extend(
             latest_by_period
@@ -1156,6 +1421,135 @@ fn build_rolling_sharpe(account_history: &[(DateTime<Utc>, Account)]) -> Vec<Rol
     }
 
     rows
+}
+
+fn build_rolling_sharpe_polars(
+    account_history: &[(DateTime<Utc>, Account)],
+) -> PolarsResult<Vec<RollingSharpeRow>> {
+    if account_history.len() < 3 {
+        return Ok(Vec::new());
+    }
+
+    let Some((first_timestamp, _)) = account_history.first() else {
+        return Ok(Vec::new());
+    };
+    let Some((last_timestamp, _)) = account_history.last() else {
+        return Ok(Vec::new());
+    };
+    let duration_secs = (*last_timestamp - *first_timestamp).num_seconds().max(1) as f64;
+    let duration_days = duration_secs / 86_400.0;
+
+    let mut timestamp_ms = Vec::with_capacity(account_history.len());
+    let mut periods = Vec::with_capacity(account_history.len());
+    let mut equities = Vec::with_capacity(account_history.len());
+    for (timestamp, account) in account_history {
+        timestamp_ms.push(timestamp.timestamp_millis());
+        periods.push(rolling_period(*timestamp, duration_days));
+        equities.push(account.equity);
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("timestamp_ms".into(), timestamp_ms.as_slice()),
+        Column::new("period".into(), periods.as_slice()),
+        Column::new("equity".into(), equities.as_slice()),
+    ])?;
+
+    let returns_len = account_history.len().saturating_sub(1);
+    if returns_len < 2 {
+        return Ok(Vec::new());
+    }
+    let samples_per_day = (returns_len as f64 / duration_days.max(1.0 / 24.0)).max(1.0);
+    let max_window_days = duration_days.ceil().max(1.0) as i32;
+    let mut windows: Vec<i32> = [1_i32, 2, 3, 7, 14, 30, 60, 90, 120, 180]
+        .into_iter()
+        .filter(|window| *window <= max_window_days)
+        .collect();
+    if windows.is_empty() {
+        windows.push(1);
+    }
+
+    let mut rolling_exprs = Vec::with_capacity(windows.len() * 2);
+    let mut sharpe_exprs = Vec::with_capacity(windows.len());
+    for window_days in &windows {
+        let window_len = ((*window_days as f64) * samples_per_day).round() as usize;
+        let window_len = window_len.clamp(2, returns_len);
+        let options = RollingOptionsFixedWindow {
+            window_size: window_len,
+            min_periods: window_len,
+            ..Default::default()
+        };
+        let mean_name = format!("rolling_mean_{}d", window_days);
+        let std_name = format!("rolling_std_{}d", window_days);
+        let sharpe_name = format!("sharpe_{}d", window_days);
+        rolling_exprs.push(
+            col("return_value")
+                .rolling_mean(options.clone())
+                .alias(&mean_name),
+        );
+        rolling_exprs.push(col("return_value").rolling_std(options).alias(&std_name));
+        sharpe_exprs.push(
+            when(col(&std_name).abs().gt(lit(f64::EPSILON)))
+                .then((col(&mean_name) / col(&std_name)) * lit((252.0_f64).sqrt()))
+                .otherwise(lit(0.0))
+                .alias(&sharpe_name),
+        );
+    }
+
+    let mut select_exprs = Vec::with_capacity(windows.len() + 1);
+    select_exprs.push(col("period"));
+    select_exprs.extend(
+        windows
+            .iter()
+            .map(|window_days| col(format!("sharpe_{}d", window_days))),
+    );
+
+    let out = df
+        .lazy()
+        .sort(
+            ["timestamp_ms"],
+            SortMultipleOptions::new().with_maintain_order(true),
+        )
+        .with_column(col("equity").shift(lit(1_i64)).alias("previous_equity"))
+        .filter(
+            col("previous_equity")
+                .is_not_null()
+                .and(col("previous_equity").abs().gt(lit(f64::EPSILON))),
+        )
+        .with_column(
+            ((col("equity") - col("previous_equity")) / col("previous_equity"))
+                .alias("return_value"),
+        )
+        .with_columns(rolling_exprs)
+        .with_columns(sharpe_exprs)
+        .select(select_exprs)
+        .collect()?;
+
+    let period_col = out.column("period")?.str()?;
+    let mut rows = Vec::new();
+    for window_days in windows {
+        let sharpe_col = out.column(&format!("sharpe_{}d", window_days))?.f64()?;
+        let latest_by_period: BTreeMap<String, f64> = period_col
+            .into_iter()
+            .zip(sharpe_col.into_iter())
+            .filter_map(|(period, sharpe)| Some((period?.to_string(), sharpe?)))
+            .collect();
+        rows.extend(
+            latest_by_period
+                .into_iter()
+                .map(|(period, sharpe)| RollingSharpeRow {
+                    window_days,
+                    period,
+                    sharpe,
+                }),
+        );
+    }
+
+    Ok(rows)
+}
+
+fn build_rolling_sharpe(account_history: &[(DateTime<Utc>, Account)]) -> Vec<RollingSharpeRow> {
+    build_rolling_sharpe_polars(account_history)
+        .unwrap_or_else(|_| build_rolling_sharpe_iter(account_history))
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -1243,26 +1637,25 @@ fn build_regime_points(bars: &[Bar]) -> Vec<RegimePoint> {
     let q3 = percentile(&vol_values, 0.75);
 
     let mut points = Vec::new();
-    for index in 50..bars.len() {
+    for (start_index, window) in bars.windows(51).enumerate() {
+        let index = start_index + 50;
         let Some(vol) = vol_by_index.get(&index).copied() else {
             continue;
         };
-        let sma50 = bars[index - 50..index]
-            .iter()
-            .map(|bar| bar.close)
-            .sum::<f64>()
-            / 50.0;
+        let current = &window[50];
+        let previous = &window[49];
+        let sma50 = window[..50].iter().map(|bar| bar.close).sum::<f64>() / 50.0;
         if sma50.abs() <= f64::EPSILON {
             continue;
         }
-        let slope = (bars[index].close - sma50) / sma50;
-        let market_return_pct = if index > 0 && bars[index - 1].close.abs() > f64::EPSILON {
-            (bars[index].close - bars[index - 1].close) / bars[index - 1].close * 100.0
+        let slope = (current.close - sma50) / sma50;
+        let market_return_pct = if previous.close.abs() > f64::EPSILON {
+            (current.close - previous.close) / previous.close * 100.0
         } else {
             0.0
         };
         points.push(RegimePoint {
-            timestamp: bars[index].timestamp,
+            timestamp: current.timestamp,
             vol_regime: volatility_regime(vol, q1, q2, q3).to_string(),
             trend_regime: trend_regime(slope).to_string(),
             market_return_pct,
@@ -1367,15 +1760,20 @@ fn build_regime_performance_polars(
     let avg_col = out.column("avg_return_pct")?.f64()?;
     let count_col = out.column("bar_count")?.i64()?;
 
-    let mut rows = Vec::with_capacity(out.height());
-    for index in 0..out.height() {
-        rows.push(RegimePerformanceRow {
-            vol_regime: vol_col.get(index).unwrap_or_default().to_string(),
-            trend_regime: trend_col.get(index).unwrap_or_default().to_string(),
-            avg_return_pct: avg_col.get(index).unwrap_or(0.0),
-            bar_count: count_col.get(index).unwrap_or_default().max(0) as usize,
-        });
-    }
+    let rows = vol_col
+        .into_iter()
+        .zip(trend_col.into_iter())
+        .zip(avg_col.into_iter())
+        .zip(count_col.into_iter())
+        .map(
+            |(((vol_regime, trend_regime), avg_return_pct), bar_count)| RegimePerformanceRow {
+                vol_regime: vol_regime.unwrap_or_default().to_string(),
+                trend_regime: trend_regime.unwrap_or_default().to_string(),
+                avg_return_pct: avg_return_pct.unwrap_or(0.0),
+                bar_count: bar_count.unwrap_or_default().max(0) as usize,
+            },
+        )
+        .collect();
 
     Ok(rows)
 }
@@ -1559,31 +1957,55 @@ fn build_strategy_regime_performance_polars(
     let gross_profit_col = out.column("gross_profit")?.f64()?;
     let gross_loss_col = out.column("gross_loss")?.f64()?;
 
-    let mut rows = Vec::with_capacity(out.height());
-    for index in 0..out.height() {
-        let trade_count = trade_count_col.get(index).unwrap_or_default().max(0) as usize;
-        let winners = winning_col.get(index).unwrap_or_default().max(0) as usize;
-        let gross_profit = gross_profit_col.get(index).unwrap_or(0.0);
-        let gross_loss = gross_loss_col.get(index).unwrap_or(0.0);
-        rows.push(StrategyRegimePerformanceRow {
-            strategy_type: strategy_col.get(index).unwrap_or_default().to_string(),
-            vol_regime: vol_col.get(index).unwrap_or_default().to_string(),
-            trend_regime: trend_col.get(index).unwrap_or_default().to_string(),
-            trade_count,
-            win_rate: if trade_count > 0 {
-                winners as f64 / trade_count as f64 * 100.0
-            } else {
-                0.0
+    let rows = strategy_col
+        .into_iter()
+        .zip(vol_col.into_iter())
+        .zip(trend_col.into_iter())
+        .zip(total_pnl_col.into_iter())
+        .zip(avg_return_col.into_iter())
+        .zip(trade_count_col.into_iter())
+        .zip(winning_col.into_iter())
+        .zip(gross_profit_col.into_iter())
+        .zip(gross_loss_col.into_iter())
+        .map(
+            |(
+                (
+                    (
+                        (
+                            ((((strategy, vol_regime), trend_regime), total_pnl), avg_return),
+                            trade_count,
+                        ),
+                        winners,
+                    ),
+                    gross_profit,
+                ),
+                gross_loss,
+            )| {
+                let trade_count = trade_count.unwrap_or_default().max(0) as usize;
+                let winners = winners.unwrap_or_default().max(0) as usize;
+                let gross_profit = gross_profit.unwrap_or(0.0);
+                let gross_loss = gross_loss.unwrap_or(0.0);
+                StrategyRegimePerformanceRow {
+                    strategy_type: strategy.unwrap_or_default().to_string(),
+                    vol_regime: vol_regime.unwrap_or_default().to_string(),
+                    trend_regime: trend_regime.unwrap_or_default().to_string(),
+                    trade_count,
+                    win_rate: if trade_count > 0 {
+                        winners as f64 / trade_count as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                    total_pnl: total_pnl.unwrap_or(0.0),
+                    avg_return_pct: avg_return.unwrap_or(0.0),
+                    profit_factor: if gross_loss > f64::EPSILON {
+                        gross_profit / gross_loss
+                    } else {
+                        0.0
+                    },
+                }
             },
-            total_pnl: total_pnl_col.get(index).unwrap_or(0.0),
-            avg_return_pct: avg_return_col.get(index).unwrap_or(0.0),
-            profit_factor: if gross_loss > f64::EPSILON {
-                gross_profit / gross_loss
-            } else {
-                0.0
-            },
-        });
-    }
+        )
+        .collect();
 
     Ok(rows)
 }
@@ -1786,40 +2208,53 @@ fn build_setup_performance_polars(
     let gross_profit_col = out.column("gross_profit")?.f64()?;
     let gross_loss_col = out.column("gross_loss")?.f64()?;
 
-    let mut rows = Vec::with_capacity(out.height());
-    for index in 0..out.height() {
-        let trade_count = trade_count_col.get(index).unwrap_or_default().max(0) as usize;
-        let winners = winning_col.get(index).unwrap_or_default().max(0) as usize;
-        let losers = losing_col.get(index).unwrap_or_default().max(0) as usize;
-        let gross_profit = gross_profit_col.get(index).unwrap_or(0.0);
-        let gross_loss = gross_loss_col.get(index).unwrap_or(0.0);
-        let avg_win = if winners > 0 {
-            gross_profit / winners as f64
-        } else {
-            0.0
-        };
-        let avg_loss = if losers > 0 {
-            gross_loss / losers as f64
-        } else {
-            0.0
-        };
+    let rows = setup_col
+        .into_iter()
+        .zip(total_pnl_col.into_iter())
+        .zip(trade_count_col.into_iter())
+        .zip(winning_col.into_iter())
+        .zip(losing_col.into_iter())
+        .zip(gross_profit_col.into_iter())
+        .zip(gross_loss_col.into_iter())
+        .map(
+            |(
+                (((((setup_name, total_pnl), trade_count), winners), losers), gross_profit),
+                gross_loss,
+            )| {
+                let trade_count = trade_count.unwrap_or_default().max(0) as usize;
+                let winners = winners.unwrap_or_default().max(0) as usize;
+                let losers = losers.unwrap_or_default().max(0) as usize;
+                let gross_profit = gross_profit.unwrap_or(0.0);
+                let gross_loss = gross_loss.unwrap_or(0.0);
+                let avg_win = if winners > 0 {
+                    gross_profit / winners as f64
+                } else {
+                    0.0
+                };
+                let avg_loss = if losers > 0 {
+                    gross_loss / losers as f64
+                } else {
+                    0.0
+                };
 
-        rows.push(SetupPerformanceRow {
-            setup_name: setup_col.get(index).unwrap_or_default().to_string(),
-            win_rate: if trade_count > 0 {
-                winners as f64 / trade_count as f64 * 100.0
-            } else {
-                0.0
+                SetupPerformanceRow {
+                    setup_name: setup_name.unwrap_or_default().to_string(),
+                    win_rate: if trade_count > 0 {
+                        winners as f64 / trade_count as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                    payoff_ratio: if avg_loss > f64::EPSILON {
+                        avg_win / avg_loss
+                    } else {
+                        0.0
+                    },
+                    trade_count,
+                    total_pnl: total_pnl.unwrap_or(0.0),
+                }
             },
-            payoff_ratio: if avg_loss > f64::EPSILON {
-                avg_win / avg_loss
-            } else {
-                0.0
-            },
-            trade_count,
-            total_pnl: total_pnl_col.get(index).unwrap_or(0.0),
-        });
-    }
+        )
+        .collect();
 
     Ok(rows)
 }
@@ -1872,31 +2307,41 @@ fn build_position_concentration(trade_log: &[TradeRecord]) -> Vec<PositionConcen
         .collect()
 }
 
-fn pearson(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() || a.len() < 2 {
-        return 0.0;
-    }
-    let mean_a = a.iter().sum::<f64>() / a.len() as f64;
-    let mean_b = b.iter().sum::<f64>() / b.len() as f64;
+fn pearson_pairs<I>(pairs: I) -> (f64, usize)
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    let mut count = 0usize;
+    let mut mean_a = 0.0;
+    let mut mean_b = 0.0;
     let mut covariance = 0.0;
     let mut var_a = 0.0;
     let mut var_b = 0.0;
-    for (left, right) in a.iter().zip(b.iter()) {
-        let da = left - mean_a;
-        let db = right - mean_b;
-        covariance += da * db;
-        var_a += da * da;
-        var_b += db * db;
+
+    for (a, b) in pairs {
+        count += 1;
+        let delta_a = a - mean_a;
+        let delta_b = b - mean_b;
+        mean_a += delta_a / count as f64;
+        mean_b += delta_b / count as f64;
+        covariance += delta_a * (b - mean_b);
+        var_a += delta_a * (a - mean_a);
+        var_b += delta_b * (b - mean_b);
     }
+
+    if count < 2 {
+        return (0.0, count);
+    }
+
     let denominator = (var_a * var_b).sqrt();
     if denominator <= f64::EPSILON {
-        0.0
+        (0.0, count)
     } else {
-        covariance / denominator
+        (covariance / denominator, count)
     }
 }
 
-fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelationRow> {
+fn build_strategy_correlations_iter(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelationRow> {
     let mut by_strategy: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     for trip in trips {
         let strategy = strategy_label(trip.strategy_type.as_deref(), "Strategy");
@@ -1912,32 +2357,18 @@ fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelat
         return Vec::new();
     }
 
-    let dates: Vec<String> = by_strategy
+    let dates = by_strategy
         .values()
         .flat_map(|items| items.keys().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let strategies: Vec<String> = by_strategy.keys().cloned().collect();
+        .collect::<std::collections::BTreeSet<_>>();
     let mut rows = Vec::new();
-    for strategy_a in &strategies {
-        for strategy_b in &strategies {
-            let common_dates = dates
-                .iter()
-                .filter(|date| {
-                    by_strategy[strategy_a].contains_key(*date)
-                        && by_strategy[strategy_b].contains_key(*date)
-                })
-                .collect::<Vec<_>>();
-            let values_a: Vec<f64> = common_dates
-                .iter()
-                .map(|date| by_strategy[strategy_a].get(*date).copied().unwrap_or(0.0))
-                .collect();
-            let values_b: Vec<f64> = common_dates
-                .iter()
-                .map(|date| by_strategy[strategy_b].get(*date).copied().unwrap_or(0.0))
-                .collect();
-            let sample_count = common_dates.len();
+    for (strategy_a, series_a) in &by_strategy {
+        for (strategy_b, series_b) in &by_strategy {
+            let (correlation, sample_count) = pearson_pairs(
+                dates
+                    .iter()
+                    .filter_map(|date| Some((*series_a.get(date)?, *series_b.get(date)?))),
+            );
             rows.push(StrategyCorrelationRow {
                 strategy_a: strategy_a.clone(),
                 strategy_b: strategy_b.clone(),
@@ -1946,13 +2377,99 @@ fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelat
                 } else if sample_count < 2 {
                     0.0
                 } else {
-                    pearson(&values_a, &values_b)
+                    correlation
                 },
                 sample_count,
             });
         }
     }
     rows
+}
+
+fn build_strategy_correlations_polars(
+    trips: &[RoundTripTrade],
+) -> PolarsResult<Vec<StrategyCorrelationRow>> {
+    if trips.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let daily_returns = round_trips_frame(trips)?
+        .lazy()
+        .select([col("strategy_type"), col("exit_date"), col("return_pct")])
+        .group_by([col("strategy_type"), col("exit_date")])
+        .agg([col("return_pct").sum().alias("return_pct")])
+        .collect()?;
+
+    let strategy_col = daily_returns.column("strategy_type")?.str()?;
+    let strategies = strategy_col
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if strategies.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    for strategy_a in &strategies {
+        for strategy_b in &strategies {
+            let left = daily_returns
+                .clone()
+                .lazy()
+                .filter(col("strategy_type").eq(lit(strategy_a.as_str())))
+                .select([col("exit_date"), col("return_pct").alias("return_a")]);
+            let right = daily_returns
+                .clone()
+                .lazy()
+                .filter(col("strategy_type").eq(lit(strategy_b.as_str())))
+                .select([col("exit_date"), col("return_pct").alias("return_b")]);
+
+            let out = left
+                .join(
+                    right,
+                    [col("exit_date")],
+                    [col("exit_date")],
+                    JoinArgs::new(JoinType::Inner),
+                )
+                .select([
+                    pearson_corr(col("return_a"), col("return_b")).alias("correlation"),
+                    col("return_a")
+                        .count()
+                        .cast(DataType::Int64)
+                        .alias("sample_count"),
+                ])
+                .collect()?;
+
+            let sample_count = out
+                .column("sample_count")?
+                .i64()?
+                .get(0)
+                .unwrap_or_default()
+                .max(0) as usize;
+            let correlation = if strategy_a == strategy_b {
+                1.0
+            } else if sample_count < 2 {
+                0.0
+            } else {
+                out.column("correlation")?.f64()?.get(0).unwrap_or(0.0)
+            };
+
+            rows.push(StrategyCorrelationRow {
+                strategy_a: strategy_a.clone(),
+                strategy_b: strategy_b.clone(),
+                correlation,
+                sample_count,
+            });
+        }
+    }
+
+    Ok(rows)
+}
+
+fn build_strategy_correlations(trips: &[RoundTripTrade]) -> Vec<StrategyCorrelationRow> {
+    build_strategy_correlations_polars(trips)
+        .unwrap_or_else(|_| build_strategy_correlations_iter(trips))
 }
 
 async fn insert_analysis_tables(
@@ -2170,7 +2687,7 @@ pub async fn write_backtest_db(
     insert_trade_log_rows(&tx, &results.trade_log, &insights).await?;
     insert_account_history(&tx, &results.account_history).await?;
     insert_insights(&tx, &insights).await?;
-    insert_bars(&tx, &state.historical_bars).await?;
+    insert_bars(&tx, state).await?;
     insert_analysis_tables(&tx, results, state, &round_trips).await?;
     tx.commit().await.map_err(to_storage_err)?;
     Ok(())
@@ -2312,6 +2829,78 @@ mod tests {
         assert_eq!(rows[0].parent_id.as_deref(), Some("parent-1"));
         assert!(rows[0].is_child);
         assert_eq!(rows[0].base_strategy_type.as_deref(), Some("MeanReversion"));
+    }
+
+    #[tokio::test]
+    async fn feature_stream_bars_persist_history_key_metadata() {
+        use crate::core::broker::types::Bar;
+        use crate::core::events::{EventStreamType, ResolvedEventStream};
+        use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
+
+        let dir = std::env::temp_dir().join(format!("aqe-backtest-bars-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = BacktestState::new();
+        let timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 9, 30, 0).unwrap();
+        let main_timeframe = TimeFrame::new(5, TimeFrameUnit::Minute);
+        let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
+        let stream = ResolvedEventStream::new(
+            EventStreamType::Bar,
+            "AAPL",
+            feature_timeframe,
+            main_timeframe,
+            false,
+        );
+        state.load_event_stream_bars(
+            stream,
+            vec![Bar {
+                symbol: "AAPL".to_string(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1_000.0,
+                timestamp,
+            }],
+        );
+
+        let mut conn = connect_database(&dir).await.unwrap();
+        init_schema(&conn).await.unwrap();
+        let tx = conn.transaction().await.unwrap();
+        insert_bars(&tx, &state).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let mut rows = conn
+            .query(
+                "SELECT symbol, history_key, timeframe_label, is_feature, allow_trading, payload_json FROM bars",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let symbol: String = row.get(0).unwrap();
+        let history_key: String = row.get(1).unwrap();
+        let timeframe_label: String = row.get(2).unwrap();
+        let is_feature: i64 = row.get(3).unwrap();
+        let allow_trading: i64 = row.get(4).unwrap();
+        let payload_json: String = row.get(5).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+
+        assert_eq!(symbol, "AAPL");
+        assert_eq!(history_key, "AAPL:15m");
+        assert_eq!(timeframe_label, "15m");
+        assert_eq!(is_feature, 1);
+        assert_eq!(allow_trading, 0);
+        assert_eq!(payload["symbol"], "AAPL:15m");
+        assert_eq!(payload["asset_symbol"], "AAPL");
+        assert_eq!(payload["history_key"], "AAPL:15m");
+        assert_eq!(payload["timeframe_label"], "15m");
+        assert_eq!(payload["is_feature"], true);
+        assert_eq!(payload["allow_trading"], false);
+
+        drop(rows);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

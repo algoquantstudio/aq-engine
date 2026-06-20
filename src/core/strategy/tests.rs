@@ -25,12 +25,14 @@ mod tests {
     use crate::core::pipeline::insight_submit::InsightSubmitPipe;
     use crate::core::pipeline::scale_out::ScaleOutPipe;
     use crate::core::pipeline::{InsightPipe, InsightPipeResult, WrappedInsightPipe};
-    use crate::core::strategy::StrategyMode;
+    use crate::core::strategy::{EventStreamType, StrategyMode};
     use crate::core::universe::{UniverseModel, UniverseModelBuilder, UniverseResult};
     use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
     use chrono::{TimeZone, Utc};
     use polars::prelude::*;
+    use rustc_hash::FxHashSet;
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     static MT5_INTEGRATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -314,6 +316,156 @@ mod tests {
         }
     }
 
+    struct GeneratedWarmupDataFeed {
+        connected: Arc<Mutex<bool>>,
+        requests: Arc<Mutex<Vec<(String, TimeFrame)>>>,
+    }
+
+    impl GeneratedWarmupDataFeed {
+        fn new() -> Self {
+            Self {
+                connected: Arc::new(Mutex::new(false)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl DataFeed for GeneratedWarmupDataFeed {
+        async fn connect(&self) -> Result<bool, BrokerError> {
+            *self.connected.lock().unwrap() = true;
+            Ok(true)
+        }
+
+        async fn disconnect(&self) -> Result<bool, BrokerError> {
+            *self.connected.lock().unwrap() = false;
+            Ok(true)
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.lock().unwrap()
+        }
+    }
+
+    impl DataProvider for GeneratedWarmupDataFeed {
+        async fn get_ticker_info(&self, symbol: &str) -> Result<Asset, BrokerError> {
+            Ok(Asset {
+                id: format!("generated-{symbol}"),
+                symbol: symbol.to_string(),
+                name: symbol.to_string(),
+                asset_type: AssetType::Stock,
+                status: AssetStatus::Active,
+                exchange: AssetExchange::NASDAQ,
+                tradable: true,
+                marginable: true,
+                shortable: true,
+                fractional: true,
+                min_order_size: None,
+                quantity_base: None,
+                max_order_size: None,
+                min_price_increment: Some(0.01),
+                price_base: None,
+                contract_size: None,
+            })
+        }
+
+        async fn get_history(
+            &self,
+            symbol: &str,
+            start: chrono::DateTime<chrono::Utc>,
+            end: chrono::DateTime<chrono::Utc>,
+            time_frame: TimeFrame,
+        ) -> Result<DataFrame, BrokerError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((symbol.to_string(), time_frame));
+
+            let mut symbols = Vec::new();
+            let mut open = Vec::new();
+            let mut high = Vec::new();
+            let mut low = Vec::new();
+            let mut close = Vec::new();
+            let mut volume = Vec::new();
+            let mut timestamp = Vec::new();
+            let mut current = start;
+            let mut index = 0usize;
+
+            while current < end {
+                let price = 100.0 + index as f64;
+                symbols.push(symbol.to_string());
+                open.push(price);
+                high.push(price + 1.0);
+                low.push(price - 1.0);
+                close.push(price + 0.5);
+                volume.push(1_000.0 + index as f64);
+                timestamp.push(current.timestamp_millis());
+
+                current = time_frame
+                    .add_time_increment(current, 1)
+                    .map_err(|error| BrokerError::DataFeedError(format!("{:?}", error)))?;
+                index += 1;
+                if index > 10_000 {
+                    return Err(BrokerError::DataFeedError(
+                        "Generated history exceeded safety limit".to_string(),
+                    ));
+                }
+            }
+
+            DataFrame::new(vec![
+                Column::new("symbol".into(), symbols),
+                Column::new("open".into(), open),
+                Column::new("high".into(), high),
+                Column::new("low".into(), low),
+                Column::new("close".into(), close),
+                Column::new("volume".into(), volume),
+                Column::new("timestamp".into(), timestamp),
+            ])
+            .map_err(|error| BrokerError::DataFeedError(error.to_string()))
+        }
+
+        async fn get_latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
+            Ok(Quote {
+                symbol: symbol.to_string(),
+                bid: 100.0,
+                ask: 100.0,
+                bid_size: 100.0,
+                ask_size: 100.0,
+                last: Some(100.0),
+                last_size: Some(100.0),
+                timestamp: Utc::now(),
+            })
+        }
+
+        async fn get_latest_bar(&self, symbol: &str) -> Result<Bar, BrokerError> {
+            Ok(Bar {
+                symbol: symbol.to_string(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1_000.0,
+                timestamp: Utc::now(),
+            })
+        }
+
+        async fn subscribe_to_data_stream(
+            &self,
+            _symbols: Vec<String>,
+            _time_frame: TimeFrame,
+            _mode: DataStreamMode,
+            _on_bar: Arc<dyn Fn(Bar) + Send + Sync>,
+        ) -> Result<(), BrokerError> {
+            Ok(())
+        }
+
+        async fn unsubscribe_from_data_stream(
+            &self,
+            _symbols: Vec<String>,
+        ) -> Result<(), BrokerError> {
+            Ok(())
+        }
+    }
+
     struct FixedScaleOutBacktestStrategy {
         generated: bool,
         tp_levels: Vec<f64>,
@@ -415,6 +567,370 @@ mod tests {
         Some(state)
     }
 
+    #[derive(Clone, Debug)]
+    struct RecordedEvent {
+        history_key: String,
+        symbol: String,
+        timeframe: TimeFrame,
+        is_feature: bool,
+        allow_trading: bool,
+    }
+
+    struct MultiTimeframeBacktestStrategy {
+        feature_timeframe: TimeFrame,
+        on_bar_events: Arc<Mutex<Vec<RecordedEvent>>>,
+        generate_events: Arc<Mutex<Vec<RecordedEvent>>>,
+    }
+
+    impl Strategy for MultiTimeframeBacktestStrategy {
+        fn name(&self) -> &str {
+            "MultiTimeframeBacktestStrategy"
+        }
+
+        fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+            ctx.add_events(EventStreamType::Bar, Some(self.feature_timeframe));
+        }
+
+        fn init(&mut self, _ctx: &mut dyn StrategyContext, _asset: &Asset) {}
+
+        fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+            ["AAPL".to_string()].into_iter().collect()
+        }
+
+        fn on_bar(&mut self, ctx: &mut dyn StrategyContext, _symbol: &str, _bar: &BarData) {
+            let event = ctx
+                .current_event()
+                .expect("on_bar should run inside a market event context");
+            self.on_bar_events.lock().unwrap().push(RecordedEvent {
+                history_key: event.history_key,
+                symbol: event.symbol,
+                timeframe: event.timeframe,
+                is_feature: event.is_feature,
+                allow_trading: event.allow_trading,
+            });
+        }
+
+        fn generate_insights(&mut self, ctx: &mut dyn StrategyContext, _symbol: &str) {
+            let event = ctx
+                .current_event()
+                .expect("generate_insights should keep the active market event context");
+            self.generate_events.lock().unwrap().push(RecordedEvent {
+                history_key: event.history_key,
+                symbol: event.symbol,
+                timeframe: event.timeframe,
+                is_feature: event.is_feature,
+                allow_trading: event.allow_trading,
+            });
+        }
+
+        fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+        fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+    }
+
+    #[tokio::test]
+    async fn multi_timeframe_feature_stream_updates_feature_history_without_trading() {
+        init_test_logger("debug");
+        let on_bar_events = Arc::new(Mutex::new(Vec::new()));
+        let generate_events = Arc::new(Mutex::new(Vec::new()));
+        let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = FixedScaleOutDataFeed::new();
+        let broker = UnifiedBroker::new(execution, data);
+        let mut state = StrategyState::new(
+            "MultiTimeframeBacktest".to_string(),
+            "1.0".to_string(),
+            MultiTimeframeBacktestStrategy {
+                feature_timeframe,
+                on_bar_events: on_bar_events.clone(),
+                generate_events: generate_events.clone(),
+            },
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+
+        let start = Utc.timestamp_millis_opt(1756771200000).unwrap();
+        let end = Utc.timestamp_millis_opt(1757030400000).unwrap();
+        state
+            .run_backtest(start, end, state.timeframe())
+            .await
+            .expect("multi-timeframe fixed-data backtest should complete");
+
+        let main_history = state
+            .history
+            .get("AAPL")
+            .expect("main timeframe history should use the base symbol key");
+        let feature_history = state
+            .history
+            .get("AAPL:15m")
+            .expect("feature timeframe history should use symbol:timeframe key");
+        assert!(main_history.height() > 0);
+        assert_eq!(main_history.height(), feature_history.height());
+
+        let on_bar_events = on_bar_events.lock().unwrap();
+        assert!(
+            on_bar_events
+                .iter()
+                .any(|event| event.history_key == "AAPL" && !event.is_feature)
+        );
+        assert!(on_bar_events.iter().any(|event| {
+            event.history_key == "AAPL:15m"
+                && event.symbol == "AAPL"
+                && event.timeframe == feature_timeframe
+                && event.is_feature
+                && !event.allow_trading
+        }));
+        drop(on_bar_events);
+
+        let generate_events = generate_events.lock().unwrap();
+        assert!(
+            !generate_events.is_empty(),
+            "main timeframe events should still generate insights"
+        );
+        assert!(
+            generate_events
+                .iter()
+                .all(|event| event.history_key == "AAPL"
+                    && !event.is_feature
+                    && event.allow_trading),
+            "feature events should not call generate_insights by default"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct HistoryWindowRequest {
+        symbol: String,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        time_frame: TimeFrame,
+    }
+
+    struct HistoryWindowSpyDataFeed {
+        connected: Arc<Mutex<bool>>,
+        requests: Arc<Mutex<Vec<HistoryWindowRequest>>>,
+        subscribe_calls: Arc<Mutex<usize>>,
+    }
+
+    impl HistoryWindowSpyDataFeed {
+        fn new() -> Self {
+            Self {
+                connected: Arc::new(Mutex::new(false)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                subscribe_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl DataFeed for HistoryWindowSpyDataFeed {
+        async fn connect(&self) -> Result<bool, BrokerError> {
+            *self.connected.lock().unwrap() = true;
+            Ok(true)
+        }
+
+        async fn disconnect(&self) -> Result<bool, BrokerError> {
+            *self.connected.lock().unwrap() = false;
+            Ok(true)
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.lock().unwrap()
+        }
+    }
+
+    impl DataProvider for HistoryWindowSpyDataFeed {
+        async fn get_ticker_info(&self, symbol: &str) -> Result<Asset, BrokerError> {
+            Ok(Asset {
+                id: format!("spy-{symbol}"),
+                symbol: symbol.to_string(),
+                name: symbol.to_string(),
+                asset_type: AssetType::Stock,
+                status: AssetStatus::Active,
+                exchange: AssetExchange::NASDAQ,
+                tradable: true,
+                marginable: true,
+                shortable: true,
+                fractional: true,
+                min_order_size: None,
+                quantity_base: None,
+                max_order_size: None,
+                min_price_increment: Some(0.01),
+                price_base: None,
+                contract_size: None,
+            })
+        }
+
+        async fn get_history(
+            &self,
+            symbol: &str,
+            start: chrono::DateTime<chrono::Utc>,
+            end: chrono::DateTime<chrono::Utc>,
+            time_frame: TimeFrame,
+        ) -> Result<DataFrame, BrokerError> {
+            self.requests.lock().unwrap().push(HistoryWindowRequest {
+                symbol: symbol.to_string(),
+                start,
+                end,
+                time_frame,
+            });
+
+            let mut symbols = Vec::new();
+            let mut open = Vec::new();
+            let mut high = Vec::new();
+            let mut low = Vec::new();
+            let mut close = Vec::new();
+            let mut volume = Vec::new();
+            let mut timestamp = Vec::new();
+            let mut current = start;
+            let mut index = 0usize;
+
+            while current < end {
+                let price = 100.0 + index as f64;
+                symbols.push(symbol.to_string());
+                open.push(price);
+                high.push(price + 1.0);
+                low.push(price - 1.0);
+                close.push(price + 0.5);
+                volume.push(1_000.0 + index as f64);
+                timestamp.push(current.timestamp_millis());
+                current = time_frame
+                    .add_time_increment(current, 1)
+                    .map_err(|error| BrokerError::DataFeedError(format!("{:?}", error)))?;
+                index += 1;
+                if index > 10_000 {
+                    return Err(BrokerError::DataFeedError(
+                        "HistoryWindowSpyDataFeed exceeded safety limit".to_string(),
+                    ));
+                }
+            }
+
+            DataFrame::new(vec![
+                Column::new("symbol".into(), symbols),
+                Column::new("open".into(), open),
+                Column::new("high".into(), high),
+                Column::new("low".into(), low),
+                Column::new("close".into(), close),
+                Column::new("volume".into(), volume),
+                Column::new("timestamp".into(), timestamp),
+            ])
+            .map_err(|error| BrokerError::DataFeedError(error.to_string()))
+        }
+
+        async fn get_latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
+            Ok(Quote {
+                symbol: symbol.to_string(),
+                bid: 100.0,
+                ask: 100.0,
+                bid_size: 100.0,
+                ask_size: 100.0,
+                last: Some(100.0),
+                last_size: Some(100.0),
+                timestamp: Utc::now(),
+            })
+        }
+
+        async fn get_latest_bar(&self, symbol: &str) -> Result<Bar, BrokerError> {
+            Ok(Bar {
+                symbol: symbol.to_string(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1_000.0,
+                timestamp: Utc::now(),
+            })
+        }
+
+        async fn subscribe_to_data_stream(
+            &self,
+            _symbols: Vec<String>,
+            _time_frame: TimeFrame,
+            _mode: DataStreamMode,
+            _on_bar: Arc<dyn Fn(Bar) + Send + Sync>,
+        ) -> Result<(), BrokerError> {
+            *self.subscribe_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        async fn unsubscribe_from_data_stream(
+            &self,
+            _symbols: Vec<String>,
+        ) -> Result<(), BrokerError> {
+            Ok(())
+        }
+    }
+
+    struct HistoryWindowSpyStrategy {
+        feature_timeframe: TimeFrame,
+    }
+
+    impl Strategy for HistoryWindowSpyStrategy {
+        fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+            ctx.add_events(EventStreamType::Bar, Some(self.feature_timeframe));
+        }
+
+        fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+            ["AAPL".to_string()].into_iter().collect()
+        }
+
+        fn init(&mut self, _ctx: &mut dyn StrategyContext, _asset: &Asset) {}
+
+        fn on_bar(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str, _bar: &BarData) {}
+
+        fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+        fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+        fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+    }
+
+    #[tokio::test]
+    async fn backtest_add_event_history_uses_backtest_end_not_wall_clock_now() {
+        let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = HistoryWindowSpyDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "HistoryWindowSpy".to_string(),
+            "1.0".to_string(),
+            HistoryWindowSpyStrategy { feature_timeframe },
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+
+        let start = Utc.with_ymd_and_hms(2025, 2, 3, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 2, 4, 0, 0, 0).unwrap();
+        state
+            .run_backtest(start, end, state.timeframe())
+            .await
+            .expect("history window spy backtest should complete");
+
+        let requests = state.broker.data.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.symbol == "AAPL"));
+        assert!(requests.iter().all(|request| request.start == start));
+        assert!(
+            requests.iter().all(|request| request.end == end),
+            "all backtest history requests, including add_event feature streams, should end at the configured backtest end"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.time_frame == TimeFrame::new(1, TimeFrameUnit::Day))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.time_frame == feature_timeframe)
+        );
+        assert_eq!(
+            *state.broker.data.subscribe_calls.lock().unwrap(),
+            0,
+            "backtests should load historical event streams instead of starting live subscriptions"
+        );
+    }
+
     async fn assert_scaled_out(
         state: &StrategyState<FixedScaleOutBacktestStrategy, PaperBroker, FixedScaleOutDataFeed>,
     ) {
@@ -423,7 +939,7 @@ mod tests {
             state.insights.len()
         );
         let mut found_scaled_out = false;
-        for id in state.insights.keys().cloned().collect::<Vec<_>>() {
+        for id in state.insights.ids() {
             if let Some(insight) = state.insights.get(&id) {
                 println!(
                     "[scale-out-test] insight id={} state={:?} partials={} partial_qty={:?}",
@@ -482,7 +998,7 @@ mod tests {
                 !matches!(
                     order.status,
                     TradeUpdateEvent::Closed
-                        | TradeUpdateEvent::Canceled
+                        | TradeUpdateEvent::Cancelled
                         | TradeUpdateEvent::Rejected
                 )
             })
@@ -874,6 +1390,36 @@ mod tests {
         assert!(matches!(order.order_class, OrderClass::Bracket));
     }
 
+    #[test]
+    fn test_max_history_rows_respects_warm_up_floor() {
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = FixedScaleOutDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "HistoryRetention".to_string(),
+            "1.0".to_string(),
+            FixedScaleOutBacktestStrategy {
+                generated: false,
+                tp_levels: vec![105.0],
+                sl_levels: vec![95.0],
+            },
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+
+        assert_eq!(state.max_history_rows(), 2000);
+
+        state.set_warm_up_bars(2500);
+        assert_eq!(state.max_history_rows(), 2501);
+
+        state.update_max_history_rows(50);
+        assert_eq!(state.max_history_rows(), 2501);
+
+        state.update_max_history_rows(3000);
+        assert_eq!(state.max_history_rows(), 3000);
+    }
+
     /// Test 1: Full backtest with SMA crossover alpha using Yahoo Finance data.
     ///
     /// Verifies:
@@ -1064,7 +1610,7 @@ mod tests {
         );
 
         // Check that the pipe modified the insight correctly
-        let insight_ids: Vec<_> = state.insights.keys().cloned().collect();
+        let insight_ids = state.insights.ids();
         for id in &insight_ids {
             if let Some(insight) = state.insights.get_mut(id) {
                 println!("  Insight {} for {}:", insight.insight_id, insight.symbol);
@@ -1092,7 +1638,7 @@ mod tests {
                 );
 
                 // Verify SL is below close for a BUY
-                let sl = insight.stop_loss().unwrap();
+                let _sl = insight.stop_loss().unwrap();
                 let tp = insight.take_profit_levels().unwrap();
                 assert!(!tp.is_empty(), "Take profit levels should not be empty");
 
@@ -1323,6 +1869,119 @@ mod tests {
         assert_eq!(
             alpha_rows, strategy_rows,
             "alpha init should run after strategy init without losing seeded history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preseed_warmup_history_seeds_registered_feature_streams() {
+        let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
+
+        struct FeatureWarmupStrategy {
+            feature_timeframe: TimeFrame,
+        }
+
+        impl Strategy for FeatureWarmupStrategy {
+            fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+                ctx.set_warm_up_bars(5);
+                ctx.add_events(EventStreamType::Bar, Some(self.feature_timeframe));
+            }
+
+            fn init(&mut self, ctx: &mut dyn StrategyContext, asset: &Asset) {
+                let feature_key = format!(
+                    "{}:{}",
+                    asset.symbol,
+                    self.feature_timeframe.compact_label()
+                );
+                let main_rows = ctx
+                    .history()
+                    .get(&asset.symbol)
+                    .map(|history| history.height())
+                    .unwrap_or_default();
+                let feature_rows = ctx
+                    .history()
+                    .get(&feature_key)
+                    .map(|history| history.height())
+                    .unwrap_or_default();
+                ctx.variables()
+                    .insert("feature_warmup_main_rows".to_string(), json!(main_rows));
+                ctx.variables().insert(
+                    "feature_warmup_feature_rows".to_string(),
+                    json!(feature_rows),
+                );
+            }
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                ["AAPL".to_string()].into_iter().collect()
+            }
+
+            fn on_bar(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str, _bar: &BarData) {}
+
+            fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+        }
+
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let data = GeneratedWarmupDataFeed::new();
+        let broker = UnifiedBroker::new_backtest(execution, data);
+        let mut state = StrategyState::new(
+            "FeatureWarmupHistoryTest".to_string(),
+            "1.0".to_string(),
+            FeatureWarmupStrategy { feature_timeframe },
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Day),
+        );
+        state.add_on_init_logic(
+            OnInitLogicBuilder::new(Box::new(
+                crate::core::lifecycle::preseed_warmup_history::PreseedWarmupHistory::new(),
+            ))
+            .timing(LifecycleTiming::BeforeGenerated)
+            .build(),
+        );
+
+        let start = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
+        state
+            .run_backtest(start, end, state.timeframe())
+            .await
+            .expect("feature warm-up backtest should complete");
+
+        let main_rows = state
+            .variables
+            .get("feature_warmup_main_rows")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let feature_rows = state
+            .variables
+            .get("feature_warmup_feature_rows")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        assert_eq!(main_rows, 5);
+        assert_eq!(feature_rows, 5);
+
+        let feature_history = state
+            .history
+            .get("AAPL:15m")
+            .expect("feature warm-up history should use symbol:timeframe key");
+        assert!(
+            feature_history.height() >= feature_rows as usize,
+            "feature history should retain seeded rows and append runtime bars"
+        );
+
+        let requests = state.broker.data.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|(symbol, timeframe)| symbol == "AAPL"
+                && *timeframe == TimeFrame::new(1, TimeFrameUnit::Day)),
+            "main timeframe warm-up should request daily bars"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(symbol, timeframe)| symbol == "AAPL" && *timeframe == feature_timeframe),
+            "feature timeframe warm-up should request feature bars"
         );
     }
 
@@ -1713,7 +2372,7 @@ mod tests {
 
         // Check insight states — we expect at least one FILLED or CLOSED
         // (CLOSED if SL/TP triggered during remaining bars)
-        let insight_ids: Vec<_> = state.insights.keys().cloned().collect();
+        let insight_ids = state.insights.ids();
         let mut found_executed_or_filled = false;
         for id in &insight_ids {
             if let Some(insight) = state.insights.get_mut(id) {
@@ -1739,6 +2398,601 @@ mod tests {
             "Insight should be in EXECUTED, FILLED, or CLOSED state after backtest"
         );
         println!("  ✓ Trade event fill test passed!");
+    }
+
+    struct NoopStrategy;
+
+    impl Strategy for NoopStrategy {
+        fn name(&self) -> &str {
+            "NoopStrategy"
+        }
+
+        fn on_start(&mut self, _ctx: &mut dyn StrategyContext) {}
+
+        fn init(&mut self, _ctx: &mut dyn StrategyContext, _asset: &Asset) {}
+
+        fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+            HashSet::from(["AAPL".to_string()])
+        }
+
+        fn on_bar(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str, _bar: &BarData) {}
+
+        fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+        fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+        fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+    }
+
+    fn test_asset(symbol: &str) -> Asset {
+        Asset {
+            id: symbol.to_string(),
+            symbol: symbol.to_string(),
+            name: symbol.to_string(),
+            asset_type: AssetType::Stock,
+            exchange: AssetExchange::NASDAQ,
+            status: AssetStatus::Active,
+            tradable: true,
+            marginable: true,
+            shortable: true,
+            fractional: true,
+            min_order_size: None,
+            quantity_base: None,
+            max_order_size: None,
+            min_price_increment: None,
+            price_base: None,
+            contract_size: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestExecutionBroker {
+        events: Arc<Mutex<VecDeque<(crate::core::broker::types::Order, TradeUpdateEvent)>>>,
+        close_requests: Arc<Mutex<Vec<String>>>,
+        cancel_requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestExecutionBroker {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(VecDeque::new())),
+                close_requests: Arc::new(Mutex::new(Vec::new())),
+                cancel_requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn emit(&self, order: crate::core::broker::types::Order, event: TradeUpdateEvent) {
+            self.events.lock().unwrap().push_back((order, event));
+        }
+    }
+
+    impl Broker for TestExecutionBroker {
+        async fn connect(&self) -> Result<bool, BrokerError> {
+            Ok(true)
+        }
+
+        async fn disconnect(&self) -> Result<bool, BrokerError> {
+            Ok(true)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn get_current_time(&self) -> chrono::DateTime<Utc> {
+            Utc::now()
+        }
+
+        fn get_name(&self) -> String {
+            "TestExecutionBroker".to_string()
+        }
+
+        fn get_account_type(&self) -> Result<AccountType, BrokerError> {
+            Ok(AccountType::Paper)
+        }
+    }
+
+    impl OrderManagementProvider for TestExecutionBroker {
+        async fn submit_order(
+            &self,
+            insight: Insight,
+        ) -> Result<crate::core::broker::types::Order, BrokerError> {
+            Ok(test_order(
+                "submitted-order",
+                &insight,
+                TradeUpdateEvent::Accepted,
+                insight.side.clone(),
+                None,
+            ))
+        }
+
+        async fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError> {
+            self.cancel_requests
+                .lock()
+                .unwrap()
+                .push(order_id.to_string());
+            Ok(true)
+        }
+
+        async fn update_order(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
+            Ok(true)
+        }
+
+        async fn update_stop_loss(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
+            Ok(true)
+        }
+
+        async fn close_position(
+            &self,
+            order_id: &str,
+            _qty: f64,
+            _price: Option<f64>,
+        ) -> Result<bool, BrokerError> {
+            self.close_requests
+                .lock()
+                .unwrap()
+                .push(order_id.to_string());
+            Ok(true)
+        }
+
+        async fn close_all_positions(&self) -> Result<bool, BrokerError> {
+            Ok(true)
+        }
+
+        async fn get_orders(&self) -> Result<Vec<crate::core::broker::types::Order>, BrokerError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_order(
+            &self,
+            order_id: &str,
+        ) -> Result<crate::core::broker::types::Order, BrokerError> {
+            Err(BrokerError::OrderError(format!(
+                "test order {} not found",
+                order_id
+            )))
+        }
+
+        async fn get_positions(
+            &self,
+        ) -> Result<Vec<crate::core::broker::types::Position>, BrokerError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_position(
+            &self,
+            symbol: &str,
+        ) -> Result<crate::core::broker::types::Position, BrokerError> {
+            Err(BrokerError::PositionError(format!(
+                "test position {} not found",
+                symbol
+            )))
+        }
+
+        async fn get_account(&self) -> Result<crate::core::broker::types::Account, BrokerError> {
+            Ok(crate::core::broker::types::Account {
+                account_id: "test".to_string(),
+                account_type: AccountType::Paper,
+                equity: 100_000.0,
+                cash: 100_000.0,
+                currency: "USD".to_string(),
+                buying_power: 100_000.0,
+                shorting_enabled: true,
+                leverage: 1,
+            })
+        }
+
+        fn drain_trade_events(&self) -> Vec<(crate::core::broker::types::Order, TradeUpdateEvent)> {
+            self.events.lock().unwrap().drain(..).collect()
+        }
+
+        async fn subscribe_to_trade_stream(
+            &self,
+            _on_trade: Arc<
+                dyn Fn((crate::core::broker::types::Order, TradeUpdateEvent)) + Send + Sync,
+            >,
+        ) -> Result<(), BrokerError> {
+            Ok(())
+        }
+
+        async fn unsubscribe_from_trade_stream(&self) -> Result<(), BrokerError> {
+            Ok(())
+        }
+    }
+
+    fn trade_update_state() -> (
+        StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>,
+        TestExecutionBroker,
+    ) {
+        let execution = TestExecutionBroker::new();
+        let broker = UnifiedBroker::new(execution.clone(), YahooFinanceDataFeed::new());
+        let mut state = StrategyState::new(
+            "Mt5TradeUpdateTest".to_string(),
+            "1.0".to_string(),
+            NoopStrategy,
+            broker,
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+        state
+            .universe
+            .insert("AAPL".to_string(), test_asset("AAPL"));
+        (state, execution)
+    }
+
+    fn test_order(
+        order_id: &str,
+        insight: &Insight,
+        event: TradeUpdateEvent,
+        side: OrderSide,
+        filled_price: Option<f64>,
+    ) -> crate::core::broker::types::Order {
+        crate::core::broker::types::Order {
+            order_id: order_id.to_string(),
+            insight_id: Some(insight.insight_id.to_string()),
+            strategy_type: Some(insight.strategy_type.to_string()),
+            asset: test_asset(&insight.symbol),
+            qty: insight.quantity.unwrap_or(1.0),
+            filled_qty: insight.quantity.unwrap_or(1.0),
+            limit_price: insight.limit_price,
+            filled_price,
+            stop_price: insight.stop_price,
+            side,
+            order_type: OrderType::Market,
+            time_in_force: crate::core::broker::types::TimeInForce::GTC,
+            status: event,
+            order_class: OrderClass::Simple,
+            created_at: 0,
+            updated_at: 0,
+            submitted_at: 0,
+            filled_at: Some(0),
+            realized_pnl: None,
+            rejection_reason: None,
+            legs: None,
+        }
+    }
+
+    #[test]
+    fn test_mt5_fill_with_changed_ticket_updates_insight_order_id() {
+        let (mut state, execution) = trade_update_state();
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(2.0));
+        insight.order_id = Some("client-order".to_string());
+        insight.state = InsightState::Executed;
+        let insight_id = *insight.insight_id();
+        state.insights.add_insight(insight.clone());
+
+        let fill = test_order(
+            "mt5-position-123",
+            &insight,
+            TradeUpdateEvent::Filled,
+            OrderSide::Buy,
+            Some(101.25),
+        );
+        execution.emit(fill, TradeUpdateEvent::Filled);
+
+        state.on_trade_update();
+
+        let updated = state.insights.get(&insight_id).unwrap();
+        assert_eq!(updated.state, InsightState::Filled);
+        assert_eq!(updated.order_id.as_deref(), Some("mt5-position-123"));
+        assert_eq!(updated.filled_price, Some(101.25));
+    }
+
+    #[test]
+    fn test_mt5_late_fill_corrects_cancelled_insight() {
+        let (mut state, execution) = trade_update_state();
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(1.0));
+        insight.order_id = Some("client-order".to_string());
+        insight.state = InsightState::Cancelled;
+        let insight_id = *insight.insight_id();
+        state.insights.add_insight(insight.clone());
+
+        let fill = test_order(
+            "mt5-position-after-cancel",
+            &insight,
+            TradeUpdateEvent::Filled,
+            OrderSide::Buy,
+            Some(102.0),
+        );
+        execution.emit(fill, TradeUpdateEvent::Filled);
+
+        state.on_trade_update();
+
+        let updated = state.insights.get(&insight_id).unwrap();
+        assert_eq!(updated.state, InsightState::Filled);
+        assert_eq!(
+            updated.order_id.as_deref(),
+            Some("mt5-position-after-cancel")
+        );
+        assert_eq!(updated.filled_price, Some(102.0));
+    }
+
+    #[test]
+    fn test_parent_closed_does_not_cancel_children_without_event_trigger() {
+        let (mut state, _execution) = trade_update_state();
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        parent.state = InsightState::Closed;
+        let parent_id = *parent.insight_id();
+        let mut child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(parent_id),
+        );
+        let child_id = *child.insight_id();
+        child.state = InsightState::New;
+        state.insights.add_insight(parent);
+        state.insights.add_insight(child);
+
+        state.on_trade_update();
+
+        let child = state.insights.get(&child_id).unwrap();
+        assert_eq!(child.state, InsightState::New);
+
+        let parents = vec![parent_id].into_iter().collect::<FxHashSet<_>>();
+        assert_eq!(
+            state.insights.child_ids_for_parents(&parents),
+            vec![child_id]
+        );
+    }
+
+    #[test]
+    fn test_child_fill_after_parent_closed_is_queued_to_close() {
+        let (mut state, execution) = trade_update_state();
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        parent.state = InsightState::Closed;
+        let parent_id = *parent.insight_id();
+        let mut child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(parent_id),
+        );
+        child.set_quantity(Some(1.0));
+        child.order_id = Some("client-child".to_string());
+        child.state = InsightState::Executed;
+        let child_id = *child.insight_id();
+        state.insights.add_insight(parent);
+        state.insights.add_insight(child.clone());
+
+        let fill = test_order(
+            "mt5-child-position",
+            &child,
+            TradeUpdateEvent::Filled,
+            OrderSide::Buy,
+            Some(99.5),
+        );
+        execution.emit(fill, TradeUpdateEvent::Filled);
+
+        state.on_trade_update();
+
+        let child = state.insights.get(&child_id).unwrap();
+        assert_eq!(child.state, InsightState::Filled);
+        assert!(child.closing, "filled child should be queued to close");
+        assert_eq!(child.order_id.as_deref(), Some("mt5-child-position"));
+        assert_eq!(
+            execution.close_requests.lock().unwrap().as_slice(),
+            ["mt5-child-position"]
+        );
+    }
+
+    #[test]
+    fn test_parent_close_event_cancels_unfilled_child() {
+        let (mut state, execution) = trade_update_state();
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        parent.order_id = Some("parent-position".to_string());
+        parent.state = InsightState::Filled;
+        parent.filled_price = Some(100.0);
+        let parent_id = *parent.insight_id();
+        let mut child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(parent_id),
+        );
+        child.set_quantity(Some(1.0));
+        child.order_id = Some("child-pending".to_string());
+        child.state = InsightState::Executed;
+        let child_id = *child.insight_id();
+        state.insights.add_insight(parent.clone());
+        state.insights.add_insight(child);
+
+        let close = test_order(
+            "parent-close",
+            &parent,
+            TradeUpdateEvent::Closed,
+            OrderSide::Sell,
+            Some(105.0),
+        );
+        execution.emit(close, TradeUpdateEvent::Closed);
+
+        state.on_trade_update();
+
+        let parent = state.insights.get(&parent_id).unwrap();
+        assert_eq!(parent.state, InsightState::Closed);
+        let child = state.insights.get(&child_id).unwrap();
+        assert_eq!(child.state, InsightState::Executed);
+        assert!(
+            child.cancelling,
+            "unfilled child should be queued to cancel"
+        );
+        assert_eq!(
+            execution.cancel_requests.lock().unwrap().as_slice(),
+            ["child-pending"]
+        );
+    }
+
+    #[test]
+    fn test_parent_close_event_closes_filled_child_and_cancels_pending_child() {
+        let (mut state, execution) = trade_update_state();
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        parent.order_id = Some("parent-position".to_string());
+        parent.state = InsightState::Filled;
+        parent.filled_price = Some(100.0);
+        let parent_id = *parent.insight_id();
+
+        let mut market_child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(parent_id),
+        );
+        market_child.set_quantity(Some(1.0));
+        market_child.order_id = Some("market-child-position".to_string());
+        market_child.state = InsightState::Filled;
+        market_child.filled_price = Some(100.0);
+        let market_child_id = *market_child.insight_id();
+
+        let mut limit_child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(parent_id),
+        );
+        limit_child.set_quantity(Some(1.0));
+        limit_child.order_id = Some("limit-child-pending".to_string());
+        limit_child.limit_price = Some(95.0);
+        limit_child.state = InsightState::Executed;
+        let limit_child_id = *limit_child.insight_id();
+
+        state.insights.add_insight(parent.clone());
+        state.insights.add_insight(market_child.clone());
+        state.insights.add_insight(limit_child.clone());
+
+        let parent_close = test_order(
+            "parent-position",
+            &parent,
+            TradeUpdateEvent::Closed,
+            OrderSide::Sell,
+            Some(101.0),
+        );
+        execution.emit(parent_close, TradeUpdateEvent::Closed);
+        state.on_trade_update();
+
+        let parent = state.insights.get(&parent_id).unwrap();
+        assert_eq!(parent.state, InsightState::Closed);
+
+        let market_child = state.insights.get(&market_child_id).unwrap();
+        assert_eq!(market_child.state, InsightState::Filled);
+        assert!(
+            market_child.closing,
+            "filled market child should be queued to close when parent closes"
+        );
+        assert_eq!(
+            execution.close_requests.lock().unwrap().as_slice(),
+            ["market-child-position"]
+        );
+
+        let limit_child = state.insights.get(&limit_child_id).unwrap();
+        assert_eq!(limit_child.state, InsightState::Executed);
+        assert!(
+            limit_child.cancelling,
+            "pending limit child should be queued to cancel when parent closes"
+        );
+        assert_eq!(
+            execution.cancel_requests.lock().unwrap().as_slice(),
+            ["limit-child-pending"]
+        );
+
+        let market_child_close = test_order(
+            "market-child-position",
+            &market_child,
+            TradeUpdateEvent::Closed,
+            OrderSide::Sell,
+            Some(101.0),
+        );
+        let limit_child_cancel = test_order(
+            "limit-child-pending",
+            &limit_child,
+            TradeUpdateEvent::Cancelled,
+            OrderSide::Buy,
+            None,
+        );
+        execution.emit(market_child_close, TradeUpdateEvent::Closed);
+        execution.emit(limit_child_cancel, TradeUpdateEvent::Cancelled);
+        state.on_trade_update();
+
+        let market_child = state.insights.get(&market_child_id).unwrap();
+        assert_eq!(
+            market_child.state,
+            InsightState::Closed,
+            "filled market child should become Closed after broker close event"
+        );
+
+        let limit_child = state.insights.get(&limit_child_id).unwrap();
+        assert_eq!(
+            limit_child.state,
+            InsightState::Cancelled,
+            "pending limit child should become Cancelled after broker cancel event"
+        );
     }
 
     /// Test 5: Verify trade event: bracket order → SL triggers → insight becomes CLOSED.
@@ -1824,7 +3078,7 @@ mod tests {
         }
 
         // Check that at least one insight reached CLOSED state
-        let insight_ids: Vec<_> = state.insights.keys().cloned().collect();
+        let insight_ids = state.insights.ids();
         let mut found_closed = false;
         for id in &insight_ids {
             if let Some(insight) = state.insights.get_mut(id) {
@@ -1943,8 +3197,8 @@ mod tests {
             return;
         }
 
-        // The insight should have been canceled
-        let insight_ids: Vec<_> = state.insights.keys().cloned().collect();
+        // The insight should have been cancelled
+        let insight_ids = state.insights.ids();
         let mut found_cancelled = false;
         for id in &insight_ids {
             if let Some(insight) = state.insights.get(id) {
@@ -1953,7 +3207,7 @@ mod tests {
                 }
             }
         }
-        assert!(found_cancelled, "Insight should have been canceled");
+        assert!(found_cancelled, "Insight should have been cancelled");
         println!("  ✓ Trade event cancel test passed!");
     }
 
@@ -2045,7 +3299,7 @@ mod tests {
         }
 
         // Validate that both Parent and Child exist, and Child was submitted/filled
-        let insight_ids: Vec<_> = state.insights.keys().cloned().collect();
+        let insight_ids = state.insights.ids();
         let mut parent_found = false;
         let mut child_found = false;
 
@@ -2080,9 +3334,6 @@ mod tests {
     /// increments its `partial_filled_quantity` correctly while remaining in open states.
     #[tokio::test]
     async fn test_partial_return_logic() {
-        use polars::prelude::*;
-        use std::sync::{Arc, Mutex};
-
         struct PartialTestStrategy;
         impl Strategy for PartialTestStrategy {
             fn name(&self) -> &str {
@@ -2173,14 +3424,16 @@ mod tests {
         strat.insight_pipeline(&mut state, &insight);
 
         // Simulate broker partially closing half of the order
-        let mut locked_insight = state.insights.get_mut(&insight_id).unwrap();
-        locked_insight.partial_closed(5.0, 120.0, "CLOSE_TP_1");
+        {
+            let locked_insight = state.insights.get_mut(&insight_id).unwrap();
+            locked_insight.partial_closed(5.0, 120.0, "CLOSE_TP_1");
 
-        // Ensure accurate updates
-        assert_eq!(locked_insight.partial_filled_quantity, Some(5.0));
-        assert_eq!(locked_insight.partial_closes.len(), 1);
-        assert_eq!(locked_insight.partial_closes[0].get_pl(), 100.0); // (120 - 100) * 5
-        assert_eq!(locked_insight.state, InsightState::Filled); // Remains filled/open
+            // Ensure accurate updates
+            assert_eq!(locked_insight.partial_filled_quantity, Some(5.0));
+            assert_eq!(locked_insight.partial_closes.len(), 1);
+            assert_eq!(locked_insight.partial_closes[0].get_pl(), 100.0); // (120 - 100) * 5
+            assert_eq!(locked_insight.state, InsightState::Filled); // Remains filled/open
+        }
 
         // MOCK TP 2 Hit
         let s2 = Series::new("close".into(), &[150.0f64]);
@@ -2191,7 +3444,7 @@ mod tests {
         let refreshed_insight = state.insights.get(&insight_id).unwrap().clone();
         strat.insight_pipeline(&mut state, &refreshed_insight);
 
-        let mut final_insight = state.insights.get_mut(&insight_id).unwrap();
+        let final_insight = state.insights.get_mut(&insight_id).unwrap();
         final_insight.partial_closed(5.0, 150.0, "CLOSE_TP_2");
 
         // Validate final completion limits
@@ -2211,8 +3464,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_scale_out_pipe_consumes_levels_and_closes_partial() {
-        use polars::prelude::*;
-
         struct ScaleOutStrategy;
         impl Strategy for ScaleOutStrategy {
             fn name(&self) -> &str {
@@ -2404,6 +3655,28 @@ mod tests {
         }
     }
 
+    struct LifecycleHaltPipe;
+
+    impl InsightPipe for LifecycleHaltPipe {
+        fn version(&self) -> &str {
+            "1.0"
+        }
+
+        fn run(
+            &mut self,
+            _ctx: &mut dyn StrategyContext,
+            insight: &mut Insight,
+        ) -> InsightPipeResult {
+            insight.closing = true;
+            InsightPipeResult::new(
+                false,
+                true,
+                Some("close requested".to_string()),
+                self.name().to_string(),
+            )
+        }
+    }
+
     fn pipeline_harness_state()
     -> StrategyState<PipelineHarnessStrategy, PaperBroker, FixedScaleOutDataFeed> {
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
@@ -2500,6 +3773,48 @@ mod tests {
                     .as_deref()
                     .is_some_and(|value| value.contains("risk check did not pass"))
         }));
+    }
+
+    #[test]
+    fn test_run_insight_pipeline_does_not_reject_when_pipe_starts_close() {
+        let mut state = pipeline_harness_state();
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(LifecycleHaltPipe))
+                .target_state(InsightState::Filled)
+                .build(),
+        );
+
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(1.0));
+        insight.state = InsightState::Filled;
+        insight.order_id = Some("filled-order".to_string());
+        insight.filled_price = Some(123.45);
+        insight.set_first_on_fill(true);
+        let insight_id = *insight.insight_id();
+        state.add_insight(insight);
+
+        state.run_insight_pipeline();
+
+        let insight = state
+            .insights
+            .get(&insight_id)
+            .expect("filled insight should still exist after lifecycle halt");
+        assert_eq!(insight.state, InsightState::Filled);
+        assert!(insight.closing);
+        assert!(!insight.first_on_fill());
+        assert!(
+            !insight
+                .state_history
+                .iter()
+                .any(|(_, state, _)| *state == InsightState::Rejected)
+        );
     }
 
     #[test]
@@ -2962,13 +4277,16 @@ mod tests {
                     .insights()
                     .values()
                     .find(|insight| insight.symbol() == symbol);
-                if let Some(order_id) =
-                    submitted_insight.and_then(|insight| insight.order_id.clone())
+                if let Some(order_id) = submitted_insight
+                    .as_ref()
+                    .and_then(|insight| insight.order_id.clone())
                 {
                     *self.order_id.lock().unwrap() = Some(order_id);
                 }
 
-                let terminal_state = submitted_insight.map(|insight| insight.state().clone());
+                let terminal_state = submitted_insight
+                    .as_ref()
+                    .map(|insight| insight.state().clone());
 
                 match terminal_state {
                     Some(InsightState::Closed) => {
@@ -3187,6 +4505,511 @@ mod tests {
             "MT5 live entry-close left an open {} position: {:?}",
             TEST_SYMBOL,
             open_symbol_position
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "places and cleans up real MT5 parent/child orders; requires AqeMt5BridgeEA and bridge env vars configured"]
+    async fn test_run_live_mt5_child_insights_market_and_limit() {
+        let _mt5_guard = MT5_INTEGRATION_TEST_LOCK.lock().await;
+        init_test_logger("info");
+
+        if std::env::var("AQE_MT5_BRIDGE_TOKEN").is_err() {
+            println!(
+                "Skipping MT5 child insight test: AQE_MT5_BRIDGE_TOKEN is required. See integrations/mt5/README.md."
+            );
+            return;
+        }
+
+        const TEST_SYMBOL: &str = "BTCUSD";
+        const TEST_QTY: f64 = 0.01;
+
+        #[derive(Default)]
+        struct Mt5ChildInsightShared {
+            parent_id: Option<uuid::Uuid>,
+            market_child_id: Option<uuid::Uuid>,
+            limit_child_id: Option<uuid::Uuid>,
+            parent_order_id: Option<String>,
+            market_child_order_id: Option<String>,
+            limit_child_order_id: Option<String>,
+            market_child_seen: bool,
+            limit_child_seen: bool,
+            parent_close_requested: bool,
+            account_flat_after_parent_close: bool,
+            cleanup_requested: bool,
+            failed: Option<String>,
+        }
+
+        fn latest_bar_close(bar: &BarData) -> Option<f64> {
+            match bar {
+                BarData::Bars(bars) => bars.last().map(|bar| bar.close),
+                BarData::Frame(frame) => {
+                    let close = frame.column("close").ok()?.f64().ok()?;
+                    frame
+                        .height()
+                        .checked_sub(1)
+                        .and_then(|index| close.get(index))
+                }
+            }
+        }
+
+        fn request_parent_close_if_ready(
+            ctx: &mut dyn StrategyContext,
+            shared: &Arc<Mutex<Mt5ChildInsightShared>>,
+            symbol: &str,
+            parent_id: uuid::Uuid,
+        ) -> Result<bool, String> {
+            let insights = ctx
+                .insights()
+                .values()
+                .filter(|insight| insight.symbol() == symbol)
+                .collect::<Vec<_>>();
+            let market_child = insights.iter().find(|insight| {
+                insight.parent_id == Some(parent_id) && insight.limit_price.is_none()
+            });
+            let limit_child = insights.iter().find(|insight| {
+                insight.parent_id == Some(parent_id) && insight.limit_price.is_some()
+            });
+            let parent = insights
+                .iter()
+                .find(|insight| insight.insight_id == parent_id);
+
+            if let Some(insight) = insights.iter().find(|insight| {
+                insight.state() == &InsightState::Rejected
+                    || (insight.state() == &InsightState::Cancelled
+                        && insight.parent_id != Some(parent_id))
+            }) {
+                return Err(format!(
+                    "unexpected terminal insight {} state {:?}",
+                    insight.insight_id,
+                    insight.state()
+                ));
+            }
+
+            let market_child_order_id = market_child
+                .filter(|insight| insight.state() == &InsightState::Filled)
+                .and_then(|insight| insight.order_id.clone());
+            let limit_child_order_id = limit_child
+                .filter(|insight| {
+                    insight.order_id.is_some()
+                        && matches!(insight.state(), InsightState::New | InsightState::Executed)
+                })
+                .and_then(|insight| insight.order_id.clone());
+            let parent_order = parent.and_then(|insight| {
+                Some((
+                    insight.order_id.as_ref()?.clone(),
+                    insight.quantity.unwrap_or(TEST_QTY),
+                ))
+            });
+
+            {
+                let mut shared = shared.lock().unwrap();
+                if let Some(order_id) = market_child_order_id.as_ref() {
+                    shared.market_child_seen = true;
+                    shared.market_child_order_id = Some(order_id.clone());
+                }
+                if let Some(order_id) = limit_child_order_id.as_ref() {
+                    shared.limit_child_seen = true;
+                    shared.limit_child_order_id = Some(order_id.clone());
+                }
+                if let Some((order_id, _)) = parent_order.as_ref() {
+                    shared.parent_order_id = Some(order_id.clone());
+                }
+                if shared.parent_close_requested {
+                    return Ok(false);
+                }
+            }
+
+            let Some(limit_order_id) = limit_child_order_id else {
+                return Ok(false);
+            };
+            let Some((parent_order_id, parent_qty)) = parent_order else {
+                return Ok(false);
+            };
+
+            ctx.cancel_order(&limit_order_id)
+                .map_err(|error| format!("MT5 child limit cancel RPC failed: {error}"))?;
+            println!("[MT5 ChildInsights] Requested child limit cancel {limit_order_id}");
+
+            ctx.close_position(&parent_order_id, parent_qty, None)
+                .map_err(|error| format!("MT5 parent close RPC failed: {error}"))?;
+            println!(
+                "[MT5 ChildInsights] Requested parent close {parent_order_id}; market child should cascade close"
+            );
+
+            let mut shared = shared.lock().unwrap();
+            shared.parent_close_requested = true;
+            println!(
+                "[MT5 ChildInsights] Limit child cancelled; waiting for flat BTCUSD exposure"
+            );
+            Ok(true)
+        }
+
+        let preflight_execution =
+            Mt5Broker::from_env().expect("failed to create MT5 broker from env");
+        preflight_execution
+            .connect()
+            .await
+            .expect("failed to start MT5 child preflight bridge");
+        let preflight_positions = preflight_execution
+            .get_positions()
+            .await
+            .expect("failed to fetch MT5 positions before child insight test");
+        let preflight_orders = preflight_execution
+            .get_orders()
+            .await
+            .expect("failed to fetch MT5 orders before child insight test");
+        let _ = preflight_execution.disconnect().await;
+
+        let open_symbol_position = preflight_positions
+            .iter()
+            .find(|position| position.asset.symbol == TEST_SYMBOL && position.qty.abs() > 0.0);
+        assert!(
+            open_symbol_position.is_none(),
+            "MT5 child insight test requires no pre-existing {} position; found {:?}",
+            TEST_SYMBOL,
+            open_symbol_position
+        );
+        let open_symbol_order = preflight_orders
+            .iter()
+            .find(|order| order.asset.symbol == TEST_SYMBOL);
+        assert!(
+            open_symbol_order.is_none(),
+            "MT5 child insight test requires no pre-existing {} order; found {:?}",
+            TEST_SYMBOL,
+            open_symbol_order
+        );
+
+        struct Mt5ChildInsightsStrategy {
+            submitted: bool,
+            bars_after_submit: usize,
+            shared: Arc<Mutex<Mt5ChildInsightShared>>,
+        }
+
+        impl Strategy for Mt5ChildInsightsStrategy {
+            fn name(&self) -> &str {
+                "Mt5ChildInsightsStrategy"
+            }
+
+            fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+                println!(
+                    "[MT5 ChildInsights] Started qty={} timeframe={:?}",
+                    TEST_QTY,
+                    ctx.timeframe()
+                );
+            }
+
+            fn init(&mut self, _ctx: &mut dyn StrategyContext, asset: &Asset) {
+                println!(
+                    "[MT5 ChildInsights] Initialised asset {} ({:?})",
+                    asset.symbol, asset.asset_type
+                );
+            }
+
+            fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+                HashSet::from([TEST_SYMBOL.to_string()])
+            }
+
+            fn on_bar(&mut self, ctx: &mut dyn StrategyContext, symbol: &str, bar: &BarData) {
+                println!("[MT5 ChildInsights] Bar for {}: {:?}", symbol, bar);
+
+                if !self.submitted {
+                    let reference_price = ctx
+                        .latest_quote(symbol)
+                        .ok()
+                        .map(|quote| quote.ask.max(quote.last.unwrap_or(quote.ask)))
+                        .or_else(|| latest_bar_close(bar))
+                        .unwrap_or(0.0);
+
+                    if reference_price <= 0.0 {
+                        return;
+                    }
+
+                    let mut parent = Insight::new(
+                        OrderSide::Buy,
+                        symbol.to_string(),
+                        StrategyType::Testing,
+                        ctx.timeframe().clone(),
+                        90,
+                        None,
+                    );
+                    parent.set_quantity(Some(TEST_QTY));
+
+                    let mut market_child = Insight::new(
+                        OrderSide::Buy,
+                        symbol.to_string(),
+                        StrategyType::Testing,
+                        ctx.timeframe().clone(),
+                        90,
+                        None,
+                    );
+                    market_child.set_quantity(Some(TEST_QTY));
+
+                    let mut limit_child = Insight::new(
+                        OrderSide::Buy,
+                        symbol.to_string(),
+                        StrategyType::Testing,
+                        ctx.timeframe().clone(),
+                        90,
+                        None,
+                    );
+                    limit_child
+                        .set_quantity(Some(TEST_QTY))
+                        .set_limit_price(Some(reference_price * 0.95));
+
+                    let parent_id = *parent.insight_id();
+                    let market_child_id = *market_child.insight_id();
+                    let limit_child_id = *limit_child.insight_id();
+                    parent.add_child_insight(market_child, ctx);
+                    parent.add_child_insight(limit_child, ctx);
+
+                    {
+                        let mut shared = self.shared.lock().unwrap();
+                        shared.parent_id = Some(parent_id);
+                        shared.market_child_id = Some(market_child_id);
+                        shared.limit_child_id = Some(limit_child_id);
+                    }
+                    parent.submit(ctx);
+                    ctx.add_insight(parent);
+                    self.submitted = true;
+                    println!(
+                        "[MT5 ChildInsights] Submitted parent market BUY with market and limit children"
+                    );
+                    match request_parent_close_if_ready(
+                        ctx,
+                        &self.shared,
+                        symbol,
+                        parent_id,
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.shared.lock().unwrap().failed = Some(error);
+                            ctx.shutdown();
+                        }
+                    }
+                    return;
+                }
+
+                if self.shared.lock().unwrap().cleanup_requested {
+                    println!("[MT5 ChildInsights] BTCUSD exposure flat after parent close");
+                    ctx.shutdown();
+                    return;
+                }
+
+                self.bars_after_submit += 1;
+                let parent_id = self.shared.lock().unwrap().parent_id;
+                let Some(parent_id) = parent_id else {
+                    self.shared.lock().unwrap().failed =
+                        Some("parent id was not recorded".to_string());
+                    ctx.shutdown();
+                    return;
+                };
+
+                match request_parent_close_if_ready(ctx, &self.shared, symbol, parent_id) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.shared.lock().unwrap().failed = Some(error);
+                        ctx.shutdown();
+                        return;
+                    }
+                }
+
+                let shared = self.shared.lock().unwrap();
+                if self.bars_after_submit >= 8 {
+                    let message = format!(
+                        "timed out waiting for child cascade: market_seen={} limit_seen={} parent_close_requested={} account_flat_after_parent_close={}",
+                        shared.market_child_seen,
+                        shared.limit_child_seen,
+                        shared.parent_close_requested,
+                        shared.account_flat_after_parent_close
+                    );
+                    drop(shared);
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.failed = Some(format!(
+                        "{message}"
+                    ));
+                    ctx.shutdown();
+                }
+            }
+
+            fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+            fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+            fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {
+                println!("[MT5 ChildInsights] Tearing down");
+            }
+        }
+
+        let shared = Arc::new(Mutex::new(Mt5ChildInsightShared::default()));
+        let execution = Mt5Broker::from_env().expect("failed to create MT5 broker from env");
+        let monitor_shared = shared.clone();
+        let _flat_monitor_task = tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if monitor_shared.lock().unwrap().parent_close_requested {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    monitor_shared.lock().unwrap().failed =
+                        Some("timed out waiting for MT5 parent close request".to_string());
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            let monitor = match Mt5Broker::from_env() {
+                Ok(monitor) => monitor,
+                Err(error) => {
+                    monitor_shared.lock().unwrap().failed = Some(format!(
+                        "failed to create MT5 child flat-exposure monitor: {:?}",
+                        error
+                    ));
+                    return;
+                }
+            };
+
+            let flat_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            loop {
+                let positions = match monitor.get_positions().await {
+                    Ok(positions) => positions,
+                    Err(error) => {
+                        monitor_shared.lock().unwrap().failed =
+                            Some(format!("failed to poll MT5 positions after parent close: {error}"));
+                        return;
+                    }
+                };
+                let orders = match monitor.get_orders().await {
+                    Ok(orders) => orders,
+                    Err(error) => {
+                        monitor_shared.lock().unwrap().failed =
+                            Some(format!("failed to poll MT5 orders after parent close: {error}"));
+                        return;
+                    }
+                };
+
+                let has_open_position = positions
+                    .iter()
+                    .any(|position| position.asset.symbol == TEST_SYMBOL && position.qty.abs() > 0.0);
+                let has_open_order = orders
+                    .iter()
+                    .any(|order| order.asset.symbol == TEST_SYMBOL);
+
+                if !has_open_position && !has_open_order {
+                    let mut shared = monitor_shared.lock().unwrap();
+                    shared.account_flat_after_parent_close = true;
+                    shared.cleanup_requested = true;
+                    return;
+                }
+
+                if std::time::Instant::now() >= flat_deadline {
+                    monitor_shared.lock().unwrap().failed = Some(format!(
+                        "BTCUSD was not flat after parent close: open_position={} open_order={}",
+                        has_open_position, has_open_order
+                    ));
+                    return;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+        let data = Mt5DataFeed::from_env().expect("failed to create MT5 datafeed from env");
+        let broker = UnifiedBroker::new(execution, data);
+        let mut state = StrategyState::new(
+            "Mt5ChildInsights".into(),
+            "1.0".into(),
+            Mt5ChildInsightsStrategy {
+                submitted: false,
+                bars_after_submit: 0,
+                shared: shared.clone(),
+            },
+            broker,
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+
+        let run_result =
+            tokio::time::timeout(std::time::Duration::from_secs(240), state.run_live(None)).await;
+
+        let cleanup_execution =
+            Mt5Broker::from_env().expect("failed to create MT5 child cleanup broker from env");
+        cleanup_execution
+            .connect()
+            .await
+            .expect("failed to start MT5 child cleanup bridge");
+        let cleanup_orders = cleanup_execution
+            .get_orders()
+            .await
+            .expect("failed to fetch MT5 child cleanup orders");
+        for order in cleanup_orders
+            .iter()
+            .filter(|order| order.asset.symbol == TEST_SYMBOL)
+        {
+            let _ = cleanup_execution.cancel_order(&order.order_id).await;
+        }
+        let _ = cleanup_execution.close_all_positions().await;
+        let positions = cleanup_execution
+            .get_positions()
+            .await
+            .expect("failed to fetch MT5 positions after child insight test");
+        let orders = cleanup_execution
+            .get_orders()
+            .await
+            .expect("failed to fetch MT5 orders after child insight test");
+        let _ = cleanup_execution.disconnect().await;
+
+        match run_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("MT5 child insight strategy failed: {:?}", error),
+            Err(_) => panic!("MT5 child insight strategy timed out after 240s"),
+        }
+
+        let shared = shared.lock().unwrap();
+        assert!(
+            shared.failed.is_none(),
+            "MT5 child insight strategy failed: {:?}",
+            shared.failed
+        );
+        assert!(
+            shared.market_child_seen,
+            "MT5 child insight test never observed the market child fill"
+        );
+        assert!(
+            shared.limit_child_seen,
+            "MT5 child insight test never observed the limit child broker order"
+        );
+        assert!(
+            shared.cleanup_requested,
+            "MT5 child insight test did not complete parent-close cleanup"
+        );
+        assert!(
+            shared.parent_close_requested,
+            "MT5 child insight test did not request parent close"
+        );
+        assert!(
+            shared.account_flat_after_parent_close,
+            "MT5 child insight test never observed flat BTCUSD exposure after parent close"
+        );
+        drop(shared);
+
+        let open_symbol_position = positions
+            .iter()
+            .find(|position| position.asset.symbol == TEST_SYMBOL && position.qty.abs() > 0.0);
+        assert!(
+            open_symbol_position.is_none(),
+            "MT5 child insight test left an open {} position: {:?}",
+            TEST_SYMBOL,
+            open_symbol_position
+        );
+        let open_symbol_order = orders
+            .iter()
+            .find(|order| order.asset.symbol == TEST_SYMBOL);
+        assert!(
+            open_symbol_order.is_none(),
+            "MT5 child insight test left an open {} order: {:?}",
+            TEST_SYMBOL,
+            open_symbol_order
         );
     }
 

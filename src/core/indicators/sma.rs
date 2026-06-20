@@ -68,17 +68,18 @@ impl Indicator for SimpleMovingAverage {
         let mut sum = 0.0;
         let mut valid_count = 0;
 
-        for i in 0..values.len() {
-            if let Some(v) = values[i] {
+        let outgoing_values = std::iter::repeat(None)
+            .take(period)
+            .chain(values.iter().copied());
+        for (value, outgoing) in values.iter().copied().zip(outgoing_values) {
+            if let Some(v) = value {
                 sum += v;
                 valid_count += 1;
             }
 
-            if i >= period {
-                if let Some(v) = values[i - period] {
-                    sum -= v;
-                    valid_count -= 1;
-                }
+            if let Some(v) = outgoing {
+                sum -= v;
+                valid_count -= 1;
             }
 
             if valid_count == period {

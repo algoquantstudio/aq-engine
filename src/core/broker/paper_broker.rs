@@ -13,6 +13,28 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn is_terminal_leg_status(status: &TradeUpdateEvent) -> bool {
+    matches!(
+        status,
+        TradeUpdateEvent::Filled
+            | TradeUpdateEvent::Closed
+            | TradeUpdateEvent::Cancelled
+            | TradeUpdateEvent::Rejected
+    )
+}
+
+fn update_order_leg(leg: Option<&mut OrderLeg>, order_id: &str, price: f64, now_ts: u64) -> bool {
+    let Some(leg) = leg else {
+        return false;
+    };
+    if leg.order_id.as_deref() != Some(order_id) || is_terminal_leg_status(&leg.status) {
+        return false;
+    }
+    leg.limit_price = Some(price);
+    leg.updated_at = now_ts;
+    true
+}
+
 // ─────────────────────── PaperBroker ───────────────────────
 
 /// Paper Broker — full OMS for backtesting and paper trading.
@@ -131,6 +153,29 @@ impl PaperBroker {
         debug!("PaperBroker::process_step exit");
     }
 
+    pub fn process_close_queue_at(
+        &self,
+        bars: &HashMap<String, Bar>,
+        current_time: DateTime<Utc>,
+    ) -> usize {
+        let queued_requests = self.close_orders_queue.lock().len();
+        if queued_requests == 0 {
+            return 0;
+        }
+
+        debug!(
+            "PaperBroker::process_close_queue_at enter bars={} current_time={} queued_requests={}",
+            bars.len(),
+            current_time,
+            queued_requests
+        );
+        self.set_time(current_time);
+        self.process_close_queue(bars);
+        self.update_account_balance(bars);
+        debug!("PaperBroker::process_close_queue_at exit");
+        queued_requests
+    }
+
     // ─────────────────────── Pending Orders ───────────────────────
 
     /// Process pending orders against the current bar.
@@ -141,8 +186,8 @@ impl PaperBroker {
 
         while let Some(order_id) = pending.pop_front() {
             if let Some(mut order) = self.orders.get_mut(&order_id) {
-                // Skip canceled orders
-                if order.status == TradeUpdateEvent::Canceled {
+                // Skip cancelled orders
+                if order.status == TradeUpdateEvent::Cancelled {
                     continue;
                 }
 
@@ -713,19 +758,19 @@ impl PaperBroker {
         if let Some(ref mut legs) = order.legs {
             if let Some(ref mut tp) = legs.take_profit {
                 if tp.status != TradeUpdateEvent::Filled {
-                    tp.status = TradeUpdateEvent::Canceled;
+                    tp.status = TradeUpdateEvent::Cancelled;
                     tp.updated_at = now_ts;
                 }
             }
             if let Some(ref mut sl) = legs.stop_loss {
                 if sl.status != TradeUpdateEvent::Filled {
-                    sl.status = TradeUpdateEvent::Canceled;
+                    sl.status = TradeUpdateEvent::Cancelled;
                     sl.updated_at = now_ts;
                 }
             }
             if let Some(ref mut trailing) = legs.trailing_stop {
                 if trailing.status != TradeUpdateEvent::Filled {
-                    trailing.status = TradeUpdateEvent::Canceled;
+                    trailing.status = TradeUpdateEvent::Cancelled;
                     trailing.updated_at = now_ts;
                 }
             }
@@ -741,12 +786,12 @@ impl PaperBroker {
                 leg.status,
                 TradeUpdateEvent::Filled
                     | TradeUpdateEvent::Closed
-                    | TradeUpdateEvent::Canceled
+                    | TradeUpdateEvent::Cancelled
                     | TradeUpdateEvent::Rejected
             ) {
                 return true;
             }
-            leg.status = TradeUpdateEvent::Canceled;
+            leg.status = TradeUpdateEvent::Cancelled;
             leg.updated_at = now_ts;
             true
         };
@@ -937,30 +982,47 @@ impl PaperBroker {
     ) -> BacktestResults {
         let account = self.account.read();
 
-        let (trade_log, account_history, max_drawdown, executed_at, finished_at) =
-            if let Some(ref state) = state_guard {
-                // Calculate max drawdown from account history
-                let mut peak = self.starting_cash;
-                let mut max_dd = 0.0f64;
-                for (_, acc) in &state.account_history {
-                    if acc.equity > peak {
-                        peak = acc.equity;
-                    }
-                    let dd = (peak - acc.equity) / peak;
-                    if dd > max_dd {
-                        max_dd = dd;
-                    }
+        let (
+            trade_log,
+            account_history,
+            max_drawdown,
+            executed_at,
+            finished_at,
+            backtest_start,
+            backtest_end,
+        ) = if let Some(ref state) = state_guard {
+            // Calculate max drawdown from account history
+            let mut peak = self.starting_cash;
+            let mut max_dd = 0.0f64;
+            for (_, acc) in &state.account_history {
+                if acc.equity > peak {
+                    peak = acc.equity;
                 }
-                (
-                    state.trade_log.clone(),
-                    state.account_history.clone(),
-                    max_dd,
-                    state.get_executed_at(),
-                    state.get_finished_at(),
-                )
-            } else {
-                (Vec::new(), Vec::new(), 0.0, Utc::now(), Some(Utc::now()))
-            };
+                let dd = (peak - acc.equity) / peak;
+                if dd > max_dd {
+                    max_dd = dd;
+                }
+            }
+            (
+                state.trade_log.clone(),
+                state.account_history.clone(),
+                max_dd,
+                state.get_executed_at(),
+                state.get_finished_at(),
+                state.backtest_start,
+                state.backtest_end,
+            )
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                0.0,
+                Utc::now(),
+                Some(Utc::now()),
+                None,
+                None,
+            )
+        };
 
         // Count winning/losing trades (pair entries with exits)
         let mut wins = 0usize;
@@ -1009,6 +1071,8 @@ impl PaperBroker {
             account_history,
             executed_at,
             finished_at: finished_at.unwrap_or_else(|| Utc::now()),
+            backtest_start,
+            backtest_end,
         }
     }
 }
@@ -1218,11 +1282,11 @@ impl OrderManagementProvider for PaperBroker {
                     "Cannot cancel filled/closed order".into(),
                 ));
             }
-            order.status = TradeUpdateEvent::Canceled;
+            order.status = TradeUpdateEvent::Cancelled;
             order.updated_at = self.current_time_ts();
 
-            // Emit Canceled trade event
-            self.emit_trade_event(&order, TradeUpdateEvent::Canceled);
+            // Emit Cancelled trade event
+            self.emit_trade_event(&order, TradeUpdateEvent::Cancelled);
             self.mark_order_terminal_for_release(order_id);
             Ok(true)
         } else {
@@ -1260,7 +1324,7 @@ impl OrderManagementProvider for PaperBroker {
                 if let Some(mut parent) = self.orders.get_mut(&parent_order_id) {
                     if Self::cancel_leg_on_parent(&mut parent, order_id, now_ts) {
                         parent.updated_at = now_ts;
-                        self.emit_trade_event(&parent, TradeUpdateEvent::Canceled);
+                        self.emit_trade_event(&parent, TradeUpdateEvent::Cancelled);
                         return Ok(true);
                     }
                 }
@@ -1279,14 +1343,107 @@ impl OrderManagementProvider for PaperBroker {
         price: f64,
         qty: f64,
     ) -> Result<bool, BrokerError> {
+        let now_ts = self.current_time_ts();
         if let Some(mut order) = self.orders.get_mut(order_id) {
+            if matches!(
+                order.status,
+                TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled
+            ) {
+                if let Some(legs) = order.legs.as_mut() {
+                    if let Some(tp) = legs.take_profit.as_mut() {
+                        if is_terminal_leg_status(&tp.status) {
+                            return Err(BrokerError::OrderError(format!(
+                                "Take profit leg is not active for filled order {}",
+                                order_id
+                            )));
+                        }
+                        tp.limit_price = Some(price);
+                        tp.updated_at = now_ts;
+                        order.qty = qty;
+                        order.updated_at = now_ts;
+                        return Ok(true);
+                    }
+                }
+                return Err(BrokerError::OrderError(format!(
+                    "Filled order {} has no active take profit leg to update",
+                    order_id
+                )));
+            }
             order.limit_price = Some(price);
             order.qty = qty;
-            order.updated_at = self.current_time_ts();
-            Ok(true)
-        } else {
-            Err(BrokerError::OrderError("Order not found".into()))
+            order.updated_at = now_ts;
+            return Ok(true);
         }
+
+        for mut order in self.orders.iter_mut() {
+            let Some(legs) = order.legs.as_mut() else {
+                continue;
+            };
+
+            if update_order_leg(legs.take_profit.as_mut(), order_id, price, now_ts)
+                || update_order_leg(legs.stop_loss.as_mut(), order_id, price, now_ts)
+                || update_order_leg(legs.trailing_stop.as_mut(), order_id, price, now_ts)
+            {
+                order.qty = qty;
+                order.updated_at = now_ts;
+                return Ok(true);
+            }
+        }
+
+        Err(BrokerError::OrderError("Order not found".into()))
+    }
+
+    async fn update_stop_loss(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError> {
+        let now_ts = self.current_time_ts();
+        if let Some(mut order) = self.orders.get_mut(order_id) {
+            if matches!(
+                order.status,
+                TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled
+            ) {
+                if let Some(legs) = order.legs.as_mut() {
+                    if let Some(sl) = legs.stop_loss.as_mut() {
+                        if is_terminal_leg_status(&sl.status) {
+                            return Err(BrokerError::OrderError(format!(
+                                "Stop loss leg is not active for filled order {}",
+                                order_id
+                            )));
+                        }
+                        sl.limit_price = Some(price);
+                        sl.updated_at = now_ts;
+                        order.qty = qty;
+                        order.updated_at = now_ts;
+                        return Ok(true);
+                    }
+                }
+                return Err(BrokerError::OrderError(format!(
+                    "Filled order {} has no active stop loss leg to update",
+                    order_id
+                )));
+            }
+            order.limit_price = Some(price);
+            order.qty = qty;
+            order.updated_at = now_ts;
+            return Ok(true);
+        }
+
+        for mut order in self.orders.iter_mut() {
+            let Some(legs) = order.legs.as_mut() else {
+                continue;
+            };
+
+            if update_order_leg(legs.stop_loss.as_mut(), order_id, price, now_ts) {
+                order.qty = qty;
+                order.updated_at = now_ts;
+                return Ok(true);
+            }
+        }
+
+        Err(BrokerError::OrderError("Order not found".into()))
     }
 
     async fn close_position(

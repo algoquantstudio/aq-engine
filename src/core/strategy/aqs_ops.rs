@@ -5,23 +5,29 @@ use super::aqs_sync::{
 use super::aqs_types::{
     self, AqsAuth, StrategyEventRecord, StrategyUniverseAssetRecord, action_id_from_value,
 };
+use super::live_metrics::LiveMetricsSnapshot;
 use super::traits::{Strategy, StrategyContext};
-use super::{StrategyState, StrategyStatus};
+use super::{StrategyMode, StrategyState, StrategyStatus};
 use crate::core::broker::DataStreamMode;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
-use crate::core::broker::types::{Account, BarData, BrokerError};
+use crate::core::broker::types::{Account, BrokerError};
+use crate::core::events::{MarketDataEvent, ResolvedEventStream};
 use crate::core::insight::InsightSnapshot;
 use crate::core::insight::types::InsightState;
 use crate::core::lifecycle::LifecycleTiming;
 use futures::StreamExt;
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use surrealdb::engine::any;
 use surrealdb::method::QueryStream;
 use surrealdb::opt::auth::Record;
 use surrealdb::{IndexedResults, Notification};
+use turso::{Builder, Connection, params};
 
 type StrategyActionStream = QueryStream<Notification<surrealdb::types::Value>>;
 
@@ -31,8 +37,11 @@ const LIVE_SYNC_RETRY_BASE_MS: u64 = 500;
 const LIVE_SYNC_CONNECT_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_STREAM_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_QUERY_TIMEOUT_SECS: u64 = 10;
-const LIVE_SYNC_RECONCILE_SECS: u64 = 60;
+const LIVE_SYNC_RECONCILE_SECS: u64 = 15 * 60;
 const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 40;
+const LOCAL_LIVE_METRICS_WRITE_SECS: u64 = 5;
+
+static PENDING_AQS_SYNC_DROPPED_OPS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 enum PendingAqsSyncOp {
@@ -46,6 +55,298 @@ enum PendingAqsSyncOp {
     },
     StrategyEvent(StrategyEventRecord),
     LiveMetrics(aqs_types::StrategyLiveMetricsRecord),
+}
+
+struct LocalLiveRunArtifacts {
+    run_id: String,
+    db_path: PathBuf,
+    conn: Connection,
+    last_metrics: Option<LiveMetricsSnapshot>,
+}
+
+impl LocalLiveRunArtifacts {
+    async fn start(
+        strategy_name: &str,
+        strategy_id: uuid::Uuid,
+        mode: StrategyMode,
+    ) -> Result<Self, BrokerError> {
+        let started_at = chrono::Utc::now();
+        let run_id = format!(
+            "{}-{}",
+            started_at.format("%Y%m%d-%H%M%S"),
+            uuid::Uuid::new_v4()
+        );
+        let dir = std::env::current_dir()
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to resolve current project directory for local live run: {}",
+                    error
+                ))
+            })?
+            .join("live")
+            .join(&run_id);
+        fs::create_dir_all(&dir).map_err(|error| {
+            BrokerError::ConnectionError(format!(
+                "Failed to create local live run directory {}: {}",
+                dir.display(),
+                error
+            ))
+        })?;
+
+        let db_path = dir.join("live.db");
+        let db = Builder::new_local(db_path.to_string_lossy().as_ref())
+            .build()
+            .await
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to open local live run database {}: {}",
+                    db_path.display(),
+                    error
+                ))
+            })?;
+        let conn = db.connect().map_err(|error| {
+            BrokerError::ConnectionError(format!(
+                "Failed to connect to local live run database {}: {}",
+                db_path.display(),
+                error
+            ))
+        })?;
+        let artifacts = Self {
+            run_id,
+            db_path,
+            conn,
+            last_metrics: None,
+        };
+        artifacts.init_schema().await?;
+
+        let manifest = serde_json::json!({
+            "run_id": artifacts.run_id.clone(),
+            "strategy_id": strategy_id.to_string(),
+            "strategy_name": strategy_name,
+            "mode": format!("{:?}", mode),
+            "status": "running",
+            "started_at": started_at,
+            "database_file": "live.db",
+        });
+        artifacts.upsert_metadata("run", &manifest).await?;
+        artifacts
+            .append_event(
+                "lifecycle",
+                "info",
+                "Local live run started",
+                "AQS Cloud auth was not provided; AQE is writing local live run artifacts",
+                Some(serde_json::json!({
+                    "run_id": artifacts.run_id.clone(),
+                    "strategy_id": strategy_id.to_string(),
+                    "strategy_name": strategy_name,
+                })),
+            )
+            .await?;
+
+        Ok(artifacts)
+    }
+
+    async fn init_schema(&self) -> Result<(), BrokerError> {
+        self.conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS run_metadata (
+                    key TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    payload_json TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_events_created_at ON events(created_at);
+                CREATE INDEX IF NOT EXISTS idx_live_events_type ON events(event_type);
+
+                CREATE TABLE IF NOT EXISTS metrics_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    captured_at TEXT NOT NULL,
+                    final_equity REAL NOT NULL,
+                    total_return REAL NOT NULL,
+                    total_return_pct REAL NOT NULL,
+                    open_positions_count INTEGER NOT NULL,
+                    open_insights_count INTEGER NOT NULL,
+                    total_trades INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_metrics_captured_at ON metrics_snapshots(captured_at);
+                "#,
+            )
+            .await
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to initialise local live run database {}: {}",
+                    self.db_path.display(),
+                    error
+                ))
+            })
+    }
+
+    async fn write_metrics_if_changed(
+        &mut self,
+        snapshot: Option<LiveMetricsSnapshot>,
+        force: bool,
+    ) -> Result<(), BrokerError> {
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+        if !force && self.last_metrics.as_ref() == Some(&snapshot) {
+            return Ok(());
+        }
+
+        let saved_snapshot = snapshot.clone();
+        let payload_json = serde_json::to_string(&serde_json::json!({
+            "run_id": self.run_id,
+            "updated_at": chrono::Utc::now(),
+            "metrics": snapshot,
+        }))
+        .map_err(|error| {
+            BrokerError::ConnectionError(format!(
+                "Failed to serialise local live metrics for {}: {}",
+                self.run_id, error
+            ))
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO metrics_snapshots (
+                    captured_at,
+                    final_equity,
+                    total_return,
+                    total_return_pct,
+                    open_positions_count,
+                    open_insights_count,
+                    total_trades,
+                    payload_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    saved_snapshot.updated_at.to_rfc3339(),
+                    saved_snapshot.final_equity,
+                    saved_snapshot.total_return,
+                    saved_snapshot.total_return_pct,
+                    saved_snapshot.open_positions_count as i64,
+                    saved_snapshot.open_insights_count as i64,
+                    saved_snapshot.total_trades as i64,
+                    payload_json
+                ],
+            )
+            .await
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to write local live metrics into {}: {}",
+                    self.db_path.display(),
+                    error
+                ))
+            })?;
+        self.last_metrics = Some(saved_snapshot);
+        Ok(())
+    }
+
+    async fn finish(
+        &mut self,
+        status: &str,
+        message: &str,
+        snapshot: Option<LiveMetricsSnapshot>,
+    ) -> Result<(), BrokerError> {
+        self.write_metrics_if_changed(snapshot, true).await?;
+        let finished_at = chrono::Utc::now();
+        self.append_event("lifecycle", "info", status, message, None)
+            .await?;
+        let completed = serde_json::json!({
+            "run_id": self.run_id,
+            "status": status,
+            "message": message,
+            "finished_at": finished_at,
+        });
+        self.upsert_metadata("completion", &completed).await
+    }
+
+    async fn append_event(
+        &self,
+        event_type: &str,
+        level: &str,
+        title: &str,
+        message: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<(), BrokerError> {
+        let created_at = chrono::Utc::now();
+        let payload_json = payload
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to serialise local live event for {}: {}",
+                    self.run_id, error
+                ))
+            })?;
+        self.conn
+            .execute(
+                "INSERT INTO events (event_type, level, title, message, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_type.to_string(),
+                    level.to_string(),
+                    title.to_string(),
+                    message.to_string(),
+                    payload_json,
+                    created_at.to_rfc3339()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to write local live event into {}: {}",
+                    self.db_path.display(),
+                    error
+                ))
+            })
+            .map(|_| ())
+    }
+
+    async fn upsert_metadata(
+        &self,
+        key: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), BrokerError> {
+        let payload_json = serde_json::to_string(payload).map_err(|error| {
+            BrokerError::ConnectionError(format!(
+                "Failed to serialise local live metadata {} for {}: {}",
+                key, self.run_id, error
+            ))
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO run_metadata (key, payload_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    key.to_string(),
+                    payload_json,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to write local live metadata into {}: {}",
+                    self.db_path.display(),
+                    error
+                ))
+            })
+            .map(|_| ())
+    }
 }
 
 impl<S, E, D> StrategyState<S, E, D>
@@ -404,9 +705,10 @@ where
     ) {
         if pending_ops.len() >= MAX_PENDING_AQS_SYNC_OPS {
             pending_ops.pop_front();
+            let dropped_total = PENDING_AQS_SYNC_DROPPED_OPS.fetch_add(1, Ordering::Relaxed) + 1;
             warn!(
-                "Pending AQS sync queue reached capacity ({}); dropping oldest item",
-                MAX_PENDING_AQS_SYNC_OPS
+                "Pending AQS sync queue reached capacity ({}); dropping oldest item (dropped_total={})",
+                MAX_PENDING_AQS_SYNC_OPS, dropped_total
             );
         }
         pending_ops.push_back(op);
@@ -559,6 +861,69 @@ where
         Ok(())
     }
 
+    async fn persist_local_live_metrics_if_needed(
+        &mut self,
+        artifacts: &mut LocalLiveRunArtifacts,
+        force: bool,
+    ) {
+        if let Ok(account) = self.broker.get_account().await {
+            self.live_metrics
+                .update_equity(account.equity, chrono::Utc::now());
+        }
+        self.refresh_live_open_position_metrics();
+        if let Err(error) = artifacts
+            .write_metrics_if_changed(self.live_metrics.snapshot(), force)
+            .await
+        {
+            warn!(
+                "Failed to persist local live metrics into {}: {}",
+                artifacts.db_path.display(),
+                error
+            );
+        }
+    }
+
+    async fn ensure_live_provider_connections(&self) {
+        if !self.broker.is_broker_connected() {
+            warn!(
+                "Execution broker disconnected for live strategy {}; attempting reconnect",
+                self.name
+            );
+            match self.broker.connect_broker().await {
+                Ok(true) => info!(
+                    "Execution broker reconnected for live strategy {}",
+                    self.name
+                ),
+                Ok(false) => warn!(
+                    "Execution broker reconnect returned false for live strategy {}",
+                    self.name
+                ),
+                Err(error) => warn!(
+                    "Execution broker reconnect failed for live strategy {}: {}",
+                    self.name, error
+                ),
+            }
+        }
+
+        if !self.broker.is_datafeed_connected() {
+            warn!(
+                "Data feed disconnected for live strategy {}; attempting reconnect",
+                self.name
+            );
+            match self.broker.connect_datafeed().await {
+                Ok(true) => info!("Data feed reconnected for live strategy {}", self.name),
+                Ok(false) => warn!(
+                    "Data feed reconnect returned false for live strategy {}",
+                    self.name
+                ),
+                Err(error) => warn!(
+                    "Data feed reconnect failed for live strategy {}: {}",
+                    self.name, error
+                ),
+            }
+        }
+    }
+
     fn latest_price_for_symbol(&self, symbol: &str) -> Option<f64> {
         self.latest_quote(symbol)
             .ok()
@@ -610,9 +975,9 @@ where
         let live_session_key = Self::live_session_key_for_auth(auth);
         let local_active_ids = self
             .insights
-            .values()
-            .filter(|insight| insight.state().is_active())
-            .map(|insight| insight.insight_id().to_string())
+            .active_insight_ids_unsorted()
+            .into_iter()
+            .map(|insight_id| insight_id.to_string())
             .collect::<HashSet<_>>();
 
         let mut result: IndexedResults = client
@@ -805,7 +1170,10 @@ where
             .collect::<Vec<_>>();
         let mut latest_prices = HashMap::<String, f64>::new();
 
-        for insight in self.insights.values() {
+        for insight_id in self.insights.active_insight_ids_unsorted() {
+            let Some(insight) = self.insights.get(&insight_id) else {
+                continue;
+            };
             if insight.state.is_inactive() {
                 continue;
             }
@@ -884,31 +1252,51 @@ where
             auth.strategy_id,
             self.insights.len()
         );
-        if let Err(error) = self.persist_live_strategy_summary(client, auth).await {
-            if Self::is_transient_surreal_error(&error) {
-                return Err(error);
-            }
-            error!(
-                "Failed to update live strategy summary for {}: {}",
-                auth.strategy_id, error
-            );
-        }
-
         let mut persist_metrics_after_sync = false;
         let mut prune_after_sync = Vec::new();
         let insight_ids = self
             .insights
             .insight_ids_for_live_sync(include_full_reconcile);
+        let has_sync_work =
+            include_full_reconcile || !insight_ids.is_empty() || !pending_ops.is_empty();
+        let metrics_changed = self.live_metrics.should_persist();
+
+        if !has_sync_work && !metrics_changed {
+            debug!(
+                "Skipping AQS live sync for strategy {} because there are no dirty insights, queued ops, or changed metrics",
+                auth.strategy_id
+            );
+            return Ok(false);
+        }
+        if !has_sync_work && metrics_changed {
+            return Ok(true);
+        }
+
+        if has_sync_work {
+            if let Err(error) = self.persist_live_strategy_summary(client, auth).await {
+                if Self::is_transient_surreal_error(&error) {
+                    return Err(error);
+                }
+                error!(
+                    "Failed to update live strategy summary for {}: {}",
+                    auth.strategy_id, error
+                );
+            }
+        }
 
         for insight_id in insight_ids {
-            let Some(insight) = self.insights.get(&insight_id) else {
+            let Some((snapshot, is_terminal, current_state, snapshot_value)) =
+                self.insights.get(&insight_id).map(|insight| {
+                    let snapshot = InsightSnapshot::from_insight(&insight, &auth.strategy_id);
+                    let is_terminal = insight.state.is_inactive();
+                    let current_state = snapshot.state.clone();
+                    let snapshot_value =
+                        serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                    (snapshot, is_terminal, current_state, snapshot_value)
+                })
+            else {
                 continue;
             };
-            let snapshot = InsightSnapshot::from_insight(insight, &auth.strategy_id);
-            let is_terminal = insight.state.is_inactive();
-            let current_state = snapshot.state.clone();
-            let snapshot_value = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
-            let _ = insight;
             let upsert_result = Self::upsert_live_insight_with_retry(client, auth, &snapshot).await;
 
             if let Err(error) = upsert_result {
@@ -971,14 +1359,16 @@ where
             }
         }
 
-        if let Err(error) = self.persist_live_strategy_summary(client, auth).await {
-            if Self::is_transient_surreal_error(&error) {
-                return Err(error);
+        if has_sync_work || persist_metrics_after_sync {
+            if let Err(error) = self.persist_live_strategy_summary(client, auth).await {
+                if Self::is_transient_surreal_error(&error) {
+                    return Err(error);
+                }
+                error!(
+                    "Failed to update live strategy summary after reconciliation for {}: {}",
+                    auth.strategy_id, error
+                );
             }
-            error!(
-                "Failed to update live strategy summary after reconciliation for {}: {}",
-                auth.strategy_id, error
-            );
         }
 
         Ok(persist_metrics_after_sync)
@@ -999,8 +1389,28 @@ where
     /// then loop via `tokio::select!` block listening on channels to drive the pipeline.
     pub async fn run_live(&mut self, auth: Option<AqsAuth>) -> Result<(), BrokerError> {
         let auth = auth.or_else(|| self.default_live_auth.clone());
+        self.runtime_telemetry
+            .start_tui(crate::core::tui::TuiConfig::from_process_args());
+        self.publish_runtime_snapshot(
+            if auth.is_some() {
+                "connecting"
+            } else {
+                "not configured"
+            },
+            None,
+        );
         let mut db = if let Some(ref a) = auth {
-            Some(Self::connect_live_sync_db(a).await?)
+            match Self::connect_live_sync_db(a).await {
+                Ok(db) => Some(db),
+                Err(error) => {
+                    error!(
+                        "Live execution failed while connecting AQS Cloud sync: {}",
+                        error
+                    );
+                    self.runtime_telemetry.stop_tui();
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -1011,11 +1421,24 @@ where
             .take()
             .expect("strategy must be Some before run_live");
 
-        self.broker
-            .configure_live_session(&self.strategy_id.to_string())?;
+        if let Err(error) = self
+            .broker
+            .configure_live_session(&self.strategy_id.to_string())
+        {
+            error!(
+                "Live execution failed while configuring broker session: {}",
+                error
+            );
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
 
         // 1. Connect broker
-        self.broker.connect().await?;
+        if let Err(error) = self.broker.connect().await {
+            error!("Live execution failed while connecting broker: {}", error);
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
 
         let mut action_stream = if let (Some(client), Some(a)) = (&db, &auth) {
             Self::create_strategy_action_stream(client, a).await
@@ -1029,49 +1452,124 @@ where
 
         let mut pending_sync_ops = VecDeque::new();
 
-        self.start(
-            &mut strategy,
-            db.as_ref(),
-            auth.as_ref(),
-            &mut pending_sync_ops,
-        )
-        .await?;
+        if let Err(error) = self
+            .start(
+                &mut strategy,
+                db.as_ref(),
+                auth.as_ref(),
+                &mut pending_sync_ops,
+            )
+            .await
+        {
+            error!("Live execution failed during strategy startup: {}", error);
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
+        let mut local_live_artifacts = if auth.is_none() {
+            let mut artifacts =
+                match LocalLiveRunArtifacts::start(&self.name, self.strategy_id, self.mode.clone())
+                    .await
+                {
+                    Ok(artifacts) => artifacts,
+                    Err(error) => {
+                        error!(
+                            "Live execution failed while creating local live run database: {}",
+                            error
+                        );
+                        self.runtime_telemetry.stop_tui();
+                        return Err(error);
+                    }
+                };
+            info!(
+                "AQS Cloud auth not provided; writing local live run database to {}",
+                artifacts.db_path.display()
+            );
+            self.persist_local_live_metrics_if_needed(&mut artifacts, true)
+                .await;
+            Some(artifacts)
+        } else {
+            None
+        };
 
         // Channels for incoming events
         let (trade_tx, mut trade_rx) = tokio::sync::mpsc::channel(100);
-        let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel(100);
+        let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel::<MarketDataEvent>(100);
 
         // 5. Subscribe to trade event stream
         let trade_tx_clone = trade_tx.clone();
         let trade_callback = Arc::new(move |event| {
             let _ = trade_tx_clone.try_send(event);
         });
-        self.broker
-            .subscribe_to_trade_stream(trade_callback)
-            .await?;
+        if let Err(error) = self.broker.subscribe_to_trade_stream(trade_callback).await {
+            error!(
+                "Live execution failed while subscribing to trade stream: {}",
+                error
+            );
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
 
-        // 6. Subscribe to market data stream
-        let symbols: Vec<String> = self.universe.keys().cloned().collect();
-        let time_frame = self.timeframe.clone();
-        info!(
-            "Subscribing live market data symbols={:?} timeframe={:?} mode={:?}",
-            symbols,
-            time_frame,
-            DataStreamMode::CompletedBar
-        );
+        // 6. Subscribe to market data streams
+        let event_streams = self.resolve_event_streams();
+        let mut streams_by_timeframe: HashMap<
+            crate::core::utils::timeframe::TimeFrame,
+            Vec<ResolvedEventStream>,
+        > = HashMap::new();
+        for stream in event_streams {
+            streams_by_timeframe
+                .entry(stream.key.timeframe)
+                .or_default()
+                .push(stream);
+        }
 
-        let bar_tx_clone = bar_tx.clone();
-        let bar_callback = Arc::new(move |bar| {
-            let _ = bar_tx_clone.try_send(bar);
-        });
-        self.broker
-            .subscribe_to_data_stream(
-                symbols.clone(),
+        for (time_frame, streams) in streams_by_timeframe {
+            let symbols: Vec<String> = streams
+                .iter()
+                .map(|stream| stream.key.symbol.clone())
+                .collect();
+            let streams_by_symbol: Arc<HashMap<String, ResolvedEventStream>> = Arc::new(
+                streams
+                    .into_iter()
+                    .map(|stream| (stream.key.symbol.clone(), stream))
+                    .collect(),
+            );
+            info!(
+                "Subscribing live market data symbols={:?} timeframe={} mode={:?}",
+                symbols,
                 time_frame,
-                DataStreamMode::CompletedBar,
-                bar_callback,
-            )
-            .await?;
+                DataStreamMode::CompletedBar
+            );
+
+            let bar_tx_clone = bar_tx.clone();
+            let streams_by_symbol = streams_by_symbol.clone();
+            let bar_callback = Arc::new(move |bar: crate::core::broker::types::Bar| {
+                let Some(stream) = streams_by_symbol.get(&bar.symbol) else {
+                    return;
+                };
+                let event = MarketDataEvent {
+                    context: stream.context_at(bar.timestamp),
+                    bar,
+                };
+                let _ = bar_tx_clone.try_send(event);
+            });
+            if let Err(error) = self
+                .broker
+                .subscribe_to_data_stream(
+                    symbols,
+                    time_frame,
+                    DataStreamMode::CompletedBar,
+                    bar_callback,
+                )
+                .await
+            {
+                error!(
+                    "Live execution failed while subscribing to market data stream: {}",
+                    error
+                );
+                self.runtime_telemetry.stop_tui();
+                return Err(error);
+            }
+        }
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -1079,6 +1577,11 @@ where
         info!("Started live trading mode for strategy: {}", self.name);
 
         self.status = StrategyStatus::Running;
+        let mut aqs_sync_status = if auth.is_some() {
+            "connected".to_string()
+        } else {
+            "not configured".to_string()
+        };
 
         if let (Some(client), Some(a)) = (&db, &auth) {
             let _ = persist_strategy_event(
@@ -1098,19 +1601,33 @@ where
             )
             .await;
         }
+        self.publish_runtime_event("info", "Live strategy started", aqs_sync_status.clone());
 
         // 7. Main Event Loop
         // Pipeline loop interval
         let mut pipeline_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut reconcile_interval =
             tokio::time::interval(std::time::Duration::from_secs(LIVE_SYNC_RECONCILE_SECS));
+        let mut local_metrics_interval = tokio::time::interval(std::time::Duration::from_secs(
+            LOCAL_LIVE_METRICS_WRITE_SECS,
+        ));
         let mut force_full_reconcile = true;
         let mut live_sync_failure: Option<BrokerError> = None;
+        let mut last_runtime_publish = std::time::Instant::now();
 
         macro_rules! reconnect_live_sync_or_stop {
             ($auth:expr) => {{
+                aqs_sync_status = "reconnecting".to_string();
+                self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
                 match Self::reconnect_live_sync(&mut db, &mut action_stream, $auth).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        aqs_sync_status = "connected".to_string();
+                        self.publish_runtime_event(
+                            "info",
+                            "AQS live sync reconnected",
+                            aqs_sync_status.clone(),
+                        );
+                    }
                     Err(error) => {
                         let message = format!(
                             "AQS live sync unavailable for strategy {} after {} attempt(s); stopping live run: {}",
@@ -1119,7 +1636,9 @@ where
                             error
                         );
                         error!("{}", message);
-                        live_sync_failure = Some(BrokerError::ConnectionError(message));
+                        live_sync_failure = Some(BrokerError::ConnectionError(message.clone()));
+                        aqs_sync_status = "offline".to_string();
+                        self.publish_runtime_event("error", message, aqs_sync_status.clone());
                         self.status = StrategyStatus::Stopping;
                         self.shutdown();
                         continue;
@@ -1139,6 +1658,33 @@ where
                     );
                     // Process trade events (we let `on_trade_update()` drain all pending broker state)
                     self.on_trade_update();
+                    self.publish_runtime_event(
+                        "info",
+                        format!("Trade event {:?} for order {}", event, order.order_id),
+                        aqs_sync_status.clone(),
+                    );
+                    if let Some(artifacts) = local_live_artifacts.as_ref() {
+                        if let Err(error) = artifacts
+                            .append_event(
+                                "trade_event",
+                                "info",
+                                "Broker trade event",
+                                &format!("Received {:?} for order {}", event, order.order_id),
+                                Some(serde_json::json!({
+                                    "order_id": order.order_id.clone(),
+                                    "symbol": order.asset.symbol.clone(),
+                                    "event": format!("{:?}", event),
+                                })),
+                            )
+                            .await
+                        {
+                            warn!(
+                                "Failed to persist local live trade event into {}: {}",
+                                artifacts.db_path.display(),
+                                error
+                            );
+                        }
+                    }
                     if let Some(a) = auth.as_ref() {
                         if db.is_none() {
                             reconnect_live_sync_or_stop!(a);
@@ -1249,23 +1795,32 @@ where
                             }
                         }
                     }
+                    if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
+                        self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
+                        last_runtime_publish = std::time::Instant::now();
+                    }
                 }
 
                 // Handle incoming market data bars
-                Some(bar) = bar_rx.recv() => {
-                    let symbol = bar.symbol.clone();
+                Some(event) = bar_rx.recv() => {
+                    let symbol = event.context.symbol.clone();
                     info!(
-                        "Live market data bar symbol={} timeframe={:?} timestamp={}",
+                        "Live market data bar symbol={} history_key={} timeframe={} feature={} allow_trading={} timestamp={}",
                         symbol,
-                        self.timeframe,
-                        bar.timestamp
+                        event.context.history_key,
+                        event.context.timeframe,
+                        event.context.is_feature,
+                        event.context.allow_trading,
+                        event.bar.timestamp
                     );
                     debug!("Live loop processing completed bar for {}", symbol);
-                    self.broker.process_live_bar(&bar);
-                    debug!("Live loop processed execution broker for {}", symbol);
-                    self.on_trade_update();
-                    debug!("Live loop processed trade events after execution step for {}", symbol);
-                    self._on_bar(&mut strategy, &symbol, &BarData::Bars(vec![bar]));
+                    if event.context.allow_trading && !event.context.is_feature {
+                        self.broker.process_live_bar(&event.bar);
+                        debug!("Live loop processed execution broker for {}", symbol);
+                        self.on_trade_update();
+                        debug!("Live loop processed trade events after execution step for {}", symbol);
+                    }
+                    self._on_market_data_event(&mut strategy, event);
                     debug!("Live loop completed _on_bar for {}", symbol);
                     if auth.is_none() {
                         let pruned_ids = self.insights.prune_terminal_insights_without_aqs();
@@ -1316,10 +1871,23 @@ where
                             }
                         }
                     }
+                    if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
+                        self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
+                        last_runtime_publish = std::time::Instant::now();
+                    }
                 }
 
                 // Periodically run insight pipeline
                 _ = pipeline_interval.tick() => {
+                    if self.runtime_telemetry.shutdown_requested()
+                        && !matches!(self.status, StrategyStatus::Stopping)
+                    {
+                        warn!("Live stop requested from AQE TUI");
+                        self.publish_runtime_event("warn", "Live stop requested from TUI", aqs_sync_status.clone());
+                        self.status = StrategyStatus::Stopping;
+                        self.shutdown();
+                    }
+                    self.ensure_live_provider_connections().await;
                     debug!("Live loop calling run_insight_pipeline");
                     self.run_insight_pipeline();
                     debug!("Live loop completed run_insight_pipeline");
@@ -1409,6 +1977,14 @@ where
                             }
                         }
                     }
+                    self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
+                }
+
+                _ = local_metrics_interval.tick(), if local_live_artifacts.is_some() => {
+                    if let Some(artifacts) = local_live_artifacts.as_mut() {
+                        self.persist_local_live_metrics_if_needed(artifacts, false).await;
+                    }
+                    self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
                 }
 
                 _ = reconcile_interval.tick() => {
@@ -1418,6 +1994,16 @@ where
                             force_full_reconcile = true;
                         }
                         if let Some(client) = db.as_ref() {
+                            let has_reconcile_work = force_full_reconcile
+                                || !pending_sync_ops.is_empty()
+                                || self.insights.has_dirty_insights();
+                            if !has_reconcile_work {
+                                debug!(
+                                    "Skipping periodic AQS live reconcile for strategy {} because there is no local sync work",
+                                    a.strategy_id
+                                );
+                                continue;
+                            }
                             if let Err(error) = Self::flush_pending_aqs_sync_ops(client, a, &mut pending_sync_ops).await {
                                 error!(
                                     "Live sync could not flush pending AQS ops for strategy {} during reconcile: {}",
@@ -1428,7 +2014,7 @@ where
                                 continue;
                             }
                             match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, true)
+                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
                                 .await
                             {
                                 Ok(_) => {
@@ -1532,7 +2118,10 @@ where
 
         // Clean up subscriptions
         let _ = self.broker.unsubscribe_from_trade_stream().await;
-        let _ = self.broker.unsubscribe_from_data_stream(symbols).await;
+        let _ = self
+            .broker
+            .unsubscribe_from_data_stream(self.universe.keys().cloned().collect())
+            .await;
         let _ = self.broker.disconnect().await;
 
         self.strategy = Some(strategy);
@@ -1591,6 +2180,50 @@ where
             )
             .await;
         }
+
+        if let Some(artifacts) = local_live_artifacts.as_mut() {
+            if let Ok(account) = self.broker.get_account().await {
+                self.live_metrics
+                    .update_equity(account.equity, chrono::Utc::now());
+            }
+            self.refresh_live_open_position_metrics();
+            self.live_metrics.finish(chrono::Utc::now());
+            let (status, message) = if live_sync_failure.is_some() {
+                (
+                    "failed",
+                    "Strategy exited live mode after AQS live sync failure",
+                )
+            } else {
+                ("completed", "Strategy exited live mode")
+            };
+            if let Err(error) = artifacts
+                .finish(status, message, self.live_metrics.snapshot())
+                .await
+            {
+                warn!(
+                    "Failed to finalise local live run database {}: {}",
+                    artifacts.db_path.display(),
+                    error
+                );
+            }
+        }
+
+        if live_sync_failure.is_some() {
+            aqs_sync_status = "offline".to_string();
+            self.publish_runtime_event(
+                "error",
+                "Live strategy stopped after sync failure",
+                aqs_sync_status,
+            );
+        } else {
+            aqs_sync_status = if auth.is_some() {
+                "completed".to_string()
+            } else {
+                "not configured".to_string()
+            };
+            self.publish_runtime_event("info", "Live strategy stopped", aqs_sync_status);
+        }
+        self.runtime_telemetry.wait_for_tui_close();
 
         if let Some(error) = live_sync_failure {
             return Err(error);

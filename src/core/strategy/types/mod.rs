@@ -5,10 +5,19 @@ use std::{
     fmt::Display,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrategyMode {
     Backtest,
     Live,
+}
+
+impl StrategyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StrategyMode::Backtest => "Backtest",
+            StrategyMode::Live => "Live",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

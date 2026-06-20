@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
@@ -29,9 +29,10 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:18080";
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_HISTORY_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_ORDER_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 15_000;
-const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_QUEUE_LEN: usize = 10_000;
+const MAX_TRADE_EVENT_QUEUE_LEN: usize = 20_000;
 
 static SHARED_MT5_BRIDGE: OnceLock<Arc<Mt5Bridge>> = OnceLock::new();
 
@@ -125,7 +126,8 @@ pub struct Mt5Bridge {
     rpc_queue: Arc<Mutex<VecDeque<Mt5RpcRequest>>>,
     rpc_queue_notify: Arc<Notify>,
     pending_rpc: Arc<Mutex<HashMap<String, oneshot::Sender<Mt5RpcResponsePayload>>>>,
-    event_queue: Arc<Mutex<VecDeque<(Order, TradeUpdateEvent)>>>,
+    event_queue: Arc<Mutex<VecDeque<QueuedTradeEvent>>>,
+    local_trade_event_seq: Arc<AtomicU64>,
     trade_subscribers: Arc<Mutex<Vec<Arc<dyn Fn((Order, TradeUpdateEvent)) + Send + Sync>>>>,
     bar_subscribers: Arc<Mutex<Vec<Mt5BarSubscription>>>,
     server_started: Arc<AtomicBool>,
@@ -141,6 +143,7 @@ struct Mt5BridgeState {
     positions: HashMap<String, Position>,
     latest_quotes: HashMap<String, Quote>,
     latest_bars: HashMap<String, Bar>,
+    latest_bars_by_stream: HashMap<(String, String), Bar>,
     latest_intrabar_bars: HashMap<(String, String), Bar>,
     history: HashMap<String, Vec<Bar>>,
     seen_event_ids: HashSet<String>,
@@ -159,6 +162,15 @@ struct Mt5BridgeState {
     last_unknown_rpc_response_request_id: Option<String>,
     last_heartbeat: Option<DateTime<Utc>>,
     terminal_name: Option<String>,
+    dropped_trade_event_count: u64,
+    last_trade_event_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedTradeEvent {
+    sequence: u64,
+    order: Order,
+    event: TradeUpdateEvent,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,6 +193,9 @@ pub struct Mt5BridgeDiagnostics {
     pub last_response_request_id: Option<String>,
     pub last_unknown_response_request_id: Option<String>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub queued_trade_event_count: usize,
+    pub dropped_trade_event_count: u64,
+    pub last_trade_event_sequence: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -257,6 +272,7 @@ impl Mt5Bridge {
             rpc_queue_notify: Arc::new(Notify::new()),
             pending_rpc: Arc::new(Mutex::new(HashMap::new())),
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
+            local_trade_event_seq: Arc::new(AtomicU64::new(0)),
             trade_subscribers: Arc::new(Mutex::new(Vec::new())),
             bar_subscribers: Arc::new(Mutex::new(Vec::new())),
             server_started: Arc::new(AtomicBool::new(false)),
@@ -313,6 +329,7 @@ impl Mt5Bridge {
         state.positions.clear();
         state.latest_quotes.clear();
         state.latest_bars.clear();
+        state.latest_bars_by_stream.clear();
         state.latest_intrabar_bars.clear();
         state.history.clear();
         state.seen_event_ids.clear();
@@ -331,6 +348,9 @@ impl Mt5Bridge {
         state.last_unknown_rpc_response_request_id = None;
         state.last_heartbeat = None;
         state.terminal_name = None;
+        state.dropped_trade_event_count = 0;
+        state.last_trade_event_sequence = None;
+        self.local_trade_event_seq.store(0, Ordering::Relaxed);
     }
 
     fn reset_connection_markers(&self) {
@@ -419,6 +439,8 @@ impl Mt5Bridge {
             last_response_request_id,
             last_unknown_response_request_id,
             last_heartbeat_at,
+            dropped_trade_event_count,
+            last_trade_event_sequence,
         ) = {
             let state = self.state.read();
             (
@@ -435,6 +457,8 @@ impl Mt5Bridge {
                 state.last_rpc_response_request_id.clone(),
                 state.last_unknown_rpc_response_request_id.clone(),
                 state.last_heartbeat,
+                state.dropped_trade_event_count,
+                state.last_trade_event_sequence,
             )
         };
         Mt5BridgeDiagnostics {
@@ -455,6 +479,9 @@ impl Mt5Bridge {
             last_response_request_id,
             last_unknown_response_request_id,
             last_heartbeat_at,
+            queued_trade_event_count: self.event_queue.lock().len(),
+            dropped_trade_event_count,
+            last_trade_event_sequence,
         }
     }
 
@@ -472,6 +499,7 @@ impl Mt5Bridge {
             .route("/v1/snapshot", post(snapshot))
             .route("/v1/market-data", post(market_data))
             .route("/v1/trade-event", post(trade_event))
+            .route("/v1/trade-events", post(trade_events))
             .route("/v1/rpc/poll", post(poll_rpc))
             .route("/v1/rpc/response", post(rpc_response))
             .with_state(self.clone());
@@ -856,103 +884,117 @@ impl Mt5Bridge {
         payload: Value,
         request_timeout: Duration,
     ) -> Result<Value, BrokerError> {
-        let request_id = Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel();
-        self.pending_rpc.lock().insert(request_id.clone(), tx);
+        let mut remaining_attempts = 2;
 
-        let queued_len = {
-            let mut queue = self.rpc_queue.lock();
-            if queue.len() >= MAX_QUEUE_LEN {
-                self.pending_rpc.lock().remove(&request_id);
-                return Err(BrokerError::TradeError(
-                    "MT5 RPC queue is full; bridge is not keeping up".into(),
-                ));
-            }
-            queue.push_back(Mt5RpcRequest {
-                session_id: String::new(),
-                request_id: request_id.clone(),
+        loop {
+            let request_id = Uuid::new_v4().to_string();
+            let (tx, rx) = oneshot::channel();
+            self.pending_rpc.lock().insert(request_id.clone(), tx);
+
+            let queued_len = {
+                let mut queue = self.rpc_queue.lock();
+                if queue.len() >= MAX_QUEUE_LEN {
+                    self.pending_rpc.lock().remove(&request_id);
+                    return Err(BrokerError::TradeError(
+                        "MT5 RPC queue is full; bridge is not keeping up".into(),
+                    ));
+                }
+                queue.push_back(Mt5RpcRequest {
+                    session_id: String::new(),
+                    request_id: request_id.clone(),
+                    action,
+                    payload: payload.clone(),
+                });
+                queue.len()
+            };
+            self.rpc_queue_notify.notify_one();
+            let mut pending_guard = PendingMt5RpcRequest::new(
+                request_id.clone(),
+                self.rpc_queue.clone(),
+                self.pending_rpc.clone(),
+            );
+            debug!(
+                "Queued MT5 RPC request {:?} id={} pending={} queued={}",
                 action,
-                payload,
-            });
-            queue.len()
-        };
-        self.rpc_queue_notify.notify_one();
-        let mut pending_guard = PendingMt5RpcRequest::new(
-            request_id.clone(),
-            self.rpc_queue.clone(),
-            self.pending_rpc.clone(),
-        );
-        debug!(
-            "Queued MT5 RPC request {:?} id={} pending={} queued={}",
-            action,
-            request_id,
-            self.pending_rpc.lock().len(),
-            queued_len
-        );
+                request_id,
+                self.pending_rpc.lock().len(),
+                queued_len
+            );
 
-        let result = match tokio::time::timeout(request_timeout, rx).await {
-            Ok(Ok(response)) if response.ok => {
-                pending_guard.dismiss();
-                Ok(response.payload.unwrap_or(Value::Null))
+            match tokio::time::timeout(request_timeout, rx).await {
+                Ok(Ok(response)) if response.ok => {
+                    pending_guard.dismiss();
+                    return Ok(response.payload.unwrap_or(Value::Null));
+                }
+                Ok(Ok(response)) => {
+                    pending_guard.dismiss();
+                    return Err(BrokerError::TradeError(
+                        response
+                            .message
+                            .unwrap_or_else(|| "MT5 RPC request failed".to_string()),
+                    ));
+                }
+                Ok(Err(_)) => {
+                    pending_guard.cleanup();
+                    pending_guard.dismiss();
+                    return Err(BrokerError::ConnectionError(format!(
+                        "MT5 RPC response channel closed for request {}",
+                        request_id
+                    )));
+                }
+                Err(_) => {
+                    let diagnostics = self.diagnostics();
+                    let last_poll_age_ms = diagnostics
+                        .last_authorized_poll_at
+                        .map(|poll| (Utc::now() - poll).num_milliseconds());
+                    let request_was_queued = self
+                        .rpc_queue
+                        .lock()
+                        .iter()
+                        .any(|request| request.request_id == request_id);
+                    let request_was_pending = self.pending_rpc.lock().contains_key(&request_id);
+                    pending_guard.cleanup();
+                    pending_guard.dismiss();
+                    warn!(
+                        "MT5 RPC request {:?} id={} timed out after {:?}. queued_before_cleanup={} pending_before_cleanup={} last_poll_age_ms={:?} last_poll_requests={:?} last_delivery={:?} last_delivery_action={:?} last_response={:?}. Check that the EA can reach the bridge URL and is polling /v1/rpc/poll.",
+                        action,
+                        request_id,
+                        request_timeout,
+                        request_was_queued,
+                        request_was_pending,
+                        last_poll_age_ms,
+                        diagnostics.last_poll_request_count,
+                        diagnostics.last_delivery_request_id,
+                        diagnostics.last_delivery_action,
+                        diagnostics.last_response_request_id
+                    );
+
+                    if remaining_attempts > 1 && request_was_queued && request_was_pending {
+                        remaining_attempts -= 1;
+                        warn!(
+                            "MT5 RPC request {:?} id={} timed out before delivery; waiting for the EA poll loop and retrying once",
+                            action, request_id
+                        );
+                        self.wait_for_rpc_poll().await?;
+                        continue;
+                    }
+
+                    return Err(BrokerError::ConnectionError(format!(
+                        "MT5 RPC request {:?} timed out after {:?} request_id={} queued_before_cleanup={} pending_before_cleanup={} last_poll_age_ms={:?} last_poll_requests={:?} last_delivery={:?} last_delivery_action={:?} last_response={:?}",
+                        action,
+                        request_timeout,
+                        request_id,
+                        request_was_queued,
+                        request_was_pending,
+                        last_poll_age_ms,
+                        diagnostics.last_poll_request_count,
+                        diagnostics.last_delivery_request_id,
+                        diagnostics.last_delivery_action,
+                        diagnostics.last_response_request_id
+                    )));
+                }
             }
-            Ok(Ok(response)) => {
-                pending_guard.dismiss();
-                Err(BrokerError::TradeError(
-                    response
-                        .message
-                        .unwrap_or_else(|| "MT5 RPC request failed".to_string()),
-                ))
-            }
-            Ok(Err(_)) => {
-                pending_guard.cleanup();
-                pending_guard.dismiss();
-                Err(BrokerError::ConnectionError(format!(
-                    "MT5 RPC response channel closed for request {}",
-                    request_id
-                )))
-            }
-            Err(_) => {
-                let diagnostics = self.diagnostics();
-                let last_poll_age_ms = diagnostics
-                    .last_authorized_poll_at
-                    .map(|poll| (Utc::now() - poll).num_milliseconds());
-                let request_was_queued = self
-                    .rpc_queue
-                    .lock()
-                    .iter()
-                    .any(|request| request.request_id == request_id);
-                let request_was_pending = self.pending_rpc.lock().contains_key(&request_id);
-                pending_guard.cleanup();
-                pending_guard.dismiss();
-                warn!(
-                    "MT5 RPC request {:?} id={} timed out after {:?}. queued_before_cleanup={} pending_before_cleanup={} last_poll_age_ms={:?} last_poll_requests={:?} last_delivery={:?} last_delivery_action={:?} last_response={:?}. Check that the EA can reach the bridge URL and is polling /v1/rpc/poll.",
-                    action,
-                    request_id,
-                    request_timeout,
-                    request_was_queued,
-                    request_was_pending,
-                    last_poll_age_ms,
-                    diagnostics.last_poll_request_count,
-                    diagnostics.last_delivery_request_id,
-                    diagnostics.last_delivery_action,
-                    diagnostics.last_response_request_id
-                );
-                Err(BrokerError::ConnectionError(format!(
-                    "MT5 RPC request {:?} timed out after {:?} request_id={} queued_before_cleanup={} pending_before_cleanup={} last_poll_age_ms={:?} last_poll_requests={:?} last_delivery={:?} last_delivery_action={:?} last_response={:?}",
-                    action,
-                    request_timeout,
-                    request_id,
-                    request_was_queued,
-                    request_was_pending,
-                    last_poll_age_ms,
-                    diagnostics.last_poll_request_count,
-                    diagnostics.last_delivery_request_id,
-                    diagnostics.last_delivery_action,
-                    diagnostics.last_response_request_id
-                )))
-            }
-        };
-        result
+        }
     }
 
     pub fn enqueue_rpc(&self, request: Mt5RpcRequest) -> Result<(), BrokerError> {
@@ -978,17 +1020,18 @@ impl Mt5Bridge {
     }
 
     pub fn emit_order_event(&self, order: Order, event: TradeUpdateEvent) {
-        self.upsert_order(order.clone());
-        let event = (order, event);
-        self.event_queue.lock().push_back(event.clone());
-        for subscriber in self.trade_subscribers.lock().iter() {
-            subscriber(event.clone());
-        }
+        let sequence = self.local_trade_event_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        self.enqueue_trade_event(sequence, order, event);
     }
 
     pub fn drain_trade_events(&self) -> Vec<(Order, TradeUpdateEvent)> {
         let mut events = self.event_queue.lock();
-        events.drain(..).collect()
+        let mut events = events.drain(..).collect::<Vec<_>>();
+        events.sort_by_key(|event| event.sequence);
+        events
+            .into_iter()
+            .map(|event| (event.order, event.event))
+            .collect()
     }
 
     pub fn subscribe_trade_stream(
@@ -1174,9 +1217,17 @@ impl Mt5Bridge {
             }
             for stream_bar in &mut stream_bars {
                 stream_bar.bar.symbol = self.config.aqe_symbol(&stream_bar.bar.symbol);
+                let timeframe = stream_bar
+                    .timeframe
+                    .clone()
+                    .unwrap_or_else(|| "PERIOD_M1".to_string());
                 state
                     .latest_bars
                     .insert(stream_bar.bar.symbol.clone(), stream_bar.bar.clone());
+                state.latest_bars_by_stream.insert(
+                    (stream_bar.bar.symbol.clone(), timeframe),
+                    stream_bar.bar.clone(),
+                );
                 if let Some(timeframe) = stream_bar.timeframe.as_ref() {
                     state
                         .latest_intrabar_bars
@@ -1258,48 +1309,51 @@ impl Mt5Bridge {
         Some(entry.clone())
     }
 
-    fn apply_trade_event(&self, _session_id: &str, payload: Mt5TradeEventPayload) {
+    fn enqueue_trade_event(&self, sequence: u64, order: Order, event: TradeUpdateEvent) {
+        self.upsert_order(order.clone());
+        let subscriber_event = (order.clone(), event.clone());
+        {
+            let mut queue = self.event_queue.lock();
+            if queue.len() >= MAX_TRADE_EVENT_QUEUE_LEN {
+                queue.pop_front();
+                self.state.write().dropped_trade_event_count += 1;
+            }
+            queue.push_back(QueuedTradeEvent {
+                sequence,
+                order,
+                event,
+            });
+        }
+        self.state.write().last_trade_event_sequence = Some(sequence);
+        for subscriber in self.trade_subscribers.lock().iter() {
+            subscriber(subscriber_event.clone());
+        }
+    }
+
+    fn apply_trade_event(
+        &self,
+        session_id: &str,
+        envelope_sequence: Option<u64>,
+        payload: Mt5TradeEventPayload,
+    ) {
+        let sequence = payload
+            .event_seq
+            .or(envelope_sequence)
+            .unwrap_or_else(|| self.local_trade_event_seq.fetch_add(1, Ordering::Relaxed) + 1);
         let event_key = payload
             .native_event_id
             .clone()
-            .unwrap_or_else(|| format!("{}:{:?}", payload.order.order_id, payload.event));
+            .map(|native_id| format!("{}:{}", session_id, native_id))
+            .unwrap_or_else(|| format!("{}:seq:{}", session_id, sequence));
 
         {
             let mut state = self.state.write();
             if !state.seen_event_ids.insert(event_key) {
                 return;
             }
-            if payload.event == TradeUpdateEvent::Canceled
-                && state
-                    .orders
-                    .get(&payload.order.order_id)
-                    .is_some_and(|order| {
-                        matches!(
-                            order.status,
-                            TradeUpdateEvent::Filled | TradeUpdateEvent::Closed
-                        )
-                    })
-            {
-                return;
-            }
-            if payload.event == TradeUpdateEvent::Filled
-                && state
-                    .orders
-                    .get(&payload.order.order_id)
-                    .is_some_and(|order| order.status == TradeUpdateEvent::Filled)
-            {
-                return;
-            }
-            state
-                .orders
-                .insert(payload.order.order_id.clone(), payload.order.clone());
         }
 
-        let event = (payload.order, payload.event);
-        self.event_queue.lock().push_back(event.clone());
-        for subscriber in self.trade_subscribers.lock().iter() {
-            subscriber(event.clone());
-        }
+        self.enqueue_trade_event(sequence, payload.order, payload.event);
     }
 
     fn apply_rpc_response(&self, payload: Mt5RpcResponsePayload) {
@@ -1353,6 +1407,7 @@ pub enum Mt5RpcAction {
     GetAccount,
     SubmitOrder,
     CancelOrder,
+    UpdateOrder,
     ClosePosition,
     CloseAllPositions,
     SubscribeBars,
@@ -1471,8 +1526,18 @@ pub struct Mt5StreamBar {
 #[serde(rename_all = "camelCase")]
 pub struct Mt5TradeEventPayload {
     pub native_event_id: Option<String>,
+    pub event_seq: Option<u64>,
     pub event: TradeUpdateEvent,
     pub order: Order,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Mt5TradeEventsPayload {
+    #[serde(default)]
+    pub events: Vec<Mt5TradeEventPayload>,
+    #[serde(default)]
+    pub dropped_count: Option<u64>,
 }
 
 async fn health(
@@ -1586,7 +1651,7 @@ async fn trade_event(
         );
     }
     bridge.register_session(&envelope.session_id);
-    bridge.apply_trade_event(&envelope.session_id, envelope.payload);
+    bridge.apply_trade_event(&envelope.session_id, envelope.event_seq, envelope.payload);
     let session_id = bridge.session_id();
     (
         StatusCode::OK,
@@ -1594,6 +1659,38 @@ async fn trade_event(
             &session_id,
             envelope.request_id,
             Some(serde_json::json!({ "accepted": true })),
+        )),
+    )
+}
+
+async fn trade_events(
+    State(bridge): State<Arc<Mt5Bridge>>,
+    headers: HeaderMap,
+    Json(envelope): Json<Mt5BridgeEnvelope<Mt5TradeEventsPayload>>,
+) -> (StatusCode, Json<Mt5BridgeResponse<serde_json::Value>>) {
+    if let Err(message) = authorize_session_token(&bridge, &headers, &envelope.session_id) {
+        return bridge_error(
+            &bridge,
+            envelope.request_id,
+            StatusCode::UNAUTHORIZED,
+            message,
+        );
+    }
+    bridge.register_session(&envelope.session_id);
+    if let Some(dropped_count) = envelope.payload.dropped_count {
+        bridge.state.write().dropped_trade_event_count += dropped_count;
+    }
+    let accepted = envelope.payload.events.len();
+    for payload in envelope.payload.events {
+        bridge.apply_trade_event(&envelope.session_id, envelope.event_seq, payload);
+    }
+    let session_id = bridge.session_id();
+    (
+        StatusCode::OK,
+        Json(Mt5BridgeResponse::ok(
+            &session_id,
+            envelope.request_id,
+            Some(serde_json::json!({ "accepted": accepted })),
         )),
     )
 }
@@ -1844,6 +1941,7 @@ fn bars_to_frame(bars: Vec<Bar>) -> Result<DataFrame, BrokerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::broker::types::{OrderClass, OrderSide, OrderType, TimeInForce};
 
     fn test_bridge(token: &str) -> Mt5Bridge {
         Mt5Bridge::new(Mt5BridgeConfig {
@@ -1861,6 +1959,32 @@ mod tests {
         headers.insert("x-aqe-mt5-session", session_id.parse().unwrap());
         headers.insert("x-aqe-mt5-token", token.parse().unwrap());
         headers
+    }
+
+    fn trade_event_order(order_id: &str, insight_id: &str, status: TradeUpdateEvent) -> Order {
+        Order {
+            order_id: order_id.to_string(),
+            insight_id: Some(insight_id.to_string()),
+            strategy_type: Some("Testing".to_string()),
+            asset: default_mt5_asset("AAPL"),
+            qty: 1.0,
+            filled_qty: 1.0,
+            limit_price: None,
+            filled_price: Some(100.0),
+            stop_price: None,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::GTC,
+            status,
+            order_class: OrderClass::Simple,
+            created_at: 0,
+            updated_at: 0,
+            submitted_at: 0,
+            filled_at: Some(0),
+            realized_pnl: None,
+            rejection_reason: None,
+            legs: None,
+        }
     }
 
     #[test]
@@ -1922,6 +2046,65 @@ mod tests {
                 .lock()
                 .iter()
                 .any(|request| request.request_id == request_id)
+        );
+    }
+
+    #[test]
+    fn trade_events_drain_in_sequence_order() {
+        let bridge = test_bridge("test-token");
+        bridge.apply_trade_event(
+            "session-1",
+            None,
+            Mt5TradeEventPayload {
+                native_event_id: Some("event-2".to_string()),
+                event_seq: Some(2),
+                event: TradeUpdateEvent::Closed,
+                order: trade_event_order("order-2", "insight-1", TradeUpdateEvent::Closed),
+            },
+        );
+        bridge.apply_trade_event(
+            "session-1",
+            None,
+            Mt5TradeEventPayload {
+                native_event_id: Some("event-1".to_string()),
+                event_seq: Some(1),
+                event: TradeUpdateEvent::Filled,
+                order: trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled),
+            },
+        );
+
+        let events = bridge.drain_trade_events();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0.order_id, "order-1");
+        assert_eq!(events[0].1, TradeUpdateEvent::Filled);
+        assert_eq!(events[1].0.order_id, "order-2");
+        assert_eq!(events[1].1, TradeUpdateEvent::Closed);
+    }
+
+    #[test]
+    fn trade_events_dedupe_by_native_event_id_not_order_status() {
+        let bridge = test_bridge("test-token");
+        for (native_id, sequence) in [("fill-1", 1), ("fill-2", 2), ("fill-1", 3)] {
+            bridge.apply_trade_event(
+                "session-1",
+                None,
+                Mt5TradeEventPayload {
+                    native_event_id: Some(native_id.to_string()),
+                    event_seq: Some(sequence),
+                    event: TradeUpdateEvent::Filled,
+                    order: trade_event_order("same-order", "insight-1", TradeUpdateEvent::Filled),
+                },
+            );
+        }
+
+        let events = bridge.drain_trade_events();
+
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|(_, event)| *event == TradeUpdateEvent::Filled)
         );
     }
 }

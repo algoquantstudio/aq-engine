@@ -66,9 +66,9 @@ impl Indicator for RelativeStrengthIndex {
 
         let mut gains = 0.0;
         let mut losses = 0.0;
-        for i in 1..=self.period {
-            let current = values[i].ok_or_else(|| "Null value in RSI window".to_string())?;
-            let previous = values[i - 1].ok_or_else(|| "Null value in RSI window".to_string())?;
+        for pair in values.windows(2).take(self.period) {
+            let previous = pair[0].ok_or_else(|| "Null value in RSI window".to_string())?;
+            let current = pair[1].ok_or_else(|| "Null value in RSI window".to_string())?;
             let delta = current - previous;
             if delta >= 0.0 {
                 gains += delta;
@@ -79,21 +79,27 @@ impl Indicator for RelativeStrengthIndex {
 
         let mut avg_gain = gains / self.period as f64;
         let mut avg_loss = losses / self.period as f64;
-        out[self.period] = Some(if avg_loss == 0.0 {
-            100.0
-        } else {
-            100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
-        });
+        if let Some(slot) = out.get_mut(self.period) {
+            *slot = Some(if avg_loss == 0.0 {
+                100.0
+            } else {
+                100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+            });
+        }
 
-        for i in (self.period + 1)..values.len() {
-            let current = values[i].ok_or_else(|| "Null value in RSI series".to_string())?;
-            let previous = values[i - 1].ok_or_else(|| "Null value in RSI series".to_string())?;
+        for (slot, pair) in out
+            .iter_mut()
+            .skip(self.period + 1)
+            .zip(values.windows(2).skip(self.period))
+        {
+            let previous = pair[0].ok_or_else(|| "Null value in RSI series".to_string())?;
+            let current = pair[1].ok_or_else(|| "Null value in RSI series".to_string())?;
             let delta = current - previous;
             let gain = delta.max(0.0);
             let loss = (-delta).max(0.0);
             avg_gain = ((avg_gain * (self.period as f64 - 1.0)) + gain) / self.period as f64;
             avg_loss = ((avg_loss * (self.period as f64 - 1.0)) + loss) / self.period as f64;
-            out[i] = Some(if avg_loss == 0.0 {
+            *slot = Some(if avg_loss == 0.0 {
                 100.0
             } else {
                 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))

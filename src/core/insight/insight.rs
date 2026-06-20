@@ -239,7 +239,7 @@ impl Insight {
         let push_leg = |order_ids: &mut Vec<String>, leg: &crate::core::broker::types::OrderLeg| {
             if leg.status != TradeUpdateEvent::Filled
                 && leg.status != TradeUpdateEvent::Closed
-                && leg.status != TradeUpdateEvent::Canceled
+                && leg.status != TradeUpdateEvent::Cancelled
                 && leg.status != TradeUpdateEvent::Rejected
             {
                 if let Some(order_id) = leg.order_id.as_ref() {
@@ -271,17 +271,17 @@ impl Insight {
             }
             if let Some(tp) = self.legs.take_profit.as_mut() {
                 if tp.order_id.as_deref() == Some(order_id.as_str()) {
-                    tp.status = TradeUpdateEvent::Canceled;
+                    tp.status = TradeUpdateEvent::Cancelled;
                 }
             }
             if let Some(sl) = self.legs.stop_loss.as_mut() {
                 if sl.order_id.as_deref() == Some(order_id.as_str()) {
-                    sl.status = TradeUpdateEvent::Canceled;
+                    sl.status = TradeUpdateEvent::Cancelled;
                 }
             }
             if let Some(trailing) = self.legs.trailing_stop.as_mut() {
                 if trailing.order_id.as_deref() == Some(order_id.as_str()) {
-                    trailing.status = TradeUpdateEvent::Canceled;
+                    trailing.status = TradeUpdateEvent::Cancelled;
                 }
             }
         }
@@ -585,6 +585,8 @@ impl Insight {
 
     /// Entry order filled. Transitions EXECUTED → FILLED.
     pub fn position_filled(&mut self, filled_price: f64, filled_qty: f64, order_id: &str) {
+        self.order_id = Some(order_id.to_string());
+        self.submitted = true;
         self.filled_price = Some(filled_price);
         info!(
             "Insight filled: id={} {} {} qty={:.4} entry={:.4} strat={} order_id={}",
@@ -720,12 +722,16 @@ impl Insight {
         );
     }
 
-    /// Order canceled. Transitions → CANCELLED.
-    pub fn order_canceled(&mut self, reason: &str) {
-        info!("Insight canceled: {} reason={}", self.log_summary(), reason);
+    /// Order cancelled. Transitions → CANCELLED.
+    pub fn order_cancelled(&mut self, reason: &str) {
+        info!(
+            "Insight cancelled: {} reason={}",
+            self.log_summary(),
+            reason
+        );
         self.update_state(
             InsightState::Cancelled,
-            Some(format!("Canceled: {}", reason)),
+            Some(format!("Cancelled: {}", reason)),
         );
     }
 
@@ -788,7 +794,7 @@ impl Insight {
         };
         self.cancel_active_legs(ctx);
         if let Err(e) = ctx.close_position(&order_id, qty, None) {
-            eprintln!("Failed to close position for {}: {:?}", self.symbol, e);
+            warn!("Failed to close position for {}: {:?}", self.symbol, e);
             self.closing = false;
             return self;
         }
@@ -822,7 +828,7 @@ impl Insight {
                 return self;
             };
             if let Err(e) = ctx.close_position(&order_id, quantity, price) {
-                eprintln!(
+                warn!(
                     "Failed to close partial position for {}: {:?}",
                     self.symbol, e
                 );
@@ -1193,6 +1199,136 @@ impl Insight {
         );
         self
     }
+    pub fn update_take_profit(
+        &mut self,
+        ctx: &mut dyn StrategyContext,
+        take_profit_levels: Option<Vec<f64>>,
+    ) -> bool {
+        let normalized_levels = Self::normalize_levels(take_profit_levels);
+        if self.take_profit_levels == normalized_levels {
+            return true;
+        }
+
+        let previous_levels = self.take_profit_levels.clone();
+        let target_tp = normalized_levels
+            .as_ref()
+            .and_then(|levels| levels.first().copied());
+        let Some(target_tp) = target_tp else {
+            self.take_profit_levels = None;
+            self.update_order_class();
+            self.update_state(
+                self.state.clone(),
+                Some("Take profit levels cleared".to_string()),
+            );
+            return true;
+        };
+
+        let active_tp_leg_without_order_id = self
+            .legs
+            .take_profit
+            .as_ref()
+            .map(|leg| {
+                !matches!(
+                    leg.status,
+                    TradeUpdateEvent::Filled
+                        | TradeUpdateEvent::Closed
+                        | TradeUpdateEvent::Cancelled
+                        | TradeUpdateEvent::Rejected
+                ) && leg.order_id.is_none()
+            })
+            .unwrap_or(false);
+        let tp_leg_order_id = self
+            .legs
+            .take_profit
+            .as_ref()
+            .filter(|leg| {
+                !matches!(
+                    leg.status,
+                    TradeUpdateEvent::Filled
+                        | TradeUpdateEvent::Closed
+                        | TradeUpdateEvent::Cancelled
+                        | TradeUpdateEvent::Rejected
+                )
+            })
+            .and_then(|leg| leg.order_id.clone());
+        let broker_order_id = tp_leg_order_id.or_else(|| {
+            if self.state == InsightState::Filled && active_tp_leg_without_order_id {
+                self.order_id.clone()
+            } else {
+                None
+            }
+        });
+
+        if self.state == InsightState::Filled
+            && active_tp_leg_without_order_id
+            && broker_order_id.is_none()
+        {
+            self.update_state(
+                self.state.clone(),
+                Some("Failed to update take profit: filled insight has no broker order id".into()),
+            );
+            return false;
+        }
+
+        if let Some(order_id) = broker_order_id.as_ref() {
+            let qty = self.remaining_quantity();
+            if !qty.is_finite() || qty <= 0.0 {
+                self.update_state(
+                    self.state.clone(),
+                    Some(format!(
+                        "Failed to update take profit for order {order_id}: invalid remaining quantity {qty}"
+                    )),
+                );
+                return false;
+            }
+            match ctx.update_order(order_id, target_tp, qty) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.update_state(
+                        self.state.clone(),
+                        Some(format!(
+                            "Failed to update take profit for order {order_id}: broker returned false"
+                        )),
+                    );
+                    return false;
+                }
+                Err(err) => {
+                    self.update_state(
+                        self.state.clone(),
+                        Some(format!(
+                            "Failed to update take profit for order {order_id}: {err}"
+                        )),
+                    );
+                    return false;
+                }
+            }
+        }
+
+        self.take_profit_levels = normalized_levels;
+        if let Some(tp) = self.legs.take_profit.as_mut() {
+            if !matches!(
+                tp.status,
+                TradeUpdateEvent::Filled
+                    | TradeUpdateEvent::Closed
+                    | TradeUpdateEvent::Cancelled
+                    | TradeUpdateEvent::Rejected
+            ) {
+                tp.limit_price = Some(target_tp);
+                tp.updated_at = ctx.current_time().timestamp().max(0) as u64;
+            }
+        }
+        self.update_order_class();
+        self.update_state(
+            self.state.clone(),
+            Some(format!(
+                "Updated Take Profit For Order: {}: {:?} -> {:?}",
+                broker_order_id.as_deref().unwrap_or("local"),
+                previous_levels.as_deref().unwrap_or(&[]),
+                self.take_profit_levels.as_deref().unwrap_or(&[])
+            )),
+        );
+        true
+    }
     pub fn add_take_profit_levels(&mut self, levels: Vec<f64>) -> &mut Self {
         let mut combined = self.take_profit_levels.clone().unwrap_or_default();
         combined.extend(levels);
@@ -1216,6 +1352,136 @@ impl Insight {
             )),
         );
         self
+    }
+    pub fn update_stop_loss(
+        &mut self,
+        ctx: &mut dyn StrategyContext,
+        stop_loss_levels: Option<Vec<f64>>,
+    ) -> bool {
+        let normalized_levels = Self::normalize_levels(stop_loss_levels);
+        if self.stop_loss_levels == normalized_levels {
+            return true;
+        }
+
+        let previous_levels = self.stop_loss_levels.clone();
+        let target_sl = normalized_levels
+            .as_ref()
+            .and_then(|levels| levels.first().copied());
+        let Some(target_sl) = target_sl else {
+            self.stop_loss_levels = None;
+            self.update_order_class();
+            self.update_state(
+                self.state.clone(),
+                Some("Stop loss levels cleared".to_string()),
+            );
+            return true;
+        };
+
+        let active_sl_leg_without_order_id = self
+            .legs
+            .stop_loss
+            .as_ref()
+            .map(|leg| {
+                !matches!(
+                    leg.status,
+                    TradeUpdateEvent::Filled
+                        | TradeUpdateEvent::Closed
+                        | TradeUpdateEvent::Cancelled
+                        | TradeUpdateEvent::Rejected
+                ) && leg.order_id.is_none()
+            })
+            .unwrap_or(false);
+        let sl_leg_order_id = self
+            .legs
+            .stop_loss
+            .as_ref()
+            .filter(|leg| {
+                !matches!(
+                    leg.status,
+                    TradeUpdateEvent::Filled
+                        | TradeUpdateEvent::Closed
+                        | TradeUpdateEvent::Cancelled
+                        | TradeUpdateEvent::Rejected
+                )
+            })
+            .and_then(|leg| leg.order_id.clone());
+        let broker_order_id = sl_leg_order_id.or_else(|| {
+            if self.state == InsightState::Filled && active_sl_leg_without_order_id {
+                self.order_id.clone()
+            } else {
+                None
+            }
+        });
+
+        if self.state == InsightState::Filled
+            && active_sl_leg_without_order_id
+            && broker_order_id.is_none()
+        {
+            self.update_state(
+                self.state.clone(),
+                Some("Failed to update stop loss: filled insight has no broker order id".into()),
+            );
+            return false;
+        }
+
+        if let Some(order_id) = broker_order_id.as_ref() {
+            let qty = self.remaining_quantity();
+            if !qty.is_finite() || qty <= 0.0 {
+                self.update_state(
+                    self.state.clone(),
+                    Some(format!(
+                        "Failed to update stop loss for order {order_id}: invalid remaining quantity {qty}"
+                    )),
+                );
+                return false;
+            }
+            match ctx.update_stop_loss_order(order_id, target_sl, qty) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.update_state(
+                        self.state.clone(),
+                        Some(format!(
+                            "Failed to update stop loss for order {order_id}: broker returned false"
+                        )),
+                    );
+                    return false;
+                }
+                Err(err) => {
+                    self.update_state(
+                        self.state.clone(),
+                        Some(format!(
+                            "Failed to update stop loss for order {order_id}: {err}"
+                        )),
+                    );
+                    return false;
+                }
+            }
+        }
+
+        self.stop_loss_levels = normalized_levels;
+        if let Some(sl) = self.legs.stop_loss.as_mut() {
+            if !matches!(
+                sl.status,
+                TradeUpdateEvent::Filled
+                    | TradeUpdateEvent::Closed
+                    | TradeUpdateEvent::Cancelled
+                    | TradeUpdateEvent::Rejected
+            ) {
+                sl.limit_price = Some(target_sl);
+                sl.updated_at = ctx.current_time().timestamp().max(0) as u64;
+            }
+        }
+        self.update_order_class();
+        self.update_state(
+            self.state.clone(),
+            Some(format!(
+                "Updated Stop Loss For Order: {}: {:?} -> {:?}",
+                broker_order_id.as_deref().unwrap_or("local"),
+                previous_levels.as_deref().unwrap_or(&[]),
+                self.stop_loss_levels.as_deref().unwrap_or(&[])
+            )),
+        );
+        true
     }
     pub fn add_stop_loss_levels(&mut self, levels: Vec<f64>) -> &mut Self {
         let mut combined = self.stop_loss_levels.clone().unwrap_or_default();
@@ -1362,6 +1628,13 @@ impl Insight {
     }
     pub fn period_unfilled(&self) -> Option<u32> {
         self.period_unfilled
+    }
+    pub fn can_expire(&self) -> bool {
+        match self.state {
+            InsightState::New | InsightState::Executed => self.period_unfilled.is_some(),
+            InsightState::Filled => self.period_till_tp.is_some(),
+            _ => false,
+        }
     }
     pub fn set_period_unfilled(&mut self, period_unfilled: Option<u32>) -> &mut Self {
         if self.period_unfilled == period_unfilled {
@@ -1607,7 +1880,8 @@ mod tests {
         insights: crate::core::insight::InsightCollection,
         variables: DashMap<String, Value>,
         current_time: DateTime<Utc>,
-        canceled_orders: RefCell<Vec<String>>,
+        cancelled_orders: RefCell<Vec<String>>,
+        updated_stop_losses: RefCell<Vec<(String, f64, f64)>>,
         closed_positions: RefCell<Vec<(String, f64, Option<f64>)>>,
         account: Account,
     }
@@ -1639,7 +1913,8 @@ mod tests {
                 insights: crate::core::insight::InsightCollection::new(),
                 variables: DashMap::new(),
                 current_time,
-                canceled_orders: RefCell::new(Vec::new()),
+                cancelled_orders: RefCell::new(Vec::new()),
+                updated_stop_losses: RefCell::new(Vec::new()),
                 closed_positions: RefCell::new(Vec::new()),
                 account: Account {
                     account_id: "paper".to_string(),
@@ -1757,7 +2032,30 @@ mod tests {
         }
 
         fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError> {
-            self.canceled_orders.borrow_mut().push(order_id.to_string());
+            self.cancelled_orders
+                .borrow_mut()
+                .push(order_id.to_string());
+            Ok(true)
+        }
+
+        fn update_order(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
+            Ok(true)
+        }
+
+        fn update_stop_loss_order(
+            &self,
+            order_id: &str,
+            price: f64,
+            qty: f64,
+        ) -> Result<bool, BrokerError> {
+            self.updated_stop_losses
+                .borrow_mut()
+                .push((order_id.to_string(), price, qty));
             Ok(true)
         }
 
@@ -1788,6 +2086,48 @@ mod tests {
         insight.set_quantity(Some(1.0));
         insight.align_time_to(now);
         insight
+    }
+
+    #[test]
+    fn update_stop_loss_on_filled_insight_updates_broker_and_local_leg() {
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let update_time = created_at + Duration::minutes(5);
+        let mut ctx = MockStrategyContext::new(update_time);
+        let mut insight = sample_insight(created_at);
+        let leg_ts = created_at.timestamp().max(0) as u64;
+        insight.state = InsightState::Filled;
+        insight.order_id = Some("entry-order-1".to_string());
+        insight.set_quantity(Some(1.5));
+        insight.set_stop_loss_levels(Some(vec![95.0]));
+        insight.legs.stop_loss = Some(OrderLeg {
+            order_id: None,
+            limit_price: Some(95.0),
+            trail_price: None,
+            side: OrderSide::Sell,
+            filled_price: None,
+            order_type: OrderType::Stop,
+            status: TradeUpdateEvent::Pending,
+            order_class: OrderClass::OTO,
+            created_at: leg_ts,
+            updated_at: leg_ts,
+            submitted_at: leg_ts,
+            filled_at: None,
+        });
+
+        assert!(insight.update_stop_loss(&mut ctx, Some(vec![92.5])));
+
+        assert_eq!(
+            ctx.updated_stop_losses.borrow().as_slice(),
+            &[("entry-order-1".to_string(), 92.5, 1.5)]
+        );
+        assert_eq!(insight.stop_loss_levels(), Some(vec![92.5]));
+        let stop_loss = insight
+            .legs
+            .stop_loss
+            .as_ref()
+            .expect("active stop-loss leg should remain attached");
+        assert_eq!(stop_loss.limit_price, Some(92.5));
+        assert_eq!(stop_loss.updated_at, update_time.timestamp().max(0) as u64);
     }
 
     #[test]
@@ -1873,7 +2213,7 @@ mod tests {
 
         assert!(expired);
         assert_eq!(insight.state, InsightState::Rejected);
-        assert!(ctx.canceled_orders.borrow().is_empty());
+        assert!(ctx.cancelled_orders.borrow().is_empty());
         assert!(ctx.closed_positions.borrow().is_empty());
         assert!(
             insight
@@ -1900,7 +2240,7 @@ mod tests {
         assert!(expired);
         assert_eq!(insight.state, InsightState::Executed);
         assert!(insight.cancelling);
-        assert_eq!(ctx.canceled_orders.borrow().as_slice(), ["order-123"]);
+        assert_eq!(ctx.cancelled_orders.borrow().as_slice(), ["order-123"]);
         assert!(ctx.closed_positions.borrow().is_empty());
         assert!(insight.state_history.iter().any(|(_, state, message)| {
             *state == InsightState::Executed

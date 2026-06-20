@@ -95,7 +95,7 @@ pub struct InsightSnapshot {
 }
 
 impl InsightSnapshot {
-    fn insight_state_label(state: &InsightState) -> &'static str {
+    pub(crate) fn insight_state_label(state: &InsightState) -> &'static str {
         match state {
             InsightState::New => "New",
             InsightState::Executed => "Executed",
@@ -106,14 +106,14 @@ impl InsightSnapshot {
         }
     }
 
-    fn order_side_label(side: &OrderSide) -> &'static str {
+    pub(crate) fn order_side_label(side: &OrderSide) -> &'static str {
         match side {
             OrderSide::Buy => "Buy",
             OrderSide::Sell => "Sell",
         }
     }
 
-    fn order_type_label(order_type: &OrderType) -> &'static str {
+    pub(crate) fn order_type_label(order_type: &OrderType) -> &'static str {
         match order_type {
             OrderType::Market => "Market",
             OrderType::Limit => "Limit",
@@ -123,7 +123,7 @@ impl InsightSnapshot {
         }
     }
 
-    fn order_class_label(order_class: &OrderClass) -> &'static str {
+    pub(crate) fn order_class_label(order_class: &OrderClass) -> &'static str {
         match order_class {
             OrderClass::Simple => "Simple",
             OrderClass::Bracket => "Bracket",
@@ -133,7 +133,7 @@ impl InsightSnapshot {
         }
     }
 
-    fn trade_update_event_label(status: &TradeUpdateEvent) -> &'static str {
+    pub(crate) fn trade_update_event_label(status: &TradeUpdateEvent) -> &'static str {
         match status {
             TradeUpdateEvent::Accepted => "Accepted",
             TradeUpdateEvent::New => "New",
@@ -141,7 +141,7 @@ impl InsightSnapshot {
             TradeUpdateEvent::Pending => "Pending",
             TradeUpdateEvent::PartialFilled => "PartialFilled",
             TradeUpdateEvent::Filled => "Filled",
-            TradeUpdateEvent::Canceled => "Canceled",
+            TradeUpdateEvent::Cancelled => "Cancelled",
             TradeUpdateEvent::Rejected => "Rejected",
             TradeUpdateEvent::Expired => "Expired",
             TradeUpdateEvent::Closed => "Closed",
@@ -149,7 +149,7 @@ impl InsightSnapshot {
         }
     }
 
-    fn strategy_type_label(strategy_type: &StrategyType) -> Cow<'_, str> {
+    pub(crate) fn strategy_type_label(strategy_type: &StrategyType) -> Cow<'_, str> {
         match strategy_type {
             StrategyType::Manual => Cow::Borrowed("Manual"),
             StrategyType::Testing => Cow::Borrowed("Testing"),

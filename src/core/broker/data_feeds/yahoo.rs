@@ -212,10 +212,16 @@ impl YahooFinanceDataFeed {
 
         let mut bars = Vec::with_capacity(timestamp.len());
 
-        for i in 0..timestamp.len() {
-            let ts = timestamp[i].as_i64().unwrap_or(0);
-            if opens[i].is_null() || highs[i].is_null() || lows[i].is_null() || closes[i].is_null()
-            {
+        for (((((timestamp_value, open), high), low), close), volume) in timestamp
+            .iter()
+            .zip(opens.iter())
+            .zip(highs.iter())
+            .zip(lows.iter())
+            .zip(closes.iter())
+            .zip(volumes.iter())
+        {
+            let ts = timestamp_value.as_i64().unwrap_or(0);
+            if open.is_null() || high.is_null() || low.is_null() || close.is_null() {
                 continue;
             }
 
@@ -224,11 +230,11 @@ impl YahooFinanceDataFeed {
 
             bars.push(Bar {
                 symbol: symbol.to_string(),
-                open: opens[i].as_f64().unwrap_or(0.0),
-                high: highs[i].as_f64().unwrap_or(0.0),
-                low: lows[i].as_f64().unwrap_or(0.0),
-                close: closes[i].as_f64().unwrap_or(0.0),
-                volume: volumes[i].as_f64().unwrap_or(0.0),
+                open: open.as_f64().unwrap_or(0.0),
+                high: high.as_f64().unwrap_or(0.0),
+                low: low.as_f64().unwrap_or(0.0),
+                close: close.as_f64().unwrap_or(0.0),
+                volume: volume.as_f64().unwrap_or(0.0),
                 timestamp: normalized_time,
             });
         }

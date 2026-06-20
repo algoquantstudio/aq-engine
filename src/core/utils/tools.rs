@@ -83,7 +83,6 @@ pub fn filled_insights_from_collection(insights: &InsightCollection) -> Vec<Insi
         .get_active_insights()
         .into_iter()
         .filter(|insight| *insight.state() == InsightState::Filled)
-        .cloned()
         .collect()
 }
 

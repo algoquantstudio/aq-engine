@@ -214,6 +214,99 @@ async fn test_paper_broker_trailing_stop_moves_and_closes_position() {
 }
 
 #[tokio::test]
+async fn test_paper_broker_update_stop_loss_moves_active_stop_leg() {
+    let broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1);
+
+    let mut insight = Insight::new(
+        OrderSide::Buy,
+        "AAPL".to_string(),
+        StrategyType::Testing,
+        TimeFrame::new(1, TimeFrameUnit::Minute),
+        80,
+        None,
+    );
+    insight.set_quantity(Some(1.0));
+    insight.set_stop_loss(Some(95.0));
+    insight.set_take_profit_levels(Some(vec![120.0]));
+
+    let order = broker
+        .submit_order(insight)
+        .await
+        .expect("paper broker should accept bracket insight");
+
+    let entry_time = Utc::now();
+    let mut entry_bars = HashMap::new();
+    entry_bars.insert(
+        "AAPL".to_string(),
+        Bar {
+            symbol: "AAPL".to_string(),
+            open: 100.0,
+            high: 102.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1_000.0,
+            timestamp: entry_time,
+        },
+    );
+    broker.process_step(&entry_bars, entry_time);
+
+    broker
+        .update_stop_loss(&order.order_id, 97.0, 1.0)
+        .await
+        .expect("stop-loss update should succeed");
+
+    let updated_order = broker
+        .get_order(&order.order_id)
+        .await
+        .expect("filled order should still be retrievable");
+    let updated_legs = updated_order.legs.as_ref().expect("legs should remain");
+    assert_eq!(
+        updated_legs
+            .stop_loss
+            .as_ref()
+            .and_then(|leg| leg.limit_price),
+        Some(97.0)
+    );
+    assert_eq!(
+        updated_legs
+            .take_profit
+            .as_ref()
+            .and_then(|leg| leg.limit_price),
+        Some(120.0)
+    );
+
+    let stop_time = entry_time + chrono::Duration::minutes(1);
+    let mut stop_bars = HashMap::new();
+    stop_bars.insert(
+        "AAPL".to_string(),
+        Bar {
+            symbol: "AAPL".to_string(),
+            open: 98.0,
+            high: 99.0,
+            low: 96.5,
+            close: 97.5,
+            volume: 1_000.0,
+            timestamp: stop_time,
+        },
+    );
+    broker.process_step(&stop_bars, stop_time);
+
+    let closed_order = broker
+        .get_order(&order.order_id)
+        .await
+        .expect("closed order should still be queryable");
+    let closed_stop = closed_order
+        .legs
+        .as_ref()
+        .and_then(|legs| legs.stop_loss.as_ref())
+        .expect("stop-loss leg should remain attached");
+    assert_eq!(closed_order.status, TradeUpdateEvent::Closed);
+    assert_eq!(closed_order.filled_price, Some(97.0));
+    assert_eq!(closed_stop.status, TradeUpdateEvent::Filled);
+    assert_eq!(closed_stop.filled_price, Some(97.0));
+}
+
+#[tokio::test]
 async fn test_paper_broker_short_trailing_stop_moves_and_closes_position() {
     let broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1);
 

@@ -239,6 +239,24 @@ mod tests {
             Ok(false)
         }
 
+        fn update_order(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
+            Ok(false)
+        }
+
+        fn update_stop_loss_order(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
+            Ok(false)
+        }
+
         fn close_position(
             &self,
             _order_id: &str,

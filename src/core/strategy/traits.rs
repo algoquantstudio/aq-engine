@@ -3,6 +3,7 @@ use crate::core::broker::UnifiedBroker;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
 use crate::core::broker::types::BrokerError;
 use crate::core::broker::types::{Account, Asset, BarData, Quote};
+use crate::core::events::{EventStreamRequest, EventStreamType, StrategyEventContext};
 use crate::core::indicators::Indicator;
 use crate::core::insight::{Insight, InsightCollection};
 use crate::core::pipeline::WrappedInsightPipe;
@@ -58,6 +59,13 @@ pub trait StrategyContext {
     fn add_alpha(&mut self, alpha: WrappedAlphaModel);
     fn add_pipe(&mut self, pipe: WrappedInsightPipe);
     fn add_universe_model(&mut self, model: WrappedUniverseModel);
+    fn add_events(&mut self, event_type: EventStreamType, timeframe: Option<TimeFrame>) {
+        self.add_events_with_options(EventStreamRequest::new(event_type, timeframe));
+    }
+    fn add_events_with_options(&mut self, _request: EventStreamRequest) {}
+    fn current_event(&self) -> Option<StrategyEventContext> {
+        None
+    }
     fn set_execution_risk(&mut self, risk: f64);
     fn set_min_reward_risk_ratio(&mut self, ratio: f64);
     fn set_base_confidence(&mut self, confidence: f64);
@@ -94,6 +102,13 @@ pub trait StrategyContext {
 
     // Order operations (delegated to broker internally)
     fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError>;
+    fn update_order(&self, order_id: &str, price: f64, qty: f64) -> Result<bool, BrokerError>;
+    fn update_stop_loss_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError>;
     fn close_position(
         &self,
         order_id: &str,

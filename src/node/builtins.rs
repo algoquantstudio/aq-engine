@@ -4,6 +4,60 @@ use crate::node::{InputType, InsightState, Node, NodeInput, NodeOutput, OutputTy
 pub fn get_builtin_nodes() -> Vec<Node> {
     vec![
         Node {
+            id: "builtin_add_event".to_string(),
+            node_type: crate::node::NodeType::Trigger,
+            label: "Add Event".to_string(),
+            x: 0.0,
+            y: 0.0,
+            inputs: vec![
+                NodeInput {
+                    name: "on_start".to_string(),
+                    input_type: InputType::OnStart,
+                    value: None,
+                    is_public: true,
+                    insight_state: None,
+                },
+                NodeInput {
+                    name: "event_type".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("Bar")),
+                    is_public: true,
+                    insight_state: None,
+                },
+                NodeInput {
+                    name: "timeframe_amount".to_string(),
+                    input_type: InputType::Int,
+                    value: Some(serde_json::json!(15)),
+                    is_public: true,
+                    insight_state: None,
+                },
+                NodeInput {
+                    name: "timeframe_unit".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("Minute")),
+                    is_public: true,
+                    insight_state: None,
+                },
+                NodeInput {
+                    name: "allow_trading".to_string(),
+                    input_type: InputType::Bool,
+                    value: Some(serde_json::json!(false)),
+                    is_public: true,
+                    insight_state: None,
+                },
+            ],
+            outputs: vec![NodeOutput {
+                name: "on_start".to_string(),
+                output_type: OutputType::OnStart,
+                insight_state: None,
+            }],
+            source_file: Some("add_event".to_string()),
+            lifecycle_phase: None,
+            lifecycle_timing: None,
+            can_fail: None,
+            undeletable: false,
+        },
+        Node {
             id: "builtin_test_entry".to_string(),
             node_type: crate::node::NodeType::Alpha,
             label: "test_entry".to_string(),

@@ -16,12 +16,13 @@ pub enum BrokerType {
     Mt5(mt5_broker::Mt5Broker),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataStreamMode {
     Intrabar,
     CompletedBar,
 }
 
+use crate::core::events::{BacktestMarketStep, ResolvedEventStream};
 use crate::core::utils::timeframe::TimeFrame;
 use log::{debug, info};
 use parking_lot::RwLock;
@@ -188,6 +189,25 @@ where
         futures::executor::block_on(self.execution.cancel_order(order_id))
     }
 
+    /// Synchronous order update — used by insight pipes to modify broker-side legs.
+    pub fn update_order_sync(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError> {
+        futures::executor::block_on(self.execution.update_order(order_id, price, qty))
+    }
+
+    pub fn update_stop_loss_sync(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError> {
+        futures::executor::block_on(self.execution.update_stop_loss(order_id, price, qty))
+    }
+
     /// Synchronous close — safe when the underlying broker is PaperBroker.
     pub fn close_position_sync(
         &self,
@@ -232,6 +252,15 @@ where
         qty: f64,
     ) -> Result<bool, BrokerError> {
         self.execution.update_order(order_id, price, qty).await
+    }
+
+    async fn update_stop_loss(
+        &self,
+        order_id: &str,
+        price: f64,
+        qty: f64,
+    ) -> Result<bool, BrokerError> {
+        self.execution.update_stop_loss(order_id, price, qty).await
     }
 
     async fn close_position(
@@ -426,6 +455,73 @@ where
         Ok(())
     }
 
+    pub async fn load_backtest_event_streams(
+        &mut self,
+        streams: &[ResolvedEventStream],
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BrokerError> {
+        if self.backtest_state.is_none() {
+            self.backtest_state = Some(Arc::new(RwLock::new(backtest_state::BacktestState::new())));
+        }
+
+        let state = self.backtest_state.as_ref().unwrap().clone();
+        state.write().set_backtest_window(start, end);
+
+        for stream in streams {
+            let symbol = &stream.key.symbol;
+            let time_frame = stream.key.timeframe;
+            info!(
+                "Loading backtest stream symbol={} history_key={} timeframe={} feature={} allow_trading={} start={} end={}",
+                symbol,
+                stream.history_key,
+                time_frame,
+                stream.is_feature,
+                stream.allow_trading,
+                start,
+                end
+            );
+
+            let df = self
+                .data
+                .get_history(symbol, start, end, time_frame)
+                .await?;
+            debug!(
+                "Fetched dataframe for {} {} shape={:?}",
+                symbol,
+                time_frame,
+                df.shape()
+            );
+
+            let bars = Self::dataframe_to_bars(symbol, &df)?;
+            if bars.is_empty() {
+                return Err(BrokerError::DataFeedError(format!(
+                    "Backtest history request returned 0 bars for {} timeframe={} start={} end={}",
+                    symbol, time_frame, start, end
+                )));
+            }
+
+            let mut state_guard = state.write();
+            state_guard.load_event_stream_bars(stream.clone(), bars.clone());
+            if !stream.is_feature {
+                state_guard.load_bars(symbol.clone(), bars);
+                if state_guard.previous_time.is_none() {
+                    if let Some(first_bar) = state_guard
+                        .historical_bars
+                        .get(symbol)
+                        .and_then(|bars| bars.first())
+                    {
+                        state_guard.current_time = first_bar.timestamp;
+                    }
+                }
+            }
+        }
+
+        self.execution.set_backtest_state(state);
+
+        Ok(())
+    }
+
     /// Convert a Polars DataFrame (with columns: open, high, low, close, volume, timestamp)
     /// into a `Vec<Bar>` for efficient indexed access.
     fn dataframe_to_bars(symbol: &str, df: &DataFrame) -> Result<Vec<types::Bar>, BrokerError> {
@@ -468,8 +564,16 @@ where
             .i64()
             .map_err(|e| BrokerError::DataFeedError(format!("'timestamp' not i64: {}", e)))?;
 
-        for i in 0..len {
-            let ts_ms = timestamp.get(i).ok_or_else(|| {
+        let rows = timestamp
+            .into_iter()
+            .zip(open.into_iter())
+            .zip(high.into_iter())
+            .zip(low.into_iter())
+            .zip(close.into_iter())
+            .zip(volume.into_iter());
+
+        for (i, (((((ts_ms, open), high), low), close), volume)) in rows.enumerate() {
+            let ts_ms = ts_ms.ok_or_else(|| {
                 BrokerError::DataFeedError(format!("Null timestamp at row {}", i))
             })?;
             let dt = chrono::DateTime::from_timestamp_millis(ts_ms).ok_or_else(|| {
@@ -478,11 +582,11 @@ where
 
             bars.push(types::Bar {
                 symbol: symbol.to_string(),
-                open: open.get(i).unwrap_or(0.0),
-                high: high.get(i).unwrap_or(0.0),
-                low: low.get(i).unwrap_or(0.0),
-                close: close.get(i).unwrap_or(0.0),
-                volume: volume.get(i).unwrap_or(0.0),
+                open: open.unwrap_or(0.0),
+                high: high.unwrap_or(0.0),
+                low: low.unwrap_or(0.0),
+                close: close.unwrap_or(0.0),
+                volume: volume.unwrap_or(0.0),
                 timestamp: dt,
             });
         }
@@ -538,10 +642,94 @@ where
         Ok(Some(current_bars))
     }
 
+    pub fn step_market_streams(&mut self) -> Result<Option<BacktestMarketStep>, BrokerError> {
+        debug!("UnifiedBroker::step_market_streams enter");
+        let state = self
+            .backtest_state
+            .as_ref()
+            .ok_or_else(|| BrokerError::TradeError("BacktestState not initialized".into()))?;
+
+        let mut state_guard = state.write();
+        if state_guard.is_market_stream_complete() {
+            debug!("UnifiedBroker::step_market_streams complete -> no more events");
+            return Ok(None);
+        }
+
+        let Some(step) = state_guard.next_market_step() else {
+            debug!("UnifiedBroker::step_market_streams no next step");
+            return Ok(None);
+        };
+        drop(state_guard);
+
+        if !step.execution_bars.is_empty() {
+            debug!(
+                "UnifiedBroker::step_market_streams processing execution bars={} timestamp={}",
+                step.execution_bars.len(),
+                step.timestamp
+            );
+            self.execution
+                .process_step(&step.execution_bars, step.timestamp);
+        }
+
+        let mut state_guard = state.write();
+        state_guard.advance_market_step(&step);
+
+        if let Ok(account) = self.execution.get_account_sync() {
+            state_guard.snapshot_account(&account);
+        }
+
+        debug!("UnifiedBroker::step_market_streams exit");
+        Ok(Some(step))
+    }
+
     /// Get backtest results after completion.
     pub fn get_results(&self) -> backtest_state::BacktestResults {
         self.execution
             .compute_results(self.backtest_state.as_ref().map(|s| s.read()))
+    }
+}
+
+impl<D> UnifiedBroker<paper_broker::PaperBroker, D>
+where
+    D: traits::DataFeed + traits::DataProvider,
+{
+    pub fn flush_backtest_close_queue_at_last_bars(&mut self) -> Result<usize, BrokerError> {
+        let state = self
+            .backtest_state
+            .as_ref()
+            .ok_or_else(|| BrokerError::TradeError("BacktestState not initialized".into()))?;
+
+        let (last_bars, close_time) = {
+            let state_guard = state.read();
+            let last_bars = state_guard.get_last_bars();
+            let close_time = last_bars
+                .values()
+                .map(|bar| bar.timestamp)
+                .max()
+                .unwrap_or(state_guard.current_time);
+            (last_bars, close_time)
+        };
+
+        if last_bars.is_empty() {
+            return Ok(0);
+        }
+
+        let processed = self
+            .execution
+            .process_close_queue_at(&last_bars, close_time);
+        if processed == 0 {
+            return Ok(0);
+        }
+
+        let mut state_guard = state.write();
+        let previous_time = state_guard.current_time;
+        state_guard.previous_time = Some(previous_time);
+        state_guard.current_time = close_time;
+        if let Ok(account) = self.execution.get_account_sync() {
+            state_guard.snapshot_account(&account);
+        }
+
+        Ok(processed)
     }
 }
 
@@ -579,6 +767,12 @@ pub mod traits {
         async fn submit_order(&self, insight: Insight) -> Result<Order, BrokerError>;
         async fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError>;
         async fn update_order(
+            &self,
+            order_id: &str,
+            price: f64,
+            qty: f64,
+        ) -> Result<bool, BrokerError>;
+        async fn update_stop_loss(
             &self,
             order_id: &str,
             price: f64,

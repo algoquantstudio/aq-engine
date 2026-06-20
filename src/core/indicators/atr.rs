@@ -68,15 +68,19 @@ impl Indicator for AverageTrueRange {
         let closes: Vec<Option<f64>> = closes.into_iter().collect();
 
         let mut true_ranges = Vec::with_capacity(df.height());
-        for i in 0..df.height() {
-            let (Some(high), Some(low)) = (highs[i], lows[i]) else {
+        let previous_closes = std::iter::once(None).chain(closes.iter().copied());
+        for ((high, low), prev_close) in highs
+            .iter()
+            .copied()
+            .zip(lows.iter().copied())
+            .zip(previous_closes)
+        {
+            let (Some(high), Some(low)) = (high, low) else {
                 true_ranges.push(None);
                 continue;
             };
 
-            let tr = if i == 0 {
-                high - low
-            } else if let Some(prev_close) = closes[i - 1] {
+            let tr = if let Some(prev_close) = prev_close {
                 let hl = high - low;
                 let hc = (high - prev_close).abs();
                 let lc = (low - prev_close).abs();
@@ -91,17 +95,18 @@ impl Indicator for AverageTrueRange {
         let mut rolling_sum = 0.0;
         let mut valid_count = 0usize;
 
-        for i in 0..true_ranges.len() {
-            if let Some(value) = true_ranges[i] {
+        let outgoing_ranges = std::iter::repeat(None)
+            .take(self.period)
+            .chain(true_ranges.iter().copied());
+        for (value, outgoing) in true_ranges.iter().copied().zip(outgoing_ranges) {
+            if let Some(value) = value {
                 rolling_sum += value;
                 valid_count += 1;
             }
 
-            if i >= self.period {
-                if let Some(value) = true_ranges[i - self.period] {
-                    rolling_sum -= value;
-                    valid_count -= 1;
-                }
+            if let Some(value) = outgoing {
+                rolling_sum -= value;
+                valid_count -= 1;
             }
 
             if valid_count == self.period {

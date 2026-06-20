@@ -2,7 +2,7 @@ use chrono::{DateTime, Datelike, Months, TimeDelta, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Lightweight canonical `TimeFrameUnit` available on **all** targets (including wasm).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TimeFrameUnit {
     Second,
     Minute,
@@ -35,7 +35,7 @@ impl TimeFrameUnit {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, Hash)]
 pub struct TimeFrame {
     amount: u8,
     unit: TimeFrameUnit,
@@ -67,6 +67,17 @@ impl TimeFrame {
     }
     pub fn get_unit(&self) -> TimeFrameUnit {
         self.unit.clone()
+    }
+
+    pub fn compact_label(&self) -> String {
+        let suffix = match self.unit {
+            TimeFrameUnit::Second => "s",
+            TimeFrameUnit::Minute => "m",
+            TimeFrameUnit::Hour => "h",
+            TimeFrameUnit::Day => "d",
+            TimeFrameUnit::Month => "mo",
+        };
+        format!("{}{}", self.amount, suffix)
     }
 
     fn validate_time_frame(amount: &u8, unit: &TimeFrameUnit) -> Result<TimeFrame, TimeFrameError> {
@@ -240,6 +251,11 @@ impl TimeFrame {
 impl PartialEq for TimeFrame {
     fn eq(&self, other: &Self) -> bool {
         self.amount == other.amount && self.unit == other.unit
+    }
+}
+impl std::fmt::Display for TimeFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.compact_label())
     }
 }
 impl Default for TimeFrame {

@@ -74,6 +74,7 @@ impl TestEntry {
     fn active_spawn_count(&self, ctx: &dyn StrategyContext, symbol: &str) -> usize {
         ctx.insights()
             .values()
+            .into_iter()
             .filter(|insight| {
                 insight.symbol() == symbol
                     && matches!(insight.strategy_type(), StrategyType::Testing)

@@ -137,23 +137,16 @@ impl RsiDiverganceAlpha {
             return Vec::new();
         }
 
-        let first_index = local_window;
-        let last_confirmed_index = values.len().saturating_sub(local_window + 1);
-        if first_index > last_confirmed_index {
-            return Vec::new();
-        }
-
         let mut pivots = Vec::new();
-        for i in first_index..=last_confirmed_index {
-            let from = i - local_window;
-            let to = i + local_window;
-            let current = values[i];
-            let is_pivot = values[from..=to].iter().enumerate().all(|(offset, value)| {
-                let idx = from + offset;
-                idx == i || current < *value
-            });
+        let window_len = local_window.saturating_mul(2) + 1;
+        for (offset, window) in values.windows(window_len).enumerate() {
+            let current = window[local_window];
+            let is_pivot = window
+                .iter()
+                .enumerate()
+                .all(|(idx, value)| idx == local_window || current < *value);
             if is_pivot {
-                pivots.push(i);
+                pivots.push(offset + local_window);
             }
         }
         pivots
@@ -164,23 +157,16 @@ impl RsiDiverganceAlpha {
             return Vec::new();
         }
 
-        let first_index = local_window;
-        let last_confirmed_index = values.len().saturating_sub(local_window + 1);
-        if first_index > last_confirmed_index {
-            return Vec::new();
-        }
-
         let mut pivots = Vec::new();
-        for i in first_index..=last_confirmed_index {
-            let from = i - local_window;
-            let to = i + local_window;
-            let current = values[i];
-            let is_pivot = values[from..=to].iter().enumerate().all(|(offset, value)| {
-                let idx = from + offset;
-                idx == i || current > *value
-            });
+        let window_len = local_window.saturating_mul(2) + 1;
+        for (offset, window) in values.windows(window_len).enumerate() {
+            let current = window[local_window];
+            let is_pivot = window
+                .iter()
+                .enumerate()
+                .all(|(idx, value)| idx == local_window || current > *value);
             if is_pivot {
-                pivots.push(i);
+                pivots.push(offset + local_window);
             }
         }
         pivots
@@ -600,6 +586,24 @@ mod tests {
         }
 
         fn cancel_order(&self, _order_id: &str) -> Result<bool, BrokerError> {
+            Ok(false)
+        }
+
+        fn update_order(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
+            Ok(false)
+        }
+
+        fn update_stop_loss_order(
+            &self,
+            _order_id: &str,
+            _price: f64,
+            _qty: f64,
+        ) -> Result<bool, BrokerError> {
             Ok(false)
         }
 

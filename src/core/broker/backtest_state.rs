@@ -4,7 +4,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::types::{Account, Bar, OrderSide, TradeRecord, TradeRecordType};
+use crate::core::events::{
+    BacktestMarketStep, MarketDataEvent, MarketStreamKey, ResolvedEventStream,
+};
 use crate::core::insight::InsightSnapshot;
+use crate::core::tui::BacktestProgressSnapshot;
+
+fn is_terminal_insight_state(state: &str) -> bool {
+    matches!(
+        state.trim().to_ascii_lowercase().as_str(),
+        "closed" | "cancelled" | "rejected"
+    )
+}
 
 /// Shared state for backtesting. Held behind `Arc<parking_lot::RwLock<BacktestState>>`
 /// by both the `PaperBroker` (execution) and `UnifiedBroker` (orchestrator).
@@ -17,6 +28,12 @@ pub struct BacktestState {
     pub historical_bars: HashMap<String, Vec<Bar>>,
     /// Current bar index per symbol (incremented each step)
     pub bar_indices: HashMap<String, usize>,
+    /// Raw bar data per registered market stream.
+    pub event_stream_bars: HashMap<MarketStreamKey, Vec<Bar>>,
+    /// Current bar index per registered market stream.
+    pub event_stream_indices: HashMap<MarketStreamKey, usize>,
+    /// Stream metadata keyed by registered market stream.
+    pub event_streams: HashMap<MarketStreamKey, ResolvedEventStream>,
     /// Total number of bars to process (max across all symbols)
     pub total_bars: usize,
     /// Current simulation time
@@ -45,6 +62,9 @@ impl BacktestState {
         Self {
             historical_bars: HashMap::new(),
             bar_indices: HashMap::new(),
+            event_stream_bars: HashMap::new(),
+            event_stream_indices: HashMap::new(),
+            event_streams: HashMap::new(),
             total_bars: 0,
             current_time: Utc::now(),
             previous_time: None,
@@ -65,6 +85,15 @@ impl BacktestState {
         let len = bars.len();
         self.bar_indices.insert(symbol.clone(), 0);
         self.historical_bars.insert(symbol, bars);
+        self.total_bars = self.total_bars.max(len);
+    }
+
+    pub fn load_event_stream_bars(&mut self, stream: ResolvedEventStream, bars: Vec<Bar>) {
+        let len = bars.len();
+        let key = stream.key.clone();
+        self.event_stream_indices.insert(key.clone(), 0);
+        self.event_stream_bars.insert(key.clone(), bars);
+        self.event_streams.insert(key, stream);
         self.total_bars = self.total_bars.max(len);
     }
 
@@ -92,6 +121,137 @@ impl BacktestState {
             }
         }
         bars
+    }
+
+    pub fn get_last_bars(&self) -> HashMap<String, Bar> {
+        self.historical_bars
+            .iter()
+            .filter_map(|(symbol, bars)| bars.last().cloned().map(|bar| (symbol.clone(), bar)))
+            .collect()
+    }
+
+    pub fn next_market_step(&mut self) -> Option<BacktestMarketStep> {
+        let timestamp = self
+            .event_stream_indices
+            .iter()
+            .filter_map(|(key, &idx)| {
+                self.event_stream_bars
+                    .get(key)
+                    .and_then(|bars| bars.get(idx))
+                    .map(|bar| bar.timestamp)
+            })
+            .min()?;
+
+        self.previous_time = Some(self.current_time);
+        self.current_time = timestamp;
+
+        let mut events = Vec::new();
+        let mut execution_bars = HashMap::new();
+        let mut has_tradable_events = false;
+
+        let mut keys: Vec<MarketStreamKey> = self.event_stream_indices.keys().cloned().collect();
+        keys.sort_by(|left, right| {
+            left.symbol.cmp(&right.symbol).then(
+                left.timeframe
+                    .compact_label()
+                    .cmp(&right.timeframe.compact_label()),
+            )
+        });
+
+        for key in keys {
+            let Some(&idx) = self.event_stream_indices.get(&key) else {
+                continue;
+            };
+            let Some(bar) = self
+                .event_stream_bars
+                .get(&key)
+                .and_then(|bars| bars.get(idx))
+                .filter(|bar| bar.timestamp == timestamp)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(stream) = self.event_streams.get(&key).cloned() else {
+                continue;
+            };
+
+            if stream.allow_trading {
+                has_tradable_events = true;
+                if !stream.is_feature {
+                    execution_bars.insert(key.symbol.clone(), bar.clone());
+                }
+            }
+
+            events.push(MarketDataEvent {
+                context: stream.context_at(timestamp),
+                bar,
+            });
+        }
+
+        if events.is_empty() {
+            return None;
+        }
+
+        Some(BacktestMarketStep {
+            timestamp,
+            events,
+            execution_bars,
+            has_tradable_events,
+        })
+    }
+
+    pub fn advance_market_step(&mut self, step: &BacktestMarketStep) {
+        for event in &step.events {
+            let key = MarketStreamKey::new(
+                event.context.event_type,
+                event.context.symbol.clone(),
+                event.context.timeframe,
+            );
+            if let Some(idx) = self.event_stream_indices.get_mut(&key) {
+                *idx += 1;
+            }
+            if !event.context.is_feature {
+                if let Some(idx) = self.bar_indices.get_mut(&event.context.symbol) {
+                    *idx += 1;
+                }
+            }
+        }
+    }
+
+    pub fn is_market_stream_complete(&self) -> bool {
+        self.event_stream_indices.iter().all(|(key, &idx)| {
+            self.event_stream_bars
+                .get(key)
+                .map(|bars| idx >= bars.len())
+                .unwrap_or(true)
+        })
+    }
+
+    pub fn progress_snapshot(&self) -> BacktestProgressSnapshot {
+        let total_steps = self
+            .event_stream_bars
+            .values()
+            .map(|bars| bars.len())
+            .sum::<usize>();
+        let processed_steps = self.event_stream_indices.values().copied().sum::<usize>();
+        let progress_pct = if total_steps > 0 {
+            (processed_steps.min(total_steps) as f64 / total_steps as f64) * 100.0
+        } else {
+            0.0
+        };
+        let tradable_stream_count = self
+            .event_streams
+            .values()
+            .filter(|stream| stream.allow_trading)
+            .count();
+        BacktestProgressSnapshot {
+            processed_steps: processed_steps.min(total_steps),
+            total_steps,
+            progress_pct,
+            current_time: Some(self.current_time),
+            stream_count: self.event_stream_bars.len(),
+            tradable_stream_count,
+        }
     }
 
     /// Advance all symbols to the next bar.
@@ -148,6 +308,12 @@ impl BacktestState {
             .insert(snapshot.insight_id.clone(), snapshot);
     }
 
+    pub fn record_insight_snapshots(&mut self, snapshots: Vec<InsightSnapshot>) {
+        for snapshot in snapshots {
+            self.record_insight_snapshot(snapshot);
+        }
+    }
+
     pub fn record_trade_mae(&mut self, order_id: &str, mae_pct: f64) {
         self.trade_mae_by_order_id
             .entry(order_id.to_string())
@@ -189,6 +355,10 @@ pub struct BacktestResults {
     pub account_history: Vec<(DateTime<Utc>, Account)>,
     pub executed_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    #[serde(default)]
+    pub backtest_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub backtest_end: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -228,6 +398,8 @@ pub struct BacktestMetrics {
     pub open_positions_losing_count: usize,
     pub executed_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    pub backtest_start: Option<DateTime<Utc>>,
+    pub backtest_end: Option<DateTime<Utc>>,
     pub symbols: Vec<String>,
 }
 
@@ -323,24 +495,52 @@ impl BacktestResults {
             return 0.0;
         }
 
-        let days = (self.finished_at - self.executed_at).num_seconds().max(0) as f64 / 86_400.0;
-        if days <= f64::EPSILON {
+        let Some((start, end)) = self.performance_window() else {
             return self.total_return_pct / 100.0;
-        }
+        };
 
+        let days = (end - start).num_seconds().max(0) as f64 / 86_400.0;
         let years = days / 365.25;
         if years <= f64::EPSILON {
             return self.total_return_pct / 100.0;
         }
 
-        (self.final_equity / self.starting_cash).powf(1.0 / years) - 1.0
+        let cagr = (self.final_equity / self.starting_cash).powf(1.0 / years) - 1.0;
+        if cagr.is_finite() {
+            cagr
+        } else {
+            self.total_return_pct / 100.0
+        }
     }
 
     pub fn calmar_ratio(&self) -> f64 {
         if self.max_drawdown <= f64::EPSILON {
             return 0.0;
         }
-        self.cagr() / self.max_drawdown.abs()
+        let calmar = self.cagr() / self.max_drawdown.abs();
+        if calmar.is_finite() { calmar } else { 0.0 }
+    }
+
+    fn performance_window(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Self::valid_window(self.backtest_start, self.backtest_end)
+            .or_else(|| {
+                let start = self
+                    .account_history
+                    .first()
+                    .map(|(timestamp, _)| *timestamp);
+                let end = self.account_history.last().map(|(timestamp, _)| *timestamp);
+                Self::valid_window(start, end)
+            })
+            .or_else(|| Self::valid_window(Some(self.executed_at), Some(self.finished_at)))
+    }
+
+    fn valid_window(
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let start = start?;
+        let end = end?;
+        (end > start).then_some((start, end))
     }
 
     pub fn max_drawdown_duration_days(&self) -> f64 {
@@ -661,103 +861,102 @@ impl BacktestResults {
 
     // ──────────────── Pretty-Print All Metrics ──────────────────
 
+    fn format_duration_seconds(secs: i64) -> String {
+        if secs == 0 {
+            return "N/A".into();
+        }
+        let d = secs / 86_400;
+        let h = (secs % 86_400) / 3_600;
+        let m = (secs % 3_600) / 60;
+        let s = secs % 60;
+        if d > 0 {
+            format!("{}d {}h {}m {}s", d, h, m, s)
+        } else if h > 0 {
+            format!("{}h {}m {}s", h, m, s)
+        } else {
+            format!("{}m {}s", m, s)
+        }
+    }
+
+    pub fn metric_summary_lines(&self) -> Vec<String> {
+        let (n_long, n_short) = self.count_long_short();
+        vec![
+            "═══════════════════════════════════════════════".to_string(),
+            "            BACKTEST RESULTS".to_string(),
+            "═══════════════════════════════════════════════".to_string(),
+            format!("  Starting Cash:     ${:.2}", self.starting_cash),
+            format!("  Final Equity:      ${:.2}", self.final_equity),
+            format!("  Total Return:      {:.2}%", self.total_return_pct),
+            format!("  Max Drawdown:      {:.2}%", self.max_drawdown * 100.0),
+            "  ─────────────────────────────────────────────".to_string(),
+            format!("  Sharpe Ratio:      {:.4}", self.sharpe_ratio()),
+            format!("  Expectancy:        ${:.2}", self.expectancy()),
+            format!("  Profit Factor:     {:.2}", self.profit_factor()),
+            format!("  Payoff Ratio:      {:.2}", self.payoff_ratio()),
+            "  ─────────────────────────────────────────────".to_string(),
+            format!("  Total Trades:      {}", self.total_trades),
+            format!("  Winning Trades:    {}", self.winning_trades),
+            format!("  Losing Trades:     {}", self.losing_trades),
+            format!("  Win Rate:          {:.2}%", self.win_rate * 100.0),
+            "  ─────────────────────────────────────────────".to_string(),
+            format!(
+                "  Avg Winner:        ${:.2}  ({:.2}%)",
+                self.avg_winner(),
+                self.avg_winner_pct()
+            ),
+            format!(
+                "  Avg Loser:        -${:.2}  ({:.2}%)",
+                self.avg_loser(),
+                self.avg_loser_pct()
+            ),
+            format!(
+                "  Longest Win Held:  {}",
+                Self::format_duration_seconds(self.longest_winning_trade_held_secs())
+            ),
+            format!(
+                "  Longest Loss Held: {}",
+                Self::format_duration_seconds(self.longest_losing_trade_held_secs())
+            ),
+            format!(
+                "  Average Trade Held: {}",
+                Self::format_duration_seconds(self.average_trade_held_secs())
+            ),
+            "  ─────────────────────────────────────────────".to_string(),
+            format!("  Long Trades:       {}", n_long),
+            format!(
+                "  Avg Return (L):    {:.2}%  (${:.2})",
+                self.avg_return_pct_long(),
+                self.avg_nominal_long()
+            ),
+            format!("  Short Trades:      {}", n_short),
+            format!(
+                "  Avg Return (S):    {:.2}%  (${:.2})",
+                self.avg_return_pct_short(),
+                self.avg_nominal_short()
+            ),
+            "  ─────────────────────────────────────────────".to_string(),
+            format!("  Executed At:       {:?}", self.executed_at),
+            format!("  Finished At:       {:?}", self.finished_at),
+            format!(
+                "  Duration:          {}",
+                Self::format_duration_seconds(
+                    self.finished_at.timestamp() - self.executed_at.timestamp()
+                )
+            ),
+            format!("  History Points:    {}", self.account_history.len()),
+            format!("  Trade Log Size:    {}", self.trade_log.len()),
+            "═══════════════════════════════════════════════".to_string(),
+        ]
+    }
+
     /// Print a comprehensive, formatted summary of all backtest metrics.
     pub fn print_metrics(&self) {
-        let (n_long, n_short) = self.count_long_short();
-
-        println!("═══════════════════════════════════════════════");
-        println!("            BACKTEST RESULTS");
-        println!("═══════════════════════════════════════════════");
-
-        // ── Portfolio Overview
-        println!("  Starting Cash:     ${:.2}", self.starting_cash);
-        println!("  Final Equity:      ${:.2}", self.final_equity);
-        println!("  Total Return:      {:.2}%", self.total_return_pct);
-        println!("  Max Drawdown:      {:.2}%", self.max_drawdown * 100.0);
-
-        // ── Risk‑Adjusted
-        println!("  ─────────────────────────────────────────────");
-        println!("  Sharpe Ratio:      {:.4}", self.sharpe_ratio());
-        println!("  Expectancy:        ${:.2}", self.expectancy());
-        println!("  Profit Factor:     {:.2}", self.profit_factor());
-        println!("  Payoff Ratio:      {:.2}", self.payoff_ratio());
-
-        // ── Trade Summary
-        println!("  ─────────────────────────────────────────────");
-        println!("  Total Trades:      {}", self.total_trades);
-        println!("  Winning Trades:    {}", self.winning_trades);
-        println!("  Losing Trades:     {}", self.losing_trades);
-        println!("  Win Rate:          {:.2}%", self.win_rate * 100.0);
-
-        // ── Winners / Losers
-        println!("  ─────────────────────────────────────────────");
-        println!(
-            "  Avg Winner:        ${:.2}  ({:.2}%)",
-            self.avg_winner(),
-            self.avg_winner_pct()
-        );
-        println!(
-            "  Avg Loser:        -${:.2}  ({:.2}%)",
-            self.avg_loser(),
-            self.avg_loser_pct()
-        );
-
-        // ── Hold Duration
-        let fmt_dur = |secs: i64| -> String {
-            if secs == 0 {
-                return "N/A".into();
-            }
-            let d = secs / 86_400;
-            let h = (secs % 86_400) / 3_600;
-            let m = (secs % 3_600) / 60;
-            let s = secs % 60;
-            if d > 0 {
-                format!("{}d {}h {}m {}s", d, h, m, s)
-            } else if h > 0 {
-                format!("{}h {}m {}s", h, m, s)
-            } else {
-                format!("{}m {}s", m, s)
-            }
-        };
-        println!(
-            "  Longest Win Held:  {}",
-            fmt_dur(self.longest_winning_trade_held_secs())
-        );
-        println!(
-            "  Longest Loss Held: {}",
-            fmt_dur(self.longest_losing_trade_held_secs())
-        );
-        println!(
-            "  Average Trade Held: {}",
-            fmt_dur(self.average_trade_held_secs())
-        );
-
-        // ── Long / Short Breakdown
-        println!("  ─────────────────────────────────────────────");
-        println!("  Long Trades:       {}", n_long);
-        println!(
-            "  Avg Return (L):    {:.2}%  (${:.2})",
-            self.avg_return_pct_long(),
-            self.avg_nominal_long()
-        );
-        println!("  Short Trades:      {}", n_short);
-        println!(
-            "  Avg Return (S):    {:.2}%  (${:.2})",
-            self.avg_return_pct_short(),
-            self.avg_nominal_short()
-        );
-
-        // ── Data
-        println!("  ─────────────────────────────────────────────");
-        println!("  Executed At:       {:?}", self.executed_at);
-        println!("  Finished At:       {:?}", self.finished_at);
-        println!(
-            "  Duration:          {}",
-            fmt_dur(self.finished_at.timestamp() - self.executed_at.timestamp())
-        );
-        println!("  History Points:    {}", self.account_history.len());
-        println!("  Trade Log Size:    {}", self.trade_log.len());
-        println!("═══════════════════════════════════════════════");
+        if crate::core::tui::terminal_output_suspended() {
+            return;
+        }
+        for line in self.metric_summary_lines() {
+            println!("{line}");
+        }
     }
 }
 
@@ -1191,9 +1390,7 @@ impl BacktestResults {
         let mut open_positions_losing_count = 0usize;
 
         for snapshot in state.insight_snapshots.values() {
-            let state_name = snapshot.state.as_str();
-            let is_terminal = matches!(state_name, "Closed" | "Canceled" | "Rejected");
-            if !is_terminal {
+            if !is_terminal_insight_state(snapshot.state.as_str()) {
                 open_insights_count += 1;
             }
 
@@ -1271,6 +1468,8 @@ impl BacktestResults {
             open_positions_losing_count,
             executed_at: self.executed_at,
             finished_at: self.finished_at,
+            backtest_start: self.backtest_start,
+            backtest_end: self.backtest_end,
             symbols,
         };
 
@@ -1289,6 +1488,8 @@ impl BacktestResults {
 #[cfg(all(test, feature = "runtime"))]
 mod tests {
     use super::*;
+    use crate::core::broker::types::AccountType;
+    use chrono::TimeZone;
 
     struct TestDir {
         path: PathBuf,
@@ -1310,6 +1511,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn test_account(equity: f64) -> Account {
+        Account {
+            account_id: "test".to_string(),
+            account_type: AccountType::Paper,
+            equity,
+            cash: equity,
+            currency: "USD".to_string(),
+            buying_power: equity,
+            shorting_enabled: true,
+            leverage: 1,
+        }
+    }
+
+    #[test]
+    fn terminal_insight_state_uses_canonical_insight_states() {
+        assert!(is_terminal_insight_state("Closed"));
+        assert!(is_terminal_insight_state("Cancelled"));
+        assert!(is_terminal_insight_state(" rejected "));
+        assert!(!is_terminal_insight_state("Filled"));
+        assert!(!is_terminal_insight_state("Executed"));
+        assert!(!is_terminal_insight_state(""));
     }
 
     #[test]
@@ -1389,5 +1613,38 @@ mod tests {
         assert_eq!(alpha_models.len(), 1);
         assert_eq!(alpha_models[0]["label"], serde_json::json!("Entry Alpha"));
         assert_eq!(metrics["insight_pipes"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cagr_and_calmar_use_simulated_backtest_window() {
+        let run_start = Utc.with_ymd_and_hms(2026, 6, 14, 10, 0, 0).unwrap();
+        let backtest_start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let backtest_end = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let results = BacktestResults {
+            starting_cash: 10_000.0,
+            final_equity: 11_000.0,
+            total_return_pct: 10.0,
+            total_trades: 1,
+            winning_trades: 1,
+            losing_trades: 0,
+            win_rate: 1.0,
+            max_drawdown: 0.05,
+            trade_log: Vec::new(),
+            account_history: vec![
+                (backtest_start, test_account(10_000.0)),
+                (backtest_end, test_account(11_000.0)),
+            ],
+            executed_at: run_start,
+            finished_at: run_start + chrono::Duration::seconds(2),
+            backtest_start: Some(backtest_start),
+            backtest_end: Some(backtest_end),
+        };
+
+        let years = (backtest_end - backtest_start).num_seconds() as f64 / 86_400.0 / 365.25;
+        let expected_cagr = (1.1_f64).powf(1.0 / years) - 1.0;
+
+        assert!(results.cagr().is_finite());
+        assert!((results.cagr() - expected_cagr).abs() < 1e-10);
+        assert!((results.calmar_ratio() - expected_cagr / 0.05).abs() < 1e-10);
     }
 }
