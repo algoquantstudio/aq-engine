@@ -1012,11 +1012,22 @@ impl Mt5Bridge {
         Ok(())
     }
 
-    pub fn upsert_order(&self, order: Order) {
-        self.state
-            .write()
-            .orders
-            .insert(order.order_id.clone(), order);
+    pub fn upsert_order(&self, order: Order) -> Order {
+        let mut state = self.state.write();
+        let mut order = order;
+        if let Some(existing) = state.orders.get(&order.order_id) {
+            if order.insight_id.is_none() {
+                order.insight_id = existing.insight_id.clone();
+            }
+            if order.strategy_type.is_none() {
+                order.strategy_type = existing.strategy_type.clone();
+            }
+            if order.legs.is_none() {
+                order.legs = existing.legs.clone();
+            }
+        }
+        state.orders.insert(order.order_id.clone(), order.clone());
+        order
     }
 
     pub fn emit_order_event(&self, order: Order, event: TradeUpdateEvent) {
@@ -1310,7 +1321,7 @@ impl Mt5Bridge {
     }
 
     fn enqueue_trade_event(&self, sequence: u64, order: Order, event: TradeUpdateEvent) {
-        self.upsert_order(order.clone());
+        let order = self.upsert_order(order);
         let subscriber_event = (order.clone(), event.clone());
         {
             let mut queue = self.event_queue.lock();
@@ -1353,7 +1364,9 @@ impl Mt5Bridge {
             }
         }
 
-        self.enqueue_trade_event(sequence, payload.order, payload.event);
+        let mut order = payload.order;
+        self.map_order_to_aqe(&mut order);
+        self.enqueue_trade_event(sequence, order, payload.event);
     }
 
     fn apply_rpc_response(&self, payload: Mt5RpcResponsePayload) {
@@ -1941,7 +1954,9 @@ fn bars_to_frame(bars: Vec<Bar>) -> Result<DataFrame, BrokerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::broker::types::{OrderClass, OrderSide, OrderType, TimeInForce};
+    use crate::core::broker::types::{
+        OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, TimeInForce,
+    };
 
     fn test_bridge(token: &str) -> Mt5Bridge {
         Mt5Bridge::new(Mt5BridgeConfig {
@@ -2105,6 +2120,74 @@ mod tests {
             events
                 .iter()
                 .all(|(_, event)| *event == TradeUpdateEvent::Filled)
+        );
+    }
+
+    #[test]
+    fn trade_events_preserve_existing_order_route_and_legs_for_thin_mt5_events() {
+        let bridge = test_bridge("test-token");
+        let mut existing = trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled);
+        existing.legs = Some(OrderLegs {
+            take_profit: Some(OrderLeg {
+                order_id: Some("tp-1".to_string()),
+                limit_price: Some(110.0),
+                trail_price: None,
+                side: OrderSide::Sell,
+                filled_price: None,
+                order_type: OrderType::Limit,
+                status: TradeUpdateEvent::Pending,
+                order_class: OrderClass::Bracket,
+                created_at: 0,
+                updated_at: 0,
+                submitted_at: 0,
+                filled_at: None,
+            }),
+            stop_loss: Some(OrderLeg {
+                order_id: Some("sl-1".to_string()),
+                limit_price: Some(95.0),
+                trail_price: None,
+                side: OrderSide::Sell,
+                filled_price: None,
+                order_type: OrderType::Stop,
+                status: TradeUpdateEvent::Pending,
+                order_class: OrderClass::Bracket,
+                created_at: 0,
+                updated_at: 0,
+                submitted_at: 0,
+                filled_at: None,
+            }),
+            trailing_stop: None,
+        });
+        bridge.upsert_order(existing);
+
+        let mut thin_close = trade_event_order("order-1", "", TradeUpdateEvent::Closed);
+        thin_close.insight_id = None;
+        thin_close.strategy_type = None;
+        thin_close.legs = None;
+        bridge.apply_trade_event(
+            "session-1",
+            None,
+            Mt5TradeEventPayload {
+                native_event_id: Some("close-1".to_string()),
+                event_seq: Some(1),
+                event: TradeUpdateEvent::Closed,
+                order: thin_close,
+            },
+        );
+
+        let events = bridge.drain_trade_events();
+
+        assert_eq!(events.len(), 1);
+        let order = &events[0].0;
+        assert_eq!(order.insight_id.as_deref(), Some("insight-1"));
+        assert_eq!(order.strategy_type.as_deref(), Some("Testing"));
+        assert_eq!(
+            order
+                .legs
+                .as_ref()
+                .and_then(|legs| legs.take_profit.as_ref())
+                .and_then(|leg| leg.order_id.as_deref()),
+            Some("tp-1")
         );
     }
 }

@@ -760,7 +760,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     );
 
     let live_state_init = format!(
-        "        let broker = UnifiedBroker::new(execution, data_feed);\n\n        let mut state = StrategyState::new(\n            \"{name}\".to_string(),\n            \"{version}\".to_string(),\n            {struct_name} {{}},\n            broker,\n            StrategyMode::Live,\n            timeframe,\n        );\n\n        state.strategy_id = Uuid::parse_str(\"{strategy_id}\").unwrap();\n\n",
+        "        let broker = UnifiedBroker::new(execution, data_feed);\n\n        let mut state = StrategyState::new(\n            \"{name}\".to_string(),\n            \"{version}\".to_string(),\n            {struct_name} {{}},\n            broker,\n            StrategyMode::Live,\n            timeframe,\n        );\n\n        state.strategy_id = Uuid::parse_str(\"{strategy_id}\").unwrap();\n        state.set_artifact_root(env!(\"CARGO_MANIFEST_DIR\"));\n\n",
         name = meta.name,
         version = meta.version,
         struct_name = strategy_name,
@@ -768,7 +768,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     );
 
     let backtest_state_init = format!(
-        "        let broker = UnifiedBroker::new(execution, data_feed);\n\n        let mut state = StrategyState::new(\n            \"{name}\".to_string(),\n            \"{version}\".to_string(),\n            {struct_name} {{}},\n            broker,\n            StrategyMode::Backtest,\n            timeframe,\n        );\n\n        state.strategy_id = Uuid::parse_str(\"{strategy_id}\").unwrap();\n\n",
+        "        let broker = UnifiedBroker::new(execution, data_feed);\n\n        let mut state = StrategyState::new(\n            \"{name}\".to_string(),\n            \"{version}\".to_string(),\n            {struct_name} {{}},\n            broker,\n            StrategyMode::Backtest,\n            timeframe,\n        );\n\n        state.strategy_id = Uuid::parse_str(\"{strategy_id}\").unwrap();\n        state.set_artifact_root(env!(\"CARGO_MANIFEST_DIR\"));\n\n",
         name = meta.name,
         version = meta.version,
         struct_name = strategy_name,
@@ -1105,6 +1105,7 @@ mod tests {
         assert!(src.contains("set_logging_level"));
         assert!(src.contains("state.run_live(None).await"));
         assert!(src.contains("state.run_backtest(start, end, timeframe).await"));
+        assert!(src.contains("state.set_artifact_root(env!(\"CARGO_MANIFEST_DIR\"));"));
         assert!(!src.contains("session_secret"));
         assert!(!src.contains("AqsAuth"));
         assert!(!src.contains("results.save_to_disk_async"));

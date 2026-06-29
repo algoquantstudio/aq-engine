@@ -22,7 +22,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use surrealdb::engine::any;
 use surrealdb::method::QueryStream;
 use surrealdb::opt::auth::Record;
@@ -39,7 +39,11 @@ const LIVE_SYNC_STREAM_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_QUERY_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_RECONCILE_SECS: u64 = 15 * 60;
 const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 40;
+const LIVE_SYNC_FLUSH_MS: u64 = 500;
+const LIVE_SYNC_MAX_INSIGHTS_PER_FLUSH: usize = 128;
+const LIVE_ACCOUNT_SYNC_SECS: u64 = 5;
 const LOCAL_LIVE_METRICS_WRITE_SECS: u64 = 5;
+const MAX_PENDING_LOCAL_LIVE_EVENTS: usize = 512;
 
 static PENDING_AQS_SYNC_DROPPED_OPS: AtomicU64 = AtomicU64::new(0);
 
@@ -64,11 +68,58 @@ struct LocalLiveRunArtifacts {
     last_metrics: Option<LiveMetricsSnapshot>,
 }
 
+struct PendingLocalLiveEvent {
+    event_type: String,
+    level: String,
+    title: String,
+    message: String,
+    payload: Option<serde_json::Value>,
+}
+
+fn enqueue_pending_local_live_event(
+    pending_events: &mut VecDeque<PendingLocalLiveEvent>,
+    event: PendingLocalLiveEvent,
+) {
+    if pending_events.len() >= MAX_PENDING_LOCAL_LIVE_EVENTS {
+        pending_events.pop_front();
+        warn!(
+            "Pending local live event queue reached capacity ({}); dropping oldest item",
+            MAX_PENDING_LOCAL_LIVE_EVENTS
+        );
+    }
+    pending_events.push_back(event);
+}
+
+async fn flush_pending_local_live_events(
+    artifacts: &LocalLiveRunArtifacts,
+    pending_events: &mut VecDeque<PendingLocalLiveEvent>,
+) {
+    while let Some(event) = pending_events.pop_front() {
+        if let Err(error) = artifacts
+            .append_event(
+                &event.event_type,
+                &event.level,
+                &event.title,
+                &event.message,
+                event.payload,
+            )
+            .await
+        {
+            warn!(
+                "Failed to persist local live event into {}: {}",
+                artifacts.db_path.display(),
+                error
+            );
+        }
+    }
+}
+
 impl LocalLiveRunArtifacts {
     async fn start(
         strategy_name: &str,
         strategy_id: uuid::Uuid,
         mode: StrategyMode,
+        artifact_root: PathBuf,
     ) -> Result<Self, BrokerError> {
         let started_at = chrono::Utc::now();
         let run_id = format!(
@@ -76,15 +127,7 @@ impl LocalLiveRunArtifacts {
             started_at.format("%Y%m%d-%H%M%S"),
             uuid::Uuid::new_v4()
         );
-        let dir = std::env::current_dir()
-            .map_err(|error| {
-                BrokerError::ConnectionError(format!(
-                    "Failed to resolve current project directory for local live run: {}",
-                    error
-                ))
-            })?
-            .join("live")
-            .join(&run_id);
+        let dir = artifact_root.join("live").join(&run_id);
         fs::create_dir_all(&dir).map_err(|error| {
             BrokerError::ConnectionError(format!(
                 "Failed to create local live run directory {}: {}",
@@ -1246,6 +1289,7 @@ where
         synced_insight_history_offsets: &mut HashMap<String, usize>,
         pending_ops: &mut VecDeque<PendingAqsSyncOp>,
         include_full_reconcile: bool,
+        max_insights: Option<usize>,
     ) -> Result<bool, surrealdb::Error> {
         debug!(
             "Syncing live insights to AQS for strategy {}: {} in-memory insights",
@@ -1254,9 +1298,16 @@ where
         );
         let mut persist_metrics_after_sync = false;
         let mut prune_after_sync = Vec::new();
-        let insight_ids = self
+        let mut insight_ids = self
             .insights
             .insight_ids_for_live_sync(include_full_reconcile);
+        if !include_full_reconcile {
+            if let Some(max_insights) = max_insights {
+                if insight_ids.len() > max_insights {
+                    insight_ids.truncate(max_insights);
+                }
+            }
+        }
         let has_sync_work =
             include_full_reconcile || !insight_ids.is_empty() || !pending_ops.is_empty();
         let metrics_changed = self.live_metrics.should_persist();
@@ -1466,20 +1517,24 @@ where
             return Err(error);
         }
         let mut local_live_artifacts = if auth.is_none() {
-            let mut artifacts =
-                match LocalLiveRunArtifacts::start(&self.name, self.strategy_id, self.mode.clone())
-                    .await
-                {
-                    Ok(artifacts) => artifacts,
-                    Err(error) => {
-                        error!(
-                            "Live execution failed while creating local live run database: {}",
-                            error
-                        );
-                        self.runtime_telemetry.stop_tui();
-                        return Err(error);
-                    }
-                };
+            let mut artifacts = match LocalLiveRunArtifacts::start(
+                &self.name,
+                self.strategy_id,
+                self.mode.clone(),
+                self.artifact_root(),
+            )
+            .await
+            {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    error!(
+                        "Live execution failed while creating local live run database: {}",
+                        error
+                    );
+                    self.runtime_telemetry.stop_tui();
+                    return Err(error);
+                }
+            };
             info!(
                 "AQS Cloud auth not provided; writing local live run database to {}",
                 artifacts.db_path.display()
@@ -1606,14 +1661,21 @@ where
         // 7. Main Event Loop
         // Pipeline loop interval
         let mut pipeline_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut live_sync_interval =
+            tokio::time::interval(std::time::Duration::from_millis(LIVE_SYNC_FLUSH_MS));
         let mut reconcile_interval =
             tokio::time::interval(std::time::Duration::from_secs(LIVE_SYNC_RECONCILE_SECS));
         let mut local_metrics_interval = tokio::time::interval(std::time::Duration::from_secs(
             LOCAL_LIVE_METRICS_WRITE_SECS,
         ));
+        live_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut force_full_reconcile = true;
         let mut live_sync_failure: Option<BrokerError> = None;
-        let mut last_runtime_publish = std::time::Instant::now();
+        let mut last_runtime_publish = Instant::now();
+        let mut last_account_sync = Instant::now()
+            .checked_sub(Duration::from_secs(LIVE_ACCOUNT_SYNC_SECS))
+            .unwrap_or_else(Instant::now);
+        let mut pending_local_live_events = VecDeque::new();
 
         macro_rules! reconnect_live_sync_or_stop {
             ($auth:expr) => {{
@@ -1649,155 +1711,65 @@ where
 
         loop {
             tokio::select! {
+                biased;
+
                 // Handle broker trade events
                 Some((order, event)) = trade_rx.recv() => {
+                    let mut received_events = vec![(order, event)];
+                    while let Ok(event) = trade_rx.try_recv() {
+                        received_events.push(event);
+                    }
                     debug!(
-                        "Live loop received trade event {:?} for order {}",
-                        event,
-                        order.order_id
+                        "Live loop received {} trade event notification(s)",
+                        received_events.len()
                     );
                     // Process trade events (we let `on_trade_update()` drain all pending broker state)
                     self.on_trade_update();
-                    self.publish_runtime_event(
-                        "info",
-                        format!("Trade event {:?} for order {}", event, order.order_id),
-                        aqs_sync_status.clone(),
-                    );
-                    if let Some(artifacts) = local_live_artifacts.as_ref() {
-                        if let Err(error) = artifacts
-                            .append_event(
-                                "trade_event",
-                                "info",
-                                "Broker trade event",
-                                &format!("Received {:?} for order {}", event, order.order_id),
-                                Some(serde_json::json!({
-                                    "order_id": order.order_id.clone(),
-                                    "symbol": order.asset.symbol.clone(),
-                                    "event": format!("{:?}", event),
-                                })),
-                            )
-                            .await
-                        {
-                            warn!(
-                                "Failed to persist local live trade event into {}: {}",
-                                artifacts.db_path.display(),
-                                error
+
+                    for (order, event) in received_events {
+                        let message = format!("Received {:?} for order {}", event, order.order_id);
+                        self.publish_runtime_event(
+                            "info",
+                            format!("Trade event {:?} for order {}", event, order.order_id),
+                            aqs_sync_status.clone(),
+                        );
+                        let payload = serde_json::json!({
+                            "order_id": order.order_id,
+                            "symbol": order.asset.symbol,
+                            "event": format!("{:?}", event),
+                        });
+
+                        if local_live_artifacts.is_some() {
+                            enqueue_pending_local_live_event(
+                                &mut pending_local_live_events,
+                                PendingLocalLiveEvent {
+                                    event_type: "trade_event".into(),
+                                    level: "info".into(),
+                                    title: "Broker trade event".into(),
+                                    message: message.clone(),
+                                    payload: Some(payload.clone()),
+                                },
+                            );
+                        }
+
+                        if auth.is_some() {
+                            Self::enqueue_pending_aqs_sync_op(
+                                &mut pending_sync_ops,
+                                PendingAqsSyncOp::StrategyEvent(StrategyEventRecord {
+                                    event_type: "trade_event".into(),
+                                    level: "info".into(),
+                                    title: "Broker trade event".into(),
+                                    message,
+                                    payload: Some(payload),
+                                    created_at: Some(chrono::Utc::now()),
+                                }),
                             );
                         }
                     }
-                    if let Some(a) = auth.as_ref() {
-                        if db.is_none() {
-                            reconnect_live_sync_or_stop!(a);
-                            force_full_reconcile = true;
-                        }
-                        if let Some(client) = db.as_ref() {
-                            if let Err(error) = Self::flush_pending_aqs_sync_ops(client, a, &mut pending_sync_ops).await {
-                                error!(
-                                    "Live sync could not flush pending AQS ops for strategy {} after trade event: {}",
-                                    a.strategy_id, error
-                                );
-                                reconnect_live_sync_or_stop!(a);
-                                continue;
-                            }
-                            let sync_result = self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
-                                .await;
-                            match sync_result {
-                                Ok(persist_metrics_after_sync) => {
-                                    force_full_reconcile = false;
-                                    if persist_metrics_after_sync {
-                                        if let Err(error) = self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await {
-                                            error!(
-                                                "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
-                                                a.strategy_id, error
-                                            );
-                                            reconnect_live_sync_or_stop!(a);
-                                            continue;
-                                        }
-                                    }
-                                    if let Ok(account) = self.broker.get_account().await {
-                                        let captured_at = chrono::Utc::now();
-                                        self.live_metrics
-                                            .update_equity(account.equity, captured_at);
-                                        if let Err(error) = persist_live_account_state(client, a, &account, captured_at).await {
-                                            if Self::is_transient_surreal_error(&error) {
-                                                Self::enqueue_pending_aqs_sync_op(
-                                                    &mut pending_sync_ops,
-                                                    PendingAqsSyncOp::AccountState {
-                                                        account: account.clone(),
-                                                        captured_at,
-                                                    },
-                                                );
-                                                error!(
-                                                    "Live sync lost AQS connection for strategy {} while persisting account state: {}",
-                                                    a.strategy_id, error
-                                                );
-                                                reconnect_live_sync_or_stop!(a);
-                                                continue;
-                                            }
-                                            error!(
-                                                "Failed to persist live account state for strategy {}: {}",
-                                                a.strategy_id, error
-                                            );
-                                        }
-                                        if let Err(error) = self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await {
-                                            error!(
-                                                "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
-                                                a.strategy_id, error
-                                            );
-                                            reconnect_live_sync_or_stop!(a);
-                                            continue;
-                                        }
-                                    }
-                                    let trade_event_record = StrategyEventRecord {
-                                        event_type: "trade_event".into(),
-                                        level: "info".into(),
-                                        title: "Broker trade event".into(),
-                                        message: format!("Received {:?} for order {}", event, order.order_id),
-                                        payload: Some(serde_json::json!({
-                                            "order_id": order.order_id,
-                                            "symbol": order.asset.symbol,
-                                            "event": format!("{:?}", event),
-                                        })),
-                                        created_at: Some(chrono::Utc::now()),
-                                    };
-                                    if let Err(error) = persist_strategy_event(
-                                        client,
-                                        a,
-                                        trade_event_record.clone(),
-                                    ).await {
-                                        if Self::is_transient_surreal_error(&error) {
-                                            Self::enqueue_pending_aqs_sync_op(
-                                                &mut pending_sync_ops,
-                                                PendingAqsSyncOp::StrategyEvent(trade_event_record),
-                                            );
-                                            error!(
-                                                "Live sync lost AQS connection for strategy {} while persisting trade event: {}",
-                                                a.strategy_id, error
-                                            );
-                                            reconnect_live_sync_or_stop!(a);
-                                            continue;
-                                        }
-                                        error!(
-                                            "Failed to persist trade event for strategy {}: {}",
-                                            a.strategy_id, error
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    error!(
-                                        "Live sync lost AQS connection for strategy {} after trade event: {}",
-                                        a.strategy_id, error
-                                    );
-                                    reconnect_live_sync_or_stop!(a);
-                                    force_full_reconcile = true;
-                                }
-                            }
-                        }
-                    }
-                    if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
+
+                    if last_runtime_publish.elapsed() >= Duration::from_millis(500) {
                         self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
-                        last_runtime_publish = std::time::Instant::now();
+                        last_runtime_publish = Instant::now();
                     }
                 }
 
@@ -1829,51 +1801,9 @@ where
                             synced_insight_history_offsets.remove(&insight_id.to_string());
                         }
                     }
-                    if let Some(a) = auth.as_ref() {
-                        if db.is_none() {
-                            reconnect_live_sync_or_stop!(a);
-                            force_full_reconcile = true;
-                        }
-                        if let Some(client) = db.as_ref() {
-                            if let Err(error) = Self::flush_pending_aqs_sync_ops(client, a, &mut pending_sync_ops).await {
-                                error!(
-                                    "Live sync could not flush pending AQS ops for strategy {} after bar processing: {}",
-                                    a.strategy_id, error
-                                );
-                                reconnect_live_sync_or_stop!(a);
-                                continue;
-                            }
-                            match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
-                                .await
-                            {
-                                Ok(persist_metrics_after_sync) => {
-                                    force_full_reconcile = false;
-                                    if persist_metrics_after_sync {
-                                        if let Err(error) = self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await {
-                                            error!(
-                                                "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
-                                                a.strategy_id, error
-                                            );
-                                            reconnect_live_sync_or_stop!(a);
-                                            continue;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    error!(
-                                        "Live sync lost AQS connection for strategy {} after bar processing: {}",
-                                        a.strategy_id, error
-                                    );
-                                    reconnect_live_sync_or_stop!(a);
-                                    force_full_reconcile = true;
-                                }
-                            }
-                        }
-                    }
-                    if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
+                    if last_runtime_publish.elapsed() >= Duration::from_millis(500) {
                         self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
-                        last_runtime_publish = std::time::Instant::now();
+                        last_runtime_publish = Instant::now();
                     }
                 }
 
@@ -1899,43 +1829,76 @@ where
                         }
                     }
 
-                    // Optional Push to SurrealDB
-                    if let Some(a) = auth.as_ref() {
-                        if db.is_none() {
-                            reconnect_live_sync_or_stop!(a);
-                            force_full_reconcile = true;
-                        }
-                        if let Some(client) = db.as_ref() {
-                            if let Err(error) = Self::flush_pending_aqs_sync_ops(client, a, &mut pending_sync_ops).await {
-                                error!(
-                                    "Live sync could not flush pending AQS ops for strategy {} during pipeline sync: {}",
-                                    a.strategy_id, error
-                                );
-                                reconnect_live_sync_or_stop!(a);
-                                continue;
-                            }
-                            match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
-                                .await
-                            {
-                                Ok(persist_metrics_after_sync) => {
-                                    force_full_reconcile = false;
-                                    if persist_metrics_after_sync {
-                                        if let Err(error) = self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await {
-                                            error!(
-                                                "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
-                                                a.strategy_id, error
-                                            );
-                                            reconnect_live_sync_or_stop!(a);
-                                            continue;
-                                        }
-                                    }
+                    self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
+                }
 
+                    _ = live_sync_interval.tick() => {
+                        if let Some(artifacts) = local_live_artifacts.as_ref() {
+                            flush_pending_local_live_events(artifacts, &mut pending_local_live_events).await;
+                        }
+
+                        if let Some(a) = auth.as_ref() {
+                            if db.is_none() {
+                                reconnect_live_sync_or_stop!(a);
+                                force_full_reconcile = true;
+                            }
+                            if let Some(client) = db.as_ref() {
+                                let account_sync_due =
+                                    last_account_sync.elapsed() >= Duration::from_secs(LIVE_ACCOUNT_SYNC_SECS);
+                                let has_sync_work = !pending_sync_ops.is_empty()
+                                    || self.insights.has_dirty_insights()
+                                    || self.live_metrics.should_persist()
+                                    || account_sync_due;
+
+                                if !has_sync_work {
+                                    continue;
+                                }
+
+                                if let Err(error) = Self::flush_pending_aqs_sync_ops(client, a, &mut pending_sync_ops).await {
+                                    error!(
+                                        "Live sync could not flush pending AQS ops for strategy {} during sync flush: {}",
+                                        a.strategy_id, error
+                                    );
+                                    reconnect_live_sync_or_stop!(a);
+                                    force_full_reconcile = true;
+                                    continue;
+                                }
+
+                                let mut persist_metrics_after_sync = match self
+                                    .sync_live_insights_to_aqs(
+                                        client,
+                                        a,
+                                        &mut synced_insight_states,
+                                        &mut synced_insight_history_offsets,
+                                        &mut pending_sync_ops,
+                                        false,
+                                        Some(LIVE_SYNC_MAX_INSIGHTS_PER_FLUSH),
+                                    )
+                                    .await
+                                {
+                                    Ok(persist_metrics_after_sync) => {
+                                        persist_metrics_after_sync
+                                    }
+                                    Err(error) => {
+                                        error!(
+                                            "Live sync lost AQS connection for strategy {} during sync flush: {}",
+                                            a.strategy_id, error
+                                        );
+                                        reconnect_live_sync_or_stop!(a);
+                                        force_full_reconcile = true;
+                                        continue;
+                                    }
+                                };
+
+                                if account_sync_due {
+                                    last_account_sync = Instant::now();
                                     if let Ok(account) = self.broker.get_account().await {
                                         let captured_at = chrono::Utc::now();
-                                        self.live_metrics
-                                            .update_equity(account.equity, captured_at);
-                                        if let Err(error) = persist_live_account_state(client, a, &account, captured_at).await {
+                                        self.live_metrics.update_equity(account.equity, captured_at);
+                                        persist_metrics_after_sync = true;
+                                        if let Err(error) =
+                                            persist_live_account_state(client, a, &account, captured_at).await
+                                        {
                                             if Self::is_transient_surreal_error(&error) {
                                                 Self::enqueue_pending_aqs_sync_op(
                                                     &mut pending_sync_ops,
@@ -1956,35 +1919,32 @@ where
                                                 a.strategy_id, error
                                             );
                                         }
-                                        if let Err(error) = self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await {
-                                            error!(
-                                                "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
-                                                a.strategy_id, error
-                                            );
-                                            reconnect_live_sync_or_stop!(a);
-                                            continue;
-                                        }
                                     }
                                 }
-                                Err(error) => {
-                                    error!(
-                                        "Live sync lost AQS connection for strategy {} during pipeline sync: {}",
-                                        a.strategy_id, error
-                                    );
-                                    reconnect_live_sync_or_stop!(a);
-                                    force_full_reconcile = true;
+
+                                if persist_metrics_after_sync {
+                                    if let Err(error) =
+                                        self.persist_live_metrics_if_needed(client, a, &mut pending_sync_ops).await
+                                    {
+                                        error!(
+                                            "Live sync lost AQS connection for strategy {} while persisting live metrics: {}",
+                                            a.strategy_id, error
+                                        );
+                                        reconnect_live_sync_or_stop!(a);
+                                        force_full_reconcile = true;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     }
-                    self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
-                }
 
-                _ = local_metrics_interval.tick(), if local_live_artifacts.is_some() => {
-                    if let Some(artifacts) = local_live_artifacts.as_mut() {
-                        self.persist_local_live_metrics_if_needed(artifacts, false).await;
-                    }
-                    self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
+                    _ = local_metrics_interval.tick(), if local_live_artifacts.is_some() => {
+                        if let Some(artifacts) = local_live_artifacts.as_mut() {
+                            flush_pending_local_live_events(artifacts, &mut pending_local_live_events).await;
+                            self.persist_local_live_metrics_if_needed(artifacts, false).await;
+                        }
+                        self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
                 }
 
                 _ = reconcile_interval.tick() => {
@@ -2014,7 +1974,7 @@ where
                                 continue;
                             }
                             match self
-                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile)
+                                .sync_live_insights_to_aqs(client, a, &mut synced_insight_states, &mut synced_insight_history_offsets, &mut pending_sync_ops, force_full_reconcile, None)
                                 .await
                             {
                                 Ok(_) => {
@@ -2129,6 +2089,18 @@ where
         self.status = StrategyStatus::Stopped;
 
         if let (Some(client), Some(a)) = (&db, &auth) {
+            let _ = Self::flush_pending_aqs_sync_ops(client, a, &mut pending_sync_ops).await;
+            let _ = self
+                .sync_live_insights_to_aqs(
+                    client,
+                    a,
+                    &mut synced_insight_states,
+                    &mut synced_insight_history_offsets,
+                    &mut pending_sync_ops,
+                    true,
+                    None,
+                )
+                .await;
             let _: Result<IndexedResults, surrealdb::Error> = client
                 .query("UPDATE type::record('strategy', $id) SET status = 'Stopped', is_live = false, last_heartbeat = time::now()")
                 .bind(("id", a.strategy_id.clone()))
@@ -2182,6 +2154,7 @@ where
         }
 
         if let Some(artifacts) = local_live_artifacts.as_mut() {
+            flush_pending_local_live_events(artifacts, &mut pending_local_live_events).await;
             if let Ok(account) = self.broker.get_account().await {
                 self.live_metrics
                     .update_equity(account.equity, chrono::Utc::now());

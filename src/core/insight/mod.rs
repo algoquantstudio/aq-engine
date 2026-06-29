@@ -285,9 +285,31 @@ impl InsightCollection {
             candidates.push(insight_id);
         }
 
-        if let Some(mapped_id) = self.order_id_to_insight_id.get(&order.order_id) {
-            if !candidates.contains(mapped_id) {
-                candidates.push(*mapped_id);
+        let mut push_mapped = |order_id: &str| {
+            if let Some(mapped_id) = self.order_id_to_insight_id.get(order_id) {
+                if !candidates.contains(mapped_id) {
+                    candidates.push(*mapped_id);
+                }
+            }
+        };
+
+        push_mapped(&order.order_id);
+        if let Some(legs) = order.legs.as_ref() {
+            for leg_order_id in [
+                legs.take_profit
+                    .as_ref()
+                    .and_then(|leg| leg.order_id.as_deref()),
+                legs.stop_loss
+                    .as_ref()
+                    .and_then(|leg| leg.order_id.as_deref()),
+                legs.trailing_stop
+                    .as_ref()
+                    .and_then(|leg| leg.order_id.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                push_mapped(leg_order_id);
             }
         }
 
@@ -384,7 +406,10 @@ impl InsightCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::broker::types::OrderSide;
+    use crate::core::broker::types::{
+        Asset, AssetExchange, AssetStatus, AssetType, Order, OrderClass, OrderLeg, OrderLegs,
+        OrderSide, OrderType, TimeInForce, TradeUpdateEvent,
+    };
     use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
 
     fn test_insight(symbol: &str) -> Insight {
@@ -422,6 +447,91 @@ mod tests {
         assert_eq!(
             collection.order_id_to_insight_id.get("order-b").copied(),
             Some(insight_id)
+        );
+    }
+
+    #[test]
+    fn candidate_insight_ids_for_trade_event_uses_leg_order_ids() {
+        let mut collection = InsightCollection::new();
+        let mut insight = test_insight("AAPL");
+        let insight_id = *insight.insight_id();
+        insight.legs.take_profit = Some(OrderLeg {
+            order_id: Some("tp-order".to_string()),
+            limit_price: Some(105.0),
+            trail_price: None,
+            side: OrderSide::Sell,
+            filled_price: None,
+            order_type: OrderType::Limit,
+            status: TradeUpdateEvent::Pending,
+            order_class: OrderClass::Bracket,
+            created_at: 0,
+            updated_at: 0,
+            submitted_at: 0,
+            filled_at: None,
+        });
+        collection.add_insight(insight);
+
+        let order = Order {
+            order_id: "close-order".to_string(),
+            insight_id: None,
+            strategy_type: None,
+            asset: Asset {
+                id: "AAPL".to_string(),
+                symbol: "AAPL".to_string(),
+                name: "AAPL".to_string(),
+                asset_type: AssetType::Stock,
+                status: AssetStatus::Active,
+                exchange: AssetExchange::UNKNOWN("TEST".to_string()),
+                tradable: true,
+                marginable: true,
+                shortable: true,
+                fractional: true,
+                min_order_size: None,
+                quantity_base: None,
+                max_order_size: None,
+                min_price_increment: None,
+                price_base: None,
+                contract_size: None,
+            },
+            qty: 1.0,
+            filled_qty: 1.0,
+            limit_price: None,
+            filled_price: Some(105.0),
+            stop_price: None,
+            side: OrderSide::Sell,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::GTC,
+            status: TradeUpdateEvent::Closed,
+            order_class: OrderClass::Bracket,
+            created_at: 0,
+            updated_at: 0,
+            submitted_at: 0,
+            filled_at: Some(0),
+            realized_pnl: None,
+            rejection_reason: None,
+            legs: Some(OrderLegs {
+                take_profit: Some(OrderLeg {
+                    order_id: Some("tp-order".to_string()),
+                    limit_price: Some(105.0),
+                    trail_price: None,
+                    side: OrderSide::Sell,
+                    filled_price: Some(105.0),
+                    order_type: OrderType::Limit,
+                    status: TradeUpdateEvent::Filled,
+                    order_class: OrderClass::Bracket,
+                    created_at: 0,
+                    updated_at: 0,
+                    submitted_at: 0,
+                    filled_at: Some(0),
+                }),
+                stop_loss: None,
+                trailing_stop: None,
+            }),
+        };
+
+        assert_eq!(
+            collection.candidate_insight_ids_for_trade_event(&order),
+            vec![insight_id]
         );
     }
 

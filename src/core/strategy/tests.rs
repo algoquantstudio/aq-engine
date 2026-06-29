@@ -4639,9 +4639,7 @@ mod tests {
 
             let mut shared = shared.lock().unwrap();
             shared.parent_close_requested = true;
-            println!(
-                "[MT5 ChildInsights] Limit child cancelled; waiting for flat BTCUSD exposure"
-            );
+            println!("[MT5 ChildInsights] Limit child cancelled; waiting for flat BTCUSD exposure");
             Ok(true)
         }
 
@@ -4775,12 +4773,7 @@ mod tests {
                     println!(
                         "[MT5 ChildInsights] Submitted parent market BUY with market and limit children"
                     );
-                    match request_parent_close_if_ready(
-                        ctx,
-                        &self.shared,
-                        symbol,
-                        parent_id,
-                    ) {
+                    match request_parent_close_if_ready(ctx, &self.shared, symbol, parent_id) {
                         Ok(_) => {}
                         Err(error) => {
                             self.shared.lock().unwrap().failed = Some(error);
@@ -4826,9 +4819,7 @@ mod tests {
                     );
                     drop(shared);
                     let mut shared = self.shared.lock().unwrap();
-                    shared.failed = Some(format!(
-                        "{message}"
-                    ));
+                    shared.failed = Some(format!("{message}"));
                     ctx.shutdown();
                 }
             }
@@ -4875,26 +4866,26 @@ mod tests {
                 let positions = match monitor.get_positions().await {
                     Ok(positions) => positions,
                     Err(error) => {
-                        monitor_shared.lock().unwrap().failed =
-                            Some(format!("failed to poll MT5 positions after parent close: {error}"));
+                        monitor_shared.lock().unwrap().failed = Some(format!(
+                            "failed to poll MT5 positions after parent close: {error}"
+                        ));
                         return;
                     }
                 };
                 let orders = match monitor.get_orders().await {
                     Ok(orders) => orders,
                     Err(error) => {
-                        monitor_shared.lock().unwrap().failed =
-                            Some(format!("failed to poll MT5 orders after parent close: {error}"));
+                        monitor_shared.lock().unwrap().failed = Some(format!(
+                            "failed to poll MT5 orders after parent close: {error}"
+                        ));
                         return;
                     }
                 };
 
-                let has_open_position = positions
-                    .iter()
-                    .any(|position| position.asset.symbol == TEST_SYMBOL && position.qty.abs() > 0.0);
-                let has_open_order = orders
-                    .iter()
-                    .any(|order| order.asset.symbol == TEST_SYMBOL);
+                let has_open_position = positions.iter().any(|position| {
+                    position.asset.symbol == TEST_SYMBOL && position.qty.abs() > 0.0
+                });
+                let has_open_order = orders.iter().any(|order| order.asset.symbol == TEST_SYMBOL);
 
                 if !has_open_position && !has_open_order {
                     let mut shared = monitor_shared.lock().unwrap();

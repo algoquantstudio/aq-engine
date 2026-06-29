@@ -25,6 +25,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(feature = "runtime"))]
 type FxHashSet<T> = HashSet<T>;
+use std::path::PathBuf;
 use std::vec;
 use uuid::Uuid;
 mod aqs_ops;
@@ -66,6 +67,25 @@ pub fn set_logging_level(level: impl AsRef<str>) -> Result<(), log::SetLoggerErr
         info!("Logger initialised with level {}", log_level);
     }
     result
+}
+
+fn current_dir_with_aqmeta() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let has_aqmeta = std::fs::read_dir(&dir).ok()?.flatten().any(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("aqmeta"))
+        });
+        if has_aqmeta {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 // ─────────────────────── StrategyState ───────────────────────
@@ -123,6 +143,7 @@ where
     live_metrics: LivePerformanceTracker,
     default_live_auth: Option<AqsAuth>,
     runtime_telemetry: RuntimeTelemetry,
+    artifact_root: Option<PathBuf>,
 
     // Insight Pipeline
     pub insight_pipeline: InsightPipeline,
@@ -144,6 +165,24 @@ where
             .is_some_and(|value| value == insight.insight_id.to_string())
             || insight.order_id.as_deref() == Some(&order.order_id)
             || insight.close_order_id.as_deref() == Some(&order.order_id)
+            || insight
+                .legs
+                .take_profit
+                .as_ref()
+                .and_then(|leg| leg.order_id.as_deref())
+                == Some(order.order_id.as_str())
+            || insight
+                .legs
+                .stop_loss
+                .as_ref()
+                .and_then(|leg| leg.order_id.as_deref())
+                == Some(order.order_id.as_str())
+            || insight
+                .legs
+                .trailing_stop
+                .as_ref()
+                .and_then(|leg| leg.order_id.as_deref())
+                == Some(order.order_id.as_str())
     }
 
     fn close_price_from_order(order: &Order) -> f64 {
@@ -278,10 +317,32 @@ where
             live_metrics: LivePerformanceTracker::default(),
             default_live_auth: AqsAuth::from_process_args(),
             runtime_telemetry: RuntimeTelemetry::default(),
+            artifact_root: None,
             insight_pipeline: Default::default(),
             timeframe,
             shutdown_tx: tokio::sync::watch::channel(false).0,
         }
+    }
+
+    /// Set the project directory used for run artifacts such as `backtests/` and `live/`.
+    ///
+    /// Generated AQS projects set this to `CARGO_MANIFEST_DIR` so output stays beside the
+    /// strategy project even if the binary is launched from another working directory.
+    pub fn set_artifact_root(&mut self, root: impl Into<PathBuf>) {
+        self.artifact_root = Some(root.into());
+    }
+
+    pub fn with_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.set_artifact_root(root);
+        self
+    }
+
+    fn artifact_root(&self) -> PathBuf {
+        self.artifact_root
+            .clone()
+            .or_else(|| current_dir_with_aqmeta())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// Access the strategy (panics if called during backtest iteration — internal only).
@@ -1536,9 +1597,7 @@ where
                                 continue;
                             }
                             let price = Self::close_price_from_order(&order);
-                            // again we dont need to sync the TP/SL again on close because we will
-                            // have the close price.
-                            // Self::sync_broker_managed_levels(insight, &order);
+                            Self::sync_broker_managed_levels(&mut insight, &order);
                             insight.position_closed(
                                 price,
                                 &order.order_id,
@@ -1925,10 +1984,7 @@ where
         info!("Insights: {:#?}", self.insights.get_state_count());
 
         let run_id = Uuid::new_v4().to_string();
-        let out_dir = std::env::current_dir()
-            .unwrap_or_default()
-            .join("backtests")
-            .join(&run_id);
+        let out_dir = self.artifact_root().join("backtests").join(&run_id);
 
         let Some(backtest_state) = self.broker.backtest_state.as_ref() else {
             warn!("Backtest completed but no backtest state was available for result persistence");

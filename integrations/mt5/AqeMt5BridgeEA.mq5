@@ -16,8 +16,8 @@ input int InpInactiveProbeTimeoutMs = 100;
 input int InpInactiveProbeMaxCooldownMs = 2000;
 input int InpPollIntervalMs = 100;
 input int InpRequestTimeoutMs = 5000;
-input int InpTradeEventFlushIntervalMs = 100;
-input int InpTradeEventPostTimeoutMs = 750;
+input int InpTradeEventFlushIntervalMs = 10;
+input int InpTradeEventPostTimeoutMs = 250;
 input int InpTradeEventBatchSize = 32;
 input int InpTradeEventQueueCapacity = 2048;
 
@@ -1081,14 +1081,166 @@ string HistoryJson(string symbol, ENUM_TIMEFRAMES timeframe, datetime start_utc,
    return "[" + bars + "]";
 }
 
-string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false, string insight_id = "", string strategy_type = "")
+string JsonNullableString(string value)
+{
+   return value == "" ? "null" : "\"" + JsonEscape(value) + "\"";
+}
+
+string JsonNullableNumber(double value, bool has_value, int precision = 8)
+{
+   return has_value ? DoubleToString(value, precision) : "null";
+}
+
+string OrderLegJson(
+   string order_id,
+   double limit_price,
+   bool has_limit_price,
+   double trail_price,
+   bool has_trail_price,
+   string side,
+   string order_type,
+   string status,
+   double filled_price,
+   bool has_filled_price
+)
+{
+   datetime now_utc = BrokerNowUtc();
+   return "{"
+      "\"order_id\":" + JsonNullableString(order_id) + ","
+      "\"limit_price\":" + JsonNullableNumber(limit_price, has_limit_price) + ","
+      "\"trail_price\":" + JsonNullableNumber(trail_price, has_trail_price) + ","
+      "\"side\":\"" + side + "\","
+      "\"filled_price\":" + JsonNullableNumber(filled_price, has_filled_price) + ","
+      "\"order_type\":\"" + order_type + "\","
+      "\"status\":\"" + status + "\","
+      "\"order_class\":\"Bracket\","
+      "\"created_at\":" + IntegerToString((int)now_utc) + ","
+      "\"updated_at\":" + IntegerToString((int)now_utc) + ","
+      "\"submitted_at\":" + IntegerToString((int)now_utc) + ","
+      "\"filled_at\":" + (has_filled_price ? IntegerToString((int)now_utc) : "null") +
+   "}";
+}
+
+string OrderLegsJson(string hit_leg, string hit_order_id, string close_side, double close_price, double take_profit, double stop_loss)
+{
+   bool hit_tp = hit_leg == "TakeProfit";
+   bool hit_sl = hit_leg == "StopLoss";
+
+   string take_profit_json = "null";
+   if(hit_tp || take_profit > 0.0)
+   {
+      double tp_limit = take_profit > 0.0 ? take_profit : close_price;
+      take_profit_json = OrderLegJson(
+         hit_tp ? hit_order_id : "",
+         tp_limit,
+         tp_limit > 0.0,
+         0.0,
+         false,
+         close_side,
+         "Limit",
+         hit_tp ? "Filled" : "Cancelled",
+         close_price,
+         hit_tp && close_price > 0.0
+      );
+   }
+
+   string stop_loss_json = "null";
+   if(hit_sl || stop_loss > 0.0)
+   {
+      double sl_limit = stop_loss > 0.0 ? stop_loss : close_price;
+      stop_loss_json = OrderLegJson(
+         hit_sl ? hit_order_id : "",
+         sl_limit,
+         sl_limit > 0.0,
+         0.0,
+         false,
+         close_side,
+         "Stop",
+         hit_sl ? "Filled" : "Cancelled",
+         close_price,
+         hit_sl && close_price > 0.0
+      );
+   }
+
+   if(take_profit_json == "null" && stop_loss_json == "null")
+      return "";
+
+   return "{"
+      "\"take_profit\":" + take_profit_json + ","
+      "\"stop_loss\":" + stop_loss_json + ","
+      "\"trailing_stop\":null"
+   "}";
+}
+
+string HitLegFromDeal(ENUM_DEAL_REASON reason, string comment)
+{
+   if(reason == DEAL_REASON_TP)
+      return "TakeProfit";
+   if(reason == DEAL_REASON_SL)
+      return "StopLoss";
+   if(StringFind(comment, "[tp") >= 0 || StringFind(comment, "TP") >= 0)
+      return "TakeProfit";
+   if(StringFind(comment, "[sl") >= 0 || StringFind(comment, "SL") >= 0)
+      return "StopLoss";
+   return "";
+}
+
+bool FindEntryOrderForPosition(ulong position_id, string symbol, string &entry_order_id, string &entry_comment, double &entry_take_profit, double &entry_stop_loss)
+{
+   entry_order_id = "";
+   entry_comment = "";
+   entry_take_profit = 0.0;
+   entry_stop_loss = 0.0;
+   if(position_id == 0)
+      return false;
+
+   datetime history_end = TimeCurrent() + 86400;
+   if(!HistorySelect(0, history_end))
+      return false;
+
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong deal_ticket = HistoryDealGetTicket(i);
+      if(deal_ticket == 0 || !HistoryDealSelect(deal_ticket))
+         continue;
+      if((ulong)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) != position_id)
+         continue;
+
+      ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+      if(deal_entry != DEAL_ENTRY_IN && deal_entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      string deal_symbol = HistoryDealGetString(deal_ticket, DEAL_SYMBOL);
+      if(symbol != "" && deal_symbol != "" && deal_symbol != symbol)
+         continue;
+
+      ulong order_ticket = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
+      if(order_ticket == 0)
+         continue;
+
+      entry_order_id = IntegerToString((long)order_ticket);
+      entry_comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+      if(HistoryOrderSelect(order_ticket))
+      {
+         if(entry_comment == "")
+            entry_comment = HistoryOrderGetString(order_ticket, ORDER_COMMENT);
+         entry_take_profit = HistoryOrderGetDouble(order_ticket, ORDER_TP);
+         entry_stop_loss = HistoryOrderGetDouble(order_ticket, ORDER_SL);
+      }
+      return true;
+   }
+
+   return false;
+}
+
+string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false, string insight_id = "", string strategy_type = "", string legs_json = "")
 {
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    datetime now_utc = BrokerNowUtc();
    return "{"
       "\"order_id\":\"" + JsonEscape(order_id) + "\","
-      "\"insight_id\":" + (insight_id == "" ? "null" : "\"" + JsonEscape(insight_id) + "\"") + ","
-      "\"strategy_type\":" + (strategy_type == "" ? "null" : "\"" + JsonEscape(strategy_type) + "\"") + ","
+      "\"insight_id\":" + JsonNullableString(insight_id) + ","
+      "\"strategy_type\":" + JsonNullableString(strategy_type) + ","
       "\"asset\":" + AssetJson(symbol) + ","
       "\"qty\":" + DoubleToString(qty, 8) + ","
       "\"filled_qty\":" + ((status == "Filled" || status == "Closed") ? DoubleToString(qty, 8) : "0.0") + ","
@@ -1099,14 +1251,14 @@ string OrderJson(string order_id, string symbol, double qty, string side, string
       "\"order_type\":\"" + order_type + "\","
       "\"time_in_force\":\"GTC\","
       "\"status\":\"" + status + "\","
-      "\"order_class\":\"Simple\","
+      "\"order_class\":\"" + (legs_json == "" ? "Simple" : "Bracket") + "\","
       "\"created_at\":" + IntegerToString((int)now_utc) + ","
       "\"updated_at\":" + IntegerToString((int)now_utc) + ","
       "\"submitted_at\":" + IntegerToString((int)now_utc) + ","
       "\"filled_at\":" + ((status == "Filled" || status == "Closed") ? IntegerToString((int)now_utc) : "null") + ","
       "\"realized_pnl\":" + (has_realized_pnl ? DoubleToString(realized_pnl, 8) : "null") + ","
-      "\"rejection_reason\":" + (rejection_reason == "" ? "null" : "\"" + JsonEscape(rejection_reason) + "\"") + ","
-      "\"legs\":null"
+      "\"rejection_reason\":" + JsonNullableString(rejection_reason) + ","
+      "\"legs\":" + (legs_json == "" ? "null" : legs_json) +
    "}";
 }
 
@@ -1914,8 +2066,6 @@ void OnDeinit(const int reason)
 
 void OnTimer()
 {
-   PollConnectedBridges();
-
    uint now_ms = GetTickCount();
    for(int i = 0; i < ArraySize(g_bridges); i++)
    {
@@ -1926,6 +2076,14 @@ void OnTimer()
          g_bridges[i].last_trade_event_flush_ms = now_ms;
          FlushTradeEvents(i);
       }
+   }
+
+   PollConnectedBridges();
+
+   for(int i = 0; i < ArraySize(g_bridges); i++)
+   {
+      if(!IsValidBridgeIndex(i) || g_bridges[i].session_id == "")
+         continue;
       if(HasElapsedMs(g_bridges[i].last_heartbeat_ms, 2000))
       {
          g_bridges[i].last_heartbeat_ms = now_ms;
@@ -1980,23 +2138,39 @@ void OnTradeTransaction(
    bool has_realized_pnl = false;
    string event_order_id = IntegerToString((long)trans.order);
    ulong deal_position_id = 0;
+   string entry_order_id = "";
+   string entry_comment = "";
+   double entry_take_profit = 0.0;
+   double entry_stop_loss = 0.0;
+   string hit_leg = "";
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
    {
       ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
       ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+      ENUM_DEAL_REASON deal_reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
       deal_position_id = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
       string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+      string deal_comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
       double deal_volume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
       double deal_price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
       if(deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_OUT_BY)
       {
          event_name = "Closed";
+         hit_leg = HitLegFromDeal(deal_reason, deal_comment);
          realized_pnl =
             HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
             + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION)
             + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
             + HistoryDealGetDouble(trans.deal, DEAL_FEE);
          has_realized_pnl = true;
+         FindEntryOrderForPosition(
+            deal_position_id,
+            deal_symbol,
+            entry_order_id,
+            entry_comment,
+            entry_take_profit,
+            entry_stop_loss
+         );
       }
       if(deal_symbol != "") symbol = deal_symbol;
       if(deal_volume > 0.0) volume = deal_volume;
@@ -2012,10 +2186,16 @@ void OnTradeTransaction(
       route_bridge = FindOrderBridgeIndex(event_order_id);
    if(route_bridge < 0 && deal_position_id > 0)
       route_bridge = FindOrderBridgeIndex(IntegerToString((long)deal_position_id));
+   if(route_bridge < 0 && entry_order_id != "")
+      route_bridge = FindOrderBridgeIndex(entry_order_id);
+   if(route_bridge < 0 && entry_comment != "")
+      route_bridge = FindBridgeByComment(entry_comment);
    string order_key = IntegerToString((long)trans.order);
    string deal_key = trans.deal > 0 ? IntegerToString((long)trans.deal) : "";
    string position_key = deal_position_id > 0 ? IntegerToString((long)deal_position_id) : "";
    int route_index = FindOrderRouteIndexByAliases(event_order_id, order_key, deal_key, position_key);
+   if(route_index < 0 && entry_order_id != "")
+      route_index = FindOrderRouteIndex(entry_order_id);
    if(route_bridge < 0 && route_index >= 0)
       route_bridge = g_order_routes[route_index].bridge_index;
    if(route_bridge < 0 || !IsValidBridgeIndex(route_bridge) || g_bridges[route_bridge].session_id == "")
@@ -2024,9 +2204,22 @@ void OnTradeTransaction(
    string route_client_order_id = route_index >= 0 ? g_order_routes[route_index].client_order_id : "";
    string route_insight_id = route_index >= 0 ? g_order_routes[route_index].insight_id : "";
    string route_strategy_type = route_index >= 0 ? g_order_routes[route_index].strategy_type : "";
+   if(event_name == "Closed" && route_insight_id == "" && entry_order_id != "")
+      event_order_id = entry_order_id;
+
+   string legs_json = "";
+   if(event_name == "Closed" && hit_leg != "")
+   {
+      if(hit_leg == "TakeProfit" && entry_take_profit <= 0.0)
+         entry_take_profit = price;
+      if(hit_leg == "StopLoss" && entry_stop_loss <= 0.0)
+         entry_stop_loss = price;
+      legs_json = OrderLegsJson(hit_leg, order_key, side, price, entry_take_profit, entry_stop_loss);
+   }
 
    RememberOrderRouteMetadata(route_bridge, event_order_id, route_client_order_id, route_insight_id, route_strategy_type);
    if(deal_position_id > 0) RememberOrderRouteMetadata(route_bridge, IntegerToString((long)deal_position_id), route_client_order_id, route_insight_id, route_strategy_type);
+   if(entry_order_id != "") RememberOrderRouteMetadata(route_bridge, entry_order_id, route_client_order_id, route_insight_id, route_strategy_type);
    if(trans.order > 0) RememberOrderRouteMetadata(route_bridge, IntegerToString((long)trans.order), route_client_order_id, route_insight_id, route_strategy_type);
    if(trans.deal > 0) RememberOrderRouteMetadata(route_bridge, IntegerToString((long)trans.deal), route_client_order_id, route_insight_id, route_strategy_type);
 
@@ -2034,7 +2227,9 @@ void OnTradeTransaction(
    string payload = "{"
       "\"nativeEventId\":\"" + JsonEscape(native_id) + "\","
       "\"event\":\"" + event_name + "\","
-      "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl, route_insight_id, route_strategy_type) +
+      "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl, route_insight_id, route_strategy_type, legs_json) +
    "}";
    QueueTradeEvent(route_bridge, payload);
+   g_bridges[route_bridge].last_trade_event_flush_ms = GetTickCount();
+   FlushTradeEvents(route_bridge);
 }
