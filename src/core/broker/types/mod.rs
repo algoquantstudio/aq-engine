@@ -35,6 +35,8 @@ pub struct Account {
     pub cash: f64,
     pub currency: String,
     pub buying_power: f64,
+    #[serde(default)]
+    pub accrued_commission: f64,
     pub shorting_enabled: bool,
     pub leverage: u8,
 }
@@ -65,6 +67,211 @@ pub struct Asset {
     pub min_price_increment: Option<f64>,
     pub price_base: Option<i64>,
     pub contract_size: Option<i64>,
+    #[serde(default)]
+    pub fees: AssetFees,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AssetFee {
+    None,
+    Points(f64),
+    PercentageFee(f64),
+    FixedFee(f64),
+    PerContractFee(f64),
+    PercentagePerContractFee(f64),
+}
+
+impl Default for AssetFee {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl AssetFee {
+    pub fn calculate(&self, price: f64, quantity: f64) -> f64 {
+        self.calculate_with_contract(price, quantity, None)
+    }
+
+    pub fn calculate_with_contract(
+        &self,
+        price: f64,
+        quantity: f64,
+        contract_size: Option<i64>,
+    ) -> f64 {
+        if !price.is_finite() || !quantity.is_finite() {
+            return 0.0;
+        }
+
+        let quantity = quantity.abs();
+        let contract_size = contract_size.unwrap_or(1).max(1) as f64;
+        match self {
+            Self::None => 0.0,
+            Self::Points(_) => 0.0,
+            Self::PercentageFee(rate) if rate.is_finite() && *rate > 0.0 && *rate < 1.0 => {
+                price.abs() * quantity * rate
+            }
+            Self::FixedFee(value) if value.is_finite() && *value > 0.0 => *value,
+            Self::PerContractFee(value) if value.is_finite() && *value > 0.0 => value * quantity,
+            Self::PercentagePerContractFee(rate)
+                if rate.is_finite() && *rate > 0.0 && *rate < 1.0 =>
+            {
+                price.abs() * contract_size * quantity * rate
+            }
+            _ => 0.0,
+        }
+    }
+
+    pub fn calculate_swap(
+        &self,
+        price: f64,
+        quantity: f64,
+        contract_size: Option<i64>,
+        point: Option<f64>,
+        days: f64,
+    ) -> f64 {
+        if !price.is_finite() || !quantity.is_finite() || !days.is_finite() || days <= 0.0 {
+            return 0.0;
+        }
+
+        let quantity = quantity.abs();
+        let contract_size = contract_size.unwrap_or(1).max(1) as f64;
+        match self {
+            Self::None => 0.0,
+            Self::Points(points) if points.is_finite() => {
+                let point = point.filter(|value| value.is_finite() && *value > 0.0);
+                points * point.unwrap_or(0.0) * contract_size * quantity * days
+            }
+            Self::PercentageFee(rate) if rate.is_finite() => price.abs() * quantity * rate * days,
+            Self::FixedFee(value) if value.is_finite() => value * days,
+            Self::PerContractFee(value) if value.is_finite() => value * quantity * days,
+            Self::PercentagePerContractFee(rate) if rate.is_finite() => {
+                price.abs() * contract_size * quantity * rate * days
+            }
+            _ => 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetSideFees {
+    #[serde(default)]
+    pub long: AssetFee,
+    #[serde(default)]
+    pub short: AssetFee,
+}
+
+impl AssetSideFees {
+    pub fn for_side(&self, side: &OrderSide) -> &AssetFee {
+        match side {
+            OrderSide::Buy => &self.long,
+            OrderSide::Sell => &self.short,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetCommissionFees {
+    #[serde(default)]
+    pub entry: AssetSideFees,
+    #[serde(default)]
+    pub exit: AssetSideFees,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetSwapFees {
+    #[serde(default)]
+    pub long: AssetFee,
+    #[serde(default)]
+    pub short: AssetFee,
+}
+
+impl AssetSwapFees {
+    pub fn for_side(&self, side: &OrderSide) -> &AssetFee {
+        match side {
+            OrderSide::Buy => &self.long,
+            OrderSide::Sell => &self.short,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetFees {
+    #[serde(default)]
+    pub commission: AssetCommissionFees,
+    #[serde(default)]
+    pub swap: AssetSwapFees,
+    // Legacy backtest config fields. Kept for compatibility with existing strategy metadata and UI.
+    #[serde(default)]
+    pub entry: AssetFee,
+    #[serde(default)]
+    pub exit: AssetFee,
+}
+
+impl AssetFees {
+    pub fn entry_commission(&self, price: f64, quantity: f64, contract_size: Option<i64>) -> f64 {
+        self.entry
+            .calculate_with_contract(price, quantity, contract_size)
+    }
+
+    pub fn exit_commission(&self, price: f64, quantity: f64, contract_size: Option<i64>) -> f64 {
+        self.exit
+            .calculate_with_contract(price, quantity, contract_size)
+    }
+
+    pub fn entry_commission_for_side(
+        &self,
+        side: &OrderSide,
+        price: f64,
+        quantity: f64,
+        contract_size: Option<i64>,
+    ) -> f64 {
+        let side_fee = self.commission.entry.for_side(side);
+        if matches!(side_fee, AssetFee::None)
+            && self.commission.entry.long == AssetFee::None
+            && self.commission.entry.short == AssetFee::None
+        {
+            self.entry_commission(price, quantity, contract_size)
+        } else {
+            side_fee.calculate_with_contract(price, quantity, contract_size)
+        }
+    }
+
+    pub fn exit_commission_for_side(
+        &self,
+        side: &OrderSide,
+        price: f64,
+        quantity: f64,
+        contract_size: Option<i64>,
+    ) -> f64 {
+        let side_fee = self.commission.exit.for_side(side);
+        if matches!(side_fee, AssetFee::None)
+            && self.commission.exit.long == AssetFee::None
+            && self.commission.exit.short == AssetFee::None
+        {
+            self.exit_commission(price, quantity, contract_size)
+        } else {
+            side_fee.calculate_with_contract(price, quantity, contract_size)
+        }
+    }
+
+    pub fn swap_for_side(
+        &self,
+        side: &OrderSide,
+        price: f64,
+        quantity: f64,
+        contract_size: Option<i64>,
+        point: Option<f64>,
+        days: f64,
+    ) -> f64 {
+        self.swap
+            .for_side(side)
+            .calculate_swap(price, quantity, contract_size, point, days)
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -114,6 +321,8 @@ pub struct Position {
     pub current_price: f64,
     pub unrealized_pnl: f64,
     pub realized_pnl: f64,
+    #[serde(default)]
+    pub entry_commission: f64,
     pub margin_required: Option<f64>,
 }
 
@@ -156,6 +365,10 @@ pub struct Order {
     pub filled_at: Option<u64>,
     #[serde(default)]
     pub realized_pnl: Option<f64>,
+    #[serde(default)]
+    pub commission: Option<f64>,
+    #[serde(default)]
+    pub swap: Option<f64>,
     pub rejection_reason: Option<String>,
     pub legs: Option<OrderLegs>,
 }
@@ -262,6 +475,10 @@ pub struct TradeRecord {
     pub insight_id: Option<String>,
     #[serde(default)]
     pub strategy_type: Option<String>,
+    #[serde(default)]
+    pub commission: f64,
+    #[serde(default)]
+    pub swap: f64,
     pub trade_type: TradeRecordType,
 }
 
@@ -373,4 +590,117 @@ pub struct Quote {
     pub last: Option<f64>,
     pub last_size: Option<f64>,
     pub timestamp: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::utils::tools::dynamic_round_for_asset;
+
+    fn fee_rounding_asset() -> Asset {
+        Asset {
+            id: "rounding-asset".to_string(),
+            symbol: "TEST".to_string(),
+            name: "TEST".to_string(),
+            asset_type: AssetType::Stock,
+            status: AssetStatus::Active,
+            exchange: AssetExchange::NASDAQ,
+            tradable: true,
+            marginable: true,
+            shortable: true,
+            fractional: true,
+            min_order_size: None,
+            quantity_base: None,
+            max_order_size: None,
+            min_price_increment: Some(0.01),
+            price_base: None,
+            contract_size: Some(10),
+            fees: AssetFees::default(),
+        }
+    }
+
+    fn assert_dynamic_round_eq(left: f64, right: f64) {
+        let asset = fee_rounding_asset();
+        assert_eq!(
+            dynamic_round_for_asset(left, &asset),
+            dynamic_round_for_asset(right, &asset)
+        );
+    }
+
+    #[test]
+    fn percentage_per_contract_fee_uses_contract_notional() {
+        let fee = AssetFee::PercentagePerContractFee(0.0002);
+
+        let calculated = fee.calculate_with_contract(100.0, 2.0, Some(10));
+        assert!((calculated - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn side_specific_none_does_not_fallback_when_other_side_is_set() {
+        let fees = AssetFees {
+            commission: AssetCommissionFees {
+                entry: AssetSideFees {
+                    long: AssetFee::PerContractFee(2.0),
+                    short: AssetFee::None,
+                },
+                exit: AssetSideFees::default(),
+            },
+            entry: AssetFee::FixedFee(10.0),
+            ..AssetFees::default()
+        };
+
+        assert_eq!(
+            fees.entry_commission_for_side(&OrderSide::Buy, 100.0, 3.0, Some(1)),
+            6.0
+        );
+        assert_eq!(
+            fees.entry_commission_for_side(&OrderSide::Sell, 100.0, 3.0, Some(1)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn swap_percentage_per_contract_fee_uses_daily_decimal_rate() {
+        let fee = AssetFee::PercentagePerContractFee(0.0001);
+
+        let calculated = fee.calculate_swap(100.0, 2.0, Some(10), Some(0.01), 3.0);
+        assert!((calculated - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn asset_fee_variants_calculate_expected_values() {
+        assert_dynamic_round_eq(
+            AssetFee::PercentageFee(0.01).calculate_with_contract(100.0, 2.0, Some(10)),
+            2.0,
+        );
+        assert_dynamic_round_eq(
+            AssetFee::FixedFee(5.0).calculate_with_contract(100.0, 2.0, Some(10)),
+            5.0,
+        );
+        assert_dynamic_round_eq(
+            AssetFee::PerContractFee(3.0).calculate_with_contract(100.0, 2.0, Some(10)),
+            6.0,
+        );
+        assert_dynamic_round_eq(
+            AssetFee::Points(2.0).calculate_with_contract(100.0, 2.0, Some(10)),
+            0.0,
+        );
+
+        assert_dynamic_round_eq(
+            AssetFee::Points(1.0).calculate_swap(100.0, 2.0, Some(10), Some(0.01), 3.0),
+            0.6,
+        );
+        assert_dynamic_round_eq(
+            AssetFee::PercentageFee(0.01).calculate_swap(100.0, 2.0, Some(10), Some(0.01), 3.0),
+            6.0,
+        );
+        assert_dynamic_round_eq(
+            AssetFee::FixedFee(5.0).calculate_swap(100.0, 2.0, Some(10), Some(0.01), 3.0),
+            15.0,
+        );
+        assert_dynamic_round_eq(
+            AssetFee::PerContractFee(3.0).calculate_swap(100.0, 2.0, Some(10), Some(0.01), 3.0),
+            18.0,
+        );
+    }
 }

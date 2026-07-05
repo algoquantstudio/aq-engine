@@ -188,6 +188,7 @@ mod tests {
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                fees: Default::default(),
             })
         }
 
@@ -365,6 +366,7 @@ mod tests {
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                fees: Default::default(),
             })
         }
 
@@ -757,6 +759,7 @@ mod tests {
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                fees: Default::default(),
             })
         }
 
@@ -2258,6 +2261,7 @@ mod tests {
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                fees: Default::default(),
             },
         );
 
@@ -2442,6 +2446,7 @@ mod tests {
             min_price_increment: None,
             price_base: None,
             contract_size: None,
+            fees: Default::default(),
         }
     }
 
@@ -2587,6 +2592,7 @@ mod tests {
                 cash: 100_000.0,
                 currency: "USD".to_string(),
                 buying_power: 100_000.0,
+                accrued_commission: 0.0,
                 shorting_enabled: true,
                 leverage: 1,
             })
@@ -2657,6 +2663,8 @@ mod tests {
             submitted_at: 0,
             filled_at: Some(0),
             realized_pnl: None,
+            commission: None,
+            swap: None,
             rejection_reason: None,
             legs: None,
         }
@@ -2694,6 +2702,67 @@ mod tests {
         assert_eq!(updated.state, InsightState::Filled);
         assert_eq!(updated.order_id.as_deref(), Some("mt5-position-123"));
         assert_eq!(updated.filled_price, Some(101.25));
+    }
+
+    #[test]
+    fn trade_update_rounds_insight_fee_fields_before_snapshot() {
+        let (mut state, execution) = trade_update_state();
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(2.0));
+        insight.order_id = Some("position-123".to_string());
+        insight.state = InsightState::Filled;
+        insight.filled_price = Some(100.0);
+        let insight_id = *insight.insight_id();
+        state.insights.add_insight(insight.clone());
+
+        let mut close = test_order(
+            "position-123",
+            &insight,
+            TradeUpdateEvent::Closed,
+            OrderSide::Sell,
+            Some(110.237),
+        );
+        close.realized_pnl = Some(20.236);
+        close.commission = Some(1.234);
+        close.swap = Some(-0.345);
+        execution.emit(close, TradeUpdateEvent::Closed);
+
+        state.on_trade_update();
+
+        let asset = test_asset("AAPL");
+        let updated = state.insights.get(&insight_id).unwrap();
+        assert_eq!(updated.state, InsightState::Closed);
+        assert_eq!(
+            updated.close_price,
+            Some(crate::core::utils::tools::dynamic_round_for_asset(
+                110.237, &asset
+            ))
+        );
+        assert_eq!(
+            updated.broker_realized_pnl,
+            Some(crate::core::utils::tools::dynamic_round_for_asset(
+                20.236, &asset
+            ))
+        );
+        assert_eq!(
+            updated.commission,
+            Some(crate::core::utils::tools::dynamic_round_for_asset(
+                1.234, &asset
+            ))
+        );
+        assert_eq!(
+            updated.swap,
+            Some(crate::core::utils::tools::dynamic_round_for_asset(
+                -0.345, &asset
+            ))
+        );
     }
 
     #[test]
@@ -3426,7 +3495,7 @@ mod tests {
         // Simulate broker partially closing half of the order
         {
             let locked_insight = state.insights.get_mut(&insight_id).unwrap();
-            locked_insight.partial_closed(5.0, 120.0, "CLOSE_TP_1");
+            locked_insight.partial_closed(5.0, 120.0, "CLOSE_TP_1", None);
 
             // Ensure accurate updates
             assert_eq!(locked_insight.partial_filled_quantity, Some(5.0));
@@ -3445,7 +3514,7 @@ mod tests {
         strat.insight_pipeline(&mut state, &refreshed_insight);
 
         let final_insight = state.insights.get_mut(&insight_id).unwrap();
-        final_insight.partial_closed(5.0, 150.0, "CLOSE_TP_2");
+        final_insight.partial_closed(5.0, 150.0, "CLOSE_TP_2", None);
 
         // Validate final completion limits
         assert_eq!(final_insight.partial_filled_quantity, Some(10.0));

@@ -159,6 +159,7 @@ mod tests {
             min_price_increment: Some(0.01),
             price_base: Some(2),
             contract_size: None,
+            fees: Default::default(),
         }
     }
 
@@ -190,6 +191,7 @@ mod tests {
             current_price: 105.0,
             unrealized_pnl: 0.0,
             realized_pnl: 0.0,
+            entry_commission: 0.0,
             margin_required: None,
         };
         assert_eq!(unrealized_pnl_for_position(&position), 10.0);

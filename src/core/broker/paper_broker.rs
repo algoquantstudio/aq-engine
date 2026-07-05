@@ -1,8 +1,8 @@
 use super::backtest_state::{BacktestResults, BacktestState};
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
-    Account, AccountType, Asset, Bar, BrokerError, Order, OrderClass, OrderLeg, OrderLegs,
-    OrderSide, OrderType, Position, TradeRecord, TradeRecordType, TradeUpdateEvent,
+    Account, AccountType, Asset, AssetFees, Bar, BrokerError, Order, OrderClass, OrderLeg,
+    OrderLegs, OrderSide, OrderType, Position, TradeRecord, TradeRecordType, TradeUpdateEvent,
 };
 use crate::core::insight::Insight;
 use chrono::{DateTime, Utc};
@@ -35,6 +35,16 @@ fn update_order_leg(leg: Option<&mut OrderLeg>, order_id: &str, price: f64, now_
     true
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ClosePositionResult {
+    fully_closed: bool,
+    qty: f64,
+    net_pnl: f64,
+    entry_commission: f64,
+    exit_commission: f64,
+    swap: f64,
+}
+
 // ─────────────────────── PaperBroker ───────────────────────
 
 /// Paper Broker — full OMS for backtesting and paper trading.
@@ -52,6 +62,8 @@ pub struct PaperBroker {
     account: Arc<RwLock<Account>>,
     starting_cash: f64,
     leverage: u8,
+    asset_fees: AssetFees,
+    asset_metadata: Arc<DashMap<String, Asset>>,
 
     // OMS State
     orders: Arc<DashMap<String, Order>>,
@@ -88,6 +100,8 @@ impl PaperBroker {
             connected: Arc::new(Mutex::new(false)),
             starting_cash: cash,
             leverage,
+            asset_fees: AssetFees::default(),
+            asset_metadata: Arc::new(DashMap::new()),
             account: Arc::new(RwLock::new(Account {
                 account_id: Uuid::new_v4().to_string(),
                 account_type: account_type.clone(),
@@ -95,6 +109,7 @@ impl PaperBroker {
                 cash,
                 currency: "USD".to_string(),
                 buying_power: cash * leverage as f64,
+                accrued_commission: 0.0,
                 shorting_enabled: true,
                 leverage,
             })),
@@ -110,6 +125,20 @@ impl PaperBroker {
             current_time: Arc::new(RwLock::new(Utc::now())),
             backtest_state: None,
         }
+    }
+
+    pub fn with_asset_fees(mut self, asset_fees: AssetFees) -> Self {
+        self.asset_fees = asset_fees;
+        for mut asset in self.asset_metadata.iter_mut() {
+            asset.fees = self.asset_fees.clone();
+        }
+        self
+    }
+
+    pub fn register_asset_metadata(&self, asset: &Asset) {
+        let mut asset = asset.clone();
+        asset.fees = self.asset_fees.clone();
+        self.asset_metadata.insert(asset.symbol.clone(), asset);
     }
 
     /// Set the shared backtest state (called by UnifiedBroker during backtest setup).
@@ -201,7 +230,12 @@ impl PaperBroker {
                 if let Some(fill_price) = fill_result {
                     let _now_ts = self.current_time_ts();
 
-                    if let Some(reason) = self.insufficient_funds_reason(order.qty, fill_price) {
+                    if let Some(reason) = self.insufficient_funds_reason(
+                        &order.side,
+                        order.qty,
+                        fill_price,
+                        order.asset.contract_size,
+                    ) {
                         order.status = TradeUpdateEvent::Rejected;
                         order.rejection_reason = Some(reason);
                         order.updated_at = _now_ts;
@@ -216,6 +250,12 @@ impl PaperBroker {
                     order.filled_price = Some(fill_price);
                     order.filled_at = Some(_now_ts);
                     order.updated_at = _now_ts;
+                    order.commission = Some(order.asset.fees.entry_commission_for_side(
+                        &order.side,
+                        fill_price,
+                        order.filled_qty,
+                        order.asset.contract_size,
+                    ));
 
                     // Build bracket legs if order_class is Bracket
                     if order.order_class == OrderClass::Bracket {
@@ -333,17 +373,37 @@ impl PaperBroker {
         }
     }
 
-    fn insufficient_funds_reason(&self, qty: f64, price: f64) -> Option<String> {
+    fn insufficient_funds_reason(
+        &self,
+        side: &OrderSide,
+        qty: f64,
+        price: f64,
+        contract_size: Option<i64>,
+    ) -> Option<String> {
         if !qty.is_finite() || qty <= 0.0 || !price.is_finite() || price <= 0.0 {
             return None;
         }
 
         let notional = qty * price;
+        let commission = self
+            .asset_fees
+            .entry_commission_for_side(side, price, qty, contract_size);
+        let margin_cost = if self.leverage > 1 {
+            notional / self.leverage as f64
+        } else {
+            notional
+        };
         let account = self.account.read();
         if notional > account.buying_power {
             Some(format!(
                 "Insufficient funds: required buying power {:.2}, available {:.2}",
                 notional, account.buying_power
+            ))
+        } else if margin_cost + commission > account.cash {
+            Some(format!(
+                "Insufficient cash: required cash {:.2}, available {:.2}",
+                margin_cost + commission,
+                account.cash
             ))
         } else {
             None
@@ -355,8 +415,6 @@ impl PaperBroker {
     /// Check active orders' bracket legs (TP/SL) against the current bar.
     fn process_active_orders(&self, bars: &HashMap<String, Bar>) {
         let mut to_remove = Vec::new();
-        // Deferred closes: (order_id, fill_price) to process after releasing the mutable guard
-        let mut deferred_closes: Vec<(String, f64)> = Vec::new();
 
         for entry in self.active_orders.iter() {
             let order_id = entry.key();
@@ -436,10 +494,18 @@ impl PaperBroker {
                     }
 
                     if closed {
+                        let close_result =
+                            self.close_position_for_order(&order, close_price, order.qty);
                         order.status = TradeUpdateEvent::Closed;
                         order.updated_at = now_ts;
                         order.filled_price = Some(close_price);
                         order.filled_qty = order.qty;
+                        if let Some(result) = close_result {
+                            order.realized_pnl = Some(result.net_pnl);
+                            order.commission =
+                                Some(result.entry_commission + result.exit_commission);
+                            order.swap = Some(result.swap);
+                        }
                         order.qty = 0.0;
                         self.cancel_remaining_legs(&mut order);
 
@@ -448,16 +514,8 @@ impl PaperBroker {
                         self.mark_order_terminal_for_release(&oid);
 
                         to_remove.push(oid.clone());
-                        deferred_closes.push((oid, close_price));
                     }
                 }
-            }
-        }
-
-        // Process deferred position closes (after releasing DashMap guards)
-        for (order_id, fill_price) in deferred_closes {
-            if let Some(order) = self.orders.get(&order_id) {
-                self.close_position_for_order(&order, fill_price, 0.0);
             }
         }
 
@@ -495,6 +553,7 @@ impl PaperBroker {
             current_price: fill_price,
             unrealized_pnl: 0.0,
             realized_pnl: 0.0,
+            entry_commission: order.commission.unwrap_or(0.0),
             margin_required: if self.leverage > 1 {
                 Some(fill_price * order.filled_qty / self.leverage as f64)
             } else {
@@ -513,12 +572,19 @@ impl PaperBroker {
         };
 
         let mut account = self.account.write();
-        account.cash -= margin_cost;
-        account.buying_power = (account.buying_power - cost).max(0.0);
+        let entry_commission = order.commission.unwrap_or(0.0);
+        account.cash -= margin_cost + entry_commission;
+        account.buying_power = (account.buying_power - cost - entry_commission).max(0.0);
+        account.accrued_commission += entry_commission;
     }
 
     /// Close a position for a specific order (bracket leg fill or explicit close).
-    fn close_position_for_order(&self, order: &Order, close_price: f64, close_qty: f64) -> bool {
+    fn close_position_for_order(
+        &self,
+        order: &Order,
+        close_price: f64,
+        close_qty: f64,
+    ) -> Option<ClosePositionResult> {
         let symbol = &order.asset.symbol;
         let order_id = &order.order_id;
 
@@ -529,13 +595,34 @@ impl PaperBroker {
                 } else {
                     close_qty.min(position.qty)
                 };
+                let position_qty_before = position.qty;
                 let fully_closed = requested_qty >= position.qty;
+                let entry_commission = if position_qty_before > f64::EPSILON {
+                    position.entry_commission * (requested_qty / position_qty_before)
+                } else {
+                    0.0
+                };
+                let exit_commission = order.asset.fees.exit_commission_for_side(
+                    &position.side,
+                    close_price,
+                    requested_qty,
+                    order.asset.contract_size,
+                );
+                let swap = order.asset.fees.swap_for_side(
+                    &position.side,
+                    position.avg_entry_price,
+                    requested_qty,
+                    order.asset.contract_size,
+                    order.asset.min_price_increment,
+                    self.swap_days_for_order(order),
+                );
 
                 // Calculate realized P&L
-                let pnl = match position.side {
+                let gross_pnl = match position.side {
                     OrderSide::Buy => (close_price - position.avg_entry_price) * requested_qty,
                     OrderSide::Sell => (position.avg_entry_price - close_price) * requested_qty,
                 };
+                let net_pnl = gross_pnl + swap - entry_commission - exit_commission;
 
                 // Return capital + profit to account
                 let cost = position.avg_entry_price * requested_qty;
@@ -546,8 +633,10 @@ impl PaperBroker {
                 };
 
                 let mut account = self.account.write();
-                account.cash += margin_cost + pnl;
-                account.buying_power = (account.buying_power + cost + pnl).max(0.0);
+                account.cash += margin_cost + gross_pnl + swap - exit_commission;
+                account.buying_power =
+                    (account.buying_power + cost + gross_pnl + swap - exit_commission).max(0.0);
+                account.accrued_commission += exit_commission;
 
                 // Record exit trade
                 if let Some(ref state) = self.backtest_state {
@@ -560,12 +649,16 @@ impl PaperBroker {
                         order_id: order_id.clone(),
                         insight_id: order.insight_id.clone(),
                         strategy_type: order.strategy_type.clone(),
+                        commission: exit_commission,
+                        swap,
                         trade_type: TradeRecordType::Exit,
                     });
                 }
 
                 if !fully_closed {
                     position.qty -= requested_qty;
+                    position.entry_commission =
+                        (position.entry_commission - entry_commission).max(0.0);
                     position.cost_basis = position.avg_entry_price * position.qty;
                     position.market_value = position.current_price * position.qty;
                     position.margin_required = if self.leverage > 1 {
@@ -575,12 +668,19 @@ impl PaperBroker {
                     };
                 }
 
-                fully_closed
+                ClosePositionResult {
+                    fully_closed,
+                    qty: requested_qty,
+                    net_pnl,
+                    entry_commission,
+                    exit_commission,
+                    swap,
+                }
             } else {
-                return false;
+                return None;
             };
 
-            if fully_closed {
+            if fully_closed.fully_closed {
                 symbol_positions.remove(order_id);
             }
             let empty = symbol_positions.is_empty();
@@ -588,9 +688,9 @@ impl PaperBroker {
             if empty {
                 self.positions.remove(symbol);
             }
-            return fully_closed;
+            return Some(fully_closed);
         }
-        false
+        None
     }
 
     // ─────────────────────── Account Balance ───────────────────────
@@ -667,8 +767,13 @@ impl PaperBroker {
                         "PaperBroker::process_close_queue closing order_id={} symbol={} fill_price={:.4}",
                         order_id, order.asset.symbol, fill_price
                     );
-                    let fully_closed = self.close_position_for_order(&order, fill_price, qty);
-                    let close_qty = if qty <= 0.0 { order.filled_qty } else { qty };
+                    let close_result = self.close_position_for_order(&order, fill_price, qty);
+                    let fully_closed = close_result
+                        .map(|result| result.fully_closed)
+                        .unwrap_or(false);
+                    let close_qty = close_result
+                        .map(|result| result.qty)
+                        .unwrap_or_else(|| if qty <= 0.0 { order.filled_qty } else { qty });
                     debug!(
                         "PaperBroker::process_close_queue close_position_for_order returned fully_closed={} close_qty={:.4}",
                         fully_closed, close_qty
@@ -681,6 +786,14 @@ impl PaperBroker {
                         o.filled_qty = close_qty;
                         let remaining_qty = (o.qty - close_qty).max(0.0);
                         terminal_close = fully_closed || remaining_qty <= f64::EPSILON;
+                        if let Some(result) = close_result {
+                            let previous_realized = o.realized_pnl.unwrap_or(0.0);
+                            o.realized_pnl = Some(previous_realized + result.net_pnl);
+                            let previous_commission = o.commission.unwrap_or(0.0);
+                            o.commission = Some(previous_commission + result.exit_commission);
+                            let previous_swap = o.swap.unwrap_or(0.0);
+                            o.swap = Some(previous_swap + result.swap);
+                        }
 
                         if terminal_close {
                             o.qty = 0.0;
@@ -735,6 +848,8 @@ impl PaperBroker {
                 order_id: order.order_id.clone(),
                 insight_id: order.insight_id.clone(),
                 strategy_type: order.strategy_type.clone(),
+                commission: order.commission.unwrap_or(0.0),
+                swap: 0.0,
                 trade_type: TradeRecordType::Entry,
             });
         }
@@ -932,6 +1047,18 @@ impl PaperBroker {
         self.current_time.read().timestamp() as u64
     }
 
+    #[inline]
+    fn swap_days_for_order(&self, order: &Order) -> f64 {
+        let Some(opened_at) = order.filled_at else {
+            return 0.0;
+        };
+        let current = self.current_time_ts();
+        if current <= opened_at {
+            return 0.0;
+        }
+        (current - opened_at) as f64 / 86_400.0
+    }
+
     /// Synchronous account access (no async overhead).
     pub fn get_account_sync(&self) -> Result<Account, BrokerError> {
         let acc = self.account.read();
@@ -1107,6 +1234,11 @@ impl Broker for PaperBroker {
     fn get_account_type(&self) -> Result<AccountType, BrokerError> {
         Ok(self.account_type.clone())
     }
+
+    fn configure_asset_metadata(&self, asset: &Asset) -> Result<(), BrokerError> {
+        self.register_asset_metadata(asset);
+        Ok(())
+    }
 }
 
 // ─────────────────────── OrderManagementProvider Trait ───────────────────────
@@ -1135,25 +1267,33 @@ impl OrderManagementProvider for PaperBroker {
         let order_id = Uuid::new_v4().to_string();
         let now_ts = self.current_time_ts();
 
-        // Build Asset from insight (paper broker creates a synthetic asset if needed)
-        let asset = Asset {
-            id: Uuid::new_v4().to_string(),
-            symbol: insight.symbol.clone(),
-            name: insight.symbol.clone(),
-            asset_type: super::types::AssetType::Stock,
-            status: super::types::AssetStatus::Active,
-            exchange: super::types::AssetExchange::NYSE,
-            tradable: true,
-            marginable: true,
-            shortable: true,
-            fractional: true,
-            min_order_size: None,
-            quantity_base: None,
-            max_order_size: None,
-            min_price_increment: None,
-            price_base: None,
-            contract_size: None,
-        };
+        let asset = self
+            .asset_metadata
+            .get(&insight.symbol)
+            .map(|asset| {
+                let mut asset = asset.clone();
+                asset.fees = self.asset_fees.clone();
+                asset
+            })
+            .unwrap_or_else(|| Asset {
+                id: Uuid::new_v4().to_string(),
+                symbol: insight.symbol.clone(),
+                name: insight.symbol.clone(),
+                asset_type: super::types::AssetType::Stock,
+                status: super::types::AssetStatus::Active,
+                exchange: super::types::AssetExchange::NYSE,
+                tradable: true,
+                marginable: true,
+                shortable: true,
+                fractional: true,
+                min_order_size: None,
+                quantity_base: None,
+                max_order_size: None,
+                min_price_increment: None,
+                price_base: None,
+                contract_size: None,
+                fees: self.asset_fees.clone(),
+            });
 
         // Build bracket legs from insight if applicable
         let legs = if insight.order_class == OrderClass::Bracket {
@@ -1240,13 +1380,20 @@ impl OrderManagementProvider for PaperBroker {
             submitted_at: now_ts,
             filled_at: None,
             realized_pnl: None,
+            commission: None,
+            swap: None,
             rejection_reason: None,
             legs,
         };
 
         // Validate affordability up front when the trigger price is already known.
         if let Some(estimated_price) = order.limit_price.or(order.stop_price) {
-            if let Some(reason) = self.insufficient_funds_reason(order.qty, estimated_price) {
+            if let Some(reason) = self.insufficient_funds_reason(
+                &order.side,
+                order.qty,
+                estimated_price,
+                order.asset.contract_size,
+            ) {
                 let mut rejected_order = order.clone();
                 rejected_order.status = TradeUpdateEvent::Rejected;
                 rejected_order.rejection_reason = Some(reason);

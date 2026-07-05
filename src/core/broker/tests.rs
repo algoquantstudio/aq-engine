@@ -1,12 +1,15 @@
-use super::traits::{DataFeed, DataProvider, OrderManagementProvider};
+use super::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
 use super::types::{
-    AccountType, Asset, Bar, BrokerError, OrderSide, OrderType, Quote, TradeUpdateEvent,
+    AccountType, Asset, AssetCommissionFees, AssetExchange, AssetFee, AssetFees, AssetSideFees,
+    AssetStatus, AssetSwapFees, AssetType, Bar, BrokerError, OrderSide, OrderType, Quote,
+    TradeUpdateEvent,
 };
 use super::{DataStreamMode, UnifiedBroker, paper_broker::PaperBroker};
 use crate::core::insight::Insight;
 use crate::core::insight::types::StrategyType;
 use crate::core::utils::timeframe::TimeFrame;
 use crate::core::utils::timeframe::TimeFrameUnit;
+use crate::core::utils::tools::dynamic_round_for_asset;
 use chrono::Utc;
 use polars::prelude::*;
 use std::collections::HashMap;
@@ -480,4 +483,163 @@ async fn test_paper_broker_rejects_market_order_when_fill_would_overdraw_cash() 
                 .unwrap_or_default()
                 .contains("Insufficient funds")
     }));
+}
+
+#[tokio::test]
+async fn test_paper_broker_applies_side_specific_commission_and_swap_fees() {
+    let fees = AssetFees {
+        commission: AssetCommissionFees {
+            entry: AssetSideFees {
+                long: AssetFee::PercentagePerContractFee(0.001),
+                short: AssetFee::PerContractFee(3.0),
+            },
+            exit: AssetSideFees {
+                long: AssetFee::FixedFee(2.0),
+                short: AssetFee::PercentageFee(0.001),
+            },
+        },
+        swap: AssetSwapFees {
+            long: AssetFee::Points(-1.0),
+            short: AssetFee::PercentagePerContractFee(0.0001),
+        },
+        ..AssetFees::default()
+    };
+    let broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1).with_asset_fees(fees);
+    broker
+        .configure_asset_metadata(&Asset {
+            id: "asset-aapl".to_string(),
+            symbol: "AAPL".to_string(),
+            name: "AAPL".to_string(),
+            asset_type: AssetType::Stock,
+            status: AssetStatus::Active,
+            exchange: AssetExchange::NASDAQ,
+            tradable: true,
+            marginable: true,
+            shortable: true,
+            fractional: true,
+            min_order_size: None,
+            quantity_base: None,
+            max_order_size: None,
+            min_price_increment: Some(0.01),
+            price_base: None,
+            contract_size: Some(10),
+            fees: AssetFees::default(),
+        })
+        .expect("paper broker should accept asset metadata");
+
+    let mut insight = Insight::new(
+        OrderSide::Buy,
+        "AAPL".to_string(),
+        StrategyType::Testing,
+        TimeFrame::new(1, TimeFrameUnit::Minute),
+        80,
+        None,
+    );
+    insight.set_quantity(Some(2.0));
+
+    let order = broker
+        .submit_order(insight)
+        .await
+        .expect("paper broker should accept fee test insight");
+
+    let entry_time = Utc::now();
+    let mut entry_bars = HashMap::new();
+    entry_bars.insert(
+        "AAPL".to_string(),
+        Bar {
+            symbol: "AAPL".to_string(),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1_000.0,
+            timestamp: entry_time,
+        },
+    );
+    broker.process_step(&entry_bars, entry_time);
+    let filled_events = broker.drain_trade_events();
+    let filled_order = filled_events
+        .iter()
+        .find_map(|(event_order, event)| {
+            (*event == TradeUpdateEvent::Filled).then_some(event_order)
+        })
+        .expect("filled trade event should be emitted");
+
+    assert_eq!(
+        dynamic_round_for_asset(
+            filled_order.commission.unwrap_or_default(),
+            &filled_order.asset
+        ),
+        dynamic_round_for_asset(2.0, &filled_order.asset),
+        "entry commission should use registered contract size"
+    );
+
+    broker
+        .close_position(&order.order_id, 0.0, Some(110.0))
+        .await
+        .expect("paper broker should queue close request");
+
+    let close_time = entry_time + chrono::Duration::days(1);
+    let mut close_bars = HashMap::new();
+    close_bars.insert(
+        "AAPL".to_string(),
+        Bar {
+            symbol: "AAPL".to_string(),
+            open: 110.0,
+            high: 111.0,
+            low: 109.0,
+            close: 110.0,
+            volume: 1_000.0,
+            timestamp: close_time,
+        },
+    );
+    broker.process_step(&close_bars, close_time);
+
+    let closed_events = broker.drain_trade_events();
+    let closed_order = closed_events
+        .iter()
+        .find_map(|(event_order, event)| {
+            (*event == TradeUpdateEvent::Closed).then_some(event_order)
+        })
+        .expect("closed trade event should be emitted");
+
+    let expected_entry_commission = 2.0;
+    let expected_exit_commission = 2.0;
+    let expected_swap = -0.2;
+    let expected_net_pnl =
+        20.0 + expected_swap - expected_entry_commission - expected_exit_commission;
+
+    assert_eq!(
+        dynamic_round_for_asset(
+            closed_order.commission.unwrap_or_default(),
+            &closed_order.asset
+        ),
+        dynamic_round_for_asset(
+            expected_entry_commission + expected_exit_commission,
+            &closed_order.asset,
+        )
+    );
+    assert_eq!(
+        dynamic_round_for_asset(closed_order.swap.unwrap_or_default(), &closed_order.asset),
+        dynamic_round_for_asset(expected_swap, &closed_order.asset)
+    );
+    assert_eq!(
+        dynamic_round_for_asset(
+            closed_order.realized_pnl.unwrap_or_default(),
+            &closed_order.asset
+        ),
+        dynamic_round_for_asset(expected_net_pnl, &closed_order.asset)
+    );
+
+    let account = broker
+        .get_account()
+        .await
+        .expect("paper account should remain readable");
+    assert_eq!(
+        dynamic_round_for_asset(account.accrued_commission, &closed_order.asset),
+        dynamic_round_for_asset(
+            expected_entry_commission + expected_exit_commission,
+            &closed_order.asset,
+        )
+    );
 }

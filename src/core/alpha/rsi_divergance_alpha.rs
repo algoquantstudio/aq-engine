@@ -481,6 +481,7 @@ mod tests {
                 min_price_increment: Some(0.01),
                 price_base: Some(2),
                 contract_size: None,
+                fees: Default::default(),
             };
             Self {
                 universe: HashMap::from([(symbol.to_string(), asset)]),

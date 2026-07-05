@@ -334,6 +334,7 @@ impl DataProvider for YahooFinanceDataFeed {
             min_price_increment: Some(1.0 / 10f64.powf(price_hint as f64)),
             price_base: Some(price_hint),
             contract_size: None,
+            fees: Default::default(),
         };
 
         ticker_info.insert(symbol.to_string(), asset.clone());

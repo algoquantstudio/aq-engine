@@ -28,5 +28,9 @@ pub struct BacktestTradeLogRow {
     #[serde(alias = "return_pct")]
     pub return_pct: Option<f64>,
     pub pnl: Option<f64>,
+    #[serde(default)]
+    pub commission: Option<f64>,
+    #[serde(default)]
+    pub swap: Option<f64>,
     pub status: String,
 }

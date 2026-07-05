@@ -3,7 +3,9 @@ use serde::Serialize;
 use surrealdb::types::SurrealValue;
 
 use super::live_metrics::LiveMetricsSnapshot;
-use crate::core::broker::types::{Asset, AssetExchange, AssetStatus, AssetType};
+use crate::core::broker::types::{
+    Asset, AssetExchange, AssetFee, AssetFees, AssetStatus, AssetType,
+};
 
 #[derive(Clone, Debug)]
 pub struct AqsAuth {
@@ -84,6 +86,7 @@ pub struct StrategyAccountSnapshotRecord {
     pub cash: f64,
     pub currency: String,
     pub buying_power: f64,
+    pub accrued_commission: f64,
     pub shorting_enabled: bool,
     pub leverage: i64,
 }
@@ -106,6 +109,39 @@ pub struct StrategyUniverseAssetRecord {
     pub min_price_increment: Option<f64>,
     pub price_base: Option<i64>,
     pub contract_size: Option<i64>,
+    pub fees: StrategyUniverseAssetFeesRecord,
+}
+
+#[derive(Debug, Clone, Serialize, SurrealValue)]
+pub struct StrategyUniverseAssetFeesRecord {
+    pub commission: StrategyUniverseAssetCommissionFeesRecord,
+    pub swap: StrategyUniverseAssetSwapFeesRecord,
+    pub entry: StrategyUniverseAssetFeeRecord,
+    pub exit: StrategyUniverseAssetFeeRecord,
+}
+
+#[derive(Debug, Clone, Serialize, SurrealValue)]
+pub struct StrategyUniverseAssetCommissionFeesRecord {
+    pub entry: StrategyUniverseAssetSideFeesRecord,
+    pub exit: StrategyUniverseAssetSideFeesRecord,
+}
+
+#[derive(Debug, Clone, Serialize, SurrealValue)]
+pub struct StrategyUniverseAssetSideFeesRecord {
+    pub long: StrategyUniverseAssetFeeRecord,
+    pub short: StrategyUniverseAssetFeeRecord,
+}
+
+#[derive(Debug, Clone, Serialize, SurrealValue)]
+pub struct StrategyUniverseAssetSwapFeesRecord {
+    pub long: StrategyUniverseAssetFeeRecord,
+    pub short: StrategyUniverseAssetFeeRecord,
+}
+
+#[derive(Debug, Clone, Serialize, SurrealValue)]
+pub struct StrategyUniverseAssetFeeRecord {
+    pub kind: String,
+    pub value: Option<f64>,
 }
 
 impl From<&Asset> for StrategyUniverseAssetRecord {
@@ -127,6 +163,61 @@ impl From<&Asset> for StrategyUniverseAssetRecord {
             min_price_increment: value.min_price_increment,
             price_base: value.price_base,
             contract_size: value.contract_size,
+            fees: StrategyUniverseAssetFeesRecord::from(&value.fees),
+        }
+    }
+}
+
+impl From<&AssetFees> for StrategyUniverseAssetFeesRecord {
+    fn from(value: &AssetFees) -> Self {
+        Self {
+            commission: StrategyUniverseAssetCommissionFeesRecord {
+                entry: StrategyUniverseAssetSideFeesRecord {
+                    long: StrategyUniverseAssetFeeRecord::from(&value.commission.entry.long),
+                    short: StrategyUniverseAssetFeeRecord::from(&value.commission.entry.short),
+                },
+                exit: StrategyUniverseAssetSideFeesRecord {
+                    long: StrategyUniverseAssetFeeRecord::from(&value.commission.exit.long),
+                    short: StrategyUniverseAssetFeeRecord::from(&value.commission.exit.short),
+                },
+            },
+            swap: StrategyUniverseAssetSwapFeesRecord {
+                long: StrategyUniverseAssetFeeRecord::from(&value.swap.long),
+                short: StrategyUniverseAssetFeeRecord::from(&value.swap.short),
+            },
+            entry: StrategyUniverseAssetFeeRecord::from(&value.entry),
+            exit: StrategyUniverseAssetFeeRecord::from(&value.exit),
+        }
+    }
+}
+
+impl From<&AssetFee> for StrategyUniverseAssetFeeRecord {
+    fn from(value: &AssetFee) -> Self {
+        match value {
+            AssetFee::None => Self {
+                kind: "none".to_string(),
+                value: None,
+            },
+            AssetFee::Points(points) => Self {
+                kind: "points".to_string(),
+                value: Some(*points),
+            },
+            AssetFee::PercentageFee(rate) => Self {
+                kind: "percentageFee".to_string(),
+                value: Some(*rate),
+            },
+            AssetFee::FixedFee(amount) => Self {
+                kind: "fixedFee".to_string(),
+                value: Some(*amount),
+            },
+            AssetFee::PerContractFee(amount) => Self {
+                kind: "perContractFee".to_string(),
+                value: Some(*amount),
+            },
+            AssetFee::PercentagePerContractFee(rate) => Self {
+                kind: "percentagePerContractFee".to_string(),
+                value: Some(*rate),
+            },
         }
     }
 }
@@ -136,6 +227,7 @@ pub struct StrategyEquityPointRecord {
     pub equity: f64,
     pub cash: f64,
     pub buying_power: f64,
+    pub accrued_commission: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +235,7 @@ pub struct LatestPersistedAccountState {
     pub equity: f64,
     pub cash: f64,
     pub buying_power: f64,
+    pub accrued_commission: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

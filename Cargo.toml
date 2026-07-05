@@ -1,6 +1,6 @@
 [package]
 name = "aq-engine"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["Moustapha Diaby <contact@isaacdiaby.tech>"]
 description = "AlgoQuant Engine"
 documentation = "https://algoquantstudio.com"

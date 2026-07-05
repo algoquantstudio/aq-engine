@@ -56,6 +56,7 @@ pub struct InsightSnapshot {
     pub insight_id: String,
     pub parent_id: Option<String>,
     pub state: String,
+    #[serde(default)]
     pub children: Vec<serde_json::Value>,
     pub order_id: Option<String>,
     pub side: String,
@@ -79,6 +80,9 @@ pub struct InsightSnapshot {
     pub close_order_id: Option<String>,
     pub close_price: Option<f64>,
     pub broker_realized_pnl: Option<f64>,
+    pub commission: Option<f64>,
+    #[serde(default)]
+    pub swap: Option<f64>,
     pub partial_closes: Vec<InsightPartialCloseSnapshot>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -244,6 +248,8 @@ impl InsightSnapshot {
             close_order_id: insight.close_order_id.clone(),
             close_price: insight.close_price,
             broker_realized_pnl: insight.broker_realized_pnl,
+            commission: insight.commission,
+            swap: insight.swap,
             partial_closes: insight
                 .partial_closes
                 .iter()

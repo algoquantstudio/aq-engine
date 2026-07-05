@@ -213,6 +213,7 @@ mod tests {
                 cash: 10_000.0,
                 currency: "USD".to_string(),
                 buying_power: 10_000.0,
+                accrued_commission: 0.0,
                 shorting_enabled: true,
                 leverage: 1,
             })

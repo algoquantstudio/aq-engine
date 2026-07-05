@@ -715,8 +715,9 @@ ENUM_ORDER_TYPE_FILLING PreferredFillingType(string symbol)
    return ORDER_FILLING_RETURN;
 }
 
-bool ClosePositionWithComment(ulong position_ticket, string symbol, double qty, string comment, uint &retcode)
+bool ClosePositionWithComment(ulong position_ticket, string symbol, double qty, string comment, uint &retcode, ulong &deal_ticket)
 {
+   deal_ticket = 0;
    if(position_ticket == 0 || !PositionSelectByTicket(position_ticket))
    {
       retcode = 0;
@@ -760,6 +761,7 @@ bool ClosePositionWithComment(ulong position_ticket, string symbol, double qty, 
 
    bool ok = OrderSend(request, result);
    retcode = result.retcode;
+   deal_ticket = result.deal;
    return ok && IsTradeRetcodeSuccess(result.retcode);
 }
 
@@ -956,6 +958,47 @@ bool IsShortable(string symbol)
    return trade_mode == SYMBOL_TRADE_MODE_FULL || trade_mode == SYMBOL_TRADE_MODE_SHORTONLY;
 }
 
+string AssetFeeJson(long swap_mode, double value)
+{
+   if(swap_mode == SYMBOL_SWAP_MODE_DISABLED || MathAbs(value) <= 0.00000001)
+      return "\"none\"";
+
+   if(swap_mode == SYMBOL_SWAP_MODE_POINTS)
+      return "{\"points\":" + DoubleToString(value, 8) + "}";
+   if(swap_mode == SYMBOL_SWAP_MODE_CURRENCY_SYMBOL
+      || swap_mode == SYMBOL_SWAP_MODE_CURRENCY_MARGIN
+      || swap_mode == SYMBOL_SWAP_MODE_CURRENCY_DEPOSIT
+      || swap_mode == SYMBOL_SWAP_MODE_CURRENCY_PROFIT)
+      return "{\"perContractFee\":" + DoubleToString(value, 8) + "}";
+   if(swap_mode == SYMBOL_SWAP_MODE_INTEREST_CURRENT
+      || swap_mode == SYMBOL_SWAP_MODE_INTEREST_OPEN)
+      return "{\"percentagePerContractFee\":" + DoubleToString(value / 100.0 / 360.0, 12) + "}";
+   if(swap_mode == SYMBOL_SWAP_MODE_REOPEN_CURRENT
+      || swap_mode == SYMBOL_SWAP_MODE_REOPEN_BID)
+      return "{\"points\":" + DoubleToString(value, 8) + "}";
+
+   return "\"none\"";
+}
+
+string AssetFeesJson(string symbol)
+{
+   long swap_mode = SymbolInfoInteger(symbol, SYMBOL_SWAP_MODE);
+   double swap_long = SymbolInfoDouble(symbol, SYMBOL_SWAP_LONG);
+   double swap_short = SymbolInfoDouble(symbol, SYMBOL_SWAP_SHORT);
+   return "{"
+      "\"commission\":{"
+         "\"entry\":{\"long\":\"none\",\"short\":\"none\"},"
+         "\"exit\":{\"long\":\"none\",\"short\":\"none\"}"
+      "},"
+      "\"swap\":{"
+         "\"long\":" + AssetFeeJson(swap_mode, swap_long) + ","
+         "\"short\":" + AssetFeeJson(swap_mode, swap_short) +
+      "},"
+      "\"entry\":\"none\","
+      "\"exit\":\"none\""
+   "}";
+}
+
 string AssetJson(string symbol)
 {
    SymbolSelect(symbol, true);
@@ -986,7 +1029,8 @@ string AssetJson(string symbol)
       "\"max_order_size\":" + DoubleToString(volume_max, 8) + ","
       "\"min_price_increment\":" + DoubleToString(point, 10) + ","
       "\"price_base\":" + IntegerToString(digits) + ","
-      "\"contract_size\":" + IntegerToString(contract_size) +
+      "\"contract_size\":" + IntegerToString(contract_size) + ","
+      "\"fees\":" + AssetFeesJson(symbol) +
    "}";
 }
 
@@ -1233,7 +1277,7 @@ bool FindEntryOrderForPosition(ulong position_id, string symbol, string &entry_o
    return false;
 }
 
-string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false, string insight_id = "", string strategy_type = "", string legs_json = "")
+string OrderJson(string order_id, string symbol, double qty, string side, string order_type, string status, double price, string rejection_reason = "", double realized_pnl = 0.0, bool has_realized_pnl = false, string insight_id = "", string strategy_type = "", string legs_json = "", double commission = 0.0, bool has_commission = false, double swap = 0.0, bool has_swap = false)
 {
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    datetime now_utc = BrokerNowUtc();
@@ -1257,6 +1301,8 @@ string OrderJson(string order_id, string symbol, double qty, string side, string
       "\"submitted_at\":" + IntegerToString((int)now_utc) + ","
       "\"filled_at\":" + ((status == "Filled" || status == "Closed") ? IntegerToString((int)now_utc) : "null") + ","
       "\"realized_pnl\":" + (has_realized_pnl ? DoubleToString(realized_pnl, 8) : "null") + ","
+      "\"commission\":" + (has_commission ? DoubleToString(commission, 8) : "null") + ","
+      "\"swap\":" + (has_swap ? DoubleToString(swap, 8) : "null") + ","
       "\"rejection_reason\":" + JsonNullableString(rejection_reason) + ","
       "\"legs\":" + (legs_json == "" ? "null" : legs_json) +
    "}";
@@ -1833,8 +1879,15 @@ void ExecuteRpcRequest(int bridge_index, string json)
          }
       }
       uint retcode = 0;
-      bool ok = position_ticket > 0 && ClosePositionWithComment(position_ticket, close_symbol, close_qty, comment, retcode);
+      ulong result_deal = 0;
+      bool ok = position_ticket > 0 && ClosePositionWithComment(position_ticket, close_symbol, close_qty, comment, retcode, result_deal);
       string reason = position_ticket == 0 ? "position ticket not found" : (ok ? "" : IntegerToString((int)retcode));
+      double realized_pnl = 0.0;
+      bool has_realized_pnl = false;
+      double commission = 0.0;
+      bool has_commission = false;
+      double swap = 0.0;
+      bool has_swap = false;
       if(ok)
       {
          double result_price = trade.ResultPrice();
@@ -1847,9 +1900,25 @@ void ExecuteRpcRequest(int bridge_index, string json)
             close_price = close_side == "Sell" ? (tick.bid > 0.0 ? tick.bid : SymbolInfoDouble(close_symbol, SYMBOL_BID))
                                                : (tick.ask > 0.0 ? tick.ask : SymbolInfoDouble(close_symbol, SYMBOL_ASK));
          }
+         if(result_deal > 0 && HistoryDealSelect(result_deal))
+         {
+            commission = MathAbs(
+               HistoryDealGetDouble(result_deal, DEAL_COMMISSION)
+               + HistoryDealGetDouble(result_deal, DEAL_FEE)
+            );
+            has_commission = true;
+            swap = HistoryDealGetDouble(result_deal, DEAL_SWAP);
+            has_swap = true;
+            realized_pnl =
+               HistoryDealGetDouble(result_deal, DEAL_PROFIT)
+               + HistoryDealGetDouble(result_deal, DEAL_COMMISSION)
+               + HistoryDealGetDouble(result_deal, DEAL_SWAP)
+               + HistoryDealGetDouble(result_deal, DEAL_FEE);
+            has_realized_pnl = true;
+         }
       }
       string payload = ok
-         ? OrderJson(IntegerToString((long)position_ticket), close_symbol, close_qty, close_side, "Market", "Closed", close_price, "", 0.0, false, insight_id, strategy_type)
+         ? OrderJson(IntegerToString((long)position_ticket), close_symbol, close_qty, close_side, "Market", "Closed", close_price, "", realized_pnl, has_realized_pnl, insight_id, strategy_type, "", commission, has_commission, swap, has_swap)
          : "{\"closed\":false}";
       SendRpcResponse(bridge_index, request_id, ok, reason, payload, action);
       return;
@@ -1864,7 +1933,8 @@ void ExecuteRpcRequest(int bridge_index, string json)
             ? PositionGetString(POSITION_SYMBOL)
             : "";
          uint retcode = 0;
-         if(sym != "") ok = ClosePositionWithComment(position_ticket, sym, 0.0, comment, retcode) && ok;
+         ulong result_deal = 0;
+         if(sym != "") ok = ClosePositionWithComment(position_ticket, sym, 0.0, comment, retcode, result_deal) && ok;
       }
       SendRpcResponse(bridge_index, request_id, ok, ok ? "" : IntegerToString((int)GetLastError()), "{\"closed\":true}", action);
       return;
@@ -2136,6 +2206,10 @@ void OnTradeTransaction(
    double price = result.price;
    double realized_pnl = 0.0;
    bool has_realized_pnl = false;
+   bool has_commission = false;
+   double commission = 0.0;
+   bool has_swap = false;
+   double swap = 0.0;
    string event_order_id = IntegerToString((long)trans.order);
    ulong deal_position_id = 0;
    string entry_order_id = "";
@@ -2157,6 +2231,13 @@ void OnTradeTransaction(
       {
          event_name = "Closed";
          hit_leg = HitLegFromDeal(deal_reason, deal_comment);
+         commission = MathAbs(
+            HistoryDealGetDouble(trans.deal, DEAL_COMMISSION)
+            + HistoryDealGetDouble(trans.deal, DEAL_FEE)
+         );
+         has_commission = true;
+         swap = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
+         has_swap = true;
          realized_pnl =
             HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
             + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION)
@@ -2227,7 +2308,7 @@ void OnTradeTransaction(
    string payload = "{"
       "\"nativeEventId\":\"" + JsonEscape(native_id) + "\","
       "\"event\":\"" + event_name + "\","
-      "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl, route_insight_id, route_strategy_type, legs_json) +
+      "\"order\":" + OrderJson(event_order_id, symbol, volume, side, "Market", event_name, price, "", realized_pnl, has_realized_pnl, route_insight_id, route_strategy_type, legs_json, commission, has_commission, swap, has_swap) +
    "}";
    QueueTradeEvent(route_bridge, payload);
    g_bridges[route_bridge].last_trade_event_flush_ms = GetTickCount();

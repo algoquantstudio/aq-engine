@@ -28,7 +28,7 @@ use log::{debug, info};
 use parking_lot::RwLock;
 use polars::prelude::*;
 use std::sync::Arc;
-use types::{AccountType, Bar, BrokerError, Order};
+use types::{AccountType, Asset, Bar, BrokerError, Order};
 
 // ─────────────────────── UnifiedBroker ───────────────────────
 
@@ -171,6 +171,10 @@ where
     }
     fn get_account_type(&self) -> Result<AccountType, BrokerError> {
         self.execution.get_account_type()
+    }
+
+    fn configure_asset_metadata(&self, asset: &Asset) -> Result<(), BrokerError> {
+        self.execution.configure_asset_metadata(asset)
     }
 }
 
@@ -758,6 +762,10 @@ pub mod traits {
         fn get_account_type(&self) -> Result<AccountType, BrokerError>;
 
         fn configure_live_session(&self, _session_id: &str) -> Result<(), BrokerError> {
+            Ok(())
+        }
+
+        fn configure_asset_metadata(&self, _asset: &Asset) -> Result<(), BrokerError> {
             Ok(())
         }
     }

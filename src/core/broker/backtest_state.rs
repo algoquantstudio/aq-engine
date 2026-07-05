@@ -407,6 +407,8 @@ pub struct BacktestMetrics {
 pub struct AccountHistoryItem {
     pub timestamp: DateTime<Utc>,
     pub equity: f64,
+    #[serde(default)]
+    pub accrued_commission: f64,
 }
 
 impl BacktestResults {
@@ -430,15 +432,20 @@ impl BacktestResults {
                             continue;
                         }
 
-                        let pnl = match entry.side {
+                        let gross_pnl = match entry.side {
                             OrderSide::Buy => (rec.price - entry.price) * matched_qty,
                             OrderSide::Sell => (entry.price - rec.price) * matched_qty,
                         };
+                        let entry_commission = if entry.qty.abs() > f64::EPSILON {
+                            entry.commission * (matched_qty / entry.qty)
+                        } else {
+                            0.0
+                        };
+                        let commission = entry_commission + rec.commission;
+                        let swap = rec.swap;
+                        let pnl = gross_pnl + swap - commission;
                         let return_pct = if entry.price != 0.0 {
-                            match entry.side {
-                                OrderSide::Buy => (rec.price - entry.price) / entry.price * 100.0,
-                                OrderSide::Sell => (entry.price - rec.price) / entry.price * 100.0,
-                            }
+                            (pnl / (entry.price * matched_qty)) * 100.0
                         } else {
                             0.0
                         };
@@ -456,6 +463,8 @@ impl BacktestResults {
                             exit_price: rec.price,
                             qty: matched_qty,
                             pnl,
+                            commission,
+                            swap,
                             return_pct,
                             hold_secs,
                         });
@@ -977,6 +986,10 @@ pub struct RoundTripTrade {
     pub qty: f64,
     /// Dollar PnL (positive = profit, negative = loss).
     pub pnl: f64,
+    #[serde(default)]
+    pub commission: f64,
+    #[serde(default)]
+    pub swap: f64,
     /// % return relative to entry price.
     pub return_pct: f64,
     /// How long the position was held (seconds).
@@ -1521,6 +1534,7 @@ mod tests {
             cash: equity,
             currency: "USD".to_string(),
             buying_power: equity,
+            accrued_commission: 0.0,
             shorting_enabled: true,
             leverage: 1,
         }

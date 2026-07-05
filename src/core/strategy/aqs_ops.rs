@@ -10,7 +10,7 @@ use super::traits::{Strategy, StrategyContext};
 use super::{StrategyMode, StrategyState, StrategyStatus};
 use crate::core::broker::DataStreamMode;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
-use crate::core::broker::types::{Account, BrokerError};
+use crate::core::broker::types::{Account, BrokerError, Order, Position, TradeUpdateEvent};
 use crate::core::events::{MarketDataEvent, ResolvedEventStream};
 use crate::core::insight::InsightSnapshot;
 use crate::core::insight::types::InsightState;
@@ -41,6 +41,7 @@ const LIVE_SYNC_RECONCILE_SECS: u64 = 15 * 60;
 const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 40;
 const LIVE_SYNC_FLUSH_MS: u64 = 500;
 const LIVE_SYNC_MAX_INSIGHTS_PER_FLUSH: usize = 128;
+const LIVE_STARTUP_CLEANUP_MAX_CONCURRENT_BROKER_OPS: usize = 8;
 const LIVE_ACCOUNT_SYNC_SECS: u64 = 5;
 const LOCAL_LIVE_METRICS_WRITE_SECS: u64 = 5;
 const MAX_PENDING_LOCAL_LIVE_EVENTS: usize = 512;
@@ -73,7 +74,53 @@ struct PendingLocalLiveEvent {
     level: String,
     title: String,
     message: String,
-    payload: Option<serde_json::Value>,
+    details: LocalLiveEventDetails,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalLiveEventDetails {
+    run_id: Option<String>,
+    strategy_id: Option<String>,
+    strategy_name: Option<String>,
+    node_id: Option<String>,
+    order_id: Option<String>,
+    symbol: Option<String>,
+    broker_event: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteStartupInsight {
+    insight_id: String,
+    symbol: String,
+    previous_state: String,
+    side: String,
+    order_id: Option<String>,
+    live_session_id: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StartupBrokerActionKind {
+    CancelOrder,
+    ClosePosition,
+}
+
+#[derive(Clone, Debug)]
+struct StartupBrokerAction {
+    remote: RemoteStartupInsight,
+    order_id: String,
+    broker_order_status: String,
+    broker_position_qty: Option<f64>,
+    action: StartupBrokerActionKind,
+}
+
+#[derive(Clone, Debug)]
+struct StartupCleanupDecision {
+    remote: RemoteStartupInsight,
+    target_state: String,
+    broker_order_status: Option<String>,
+    broker_action: Option<String>,
+    broker_error: Option<String>,
+    broker_position_qty: Option<f64>,
 }
 
 fn enqueue_pending_local_live_event(
@@ -101,7 +148,7 @@ async fn flush_pending_local_live_events(
                 &event.level,
                 &event.title,
                 &event.message,
-                event.payload,
+                event.details,
             )
             .await
         {
@@ -162,27 +209,21 @@ impl LocalLiveRunArtifacts {
         };
         artifacts.init_schema().await?;
 
-        let manifest = serde_json::json!({
-            "run_id": artifacts.run_id.clone(),
-            "strategy_id": strategy_id.to_string(),
-            "strategy_name": strategy_name,
-            "mode": format!("{:?}", mode),
-            "status": "running",
-            "started_at": started_at,
-            "database_file": "live.db",
-        });
-        artifacts.upsert_metadata("run", &manifest).await?;
+        artifacts
+            .upsert_run_metadata(strategy_id, strategy_name, mode, started_at)
+            .await?;
         artifacts
             .append_event(
                 "lifecycle",
                 "info",
                 "Local live run started",
                 "AQS Cloud auth was not provided; AQE is writing local live run artifacts",
-                Some(serde_json::json!({
-                    "run_id": artifacts.run_id.clone(),
-                    "strategy_id": strategy_id.to_string(),
-                    "strategy_name": strategy_name,
-                })),
+                LocalLiveEventDetails {
+                    run_id: Some(artifacts.run_id.clone()),
+                    strategy_id: Some(strategy_id.to_string()),
+                    strategy_name: Some(strategy_name.to_string()),
+                    ..Default::default()
+                },
             )
             .await?;
 
@@ -195,7 +236,15 @@ impl LocalLiveRunArtifacts {
                 r#"
                 CREATE TABLE IF NOT EXISTS run_metadata (
                     key TEXT PRIMARY KEY,
-                    payload_json TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    strategy_id TEXT,
+                    strategy_name TEXT,
+                    mode TEXT,
+                    status TEXT,
+                    message TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    database_file TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -205,24 +254,71 @@ impl LocalLiveRunArtifacts {
                     level TEXT NOT NULL,
                     title TEXT NOT NULL,
                     message TEXT NOT NULL,
-                    payload_json TEXT,
+                    run_id TEXT,
+                    strategy_id TEXT,
+                    strategy_name TEXT,
+                    node_id TEXT,
+                    order_id TEXT,
+                    symbol TEXT,
+                    broker_event TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_live_events_created_at ON events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_live_events_type ON events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_live_events_symbol ON events(symbol);
+                CREATE INDEX IF NOT EXISTS idx_live_events_order_id ON events(order_id);
 
                 CREATE TABLE IF NOT EXISTS metrics_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     captured_at TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    starting_cash REAL NOT NULL,
                     final_equity REAL NOT NULL,
                     total_return REAL NOT NULL,
                     total_return_pct REAL NOT NULL,
+                    total_trades INTEGER NOT NULL,
+                    winning_trades INTEGER NOT NULL,
+                    losing_trades INTEGER NOT NULL,
+                    win_rate REAL NOT NULL,
+                    max_drawdown REAL NOT NULL,
+                    cagr REAL NOT NULL,
+                    annualized_volatility REAL NOT NULL,
+                    sharpe_ratio REAL NOT NULL,
+                    sortino_ratio REAL NOT NULL,
+                    calmar_ratio REAL NOT NULL,
+                    max_drawdown_duration_days REAL NOT NULL,
+                    expectancy REAL NOT NULL,
+                    profit_factor REAL NOT NULL,
+                    payoff_ratio REAL NOT NULL,
+                    avg_winner REAL NOT NULL,
+                    avg_loser REAL NOT NULL,
+                    avg_winner_pct REAL NOT NULL,
+                    avg_loser_pct REAL NOT NULL,
+                    best_trade REAL NOT NULL,
+                    worst_trade REAL NOT NULL,
+                    consistency_score REAL NOT NULL,
+                    longest_winning_trade_held_secs INTEGER NOT NULL,
+                    longest_losing_trade_held_secs INTEGER NOT NULL,
+                    average_trade_held_secs INTEGER NOT NULL,
                     open_positions_count INTEGER NOT NULL,
                     open_insights_count INTEGER NOT NULL,
-                    total_trades INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL
+                    open_positions_unrealized_pnl REAL NOT NULL,
+                    open_positions_profitable_count INTEGER NOT NULL,
+                    open_positions_losing_count INTEGER NOT NULL,
+                    executed_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_live_metrics_captured_at ON metrics_snapshots(captured_at);
+                CREATE INDEX IF NOT EXISTS idx_live_metrics_run_id ON metrics_snapshots(run_id);
+
+                CREATE TABLE IF NOT EXISTS metrics_snapshot_symbols (
+                    snapshot_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, symbol),
+                    FOREIGN KEY(snapshot_id) REFERENCES metrics_snapshots(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_metric_symbols_symbol ON metrics_snapshot_symbols(symbol);
                 "#,
             )
             .await
@@ -248,38 +344,87 @@ impl LocalLiveRunArtifacts {
         }
 
         let saved_snapshot = snapshot.clone();
-        let payload_json = serde_json::to_string(&serde_json::json!({
-            "run_id": self.run_id,
-            "updated_at": chrono::Utc::now(),
-            "metrics": snapshot,
-        }))
-        .map_err(|error| {
-            BrokerError::ConnectionError(format!(
-                "Failed to serialise local live metrics for {}: {}",
-                self.run_id, error
-            ))
-        })?;
         self.conn
             .execute(
                 "INSERT INTO metrics_snapshots (
                     captured_at,
+                    run_id,
+                    starting_cash,
                     final_equity,
                     total_return,
                     total_return_pct,
+                    total_trades,
+                    winning_trades,
+                    losing_trades,
+                    win_rate,
+                    max_drawdown,
+                    cagr,
+                    annualized_volatility,
+                    sharpe_ratio,
+                    sortino_ratio,
+                    calmar_ratio,
+                    max_drawdown_duration_days,
+                    expectancy,
+                    profit_factor,
+                    payoff_ratio,
+                    avg_winner,
+                    avg_loser,
+                    avg_winner_pct,
+                    avg_loser_pct,
+                    best_trade,
+                    worst_trade,
+                    consistency_score,
+                    longest_winning_trade_held_secs,
+                    longest_losing_trade_held_secs,
+                    average_trade_held_secs,
                     open_positions_count,
                     open_insights_count,
-                    total_trades,
-                    payload_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    open_positions_unrealized_pnl,
+                    open_positions_profitable_count,
+                    open_positions_losing_count,
+                    executed_at,
+                    finished_at,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
                 params![
                     saved_snapshot.updated_at.to_rfc3339(),
+                    self.run_id.clone(),
+                    saved_snapshot.starting_cash,
                     saved_snapshot.final_equity,
                     saved_snapshot.total_return,
                     saved_snapshot.total_return_pct,
+                    saved_snapshot.total_trades as i64,
+                    saved_snapshot.winning_trades as i64,
+                    saved_snapshot.losing_trades as i64,
+                    saved_snapshot.win_rate,
+                    saved_snapshot.max_drawdown,
+                    saved_snapshot.cagr,
+                    saved_snapshot.annualized_volatility,
+                    saved_snapshot.sharpe_ratio,
+                    saved_snapshot.sortino_ratio,
+                    saved_snapshot.calmar_ratio,
+                    saved_snapshot.max_drawdown_duration_days,
+                    saved_snapshot.expectancy,
+                    saved_snapshot.profit_factor,
+                    saved_snapshot.payoff_ratio,
+                    saved_snapshot.avg_winner,
+                    saved_snapshot.avg_loser,
+                    saved_snapshot.avg_winner_pct,
+                    saved_snapshot.avg_loser_pct,
+                    saved_snapshot.best_trade,
+                    saved_snapshot.worst_trade,
+                    saved_snapshot.consistency_score,
+                    saved_snapshot.longest_winning_trade_held_secs,
+                    saved_snapshot.longest_losing_trade_held_secs,
+                    saved_snapshot.average_trade_held_secs,
                     saved_snapshot.open_positions_count as i64,
                     saved_snapshot.open_insights_count as i64,
-                    saved_snapshot.total_trades as i64,
-                    payload_json
+                    saved_snapshot.open_positions_unrealized_pnl,
+                    saved_snapshot.open_positions_profitable_count as i64,
+                    saved_snapshot.open_positions_losing_count as i64,
+                    saved_snapshot.executed_at.to_rfc3339(),
+                    saved_snapshot.finished_at.map(|value| value.to_rfc3339()),
+                    saved_snapshot.updated_at.to_rfc3339()
                 ],
             )
             .await
@@ -290,6 +435,23 @@ impl LocalLiveRunArtifacts {
                     error
                 ))
             })?;
+        let snapshot_id = self.conn.last_insert_rowid();
+        for symbol in &saved_snapshot.symbols {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO metrics_snapshot_symbols (snapshot_id, symbol)
+                     VALUES (?1, ?2)",
+                    params![snapshot_id, symbol.clone()],
+                )
+                .await
+                .map_err(|error| {
+                    BrokerError::ConnectionError(format!(
+                        "Failed to write local live metric symbol into {}: {}",
+                        self.db_path.display(),
+                        error
+                    ))
+                })?;
+        }
         self.last_metrics = Some(saved_snapshot);
         Ok(())
     }
@@ -302,15 +464,16 @@ impl LocalLiveRunArtifacts {
     ) -> Result<(), BrokerError> {
         self.write_metrics_if_changed(snapshot, true).await?;
         let finished_at = chrono::Utc::now();
-        self.append_event("lifecycle", "info", status, message, None)
-            .await?;
-        let completed = serde_json::json!({
-            "run_id": self.run_id,
-            "status": status,
-            "message": message,
-            "finished_at": finished_at,
-        });
-        self.upsert_metadata("completion", &completed).await
+        self.append_event(
+            "lifecycle",
+            "info",
+            status,
+            message,
+            LocalLiveEventDetails::default(),
+        )
+        .await?;
+        self.upsert_completion_metadata(status, message, finished_at)
+            .await
     }
 
     async fn append_event(
@@ -319,29 +482,37 @@ impl LocalLiveRunArtifacts {
         level: &str,
         title: &str,
         message: &str,
-        payload: Option<serde_json::Value>,
+        details: LocalLiveEventDetails,
     ) -> Result<(), BrokerError> {
         let created_at = chrono::Utc::now();
-        let payload_json = payload
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| {
-                BrokerError::ConnectionError(format!(
-                    "Failed to serialise local live event for {}: {}",
-                    self.run_id, error
-                ))
-            })?;
         self.conn
             .execute(
-                "INSERT INTO events (event_type, level, title, message, payload_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events (
+                    event_type,
+                    level,
+                    title,
+                    message,
+                    run_id,
+                    strategy_id,
+                    strategy_name,
+                    node_id,
+                    order_id,
+                    symbol,
+                    broker_event,
+                    created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     event_type.to_string(),
                     level.to_string(),
                     title.to_string(),
                     message.to_string(),
-                    payload_json,
+                    details.run_id,
+                    details.strategy_id,
+                    details.strategy_name,
+                    details.node_id,
+                    details.order_id,
+                    details.symbol,
+                    details.broker_event,
                     created_at.to_rfc3339()
                 ],
             )
@@ -356,27 +527,44 @@ impl LocalLiveRunArtifacts {
             .map(|_| ())
     }
 
-    async fn upsert_metadata(
+    async fn upsert_run_metadata(
         &self,
-        key: &str,
-        payload: &serde_json::Value,
+        strategy_id: uuid::Uuid,
+        strategy_name: &str,
+        mode: StrategyMode,
+        started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), BrokerError> {
-        let payload_json = serde_json::to_string(payload).map_err(|error| {
-            BrokerError::ConnectionError(format!(
-                "Failed to serialise local live metadata {} for {}: {}",
-                key, self.run_id, error
-            ))
-        })?;
         self.conn
             .execute(
-                "INSERT INTO run_metadata (key, payload_json, updated_at)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO run_metadata (
+                    key,
+                    run_id,
+                    strategy_id,
+                    strategy_name,
+                    mode,
+                    status,
+                    started_at,
+                    database_file,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(key) DO UPDATE SET
-                    payload_json = excluded.payload_json,
+                    run_id = excluded.run_id,
+                    strategy_id = excluded.strategy_id,
+                    strategy_name = excluded.strategy_name,
+                    mode = excluded.mode,
+                    status = excluded.status,
+                    started_at = excluded.started_at,
+                    database_file = excluded.database_file,
                     updated_at = excluded.updated_at",
                 params![
-                    key.to_string(),
-                    payload_json,
+                    "run".to_string(),
+                    self.run_id.clone(),
+                    strategy_id.to_string(),
+                    strategy_name.to_string(),
+                    format!("{:?}", mode),
+                    "running".to_string(),
+                    started_at.to_rfc3339(),
+                    "live.db".to_string(),
                     chrono::Utc::now().to_rfc3339()
                 ],
             )
@@ -384,6 +572,48 @@ impl LocalLiveRunArtifacts {
             .map_err(|error| {
                 BrokerError::ConnectionError(format!(
                     "Failed to write local live metadata into {}: {}",
+                    self.db_path.display(),
+                    error
+                ))
+            })
+            .map(|_| ())
+    }
+
+    async fn upsert_completion_metadata(
+        &self,
+        status: &str,
+        message: &str,
+        finished_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BrokerError> {
+        self.conn
+            .execute(
+                "INSERT INTO run_metadata (
+                    key,
+                    run_id,
+                    status,
+                    message,
+                    finished_at,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(key) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    status = excluded.status,
+                    message = excluded.message,
+                    finished_at = excluded.finished_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    "completion".to_string(),
+                    self.run_id.clone(),
+                    status.to_string(),
+                    message.to_string(),
+                    finished_at.to_rfc3339(),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .await
+            .map_err(|error| {
+                BrokerError::ConnectionError(format!(
+                    "Failed to write local live completion metadata into {}: {}",
                     self.db_path.display(),
                     error
                 ))
@@ -1139,6 +1369,387 @@ where
         Ok(reconciled)
     }
 
+    async fn cleanup_stale_remote_live_insights_on_start<C: surrealdb::Connection>(
+        &self,
+        client: &surrealdb::Surreal<C>,
+        auth: &AqsAuth,
+        pending_ops: &mut VecDeque<PendingAqsSyncOp>,
+    ) -> Result<usize, surrealdb::Error> {
+        let local_insight_ids = self
+            .insights
+            .ids()
+            .into_iter()
+            .map(|insight_id| insight_id.to_string())
+            .collect::<HashSet<_>>();
+
+        let mut result: IndexedResults = client
+            .query(
+                "SELECT insight_id, symbol, state, side, order_id, live_session_id
+                 FROM insights
+                 WHERE strategy_id = type::record('strategy', $strategy_id)
+                   AND state IN ['New', 'Executed', 'Filled']",
+            )
+            .bind(("strategy_id", auth.strategy_id.clone()))
+            .await?;
+        let rows: Vec<serde_json::Value> = result.take(0)?;
+        let mut remote_insights = Vec::new();
+
+        for row in rows {
+            let Some(insight_id) = row
+                .get("insight_id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+
+            let remote = RemoteStartupInsight {
+                insight_id: insight_id.clone(),
+                symbol: row
+                    .get("symbol")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+                previous_state: row
+                    .get("state")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+                side: row
+                    .get("side")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+                order_id: row
+                    .get("order_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+                live_session_id: row.get("live_session_id").cloned(),
+            };
+
+            if local_insight_ids.contains(&remote.insight_id) {
+                warn!(
+                    "AQS startup cleanup found active remote insight {} for strategy {} that already exists locally; leaving it untouched for future state reload handling",
+                    remote.insight_id, auth.strategy_id
+                );
+                continue;
+            }
+
+            remote_insights.push(remote);
+        }
+
+        if remote_insights.is_empty() {
+            return Ok(0);
+        }
+
+        let (orders_result, positions_result) =
+            tokio::join!(self.broker.get_orders(), self.broker.get_positions());
+
+        let (broker_orders, broker_orders_error) = match orders_result {
+            Ok(orders) => {
+                info!(
+                    "AQS startup cleanup loaded {} broker order(s) to reconcile {} stale remote insight(s) for strategy {}",
+                    orders.len(),
+                    remote_insights.len(),
+                    auth.strategy_id
+                );
+                (
+                    orders
+                        .into_iter()
+                        .map(|order| (order.order_id.clone(), order))
+                        .collect::<HashMap<String, Order>>(),
+                    None,
+                )
+            }
+            Err(error) => {
+                let error = format!("{:?}", error);
+                warn!(
+                    "AQS startup cleanup failed to load broker orders for strategy {}; stale remote insights will be reconciled without broker order confirmation: {}",
+                    auth.strategy_id, error
+                );
+                (HashMap::new(), Some(error))
+            }
+        };
+
+        let broker_positions = match positions_result {
+            Ok(positions) => positions
+                .into_iter()
+                .map(|position| (position.asset.symbol.clone(), position))
+                .collect::<HashMap<String, Position>>(),
+            Err(error) => {
+                warn!(
+                    "AQS startup cleanup failed to load broker positions for strategy {}; position context will be omitted from cleanup events: {:?}",
+                    auth.strategy_id, error
+                );
+                HashMap::new()
+            }
+        };
+
+        let mut decisions = Vec::new();
+        let mut broker_actions = Vec::new();
+        let mut missing_order_count = 0usize;
+        let mut missing_order_samples = Vec::new();
+
+        for remote in remote_insights {
+            let remote_order_id = remote.order_id.clone();
+            if let Some(order_id) = remote_order_id.as_deref() {
+                if let Some(order) = broker_orders.get(order_id) {
+                    let broker_order_status = format!("{:?}", order.status);
+                    match order.status {
+                        TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled => {
+                            let broker_position_qty = broker_positions
+                                .get(&remote.symbol)
+                                .map(|position| position.qty);
+                            if broker_position_qty.is_none_or(|qty| qty.abs() <= f64::EPSILON) {
+                                warn!(
+                                    "AQS startup cleanup found stale remote insight {} state={} with filled broker order {} but no matching open broker position for {}; marking remote insight as Closed",
+                                    remote.insight_id,
+                                    remote.previous_state,
+                                    order_id,
+                                    remote.symbol
+                                );
+                                decisions.push(StartupCleanupDecision {
+                                    remote,
+                                    target_state: "Closed".to_string(),
+                                    broker_order_status: Some(broker_order_status),
+                                    broker_action: Some("position_not_found".to_string()),
+                                    broker_error: None,
+                                    broker_position_qty,
+                                });
+                                continue;
+                            }
+
+                            warn!(
+                                "AQS startup cleanup found stale remote insight {} state={} with filled broker order {}; requesting broker position close",
+                                remote.insight_id, remote.previous_state, order_id
+                            );
+                            broker_actions.push(StartupBrokerAction {
+                                remote,
+                                order_id: order_id.to_string(),
+                                broker_order_status,
+                                broker_position_qty,
+                                action: StartupBrokerActionKind::ClosePosition,
+                            });
+                        }
+                        TradeUpdateEvent::Closed => {
+                            decisions.push(StartupCleanupDecision {
+                                remote,
+                                target_state: "Closed".to_string(),
+                                broker_order_status: Some(broker_order_status),
+                                broker_action: Some("already_closed".to_string()),
+                                broker_error: None,
+                                broker_position_qty: None,
+                            });
+                        }
+                        TradeUpdateEvent::Cancelled
+                        | TradeUpdateEvent::Rejected
+                        | TradeUpdateEvent::Expired => {
+                            decisions.push(StartupCleanupDecision {
+                                remote,
+                                target_state: "Cancelled".to_string(),
+                                broker_order_status: Some(broker_order_status),
+                                broker_action: Some("already_terminal".to_string()),
+                                broker_error: None,
+                                broker_position_qty: None,
+                            });
+                        }
+                        _ => {
+                            broker_actions.push(StartupBrokerAction {
+                                remote,
+                                order_id: order_id.to_string(),
+                                broker_order_status,
+                                broker_position_qty: None,
+                                action: StartupBrokerActionKind::CancelOrder,
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                missing_order_count += 1;
+                if missing_order_samples.len() < 5 {
+                    missing_order_samples.push(format!("{}:{}", remote.insight_id, order_id));
+                }
+            }
+
+            let broker_position_qty = broker_positions
+                .get(&remote.symbol)
+                .map(|position| position.qty);
+            decisions.push(StartupCleanupDecision {
+                remote,
+                target_state: "Cancelled".to_string(),
+                broker_order_status: None,
+                broker_action: Some("order_not_found".to_string()),
+                broker_error: broker_orders_error.clone().or_else(|| {
+                    Some("broker order not found in startup order snapshot".to_string())
+                }),
+                broker_position_qty,
+            });
+        }
+
+        if missing_order_count > 0 {
+            warn!(
+                "AQS startup cleanup did not find {} broker order(s) for stale remote insight(s) on strategy {}; marking matching remote insights as Cancelled. samples=[{}]",
+                missing_order_count,
+                auth.strategy_id,
+                missing_order_samples.join(", ")
+            );
+        }
+
+        if !broker_actions.is_empty() {
+            let action_results = futures::stream::iter(broker_actions)
+                .map(|action| async move {
+                    match action.action {
+                        StartupBrokerActionKind::ClosePosition => {
+                            match self.broker.close_position(&action.order_id, 0.0, None).await {
+                                Ok(true) => Some(StartupCleanupDecision {
+                                    remote: action.remote,
+                                    target_state: "Closed".to_string(),
+                                    broker_order_status: Some(action.broker_order_status),
+                                    broker_action: Some("close_position".to_string()),
+                                    broker_error: None,
+                                    broker_position_qty: action.broker_position_qty,
+                                }),
+                                Ok(false) => {
+                                    warn!(
+                                        "AQS startup cleanup could not close broker position for stale insight {} order {}: close_position returned false",
+                                        action.remote.insight_id, action.order_id
+                                    );
+                                    None
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        "AQS startup cleanup could not close broker position for stale insight {} order {}: {:?}",
+                                        action.remote.insight_id, action.order_id, error
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        StartupBrokerActionKind::CancelOrder => {
+                            match self.broker.cancel_order(&action.order_id).await {
+                                Ok(true) => Some(StartupCleanupDecision {
+                                    remote: action.remote,
+                                    target_state: "Cancelled".to_string(),
+                                    broker_order_status: Some(action.broker_order_status),
+                                    broker_action: Some("cancel_order".to_string()),
+                                    broker_error: None,
+                                    broker_position_qty: None,
+                                }),
+                                Ok(false) => {
+                                    warn!(
+                                        "AQS startup cleanup could not cancel stale remote insight {} order {}: cancel_order returned false",
+                                        action.remote.insight_id, action.order_id
+                                    );
+                                    None
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        "AQS startup cleanup could not cancel stale remote insight {} order {}: {:?}",
+                                        action.remote.insight_id, action.order_id, error
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(LIVE_STARTUP_CLEANUP_MAX_CONCURRENT_BROKER_OPS)
+                .collect::<Vec<_>>()
+                .await;
+            decisions.extend(action_results.into_iter().flatten());
+        }
+
+        let mut cleaned = 0usize;
+        for decision in decisions {
+            let insight_id = decision.remote.insight_id.clone();
+
+            let now = chrono::Utc::now();
+            let update_result = client
+                .query(
+                    "UPDATE insights
+                     SET state = $target_state,
+                         cancelling = false,
+                         closing = false,
+                         first_on_fill = false,
+                         updated_at = <datetime>$now,
+                         closed_at = <datetime>$now
+                     WHERE strategy_id = type::record('strategy', $strategy_id)
+                       AND insight_id = $insight_id
+                       AND state IN ['New', 'Executed', 'Filled']",
+                )
+                .bind(("target_state", decision.target_state.clone()))
+                .bind(("now", now))
+                .bind(("strategy_id", auth.strategy_id.clone()))
+                .bind(("insight_id", insight_id.clone()))
+                .await
+                .and_then(|response| response.check());
+
+            if let Err(error) = update_result {
+                if Self::is_transient_surreal_error(&error) {
+                    return Err(error);
+                }
+                error!(
+                    "Failed to clean stale remote insight {} for strategy {} on live startup: {}",
+                    insight_id, auth.strategy_id, error
+                );
+                continue;
+            }
+
+            cleaned += 1;
+            let reason = format!(
+                "AQS live startup cleaned stale remote insight {}; AQE did not have this insight in local state",
+                insight_id
+            );
+            let event = StrategyEventRecord {
+                event_type: "insight_startup_cleanup".into(),
+                level: "warn".into(),
+                title: "Stale remote insight cleaned up".into(),
+                message: reason.clone(),
+                payload: Some(serde_json::json!({
+                    "insight_id": insight_id,
+                    "symbol": decision.remote.symbol,
+                    "side": decision.remote.side,
+                    "order_id": decision.remote.order_id,
+                    "previous_state": decision.remote.previous_state,
+                    "state": decision.target_state,
+                    "live_session_id": decision.remote.live_session_id,
+                    "broker_order_status": decision.broker_order_status,
+                    "broker_action": decision.broker_action,
+                    "broker_error": decision.broker_error,
+                    "broker_position_qty": decision.broker_position_qty,
+                    "reason": reason,
+                })),
+                created_at: Some(now),
+            };
+
+            if let Err(error) = persist_strategy_event(client, auth, event.clone()).await {
+                if Self::is_transient_surreal_error(&error) {
+                    Self::enqueue_pending_aqs_sync_op(
+                        pending_ops,
+                        PendingAqsSyncOp::StrategyEvent(event),
+                    );
+                    return Err(error);
+                }
+                error!(
+                    "Failed to persist startup cleanup event for strategy {} insight {}: {}",
+                    auth.strategy_id, insight_id, error
+                );
+            }
+        }
+
+        if cleaned > 0 {
+            warn!(
+                "AQS live startup cleaned {} stale remote active insight(s) for strategy {}",
+                cleaned, auth.strategy_id
+            );
+        }
+
+        Ok(cleaned)
+    }
+
     async fn persist_unsynced_insight_transitions<C: surrealdb::Connection>(
         client: &surrealdb::Surreal<C>,
         auth: &AqsAuth,
@@ -1247,7 +1858,7 @@ where
                 continue;
             };
 
-            let pnl = match insight.side {
+            let gross_pnl = match insight.side {
                 crate::core::broker::types::OrderSide::Buy => {
                     (current_price - entry_price) * remaining_qty
                 }
@@ -1255,6 +1866,7 @@ where
                     (entry_price - current_price) * remaining_qty
                 }
             };
+            let pnl = gross_pnl + insight.swap.unwrap_or(0.0) - insight.commission.unwrap_or(0.0);
 
             open_positions_count += 1;
             open_positions_unrealized_pnl += pnl;
@@ -1727,16 +2339,19 @@ where
                     self.on_trade_update();
 
                     for (order, event) in received_events {
-                        let message = format!("Received {:?} for order {}", event, order.order_id);
+                        let broker_event = format!("{:?}", event);
+                        let order_id = order.order_id.clone();
+                        let symbol = order.asset.symbol.clone();
+                        let message = format!("Received {} for order {}", broker_event, order_id);
                         self.publish_runtime_event(
                             "info",
-                            format!("Trade event {:?} for order {}", event, order.order_id),
+                            format!("Trade event {} for order {}", broker_event, order_id),
                             aqs_sync_status.clone(),
                         );
                         let payload = serde_json::json!({
-                            "order_id": order.order_id,
-                            "symbol": order.asset.symbol,
-                            "event": format!("{:?}", event),
+                            "order_id": order_id.clone(),
+                            "symbol": symbol.clone(),
+                            "event": broker_event.clone(),
                         });
 
                         if local_live_artifacts.is_some() {
@@ -1747,7 +2362,12 @@ where
                                     level: "info".into(),
                                     title: "Broker trade event".into(),
                                     message: message.clone(),
-                                    payload: Some(payload.clone()),
+                                    details: LocalLiveEventDetails {
+                                        order_id: Some(order_id.clone()),
+                                        symbol: Some(symbol.clone()),
+                                        broker_event: Some(broker_event.clone()),
+                                        ..Default::default()
+                                    },
                                 },
                             );
                         }
@@ -2268,6 +2888,23 @@ where
         );
 
         if let (Some(client), Some(auth)) = (client, auth) {
+            if let Err(error) = self
+                .cleanup_stale_remote_live_insights_on_start(client, auth, pending_ops)
+                .await
+            {
+                if Self::is_transient_surreal_error(&error) {
+                    warn!(
+                        "AQS live startup could not clean stale remote active insights for strategy {} because the database connection was transiently unavailable: {}",
+                        auth.strategy_id, error
+                    );
+                } else {
+                    error!(
+                        "AQS live startup could not clean stale remote active insights for strategy {}: {}",
+                        auth.strategy_id, error
+                    );
+                }
+            }
+
             if let Err(error) = mark_strategy_started(
                 client,
                 auth,

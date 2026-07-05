@@ -25,6 +25,61 @@ fn format_number_literal(input_type: &crate::node::InputType, n: &serde_json::Nu
     }
 }
 
+fn asset_fee_source(fee: &crate::node::AssetFee) -> String {
+    match fee {
+        crate::node::AssetFee::None => "AssetFee::None".to_string(),
+        crate::node::AssetFee::Points(value) => {
+            format!("AssetFee::Points({value:?})")
+        }
+        crate::node::AssetFee::PercentageFee(value) => {
+            format!("AssetFee::PercentageFee({value:?})")
+        }
+        crate::node::AssetFee::FixedFee(value) => {
+            format!("AssetFee::FixedFee({value:?})")
+        }
+        crate::node::AssetFee::PerContractFee(value) => {
+            format!("AssetFee::PerContractFee({value:?})")
+        }
+        crate::node::AssetFee::PercentagePerContractFee(value) => {
+            format!("AssetFee::PercentagePerContractFee({value:?})")
+        }
+    }
+}
+
+fn asset_side_fees_source(fees: &crate::node::AssetSideFees) -> String {
+    format!(
+        "AssetSideFees {{ long: {}, short: {} }}",
+        asset_fee_source(&fees.long),
+        asset_fee_source(&fees.short)
+    )
+}
+
+fn asset_commission_fees_source(fees: &crate::node::AssetCommissionFees) -> String {
+    format!(
+        "AssetCommissionFees {{ entry: {}, exit: {} }}",
+        asset_side_fees_source(&fees.entry),
+        asset_side_fees_source(&fees.exit)
+    )
+}
+
+fn asset_swap_fees_source(fees: &crate::node::AssetSwapFees) -> String {
+    format!(
+        "AssetSwapFees {{ long: {}, short: {} }}",
+        asset_fee_source(&fees.long),
+        asset_fee_source(&fees.short)
+    )
+}
+
+fn asset_fees_source(fees: &crate::node::AssetFees) -> String {
+    format!(
+        "AssetFees {{ commission: {}, swap: {}, entry: {}, exit: {} }}",
+        asset_commission_fees_source(&fees.commission),
+        asset_swap_fees_source(&fees.swap),
+        asset_fee_source(&fees.entry),
+        asset_fee_source(&fees.exit)
+    )
+}
+
 fn node_input_value<'a>(node: &'a Node, name: &str) -> Option<&'a serde_json::Value> {
     node.inputs
         .iter()
@@ -523,7 +578,9 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     src.push_str("use aq_engine::core::broker::data_feeds::mt5::Mt5DataFeed;\n");
     src.push_str("use aq_engine::core::broker::data_feeds::yahoo::YahooFinanceDataFeed;\n");
     src.push_str("use aq_engine::core::broker::UnifiedBroker;\n");
-    src.push_str("use aq_engine::core::broker::types::{Asset, BarData, AccountType};\n");
+    src.push_str(
+        "use aq_engine::core::broker::types::{AccountType, Asset, AssetCommissionFees, AssetFee, AssetFees, AssetSideFees, AssetSwapFees, BarData};\n",
+    );
     src.push_str("use aq_engine::core::utils::timeframe::{TimeFrame, TimeFrameUnit};\n");
     src.push_str(
         "use aq_engine::core::insight::{Insight, InsightCollection, types::InsightState};\n",
@@ -738,6 +795,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     ));
 
     let broker_leverage = meta.config.broker_leverage.max(1);
+    let broker_fees = asset_fees_source(&meta.config.broker_fees);
 
     let data_feed_init = if meta.data_feed == crate::node::types::DataFeedType::Mt5 {
         "        let data_feed = Mt5DataFeed::from_env().unwrap_or_else(|error| {\n            eprintln!(\"Failed to initialise MT5 data feed: {:?}\", error);\n            std::process::exit(1);\n        });\n".to_string()
@@ -749,14 +807,14 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         "        let execution = Mt5Broker::from_env().unwrap_or_else(|error| {\n            eprintln!(\"Failed to initialise MT5 broker: {:?}\", error);\n            std::process::exit(1);\n        });\n".to_string()
     } else {
         format!(
-            "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, {});\n",
-            meta.config.starting_cash, broker_leverage
+            "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, {}).with_asset_fees({});\n",
+            meta.config.starting_cash, broker_leverage, broker_fees
         )
     };
 
     let backtest_execution_init = format!(
-        "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, {});\n",
-        meta.config.starting_cash, broker_leverage
+        "        let execution = PaperBroker::new(AccountType::Paper, {:.1}, {}).with_asset_fees({});\n",
+        meta.config.starting_cash, broker_leverage, broker_fees
     );
 
     let live_state_init = format!(

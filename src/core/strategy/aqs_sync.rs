@@ -137,6 +137,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
         cash: account.cash,
         currency: account.currency.clone(),
         buying_power: account.buying_power,
+        accrued_commission: account.accrued_commission,
         shorting_enabled: account.shorting_enabled,
         leverage: account.leverage as i64,
     };
@@ -144,6 +145,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
         equity: account.equity,
         cash: account.cash,
         buying_power: account.buying_power,
+        accrued_commission: account.accrued_commission,
     };
     let live_session_key = auth
         .live_session_id
@@ -165,7 +167,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
 
     let latest_state: Option<LatestPersistedAccountState> = client
         .query(
-            "SELECT equity, cash, buying_power
+            "SELECT equity, cash, buying_power, accrued_commission
              FROM type::record('strategy_accounts', $account_record_id)
              LIMIT 1",
         )
@@ -179,6 +181,10 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
                 equity: row.get("equity")?.as_f64()?,
                 cash: row.get("cash")?.as_f64()?,
                 buying_power: row.get("buying_power")?.as_f64()?,
+                accrued_commission: row
+                    .get("accrued_commission")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0),
             })
         });
 
@@ -186,6 +192,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
         latest.equity == account.equity
             && latest.cash == account.cash
             && latest.buying_power == account.buying_power
+            && latest.accrued_commission == account.accrued_commission
     });
 
     if account_changed {
@@ -213,6 +220,7 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
                 cash: $snapshot.cash,
                 currency: $snapshot.currency,
                 buying_power: $snapshot.buying_power,
+                accrued_commission: $snapshot.accrued_commission,
                 shorting_enabled: $snapshot.shorting_enabled,
                 leverage: $snapshot.leverage,
                 created_at: <datetime>$captured_at,
@@ -256,7 +264,8 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
                 timestamp: <datetime>$captured_at,
                 equity: $point.equity,
                 cash: $point.cash,
-                buying_power: $point.buying_power
+                buying_power: $point.buying_power,
+                accrued_commission: $point.accrued_commission
              }",
         )
         .bind(("user_id", auth.user_id.clone()))
@@ -283,13 +292,14 @@ pub async fn persist_live_account_state<C: surrealdb::Connection>(
             level: "debug".into(),
             title: "Account snapshot recorded".into(),
             message: format!(
-                "Equity {:.2}, cash {:.2}, buying power {:.2}",
-                account.equity, account.cash, account.buying_power
+                "Equity {:.2}, cash {:.2}, buying power {:.2}, accrued commission {:.2}",
+                account.equity, account.cash, account.buying_power, account.accrued_commission
             ),
             payload: Some(serde_json::json!({
                 "equity": account.equity,
                 "cash": account.cash,
                 "buying_power": account.buying_power,
+                "accrued_commission": account.accrued_commission,
             })),
             created_at: Some(captured_at),
         },

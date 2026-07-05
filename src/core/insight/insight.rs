@@ -131,6 +131,8 @@ pub struct InsightSnapshotFingerprint<'a> {
     close_order_id: Option<&'a str>,
     close_price: Option<f64>,
     broker_realized_pnl: Option<f64>,
+    commission: Option<f64>,
+    swap: Option<f64>,
     partial_closes_len: usize,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -211,6 +213,8 @@ pub struct Insight {
     pub close_order_id: Option<String>,
     pub close_price: Option<f64>,
     pub broker_realized_pnl: Option<f64>,
+    pub commission: Option<f64>,
+    pub swap: Option<f64>,
     pub partial_closes: Vec<PartialCloseResult>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -368,6 +372,8 @@ impl Insight {
             close_order_id: self.close_order_id.as_deref(),
             close_price: self.close_price,
             broker_realized_pnl: self.broker_realized_pnl,
+            commission: self.commission,
+            swap: self.swap,
             partial_closes_len: self.partial_closes.len(),
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -429,6 +435,8 @@ impl Insight {
         fingerprint.close_order_id.hash(&mut state);
         hash_option_f64(&mut state, fingerprint.close_price);
         hash_option_f64(&mut state, fingerprint.broker_realized_pnl);
+        hash_option_f64(&mut state, fingerprint.commission);
+        hash_option_f64(&mut state, fingerprint.swap);
         fingerprint.partial_closes_len.hash(&mut state);
         for partial in &self.partial_closes {
             partial.order_id.hash(&mut state);
@@ -584,10 +592,17 @@ impl Insight {
     }
 
     /// Entry order filled. Transitions EXECUTED → FILLED.
-    pub fn position_filled(&mut self, filled_price: f64, filled_qty: f64, order_id: &str) {
+    pub fn position_filled(
+        &mut self,
+        filled_price: f64,
+        filled_qty: f64,
+        order_id: &str,
+        commission: Option<f64>,
+    ) {
         self.order_id = Some(order_id.to_string());
         self.submitted = true;
         self.filled_price = Some(filled_price);
+        self.commission = commission;
         info!(
             "Insight filled: id={} {} {} qty={:.4} entry={:.4} strat={} order_id={}",
             self.insight_id,
@@ -610,7 +625,13 @@ impl Insight {
     }
 
     /// Partial fill received. Tracks cumulative partial fill quantity and registers a partial close result.
-    pub fn partial_filled(&mut self, filled_qty: f64, filled_price: f64, order_id: &str) {
+    pub fn partial_filled(
+        &mut self,
+        filled_qty: f64,
+        filled_price: f64,
+        order_id: &str,
+        commission: Option<f64>,
+    ) {
         info!(
             "Insight partial fill: id={} {} {} qty={:.4} fill={:.4} strat={} order_id={}",
             self.insight_id,
@@ -622,6 +643,9 @@ impl Insight {
             order_id
         );
         self.filled_price.get_or_insert(filled_price);
+        if commission.is_some() {
+            self.commission = commission;
+        }
         self.partial_filled_quantity =
             Some(self.partial_filled_quantity.unwrap_or(0.0) + filled_qty);
 
@@ -644,7 +668,13 @@ impl Insight {
     }
 
     /// Partial close / scale-out received while the insight remains open.
-    pub fn partial_closed(&mut self, close_qty: f64, close_price: f64, close_order_id: &str) {
+    pub fn partial_closed(
+        &mut self,
+        close_qty: f64,
+        close_price: f64,
+        close_order_id: &str,
+        commission: Option<f64>,
+    ) {
         info!(
             "Insight partial close: id={} {} {} qty={:.4} exit={:.4} strat={} close_order_id={}",
             self.insight_id,
@@ -658,6 +688,9 @@ impl Insight {
 
         self.partial_filled_quantity =
             Some(self.partial_filled_quantity.unwrap_or(0.0) + close_qty);
+        if commission.is_some() {
+            self.commission = commission;
+        }
 
         let entry_price = self.entry_price().unwrap_or(0.0);
         let mut partial = PartialCloseResult::new(
@@ -685,10 +718,18 @@ impl Insight {
         close_order_id: &str,
         _close_qty: f64,
         broker_realized_pnl: Option<f64>,
+        commission: Option<f64>,
+        swap: Option<f64>,
     ) {
         self.close_price = Some(close_price);
         self.close_order_id = Some(close_order_id.to_string());
         self.broker_realized_pnl = broker_realized_pnl;
+        if commission.is_some() {
+            self.commission = commission;
+        }
+        if swap.is_some() {
+            self.swap = swap;
+        }
         self.closed_at = Some(self.current_time());
         let pnl = self.get_pl(None, true);
         let pnl_pct = self.get_pl_pct();
@@ -863,7 +904,10 @@ impl Insight {
         };
 
         // Round the combined P&L to 2 decimals.
-        ((remaining_pl + partial_pl) * 100.0).round() / 100.0
+        ((remaining_pl + partial_pl + self.swap.unwrap_or(0.0) - self.commission.unwrap_or(0.0))
+            * 100.0)
+            .round()
+            / 100.0
     }
 
     pub fn get_pl_pct(&self) -> f64 {
@@ -888,10 +932,13 @@ impl Insight {
             return 0.0;
         };
 
-        let raw = match self.side {
-            OrderSide::Buy => ((close - entry) / entry) * 100.0,
-            OrderSide::Sell => ((entry - close) / entry) * 100.0,
+        let gross_pnl = match self.side {
+            OrderSide::Buy => (close - entry) * qty,
+            OrderSide::Sell => (entry - close) * qty,
         };
+        let raw = ((gross_pnl + self.swap.unwrap_or(0.0) - self.commission.unwrap_or(0.0))
+            / (entry * qty))
+            * 100.0;
         (raw * 100.0).round() / 100.0
     }
 
@@ -1796,6 +1843,8 @@ impl Default for Insight {
             close_order_id: None,
             close_price: None,
             broker_realized_pnl: None,
+            commission: None,
+            swap: None,
             partial_closes: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1881,6 +1930,7 @@ mod tests {
         variables: DashMap<String, Value>,
         current_time: DateTime<Utc>,
         cancelled_orders: RefCell<Vec<String>>,
+        updated_orders: RefCell<Vec<(String, f64, f64)>>,
         updated_stop_losses: RefCell<Vec<(String, f64, f64)>>,
         closed_positions: RefCell<Vec<(String, f64, Option<f64>)>>,
         account: Account,
@@ -1905,6 +1955,7 @@ mod tests {
                 min_price_increment: Some(0.0001),
                 price_base: Some(4),
                 contract_size: None,
+                fees: Default::default(),
             };
 
             Self {
@@ -1914,6 +1965,7 @@ mod tests {
                 variables: DashMap::new(),
                 current_time,
                 cancelled_orders: RefCell::new(Vec::new()),
+                updated_orders: RefCell::new(Vec::new()),
                 updated_stop_losses: RefCell::new(Vec::new()),
                 closed_positions: RefCell::new(Vec::new()),
                 account: Account {
@@ -1923,6 +1975,7 @@ mod tests {
                     cash: 100_000.0,
                     currency: "USD".to_string(),
                     buying_power: 100_000.0,
+                    accrued_commission: 0.0,
                     shorting_enabled: true,
                     leverage: 1,
                 },
@@ -2038,12 +2091,10 @@ mod tests {
             Ok(true)
         }
 
-        fn update_order(
-            &self,
-            _order_id: &str,
-            _price: f64,
-            _qty: f64,
-        ) -> Result<bool, BrokerError> {
+        fn update_order(&self, order_id: &str, price: f64, qty: f64) -> Result<bool, BrokerError> {
+            self.updated_orders
+                .borrow_mut()
+                .push((order_id.to_string(), price, qty));
             Ok(true)
         }
 
@@ -2086,6 +2137,51 @@ mod tests {
         insight.set_quantity(Some(1.0));
         insight.align_time_to(now);
         insight
+    }
+
+    #[test]
+    fn update_take_profit_on_filled_insight_updates_broker_and_local_leg() {
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let update_time = created_at + Duration::minutes(5);
+        let mut ctx = MockStrategyContext::new(update_time);
+        let mut insight = sample_insight(created_at);
+        let leg_ts = created_at.timestamp().max(0) as u64;
+        insight.state = InsightState::Filled;
+        insight.order_id = Some("entry-order-1".to_string());
+        insight.set_quantity(Some(1.5));
+        insight.set_take_profit_levels(Some(vec![110.0]));
+        insight.legs.take_profit = Some(OrderLeg {
+            order_id: None,
+            limit_price: Some(110.0),
+            trail_price: None,
+            side: OrderSide::Sell,
+            filled_price: None,
+            order_type: OrderType::Limit,
+            status: TradeUpdateEvent::Pending,
+            order_class: OrderClass::OTO,
+            created_at: leg_ts,
+            updated_at: leg_ts,
+            submitted_at: leg_ts,
+            filled_at: None,
+        });
+
+        assert!(insight.update_take_profit(&mut ctx, Some(vec![112.5])));
+
+        assert_eq!(
+            ctx.updated_orders.borrow().as_slice(),
+            &[("entry-order-1".to_string(), 112.5, 1.5)]
+        );
+        assert_eq!(insight.take_profit_levels(), Some(vec![112.5]));
+        let take_profit = insight
+            .legs
+            .take_profit
+            .as_ref()
+            .expect("active take-profit leg should remain attached");
+        assert_eq!(take_profit.limit_price, Some(112.5));
+        assert_eq!(
+            take_profit.updated_at,
+            update_time.timestamp().max(0) as u64
+        );
     }
 
     #[test]

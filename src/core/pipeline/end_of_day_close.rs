@@ -233,6 +233,7 @@ mod tests {
                 min_price_increment: Some(0.01),
                 price_base: Some(2),
                 contract_size: None,
+                fees: Default::default(),
             };
 
             Self {
@@ -247,6 +248,7 @@ mod tests {
                     cash: 10_000.0,
                     currency: "USD".to_string(),
                     buying_power: 10_000.0,
+                    accrued_commission: 0.0,
                     shorting_enabled: true,
                     leverage: 1,
                 },

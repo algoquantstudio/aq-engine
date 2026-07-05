@@ -492,6 +492,7 @@ mod tests {
                 min_price_increment: None,
                 price_base: None,
                 contract_size: None,
+                fees: Default::default(),
             },
             qty: 1.0,
             filled_qty: 1.0,
@@ -508,6 +509,8 @@ mod tests {
             submitted_at: 0,
             filled_at: Some(0),
             realized_pnl: None,
+            commission: None,
+            swap: None,
             rejection_reason: None,
             legs: Some(OrderLegs {
                 take_profit: Some(OrderLeg {

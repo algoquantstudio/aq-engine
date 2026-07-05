@@ -2,6 +2,64 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub enum AssetFee {
+    None,
+    Points(f64),
+    PercentageFee(f64),
+    FixedFee(f64),
+    PerContractFee(f64),
+    PercentagePerContractFee(f64),
+}
+
+impl Default for AssetFee {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetSideFees {
+    #[serde(default)]
+    pub long: AssetFee,
+    #[serde(default)]
+    pub short: AssetFee,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetCommissionFees {
+    #[serde(default)]
+    pub entry: AssetSideFees,
+    #[serde(default)]
+    pub exit: AssetSideFees,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetSwapFees {
+    #[serde(default)]
+    pub long: AssetFee,
+    #[serde(default)]
+    pub short: AssetFee,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetFees {
+    #[serde(default)]
+    pub commission: AssetCommissionFees,
+    #[serde(default)]
+    pub swap: AssetSwapFees,
+    // Legacy fields kept for existing editor/backtest metadata.
+    #[serde(default)]
+    pub entry: AssetFee,
+    #[serde(default)]
+    pub exit: AssetFee,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct StrategyBacktestConfig {
     #[serde(default = "default_timeframe_amount")]
     pub timeframe_amount: u8,
@@ -17,6 +75,8 @@ pub struct StrategyBacktestConfig {
     pub starting_cash: f64,
     #[serde(default = "default_broker_leverage")]
     pub broker_leverage: u8,
+    #[serde(default)]
+    pub broker_fees: AssetFees,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +95,7 @@ impl Default for StrategyBacktestConfig {
             base_confidence: default_base_confidence(),
             starting_cash: default_starting_cash(),
             broker_leverage: default_broker_leverage(),
+            broker_fees: AssetFees::default(),
             log_level: default_log_level(),
             start_time: None,
             end_time: None,

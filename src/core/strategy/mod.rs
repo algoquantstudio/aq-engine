@@ -16,7 +16,7 @@ use crate::core::tui::{
     RuntimeMetricsSnapshot, RuntimeTelemetry, TuiConfig, summarise_value,
 };
 use crate::core::universe::WrappedUniverseModel;
-use crate::core::utils::tools::{StrategyTools, TradingTools};
+use crate::core::utils::tools::{StrategyTools, TradingTools, dynamic_round_for_asset};
 use dashmap::DashMap;
 use polars::prelude::*;
 #[cfg(feature = "runtime")]
@@ -259,7 +259,7 @@ where
                     .take_profit_levels()
                     .is_none_or(|levels| levels.len() <= 1);
                 if should_sync_tp {
-                    insight.set_take_profit_levels(Some(vec![tp]));
+                    insight.set_take_profit_levels(Some(vec![Self::round_order_value(order, tp)]));
                 }
             }
             if let Some(sl) = legs.stop_loss.as_ref().and_then(|leg| leg.limit_price) {
@@ -267,15 +267,23 @@ where
                     .stop_loss_levels()
                     .is_none_or(|levels| levels.len() <= 1);
                 if should_sync_sl {
-                    insight.set_stop_loss_levels(Some(vec![sl]));
+                    insight.set_stop_loss_levels(Some(vec![Self::round_order_value(order, sl)]));
                 }
             }
             if let Some(trailing_gap) = legs.trailing_stop.as_ref().and_then(|leg| leg.trail_price)
             {
-                insight.set_trailing_stop_price(Some(trailing_gap));
+                insight.set_trailing_stop_price(Some(Self::round_order_value(order, trailing_gap)));
             }
             insight.legs = legs.clone();
         }
+    }
+
+    fn round_order_value(order: &Order, value: f64) -> f64 {
+        dynamic_round_for_asset(value, &order.asset)
+    }
+
+    fn round_order_option_value(order: &Order, value: Option<f64>) -> Option<f64> {
+        value.map(|value| Self::round_order_value(order, value))
     }
 
     pub fn new(
@@ -991,6 +999,12 @@ where
                     }
                     self.history
                         .insert(asset.symbol.clone(), DataFrame::default());
+                    if let Err(error) = self.broker.execution.configure_asset_metadata(&asset) {
+                        warn!(
+                            "Failed to configure execution metadata for {}: {}",
+                            asset.symbol, error
+                        );
+                    }
                     self.universe.insert(asset.symbol.clone(), asset);
                 }
                 Err(error) => {
@@ -1485,8 +1499,16 @@ where
                     (InsightState::New, TradeUpdateEvent::Filled) => {
                         if matched {
                             insight.order_accepted(&order.order_id);
-                            let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                            insight.position_filled(price, order.filled_qty, &order.order_id);
+                            let price = Self::round_order_value(
+                                &order,
+                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                            );
+                            insight.position_filled(
+                                price,
+                                order.filled_qty,
+                                &order.order_id,
+                                Self::round_order_option_value(&order, order.commission),
+                            );
                             Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             if let Some(parent_id) = insight.parent_id {
@@ -1502,8 +1524,16 @@ where
                     (InsightState::New, TradeUpdateEvent::PartialFilled) => {
                         if matched {
                             insight.order_accepted(&order.order_id);
-                            let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                            insight.partial_filled(order.filled_qty, price, &order.order_id);
+                            let price = Self::round_order_value(
+                                &order,
+                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                            );
+                            insight.partial_filled(
+                                order.filled_qty,
+                                price,
+                                &order.order_id,
+                                Self::round_order_option_value(&order, order.commission),
+                            );
                             Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             break;
@@ -1512,8 +1542,16 @@ where
                     // EXECUTED → FILLED
                     (InsightState::Executed, TradeUpdateEvent::Filled) => {
                         if matched {
-                            let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                            insight.position_filled(price, order.filled_qty, &order.order_id);
+                            let price = Self::round_order_value(
+                                &order,
+                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                            );
+                            insight.position_filled(
+                                price,
+                                order.filled_qty,
+                                &order.order_id,
+                                Self::round_order_option_value(&order, order.commission),
+                            );
                             Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             if let Some(parent_id) = insight.parent_id {
@@ -1530,8 +1568,16 @@ where
                     // EXECUTED partial fill
                     (InsightState::Executed, TradeUpdateEvent::PartialFilled) => {
                         if matched {
-                            let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                            insight.partial_filled(order.filled_qty, price, &order.order_id);
+                            let price = Self::round_order_value(
+                                &order,
+                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                            );
+                            insight.partial_filled(
+                                order.filled_qty,
+                                price,
+                                &order.order_id,
+                                Self::round_order_option_value(&order, order.commission),
+                            );
                             Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             break;
@@ -1540,8 +1586,16 @@ where
                     // FILLED partial close / scale-out
                     (InsightState::Filled, TradeUpdateEvent::PartialFilled) => {
                         if matched {
-                            let price = Self::close_price_from_order(&order);
-                            insight.partial_closed(order.filled_qty, price, &order.order_id);
+                            let price = Self::round_order_value(
+                                &order,
+                                Self::close_price_from_order(&order),
+                            );
+                            insight.partial_closed(
+                                order.filled_qty,
+                                price,
+                                &order.order_id,
+                                Self::round_order_option_value(&order, order.commission),
+                            );
                             touched_insight_ids.insert(id);
                             // We dont need to reset this when closing the insight - its kind of a
                             // design choice
@@ -1580,7 +1634,8 @@ where
                     (InsightState::Executed, TradeUpdateEvent::Replaced) => {
                         if matched {
                             if order.limit_price != insight.limit_price {
-                                insight.limit_price = order.limit_price;
+                                insight.limit_price =
+                                    Self::round_order_option_value(&order, order.limit_price);
                             }
                             if insight.quantity != Some(order.qty) {
                                 insight.quantity = Some(order.qty);
@@ -1596,13 +1651,18 @@ where
                             if event == TradeUpdateEvent::Filled && order.side == insight.side {
                                 continue;
                             }
-                            let price = Self::close_price_from_order(&order);
+                            let price = Self::round_order_value(
+                                &order,
+                                Self::close_price_from_order(&order),
+                            );
                             Self::sync_broker_managed_levels(&mut insight, &order);
                             insight.position_closed(
                                 price,
                                 &order.order_id,
                                 order.filled_qty,
-                                order.realized_pnl,
+                                Self::round_order_option_value(&order, order.realized_pnl),
+                                Self::round_order_option_value(&order, order.commission),
+                                Self::round_order_option_value(&order, order.swap),
                             );
                             touched_insight_ids.insert(id);
 
@@ -1618,8 +1678,16 @@ where
                         TradeUpdateEvent::Filled,
                     ) => {
                         if matched {
-                            let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                            insight.position_filled(price, order.filled_qty, &order.order_id);
+                            let price = Self::round_order_value(
+                                &order,
+                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                            );
+                            insight.position_filled(
+                                price,
+                                order.filled_qty,
+                                &order.order_id,
+                                Self::round_order_option_value(&order, order.commission),
+                            );
                             Self::sync_broker_managed_levels(&mut insight, &order);
                             touched_insight_ids.insert(id);
                             if let Some(parent_id) = insight.parent_id {
@@ -1735,14 +1803,30 @@ where
                     }
                     TradeUpdateEvent::Filled => {
                         insight.order_accepted(&order.order_id);
-                        let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                        insight.position_filled(price, order.filled_qty, &order.order_id);
+                        let price = Self::round_order_value(
+                            &order,
+                            order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                        );
+                        insight.position_filled(
+                            price,
+                            order.filled_qty,
+                            &order.order_id,
+                            Self::round_order_option_value(&order, order.commission),
+                        );
                         Self::sync_broker_managed_levels(insight, &order);
                     }
                     TradeUpdateEvent::PartialFilled => {
                         insight.order_accepted(&order.order_id);
-                        let price = order.filled_price.or(order.limit_price).unwrap_or(0.0);
-                        insight.partial_filled(order.filled_qty, price, &order.order_id);
+                        let price = Self::round_order_value(
+                            &order,
+                            order.filled_price.or(order.limit_price).unwrap_or(0.0),
+                        );
+                        insight.partial_filled(
+                            order.filled_qty,
+                            price,
+                            &order.order_id,
+                            Self::round_order_option_value(&order, order.commission),
+                        );
                         Self::sync_broker_managed_levels(insight, &order);
                     }
                     TradeUpdateEvent::Rejected => {

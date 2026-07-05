@@ -445,11 +445,18 @@ fn trade_return_pct(snapshot: &InsightSnapshot) -> f64 {
     if entry_price.abs() <= f64::EPSILON {
         return 0.0;
     }
-    match snapshot.side.as_str() {
-        "Buy" => ((close_price - entry_price) / entry_price) * 100.0,
-        "Sell" => ((entry_price - close_price) / entry_price) * 100.0,
-        _ => 0.0,
+    let qty = snapshot.quantity.unwrap_or(0.0);
+    if qty <= f64::EPSILON {
+        return 0.0;
     }
+    let gross_pnl = match snapshot.side.as_str() {
+        "Buy" => (close_price - entry_price) * qty,
+        "Sell" => (entry_price - close_price) * qty,
+        _ => 0.0,
+    };
+    ((gross_pnl + snapshot.swap.unwrap_or(0.0) - snapshot.commission.unwrap_or(0.0))
+        / (entry_price * qty))
+        * 100.0
 }
 
 fn trade_pnl(snapshot: &InsightSnapshot) -> f64 {
@@ -468,11 +475,12 @@ fn trade_pnl(snapshot: &InsightSnapshot) -> f64 {
         return 0.0;
     };
     let qty = snapshot.quantity.unwrap_or(0.0);
-    match snapshot.side.as_str() {
+    let gross_pnl = match snapshot.side.as_str() {
         "Buy" => (close_price - entry_price) * qty,
         "Sell" => (entry_price - close_price) * qty,
         _ => 0.0,
-    }
+    };
+    gross_pnl + snapshot.swap.unwrap_or(0.0) - snapshot.commission.unwrap_or(0.0)
 }
 
 fn trade_hold_secs(snapshot: &InsightSnapshot) -> i64 {

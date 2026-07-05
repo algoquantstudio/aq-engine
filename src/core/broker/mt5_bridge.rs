@@ -861,9 +861,11 @@ impl Mt5Bridge {
             local_order.status = broker_order.status.clone();
             local_order.filled_at = broker_order.filled_at;
             local_order.rejection_reason = broker_order.rejection_reason.clone();
+            self.upsert_order(local_order.clone());
             self.emit_order_event(local_order.clone(), local_order.status.clone());
             Ok(local_order)
         } else {
+            self.upsert_order(broker_order.clone());
             self.emit_order_event(broker_order.clone(), broker_order.status.clone());
             Ok(broker_order)
         }
@@ -1366,6 +1368,7 @@ impl Mt5Bridge {
 
         let mut order = payload.order;
         self.map_order_to_aqe(&mut order);
+        let order = self.upsert_order(order);
         self.enqueue_trade_event(sequence, order, payload.event);
     }
 
@@ -1867,6 +1870,7 @@ pub fn default_mt5_asset(symbol: &str) -> Asset {
         min_price_increment: None,
         price_base: None,
         contract_size: None,
+        fees: Default::default(),
     }
 }
 
@@ -1997,6 +2001,8 @@ mod tests {
             submitted_at: 0,
             filled_at: Some(0),
             realized_pnl: None,
+            commission: None,
+            swap: None,
             rejection_reason: None,
             legs: None,
         }

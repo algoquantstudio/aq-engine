@@ -9,7 +9,7 @@ use turso::{Builder, Connection, params, transaction::Transaction};
 mod types;
 
 use crate::core::broker::backtest_state::BacktestState;
-use crate::core::broker::backtest_state::{AccountHistoryItem, BacktestResults, RoundTripTrade};
+use crate::core::broker::backtest_state::{BacktestResults, RoundTripTrade};
 use crate::core::broker::types::{Account, Bar, TradeRecord};
 use crate::core::insight::InsightSnapshot;
 
@@ -43,8 +43,9 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             order_id TEXT NOT NULL,
             insight_id TEXT,
             strategy_type TEXT,
-            trade_type TEXT NOT NULL,
-            payload_json TEXT NOT NULL
+            commission REAL NOT NULL DEFAULT 0.0,
+            swap REAL NOT NULL DEFAULT 0.0,
+            trade_type TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_trade_log_symbol_at ON trade_log(symbol, event_at);
         CREATE INDEX IF NOT EXISTS idx_trade_log_insight_id ON trade_log(insight_id);
@@ -52,16 +53,30 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS trade_log_rows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            strategy_type TEXT,
+            parent_id TEXT,
+            is_child INTEGER NOT NULL DEFAULT 0,
+            base_strategy_type TEXT,
             entry_time TEXT NOT NULL,
+            exit_time TEXT,
             insight_id TEXT,
-            status TEXT NOT NULL,
-            payload_json TEXT NOT NULL
+            qty REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            return_pct REAL,
+            pnl REAL,
+            commission REAL NOT NULL DEFAULT 0.0,
+            swap REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_trade_log_rows_symbol_entry_time ON trade_log_rows(symbol, entry_time);
         CREATE INDEX IF NOT EXISTS idx_trade_log_rows_insight_id ON trade_log_rows(insight_id);
+        CREATE INDEX IF NOT EXISTS idx_trade_log_rows_strategy ON trade_log_rows(base_strategy_type, is_child);
 
         CREATE TABLE IF NOT EXISTS round_trips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT NOT NULL,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL,
             insight_id TEXT,
@@ -72,9 +87,10 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             exit_price REAL NOT NULL,
             qty REAL NOT NULL,
             pnl REAL NOT NULL,
+            commission REAL NOT NULL DEFAULT 0.0,
+            swap REAL NOT NULL DEFAULT 0.0,
             return_pct REAL NOT NULL,
-            hold_secs INTEGER NOT NULL,
-            payload_json TEXT NOT NULL
+            hold_secs INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_round_trips_symbol_entry_time ON round_trips(symbol, entry_time);
         CREATE INDEX IF NOT EXISTS idx_round_trips_insight_id ON round_trips(insight_id);
@@ -85,23 +101,55 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             equity REAL NOT NULL,
             cash REAL NOT NULL,
             buying_power REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            accrued_commission REAL NOT NULL DEFAULT 0.0
         );
         CREATE INDEX IF NOT EXISTS idx_account_history_event_at ON account_history(event_at);
 
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             insight_id TEXT NOT NULL UNIQUE,
+            parent_id TEXT,
+            order_id TEXT,
+            side TEXT NOT NULL,
             symbol TEXT NOT NULL,
+            quantity REAL,
+            contracts REAL,
+            order_type TEXT NOT NULL,
+            order_class TEXT NOT NULL,
+            limit_price REAL,
+            stop_price REAL,
+            take_profit_levels_json TEXT NOT NULL,
+            stop_loss_levels_json TEXT NOT NULL,
+            trailing_stop_price REAL,
             strategy_type TEXT NOT NULL,
+            confidence INTEGER NOT NULL,
+            timeframe_json TEXT NOT NULL,
+            period_unfilled INTEGER,
+            period_till_tp INTEGER,
+            execution_depends_json TEXT NOT NULL,
+            filled_price REAL,
+            close_order_id TEXT,
+            close_price REAL,
+            broker_realized_pnl REAL,
+            commission REAL,
+            swap REAL,
+            partial_closes_json TEXT NOT NULL,
             state TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             filled_at TEXT,
             closed_at TEXT,
-            payload_json TEXT NOT NULL
+            legs_json TEXT NOT NULL,
+            market_changed INTEGER NOT NULL DEFAULT 0,
+            submitted INTEGER NOT NULL DEFAULT 0,
+            cancelling INTEGER NOT NULL DEFAULT 0,
+            closing INTEGER NOT NULL DEFAULT 0,
+            first_on_fill INTEGER NOT NULL DEFAULT 0,
+            partial_filled_quantity REAL,
+            state_history_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_insights_symbol_created_at ON insights(symbol, created_at);
+        CREATE INDEX IF NOT EXISTS idx_insights_strategy_state ON insights(strategy_type, state);
 
         CREATE TABLE IF NOT EXISTS bars (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,8 +163,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             high REAL NOT NULL,
             low REAL NOT NULL,
             close REAL NOT NULL,
-            volume REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            volume REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_bars_symbol_event_at ON bars(symbol, event_at);
         CREATE INDEX IF NOT EXISTS idx_bars_history_key_event_at ON bars(history_key, event_at);
@@ -125,8 +172,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             year INT NOT NULL,
             month INT NOT NULL,
-            return_pct REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            return_pct REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_monthly_returns_period ON monthly_returns(year, month);
 
@@ -138,8 +184,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             param2_value REAL NOT NULL,
             sharpe REAL NOT NULL,
             total_return REAL NOT NULL,
-            max_drawdown REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            max_drawdown REAL NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS time_performance (
@@ -147,8 +192,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             day_of_week INT NOT NULL,
             hour INT NOT NULL,
             avg_return_bps REAL NOT NULL,
-            trade_count INT NOT NULL,
-            payload_json TEXT NOT NULL
+            trade_count INT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_time_performance_slot ON time_performance(day_of_week, hour);
 
@@ -157,7 +201,11 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             strategy_name TEXT NOT NULL,
             period TEXT NOT NULL,
             drawdown_pct REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            series_type TEXT NOT NULL,
+            basis TEXT NOT NULL,
+            cumulative_pnl REAL,
+            cumulative_return_pct REAL,
+            drawdown_pnl REAL
         );
         CREATE INDEX IF NOT EXISTS idx_drawdown_series_period ON drawdown_series(strategy_name, period);
 
@@ -166,8 +214,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             vol_regime TEXT NOT NULL,
             trend_regime TEXT NOT NULL,
             avg_return_pct REAL NOT NULL,
-            bar_count INT NOT NULL,
-            payload_json TEXT NOT NULL
+            bar_count INT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS strategy_regime_performance (
@@ -179,8 +226,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             win_rate REAL NOT NULL,
             total_pnl REAL NOT NULL,
             avg_return_pct REAL NOT NULL,
-            profit_factor REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            profit_factor REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_strategy_regime_performance_key ON strategy_regime_performance(strategy_type, vol_regime, trend_regime);
 
@@ -188,8 +234,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
             factor_name TEXT NOT NULL,
-            beta REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            beta REAL NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS strategy_correlations (
@@ -197,15 +242,14 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             strategy_a TEXT NOT NULL,
             strategy_b TEXT NOT NULL,
             correlation REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            sample_count INT NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS position_concentration (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
             sector TEXT NOT NULL,
-            weight_pct REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            weight_pct REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_position_concentration_date ON position_concentration(date);
 
@@ -214,8 +258,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             trade_id TEXT NOT NULL,
             expected_cost_bps REAL NOT NULL,
             actual_cost_bps REAL NOT NULL,
-            order_size REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            order_size REAL NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS trade_mae (
@@ -223,8 +266,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             trade_id TEXT NOT NULL,
             mae_pct REAL NOT NULL,
             final_pnl_pct REAL NOT NULL,
-            is_winner BOOL NOT NULL,
-            payload_json TEXT NOT NULL
+            is_winner BOOL NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS setup_performance (
@@ -233,16 +275,14 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             win_rate REAL NOT NULL,
             payoff_ratio REAL NOT NULL,
             trade_count INT NOT NULL,
-            total_pnl REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            total_pnl REAL NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS rolling_sharpe (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             window_days INT NOT NULL,
             period TEXT NOT NULL,
-            sharpe REAL NOT NULL,
-            payload_json TEXT NOT NULL
+            sharpe REAL NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS walk_forward (
@@ -254,8 +294,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             train_start TEXT NOT NULL,
             train_end TEXT NOT NULL,
             test_start TEXT NOT NULL,
-            test_end TEXT NOT NULL,
-            payload_json TEXT NOT NULL
+            test_end TEXT NOT NULL
         );
         "#,
     )
@@ -267,8 +306,8 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
 async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, trade_type, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -282,8 +321,9 @@ async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Re
             record.order_id.clone(),
             record.insight_id.clone(),
             record.strategy_type.clone(),
-            format!("{:?}", record.trade_type),
-            serde_json::to_string(record).map_err(to_storage_err)?
+            record.commission,
+            record.swap,
+            format!("{:?}", record.trade_type)
         ])
         .await
         .map_err(to_storage_err)?;
@@ -370,7 +410,7 @@ fn build_trade_log_rows(
                     let exit_qty = trade.qty.min(*remaining_qty);
                     *remaining_qty -= exit_qty;
                     let fully_closed = *remaining_qty <= f64::EPSILON;
-                    let pnl = match entry.side {
+                    let gross_pnl = match entry.side {
                         crate::core::broker::types::OrderSide::Buy => {
                             (trade.price - entry.price) * exit_qty
                         }
@@ -378,6 +418,14 @@ fn build_trade_log_rows(
                             (entry.price - trade.price) * exit_qty
                         }
                     };
+                    let entry_commission = if entry.qty.abs() > f64::EPSILON {
+                        entry.commission * (exit_qty / entry.qty)
+                    } else {
+                        0.0
+                    };
+                    let commission = entry_commission + trade.commission;
+                    let swap = trade.swap;
+                    let pnl = gross_pnl + swap - commission;
                     let return_pct = if entry.price.abs() > f64::EPSILON {
                         (pnl / (entry.price * exit_qty)) * 100.0
                     } else {
@@ -411,6 +459,8 @@ fn build_trade_log_rows(
                         exit_price: Some(trade.price),
                         return_pct: Some(return_pct),
                         pnl: Some(pnl),
+                        commission: Some(commission),
+                        swap: Some(swap),
                         status: if fully_closed {
                             "CLOSED".to_string()
                         } else {
@@ -443,6 +493,8 @@ fn build_trade_log_rows(
                         exit_price: None,
                         return_pct: None,
                         pnl: None,
+                        commission: Some(trade.commission),
+                        swap: Some(trade.swap),
                         status: format!("{:?}", trade.trade_type).to_uppercase(),
                     });
                 }
@@ -477,6 +529,8 @@ fn build_trade_log_rows(
             exit_price: None,
             return_pct: None,
             pnl: None,
+            commission: Some(trade.commission),
+            swap: Some(trade.swap),
             status: "OPEN".to_string(),
         });
         next_id += 1;
@@ -501,18 +555,30 @@ async fn insert_trade_log_rows(
     let rows = build_trade_log_rows(trade_events, insights);
     let mut stmt = tx
         .prepare(
-            "INSERT INTO trade_log_rows (symbol, entry_time, insight_id, status, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO trade_log_rows (symbol, side, strategy_type, parent_id, is_child, base_strategy_type, entry_time, exit_time, insight_id, qty, entry_price, exit_price, return_pct, pnl, commission, swap, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .await
         .map_err(to_storage_err)?;
     for row in rows {
         stmt.execute(params![
             row.symbol.clone(),
+            row.side.clone(),
+            row.strategy_type.clone(),
+            row.parent_id.clone(),
+            if row.is_child { 1_i64 } else { 0_i64 },
+            row.base_strategy_type.clone(),
             row.entry_time.clone(),
+            row.exit_time.clone(),
             row.insight_id.clone(),
-            row.status.clone(),
-            serde_json::to_string(&row).map_err(to_storage_err)?
+            row.qty,
+            row.entry_price,
+            row.exit_price,
+            row.return_pct,
+            row.pnl,
+            row.commission.unwrap_or(0.0),
+            row.swap.unwrap_or(0.0),
+            row.status.clone()
         ])
         .await
         .map_err(to_storage_err)?;
@@ -523,13 +589,14 @@ async fn insert_trade_log_rows(
 async fn insert_round_trips(tx: &Transaction<'_>, trips: &[RoundTripTrade]) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT INTO round_trips (symbol, side, insight_id, strategy_type, entry_time, exit_time, entry_price, exit_price, qty, pnl, return_pct, hold_secs, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO round_trips (order_id, symbol, side, insight_id, strategy_type, entry_time, exit_time, entry_price, exit_price, qty, pnl, commission, swap, return_pct, hold_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .await
         .map_err(to_storage_err)?;
     for trip in trips {
         stmt.execute(params![
+            trip.order_id.clone(),
             trip.symbol.clone(),
             format!("{:?}", trip.side),
             trip.insight_id.clone(),
@@ -540,9 +607,10 @@ async fn insert_round_trips(tx: &Transaction<'_>, trips: &[RoundTripTrade]) -> R
             trip.exit_price,
             trip.qty,
             trip.pnl,
+            trip.commission,
+            trip.swap,
             trip.return_pct,
-            trip.hold_secs,
-            serde_json::to_string(trip).map_err(to_storage_err)?
+            trip.hold_secs
         ])
         .await
         .map_err(to_storage_err)?;
@@ -556,23 +624,18 @@ async fn insert_account_history(
 ) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT INTO account_history (event_at, equity, cash, buying_power, payload_json)
+            "INSERT INTO account_history (event_at, equity, cash, buying_power, accrued_commission)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .await
         .map_err(to_storage_err)?;
     for (timestamp, account) in account_history {
-        let payload = serde_json::to_string(&AccountHistoryItem {
-            timestamp: *timestamp,
-            equity: account.equity,
-        })
-        .map_err(to_storage_err)?;
         stmt.execute(params![
             timestamp.to_rfc3339(),
             account.equity,
             account.cash,
             account.buying_power,
-            payload
+            account.accrued_commission
         ])
         .await
         .map_err(to_storage_err)?;
@@ -583,22 +646,53 @@ async fn insert_account_history(
 async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT OR REPLACE INTO insights (insight_id, symbol, strategy_type, state, created_at, updated_at, filled_at, closed_at, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO insights (insight_id, parent_id, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
         )
         .await
         .map_err(to_storage_err)?;
     for insight in insights {
         stmt.execute(params![
             insight.insight_id.clone(),
+            insight.parent_id.clone(),
+            insight.order_id.clone(),
+            insight.side.clone(),
             insight.symbol.clone(),
+            insight.quantity,
+            insight.contracts,
+            insight.order_type.clone(),
+            insight.order_class.clone(),
+            insight.limit_price,
+            insight.stop_price,
+            serde_json::to_string(&insight.take_profit_levels).map_err(to_storage_err)?,
+            serde_json::to_string(&insight.stop_loss_levels).map_err(to_storage_err)?,
+            insight.trailing_stop_price,
             insight.strategy_type.clone(),
+            insight.confidence as i64,
+            serde_json::to_string(&insight.timeframe).map_err(to_storage_err)?,
+            insight.period_unfilled.map(|value| value as i64),
+            insight.period_till_tp.map(|value| value as i64),
+            serde_json::to_string(&insight.execution_depends).map_err(to_storage_err)?,
+            insight.filled_price,
+            insight.close_order_id.clone(),
+            insight.close_price,
+            insight.broker_realized_pnl,
+            insight.commission,
+            insight.swap,
+            serde_json::to_string(&insight.partial_closes).map_err(to_storage_err)?,
             insight.state.clone(),
             insight.created_at.to_rfc3339(),
             insight.updated_at.to_rfc3339(),
             insight.filled_at.map(|value| value.to_rfc3339()),
             insight.closed_at.map(|value| value.to_rfc3339()),
-            serde_json::to_string(insight).map_err(to_storage_err)?
+            serde_json::to_string(&insight.legs).map_err(to_storage_err)?,
+            if insight.market_changed { 1_i64 } else { 0_i64 },
+            if insight.submitted { 1_i64 } else { 0_i64 },
+            if insight.cancelling { 1_i64 } else { 0_i64 },
+            if insight.closing { 1_i64 } else { 0_i64 },
+            if insight.first_on_fill { 1_i64 } else { 0_i64 },
+            insight.partial_filled_quantity,
+            serde_json::to_string(&insight.state_history).map_err(to_storage_err)?
         ])
         .await
         .map_err(to_storage_err)?;
@@ -606,66 +700,11 @@ async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> 
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize)]
-struct PersistedBarPayload {
-    symbol: String,
-    asset_symbol: String,
-    history_key: String,
-    timeframe_label: String,
-    is_feature: bool,
-    allow_trading: bool,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64,
-    timestamp: DateTime<Utc>,
-}
-
-impl PersistedBarPayload {
-    fn from_stream(bar: &Bar, stream: &crate::core::events::ResolvedEventStream) -> Self {
-        let history_key = stream.history_key.clone();
-        Self {
-            // Keep `symbol` as the stream identifier for consumers that only inspect
-            // payload_json, and keep `asset_symbol` for the tradable base asset.
-            symbol: history_key.clone(),
-            asset_symbol: stream.key.symbol.clone(),
-            history_key,
-            timeframe_label: stream.key.timeframe.compact_label(),
-            is_feature: stream.is_feature,
-            allow_trading: stream.allow_trading,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            close: bar.close,
-            volume: bar.volume,
-            timestamp: bar.timestamp,
-        }
-    }
-
-    fn from_main(bar: &Bar, symbol: &str) -> Self {
-        Self {
-            symbol: symbol.to_string(),
-            asset_symbol: symbol.to_string(),
-            history_key: symbol.to_string(),
-            timeframe_label: String::new(),
-            is_feature: false,
-            allow_trading: true,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            close: bar.close,
-            volume: bar.volume,
-            timestamp: bar.timestamp,
-        }
-    }
-}
-
 async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT INTO bars (symbol, history_key, timeframe_label, is_feature, allow_trading, event_at, open, high, low, close, volume, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO bars (symbol, history_key, timeframe_label, is_feature, allow_trading, event_at, open, high, low, close, volume)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -688,7 +727,6 @@ async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), 
                 continue;
             };
             for bar in bars {
-                let payload = PersistedBarPayload::from_stream(bar, stream);
                 stmt.execute(params![
                     bar.symbol.clone(),
                     stream.history_key.clone(),
@@ -700,8 +738,7 @@ async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), 
                     bar.high,
                     bar.low,
                     bar.close,
-                    bar.volume,
-                    serde_json::to_string(&payload).map_err(to_storage_err)?
+                    bar.volume
                 ])
                 .await
                 .map_err(to_storage_err)?;
@@ -712,7 +749,6 @@ async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), 
 
     for (symbol, bars) in &state.historical_bars {
         for bar in bars {
-            let payload = PersistedBarPayload::from_main(bar, symbol);
             stmt.execute(params![
                 symbol.clone(),
                 symbol.clone(),
@@ -724,8 +760,7 @@ async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), 
                 bar.high,
                 bar.low,
                 bar.close,
-                bar.volume,
-                serde_json::to_string(&payload).map_err(to_storage_err)?
+                bar.volume
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2479,26 +2514,19 @@ async fn insert_analysis_tables(
     trips: &[RoundTripTrade],
 ) -> Result<(), String> {
     let mut monthly_returns_stmt = tx
-        .prepare(
-            "INSERT INTO monthly_returns (year, month, return_pct, payload_json) VALUES (?1, ?2, ?3, ?4)",
-        )
+        .prepare("INSERT INTO monthly_returns (year, month, return_pct) VALUES (?1, ?2, ?3)")
         .await
         .map_err(to_storage_err)?;
     for row in build_monthly_returns(&results.account_history) {
         monthly_returns_stmt
-            .execute(params![
-                row.year,
-                row.month as i64,
-                row.return_pct,
-                serde_json::to_string(&row).map_err(to_storage_err)?
-            ])
+            .execute(params![row.year, row.month as i64, row.return_pct])
             .await
             .map_err(to_storage_err)?;
     }
 
     let mut time_performance_stmt = tx
         .prepare(
-            "INSERT INTO time_performance (day_of_week, hour, avg_return_bps, trade_count, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO time_performance (day_of_week, hour, avg_return_bps, trade_count) VALUES (?1, ?2, ?3, ?4)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2508,8 +2536,7 @@ async fn insert_analysis_tables(
                 row.day_of_week as i64,
                 row.hour as i64,
                 row.avg_return_bps,
-                row.trade_count as i64,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.trade_count as i64
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2517,7 +2544,7 @@ async fn insert_analysis_tables(
 
     let mut drawdown_series_stmt = tx
         .prepare(
-            "INSERT INTO drawdown_series (strategy_name, period, drawdown_pct, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO drawdown_series (strategy_name, period, drawdown_pct, series_type, basis, cumulative_pnl, cumulative_return_pct, drawdown_pnl) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2527,7 +2554,11 @@ async fn insert_analysis_tables(
                 row.strategy_name.clone(),
                 row.period.clone(),
                 row.drawdown_pct,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.series_type.clone(),
+                row.basis.clone(),
+                row.cumulative_pnl,
+                row.cumulative_return_pct,
+                row.drawdown_pnl
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2535,7 +2566,7 @@ async fn insert_analysis_tables(
 
     let mut regime_performance_stmt = tx
         .prepare(
-            "INSERT INTO regime_performance (vol_regime, trend_regime, avg_return_pct, bar_count, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO regime_performance (vol_regime, trend_regime, avg_return_pct, bar_count) VALUES (?1, ?2, ?3, ?4)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2545,8 +2576,7 @@ async fn insert_analysis_tables(
                 row.vol_regime.clone(),
                 row.trend_regime.clone(),
                 row.avg_return_pct,
-                row.bar_count as i64,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.bar_count as i64
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2554,7 +2584,7 @@ async fn insert_analysis_tables(
 
     let mut strategy_regime_performance_stmt = tx
         .prepare(
-            "INSERT INTO strategy_regime_performance (strategy_type, vol_regime, trend_regime, trade_count, win_rate, total_pnl, avg_return_pct, profit_factor, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO strategy_regime_performance (strategy_type, vol_regime, trend_regime, trade_count, win_rate, total_pnl, avg_return_pct, profit_factor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2568,34 +2598,26 @@ async fn insert_analysis_tables(
                 row.win_rate,
                 row.total_pnl,
                 row.avg_return_pct,
-                row.profit_factor,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.profit_factor
             ])
             .await
             .map_err(to_storage_err)?;
     }
 
     let mut rolling_sharpe_stmt = tx
-        .prepare(
-            "INSERT INTO rolling_sharpe (window_days, period, sharpe, payload_json) VALUES (?1, ?2, ?3, ?4)",
-        )
+        .prepare("INSERT INTO rolling_sharpe (window_days, period, sharpe) VALUES (?1, ?2, ?3)")
         .await
         .map_err(to_storage_err)?;
     for row in build_rolling_sharpe(&results.account_history) {
         rolling_sharpe_stmt
-            .execute(params![
-                row.window_days,
-                row.period.clone(),
-                row.sharpe,
-                serde_json::to_string(&row).map_err(to_storage_err)?
-            ])
+            .execute(params![row.window_days, row.period.clone(), row.sharpe])
             .await
             .map_err(to_storage_err)?;
     }
 
     let mut trade_mae_stmt = tx
         .prepare(
-            "INSERT INTO trade_mae (trade_id, mae_pct, final_pnl_pct, is_winner, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO trade_mae (trade_id, mae_pct, final_pnl_pct, is_winner) VALUES (?1, ?2, ?3, ?4)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2605,8 +2627,7 @@ async fn insert_analysis_tables(
                 row.trade_id.clone(),
                 row.mae_pct,
                 row.final_pnl_pct,
-                row.is_winner,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.is_winner
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2614,7 +2635,7 @@ async fn insert_analysis_tables(
 
     let mut setup_performance_stmt = tx
         .prepare(
-            "INSERT INTO setup_performance (setup_name, win_rate, payoff_ratio, trade_count, total_pnl, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO setup_performance (setup_name, win_rate, payoff_ratio, trade_count, total_pnl) VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2625,8 +2646,7 @@ async fn insert_analysis_tables(
                 row.win_rate,
                 row.payoff_ratio,
                 row.trade_count as i64,
-                row.total_pnl,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.total_pnl
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2634,7 +2654,7 @@ async fn insert_analysis_tables(
 
     let mut position_concentration_stmt = tx
         .prepare(
-            "INSERT INTO position_concentration (date, sector, weight_pct, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO position_concentration (date, sector, weight_pct) VALUES (?1, ?2, ?3)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2643,8 +2663,7 @@ async fn insert_analysis_tables(
             .execute(params![
                 row.date.clone(),
                 row.sector.clone(),
-                row.weight_pct,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.weight_pct
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2652,7 +2671,7 @@ async fn insert_analysis_tables(
 
     let mut strategy_correlations_stmt = tx
         .prepare(
-            "INSERT INTO strategy_correlations (strategy_a, strategy_b, correlation, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO strategy_correlations (strategy_a, strategy_b, correlation, sample_count) VALUES (?1, ?2, ?3, ?4)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -2662,7 +2681,7 @@ async fn insert_analysis_tables(
                 row.strategy_a.clone(),
                 row.strategy_b.clone(),
                 row.correlation,
-                serde_json::to_string(&row).map_err(to_storage_err)?
+                row.sample_count as i64
             ])
             .await
             .map_err(to_storage_err)?;
@@ -2708,6 +2727,7 @@ mod tests {
             cash: equity,
             currency: "USD".to_string(),
             buying_power: equity,
+            accrued_commission: 0.0,
             shorting_enabled: true,
             leverage: 1,
         }
@@ -2746,6 +2766,8 @@ mod tests {
             close_order_id: None,
             close_price: Some(110.0),
             broker_realized_pnl: None,
+            commission: None,
+            swap: None,
             partial_closes: Vec::new(),
             created_at: timestamp,
             updated_at: timestamp,
@@ -2804,6 +2826,8 @@ mod tests {
                 order_id: "order-1".to_string(),
                 insight_id: Some("child-1".to_string()),
                 strategy_type: Some("MeanReversion-CHILD".to_string()),
+                commission: 0.0,
+                swap: 0.0,
                 trade_type: TradeRecordType::Entry,
             },
             TradeRecord {
@@ -2815,6 +2839,8 @@ mod tests {
                 order_id: "order-1".to_string(),
                 insight_id: Some("child-1".to_string()),
                 strategy_type: Some("MeanReversion-CHILD".to_string()),
+                commission: 0.0,
+                swap: 0.0,
                 trade_type: TradeRecordType::Exit,
             },
         ];
@@ -2872,7 +2898,7 @@ mod tests {
 
         let mut rows = conn
             .query(
-                "SELECT symbol, history_key, timeframe_label, is_feature, allow_trading, payload_json FROM bars",
+                "SELECT symbol, history_key, timeframe_label, is_feature, allow_trading, open, high, low, close, volume, event_at FROM bars",
                 (),
             )
             .await
@@ -2883,20 +2909,24 @@ mod tests {
         let timeframe_label: String = row.get(2).unwrap();
         let is_feature: i64 = row.get(3).unwrap();
         let allow_trading: i64 = row.get(4).unwrap();
-        let payload_json: String = row.get(5).unwrap();
-        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+        let open: f64 = row.get(5).unwrap();
+        let high: f64 = row.get(6).unwrap();
+        let low: f64 = row.get(7).unwrap();
+        let close: f64 = row.get(8).unwrap();
+        let volume: f64 = row.get(9).unwrap();
+        let event_at: String = row.get(10).unwrap();
 
         assert_eq!(symbol, "AAPL");
         assert_eq!(history_key, "AAPL:15m");
         assert_eq!(timeframe_label, "15m");
         assert_eq!(is_feature, 1);
         assert_eq!(allow_trading, 0);
-        assert_eq!(payload["symbol"], "AAPL:15m");
-        assert_eq!(payload["asset_symbol"], "AAPL");
-        assert_eq!(payload["history_key"], "AAPL:15m");
-        assert_eq!(payload["timeframe_label"], "15m");
-        assert_eq!(payload["is_feature"], true);
-        assert_eq!(payload["allow_trading"], false);
+        assert_eq!(open, 100.0);
+        assert_eq!(high, 101.0);
+        assert_eq!(low, 99.0);
+        assert_eq!(close, 100.5);
+        assert_eq!(volume, 1_000.0);
+        assert_eq!(event_at, timestamp.to_rfc3339());
 
         drop(rows);
         drop(conn);
@@ -2926,6 +2956,8 @@ mod tests {
                 exit_price: 95.0,
                 qty: 1.0,
                 pnl: -5.0,
+                commission: 0.0,
+                swap: 0.0,
                 return_pct: -5.0,
                 hold_secs: 86_400,
             },
@@ -2941,6 +2973,8 @@ mod tests {
                 exit_price: 105.0,
                 qty: 1.0,
                 pnl: 5.0,
+                commission: 0.0,
+                swap: 0.0,
                 return_pct: 5.0,
                 hold_secs: 172_800,
             },
