@@ -2159,13 +2159,13 @@ where
         };
 
         // Channels for incoming events
-        let (trade_tx, mut trade_rx) = tokio::sync::mpsc::channel(100);
-        let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel::<MarketDataEvent>(100);
+        let (trade_tx, mut trade_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (bar_tx, mut bar_rx) = tokio::sync::mpsc::unbounded_channel::<MarketDataEvent>();
 
         // 5. Subscribe to trade event stream
         let trade_tx_clone = trade_tx.clone();
         let trade_callback = Arc::new(move |event| {
-            let _ = trade_tx_clone.try_send(event);
+            let _ = trade_tx_clone.send(event);
         });
         if let Err(error) = self.broker.subscribe_to_trade_stream(trade_callback).await {
             error!(
@@ -2217,7 +2217,7 @@ where
                     context: stream.context_at(bar.timestamp),
                     bar,
                 };
-                let _ = bar_tx_clone.try_send(event);
+                let _ = bar_tx_clone.send(event);
             });
             if let Err(error) = self
                 .broker
@@ -2343,10 +2343,9 @@ where
                         let order_id = order.order_id.clone();
                         let symbol = order.asset.symbol.clone();
                         let message = format!("Received {} for order {}", broker_event, order_id);
-                        self.publish_runtime_event(
+                        self.push_runtime_event(
                             "info",
                             format!("Trade event {} for order {}", broker_event, order_id),
-                            aqs_sync_status.clone(),
                         );
                         let payload = serde_json::json!({
                             "order_id": order_id.clone(),

@@ -308,20 +308,6 @@ impl OrderManagementProvider for Mt5Broker {
             )
             .await?;
 
-        let cancelled = !self
-            .bridge
-            .request_orders()
-            .await?
-            .into_iter()
-            .any(|order| order.order_id == order_id);
-
-        if !cancelled {
-            return Err(BrokerError::OrderCancellationError(format!(
-                "MT5 did not confirm cancellation for order {}",
-                order_id
-            )));
-        }
-
         existing_order.status = TradeUpdateEvent::Cancelled;
         existing_order.updated_at = Self::now_ts();
         self.bridge
@@ -409,7 +395,7 @@ impl OrderManagementProvider for Mt5Broker {
             )
             .await?;
         if let Ok(mut close_order) = serde_json::from_value::<Order>(response) {
-            close_order.asset.symbol = self.bridge.config().aqe_symbol(&close_order.asset.symbol);
+            close_order.asset.symbol = self.bridge.aqe_symbol(&close_order.asset.symbol);
             let event = close_order.status.clone();
             debug!(
                 "MT5 close_position RPC confirmed order_id={} status={:?} realized_pnl={:?} commission={:?}",

@@ -474,7 +474,7 @@ where
                 ))
             })?;
 
-        let mut seeded = futures::executor::block_on(self.broker.get_history(
+        let mut seeded = crate::core::broker::block_on_broker_future(self.broker.get_history(
             &stream.key.symbol,
             start,
             anchor,
@@ -948,6 +948,10 @@ where
         self.publish_runtime_snapshot(aqs_sync_status, None);
     }
 
+    fn push_runtime_event(&mut self, level: impl Into<String>, message: impl Into<String>) {
+        self.runtime_telemetry.push_event(level, message);
+    }
+
     pub fn max_history_rows(&self) -> usize {
         self.max_history_rows.max(self.min_history_rows())
     }
@@ -1170,40 +1174,59 @@ where
                     let _ = bar_df.with_column(null_series);
                 }
 
+                let current_time = self.broker.get_current_time();
+                for row_index in 0..appended_rows {
+                    for (_name, ind) in self.indicators.iter_mut() {
+                        let window_size = ind.window_size();
+                        let available_rows = history_df.height() + row_index + 1;
+                        if available_rows < window_size {
+                            ind.set_last_run_time(current_time);
+                            continue;
+                        }
+
+                        // Indicators only need their bounded lookback. Build that window from the
+                        // retained history and the incoming rows, then write results into the small
+                        // incoming frame before appending it to the full history frame.
+                        let prior_rows_needed = window_size.saturating_sub(row_index + 1);
+                        let mut window = history_df.tail(Some(prior_rows_needed));
+                        let incoming = bar_df.slice(0, row_index + 1);
+                        if window.height() == 0 {
+                            window = incoming;
+                        } else if window.vstack_mut(&incoming).is_err() {
+                            ind.set_last_run_time(current_time);
+                            continue;
+                        }
+                        if window.height() > window_size {
+                            window = window.tail(Some(window_size));
+                        }
+
+                        if let Ok(result) = ind.run_bar(&window) {
+                            for (column_name, value) in result {
+                                let Ok(series) = bar_df.column(&column_name) else {
+                                    continue;
+                                };
+                                let Ok(values) = series.f64() else {
+                                    continue;
+                                };
+                                let mut values = values.into_iter().collect::<Vec<Option<f64>>>();
+                                if let Some(slot) = values.get_mut(row_index) {
+                                    *slot = Some(value);
+                                    let updated = Series::new(column_name.into(), values);
+                                    let _ = bar_df.with_column(updated);
+                                }
+                            }
+                        }
+                        ind.set_last_run_time(current_time);
+                    }
+                }
+
                 if history_df.height() == 0 {
-                    *history_df = bar_df; // Just taking the newly formed df
+                    *history_df = bar_df;
                 } else {
                     let _ = history_df.vstack_mut(&bar_df);
                 }
                 if history_df.height() > max_history_rows {
                     *history_df = history_df.tail(Some(max_history_rows));
-                }
-
-                let current_time = self.broker.get_current_time();
-                for (_name, ind) in self.indicators.iter_mut() {
-                    let ws = ind.window_size();
-                    let h = history_df.height();
-                    if h >= ws {
-                        let tail = history_df.tail(Some(ws));
-                        if let Ok(res) = ind.run_bar(&tail) {
-                            for (col_name, val) in res {
-                                if let Ok(s) = history_df.column(&col_name) {
-                                    if let Ok(ca) = s.f64() {
-                                        let mut vec: Vec<Option<f64>> = ca.into_iter().collect();
-                                        if !vec.is_empty() {
-                                            let last_idx = vec.len().saturating_sub(appended_rows);
-                                            for slot in &mut vec[last_idx..] {
-                                                *slot = Some(val);
-                                            }
-                                            let new_s = Series::new(col_name.into(), &vec);
-                                            let _ = history_df.with_column(new_s);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ind.set_last_run_time(current_time);
                 }
             }
         }
@@ -1779,8 +1802,9 @@ where
 
     fn submit_insight(&mut self, insight: &mut Insight) {
         info!("Submitting order to broker: {}", insight.log_summary());
-        let result =
-            futures::executor::block_on(self.broker.execution.submit_order(insight.clone()));
+        let result = crate::core::broker::block_on_broker_future(
+            self.broker.execution.submit_order(insight.clone()),
+        );
         if let Ok(order) = result {
             debug!(
                 "Broker accepted: insight_id={} {}",
@@ -1945,7 +1969,7 @@ where
     }
 
     fn account(&self) -> Result<crate::core::broker::types::Account, BrokerError> {
-        futures::executor::block_on(self.broker.get_account())
+        crate::core::broker::block_on_broker_future(self.broker.get_account())
     }
 
     fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
@@ -1988,7 +2012,7 @@ where
                 }
             }
         }
-        futures::executor::block_on(self.broker.get_latest_quote(symbol))
+        crate::core::broker::block_on_broker_future(self.broker.get_latest_quote(symbol))
     }
 
     fn preseed_warmup_history(

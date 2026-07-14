@@ -4,7 +4,7 @@ use super::types::{
     AssetStatus, AssetSwapFees, AssetType, Bar, BrokerError, OrderSide, OrderType, Quote,
     TradeUpdateEvent,
 };
-use super::{DataStreamMode, UnifiedBroker, paper_broker::PaperBroker};
+use super::{DataStreamMode, UnifiedBroker, block_on_broker_future, paper_broker::PaperBroker};
 use crate::core::insight::Insight;
 use crate::core::insight::types::StrategyType;
 use crate::core::utils::timeframe::TimeFrame;
@@ -13,7 +13,24 @@ use crate::core::utils::tools::dynamic_round_for_asset;
 use chrono::Utc;
 use polars::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+#[test]
+fn broker_future_bridge_runs_without_a_runtime() {
+    assert_eq!(block_on_broker_future(async { 42 }), 42);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_future_bridge_releases_multithreaded_runtime_worker() {
+    assert_eq!(block_on_broker_future(async { 42 }), 42);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn broker_future_bridge_supports_immediate_backtest_futures() {
+    assert_eq!(block_on_broker_future(async { 42 }), 42);
+}
 
 struct MockDataFeed {
     connected: Arc<Mutex<bool>>,
@@ -87,6 +104,126 @@ impl DataProvider for MockDataFeed {
     async fn unsubscribe_from_data_stream(&self, _symbols: Vec<String>) -> Result<(), BrokerError> {
         Ok(())
     }
+}
+
+struct ConcurrentHistoryFeed {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl ConcurrentHistoryFeed {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl DataFeed for ConcurrentHistoryFeed {
+    async fn connect(&self) -> Result<bool, BrokerError> {
+        Ok(true)
+    }
+
+    async fn disconnect(&self) -> Result<bool, BrokerError> {
+        Ok(true)
+    }
+
+    fn is_connected(&self) -> bool {
+        true
+    }
+}
+
+impl DataProvider for ConcurrentHistoryFeed {
+    async fn get_ticker_info(&self, _symbol: &str) -> Result<Asset, BrokerError> {
+        Err(BrokerError::TradeError("Not implemented".into()))
+    }
+
+    async fn get_history(
+        &self,
+        symbol: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        _end: chrono::DateTime<chrono::Utc>,
+        _time_frame: TimeFrame,
+    ) -> Result<DataFrame, BrokerError> {
+        let index = symbol
+            .strip_prefix("SYM")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default();
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        let delay_ms = if index == 0 { 40 } else { 5 };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+
+        let timestamp = (start + chrono::Duration::minutes(index)).timestamp_millis();
+        DataFrame::new(vec![
+            Column::new("symbol".into(), vec![symbol.to_string()]),
+            Column::new("open".into(), vec![100.0]),
+            Column::new("high".into(), vec![101.0]),
+            Column::new("low".into(), vec![99.0]),
+            Column::new("close".into(), vec![100.5]),
+            Column::new("volume".into(), vec![10.0]),
+            Column::new("timestamp".into(), vec![timestamp]),
+        ])
+        .map_err(|error| BrokerError::DataFeedError(error.to_string()))
+    }
+
+    async fn get_latest_quote(&self, _symbol: &str) -> Result<Quote, BrokerError> {
+        Err(BrokerError::TradeError("Not implemented".into()))
+    }
+
+    async fn get_latest_bar(&self, _symbol: &str) -> Result<Bar, BrokerError> {
+        Err(BrokerError::TradeError("Not implemented".into()))
+    }
+
+    async fn subscribe_to_data_stream(
+        &self,
+        _symbols: Vec<String>,
+        _time_frame: TimeFrame,
+        _mode: DataStreamMode,
+        _on_bar: Arc<dyn Fn(Bar) + Send + Sync>,
+    ) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_from_data_stream(&self, _symbols: Vec<String>) -> Result<(), BrokerError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn backtest_history_loads_are_bounded_concurrent_and_installed_in_order() {
+    let feed = ConcurrentHistoryFeed::new();
+    let max_active = feed.max_active.clone();
+    let paper_broker = PaperBroker::new(AccountType::Paper, 1_000.0, 1);
+    let mut broker = UnifiedBroker::new_backtest(paper_broker, feed);
+    let symbols = (0..12)
+        .map(|index| format!("SYM{index}"))
+        .collect::<Vec<_>>();
+    let start = Utc::now();
+    let end = start + chrono::Duration::days(1);
+
+    broker
+        .load_backtest_data(
+            &symbols,
+            start,
+            end,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        )
+        .await
+        .unwrap();
+
+    let observed_max = max_active.load(Ordering::SeqCst);
+    assert!(observed_max > 1);
+    assert!(observed_max <= super::MAX_CONCURRENT_HISTORY_LOADS);
+    let state = broker.backtest_state.as_ref().unwrap().read();
+    assert_eq!(state.historical_bars.len(), symbols.len());
+    let expected_current_time = chrono::DateTime::from_timestamp_millis(
+        (start + chrono::Duration::minutes((symbols.len() - 1) as i64)).timestamp_millis(),
+    )
+    .unwrap();
+    assert_eq!(state.current_time, expected_current_time);
 }
 
 #[tokio::test]

@@ -274,10 +274,8 @@ impl DataFeed for YahooFinanceDataFeed {
 
 impl DataProvider for YahooFinanceDataFeed {
     async fn get_ticker_info(&self, symbol: &str) -> Result<Asset, BrokerError> {
-        // Check cache first
-        let mut ticker_info = self.ticker_info.lock().unwrap();
-        if ticker_info.contains_key(symbol) {
-            return Ok(ticker_info.get(symbol).unwrap().clone());
+        if let Some(asset) = self.ticker_info.lock().unwrap().get(symbol).cloned() {
+            return Ok(asset);
         }
 
         let crumb = self.crumb.lock().unwrap().clone();
@@ -324,7 +322,7 @@ impl DataProvider for YahooFinanceDataFeed {
             asset_type: self.map_asset_type(instrument_type),
             status: AssetStatus::Active,
             exchange: self.map_asset_exchange(exchange_name),
-            tradable: is_tradable || true,
+            tradable: is_tradable,
             marginable: true,
             shortable: true,
             fractional: true,
@@ -337,7 +335,10 @@ impl DataProvider for YahooFinanceDataFeed {
             fees: Default::default(),
         };
 
-        ticker_info.insert(symbol.to_string(), asset.clone());
+        self.ticker_info
+            .lock()
+            .unwrap()
+            .insert(symbol.to_string(), asset.clone());
         Ok(asset)
     }
 
@@ -461,22 +462,18 @@ impl DataProvider for YahooFinanceDataFeed {
         mode: DataStreamMode,
         on_bar: Arc<dyn Fn(Bar) + Send + Sync>,
     ) -> Result<(), BrokerError> {
-        // Build a fetch function closure that uses a fresh YahooFinanceDataFeed
-        // client for each polling cycle (to avoid borrow issues with &self)
-        let client = self.client.clone();
+        // Keep one shared fetcher alive for all polling tasks created by this call.
+        // reqwest::Client clones share the same connection pool and cookie store.
+        let fetcher = Arc::new(YahooFinanceDataFeed {
+            client: self.client.clone(),
+            connected: self.connected.clone(),
+            ticker_info: self.ticker_info.clone(),
+            crumb: self.crumb.clone(),
+            stream_manager: DataStreamManager::new(),
+        });
         let fetch_fn: FetchBarsFn = Arc::new(move |symbol, start, end, tf| {
-            let client = client.clone();
-            Box::pin(async move {
-                // Create a lightweight fetcher using the shared client
-                let feed = YahooFinanceDataFeed {
-                    client,
-                    connected: Arc::new(Mutex::new(true)),
-                    ticker_info: Arc::new(Mutex::new(HashMap::new())),
-                    crumb: Arc::new(Mutex::new(None)),
-                    stream_manager: DataStreamManager::new(),
-                };
-                feed.fetch_bars_raw(&symbol, start, end, tf).await
-            })
+            let fetcher = fetcher.clone();
+            Box::pin(async move { fetcher.fetch_bars_raw(&symbol, start, end, tf).await })
         });
 
         for symbol in symbols {

@@ -4,7 +4,7 @@ use std::path::Path;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use polars::lazy::dsl::pearson_corr;
 use polars::prelude::*;
-use turso::{Builder, Connection, params, transaction::Transaction};
+use turso::{Builder, Connection, Value, params, transaction::Transaction};
 
 mod types;
 
@@ -47,9 +47,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             swap REAL NOT NULL DEFAULT 0.0,
             trade_type TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_trade_log_symbol_at ON trade_log(symbol, event_at);
-        CREATE INDEX IF NOT EXISTS idx_trade_log_insight_id ON trade_log(insight_id);
-
         CREATE TABLE IF NOT EXISTS trade_log_rows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
@@ -70,10 +67,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             swap REAL NOT NULL DEFAULT 0.0,
             status TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_trade_log_rows_symbol_entry_time ON trade_log_rows(symbol, entry_time);
-        CREATE INDEX IF NOT EXISTS idx_trade_log_rows_insight_id ON trade_log_rows(insight_id);
-        CREATE INDEX IF NOT EXISTS idx_trade_log_rows_strategy ON trade_log_rows(base_strategy_type, is_child);
-
         CREATE TABLE IF NOT EXISTS round_trips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_id TEXT NOT NULL,
@@ -92,9 +85,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             return_pct REAL NOT NULL,
             hold_secs INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_round_trips_symbol_entry_time ON round_trips(symbol, entry_time);
-        CREATE INDEX IF NOT EXISTS idx_round_trips_insight_id ON round_trips(insight_id);
-
         CREATE TABLE IF NOT EXISTS account_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_at TEXT NOT NULL,
@@ -103,8 +93,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             buying_power REAL NOT NULL,
             accrued_commission REAL NOT NULL DEFAULT 0.0
         );
-        CREATE INDEX IF NOT EXISTS idx_account_history_event_at ON account_history(event_at);
-
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             insight_id TEXT NOT NULL UNIQUE,
@@ -148,9 +136,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             partial_filled_quantity REAL,
             state_history_json TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_insights_symbol_created_at ON insights(symbol, created_at);
-        CREATE INDEX IF NOT EXISTS idx_insights_strategy_state ON insights(strategy_type, state);
-
         CREATE TABLE IF NOT EXISTS bars (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
@@ -165,17 +150,12 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             close REAL NOT NULL,
             volume REAL NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_bars_symbol_event_at ON bars(symbol, event_at);
-        CREATE INDEX IF NOT EXISTS idx_bars_history_key_event_at ON bars(history_key, event_at);
-
         CREATE TABLE IF NOT EXISTS monthly_returns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             year INT NOT NULL,
             month INT NOT NULL,
             return_pct REAL NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_monthly_returns_period ON monthly_returns(year, month);
-
         CREATE TABLE IF NOT EXISTS param_sweep (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             param1_name TEXT NOT NULL,
@@ -194,8 +174,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             avg_return_bps REAL NOT NULL,
             trade_count INT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_time_performance_slot ON time_performance(day_of_week, hour);
-
         CREATE TABLE IF NOT EXISTS drawdown_series (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             strategy_name TEXT NOT NULL,
@@ -207,8 +185,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             cumulative_return_pct REAL,
             drawdown_pnl REAL
         );
-        CREATE INDEX IF NOT EXISTS idx_drawdown_series_period ON drawdown_series(strategy_name, period);
-
         CREATE TABLE IF NOT EXISTS regime_performance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vol_regime TEXT NOT NULL,
@@ -228,8 +204,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             avg_return_pct REAL NOT NULL,
             profit_factor REAL NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_strategy_regime_performance_key ON strategy_regime_performance(strategy_type, vol_regime, trend_regime);
-
         CREATE TABLE IF NOT EXISTS factor_exposure (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
@@ -251,8 +225,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             sector TEXT NOT NULL,
             weight_pct REAL NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_position_concentration_date ON position_concentration(date);
-
         CREATE TABLE IF NOT EXISTS slippage_analysis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             trade_id TEXT NOT NULL,
@@ -303,32 +275,141 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Result<(), String> {
-    let mut stmt = tx
-        .prepare(
-            "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .await
-        .map_err(to_storage_err)?;
-    for record in trade_log {
-        stmt.execute(params![
-            record.date.to_rfc3339(),
-            record.symbol.clone(),
-            format!("{:?}", record.side),
-            record.qty,
-            record.price,
-            record.order_id.clone(),
-            record.insight_id.clone(),
-            record.strategy_type.clone(),
-            record.commission,
-            record.swap,
-            format!("{:?}", record.trade_type)
-        ])
-        .await
-        .map_err(to_storage_err)?;
+const SECONDARY_INDEXES: &[(&str, &str)] = &[
+    ("idx_trade_log_symbol_at", "trade_log(symbol, event_at)"),
+    ("idx_trade_log_insight_id", "trade_log(insight_id)"),
+    (
+        "idx_trade_log_rows_symbol_entry_time",
+        "trade_log_rows(symbol, entry_time)",
+    ),
+    (
+        "idx_trade_log_rows_insight_id",
+        "trade_log_rows(insight_id)",
+    ),
+    (
+        "idx_trade_log_rows_strategy",
+        "trade_log_rows(base_strategy_type, is_child)",
+    ),
+    (
+        "idx_round_trips_symbol_entry_time",
+        "round_trips(symbol, entry_time)",
+    ),
+    ("idx_round_trips_insight_id", "round_trips(insight_id)"),
+    ("idx_account_history_event_at", "account_history(event_at)"),
+    (
+        "idx_insights_symbol_created_at",
+        "insights(symbol, created_at)",
+    ),
+    (
+        "idx_insights_strategy_state",
+        "insights(strategy_type, state)",
+    ),
+    ("idx_bars_symbol_event_at", "bars(symbol, event_at)"),
+    (
+        "idx_bars_history_key_event_at",
+        "bars(history_key, event_at)",
+    ),
+    ("idx_monthly_returns_period", "monthly_returns(year, month)"),
+    (
+        "idx_time_performance_slot",
+        "time_performance(day_of_week, hour)",
+    ),
+    (
+        "idx_drawdown_series_period",
+        "drawdown_series(strategy_name, period)",
+    ),
+    (
+        "idx_strategy_regime_performance_key",
+        "strategy_regime_performance(strategy_type, vol_regime, trend_regime)",
+    ),
+    (
+        "idx_position_concentration_date",
+        "position_concentration(date)",
+    ),
+];
+
+async fn drop_secondary_indexes(tx: &Transaction<'_>) -> Result<(), String> {
+    let sql = SECONDARY_INDEXES
+        .iter()
+        .map(|(name, _)| format!("DROP INDEX IF EXISTS {name};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tx.execute_batch(sql).await.map_err(to_storage_err)
+}
+
+async fn create_secondary_indexes(tx: &Transaction<'_>) -> Result<(), String> {
+    let sql = SECONDARY_INDEXES
+        .iter()
+        .map(|(name, target)| format!("CREATE INDEX IF NOT EXISTS {name} ON {target};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tx.execute_batch(sql).await.map_err(to_storage_err)
+}
+
+const MAX_BATCH_PARAMETERS: usize = 900;
+
+async fn flush_insert_batch(
+    tx: &Transaction<'_>,
+    insert_prefix: &str,
+    columns_per_row: usize,
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
     }
+
+    let placeholders = format!("({})", vec!["?"; columns_per_row].join(", "));
+    let sql = format!(
+        "{insert_prefix} {}",
+        vec![placeholders; rows.len()].join(", ")
+    );
+    let values = rows.drain(..).flatten().collect::<Vec<_>>();
+    tx.execute(sql, values).await.map_err(to_storage_err)?;
     Ok(())
+}
+
+async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Result<(), String> {
+    const COLUMNS: usize = 11;
+    let mut rows = Vec::with_capacity(MAX_BATCH_PARAMETERS / COLUMNS);
+    for record in trade_log {
+        rows.push(vec![
+            Value::Text(record.date.to_rfc3339()),
+            Value::Text(record.symbol.clone()),
+            Value::Text(format!("{:?}", record.side)),
+            Value::Real(record.qty),
+            Value::Real(record.price),
+            Value::Text(record.order_id.clone()),
+            record
+                .insight_id
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+            record
+                .strategy_type
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+            Value::Real(record.commission),
+            Value::Real(record.swap),
+            Value::Text(format!("{:?}", record.trade_type)),
+        ]);
+        if rows.len() >= MAX_BATCH_PARAMETERS / COLUMNS {
+            flush_insert_batch(
+                tx,
+                "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type) VALUES",
+                COLUMNS,
+                &mut rows,
+            )
+            .await?;
+        }
+    }
+    flush_insert_batch(
+        tx,
+        "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type) VALUES",
+        COLUMNS,
+        &mut rows,
+    )
+    .await
 }
 
 fn format_backtest_timestamp(value: DateTime<Utc>) -> String {
@@ -622,25 +703,33 @@ async fn insert_account_history(
     tx: &Transaction<'_>,
     account_history: &[(DateTime<Utc>, Account)],
 ) -> Result<(), String> {
-    let mut stmt = tx
-        .prepare(
-            "INSERT INTO account_history (event_at, equity, cash, buying_power, accrued_commission)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .await
-        .map_err(to_storage_err)?;
+    const COLUMNS: usize = 5;
+    let mut rows = Vec::with_capacity(MAX_BATCH_PARAMETERS / COLUMNS);
     for (timestamp, account) in account_history {
-        stmt.execute(params![
-            timestamp.to_rfc3339(),
-            account.equity,
-            account.cash,
-            account.buying_power,
-            account.accrued_commission
-        ])
-        .await
-        .map_err(to_storage_err)?;
+        rows.push(vec![
+            Value::Text(timestamp.to_rfc3339()),
+            Value::Real(account.equity),
+            Value::Real(account.cash),
+            Value::Real(account.buying_power),
+            Value::Real(account.accrued_commission),
+        ]);
+        if rows.len() >= MAX_BATCH_PARAMETERS / COLUMNS {
+            flush_insert_batch(
+                tx,
+                "INSERT INTO account_history (event_at, equity, cash, buying_power, accrued_commission) VALUES",
+                COLUMNS,
+                &mut rows,
+            )
+            .await?;
+        }
     }
-    Ok(())
+    flush_insert_batch(
+        tx,
+        "INSERT INTO account_history (event_at, equity, cash, buying_power, accrued_commission) VALUES",
+        COLUMNS,
+        &mut rows,
+    )
+    .await
 }
 
 async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> Result<(), String> {
@@ -701,13 +790,9 @@ async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> 
 }
 
 async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), String> {
-    let mut stmt = tx
-        .prepare(
-            "INSERT INTO bars (symbol, history_key, timeframe_label, is_feature, allow_trading, event_at, open, high, low, close, volume)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .await
-        .map_err(to_storage_err)?;
+    const COLUMNS: usize = 11;
+    const INSERT_PREFIX: &str = "INSERT INTO bars (symbol, history_key, timeframe_label, is_feature, allow_trading, event_at, open, high, low, close, volume) VALUES";
+    let mut rows = Vec::with_capacity(MAX_BATCH_PARAMETERS / COLUMNS);
 
     if !state.event_stream_bars.is_empty() {
         let mut keys = state.event_stream_bars.keys().cloned().collect::<Vec<_>>();
@@ -727,46 +812,48 @@ async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), 
                 continue;
             };
             for bar in bars {
-                stmt.execute(params![
-                    bar.symbol.clone(),
-                    stream.history_key.clone(),
-                    key.timeframe.compact_label(),
-                    if stream.is_feature { 1_i64 } else { 0_i64 },
-                    if stream.allow_trading { 1_i64 } else { 0_i64 },
-                    bar.timestamp.to_rfc3339(),
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    bar.volume
-                ])
-                .await
-                .map_err(to_storage_err)?;
+                rows.push(vec![
+                    Value::Text(bar.symbol.clone()),
+                    Value::Text(stream.history_key.clone()),
+                    Value::Text(key.timeframe.compact_label()),
+                    Value::Integer(if stream.is_feature { 1 } else { 0 }),
+                    Value::Integer(if stream.allow_trading { 1 } else { 0 }),
+                    Value::Text(bar.timestamp.to_rfc3339()),
+                    Value::Real(bar.open),
+                    Value::Real(bar.high),
+                    Value::Real(bar.low),
+                    Value::Real(bar.close),
+                    Value::Real(bar.volume),
+                ]);
+                if rows.len() >= MAX_BATCH_PARAMETERS / COLUMNS {
+                    flush_insert_batch(tx, INSERT_PREFIX, COLUMNS, &mut rows).await?;
+                }
             }
         }
-        return Ok(());
+        return flush_insert_batch(tx, INSERT_PREFIX, COLUMNS, &mut rows).await;
     }
 
     for (symbol, bars) in &state.historical_bars {
         for bar in bars {
-            stmt.execute(params![
-                symbol.clone(),
-                symbol.clone(),
-                String::new(),
-                0_i64,
-                1_i64,
-                bar.timestamp.to_rfc3339(),
-                bar.open,
-                bar.high,
-                bar.low,
-                bar.close,
-                bar.volume
-            ])
-            .await
-            .map_err(to_storage_err)?;
+            rows.push(vec![
+                Value::Text(symbol.clone()),
+                Value::Text(symbol.clone()),
+                Value::Text(String::new()),
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Text(bar.timestamp.to_rfc3339()),
+                Value::Real(bar.open),
+                Value::Real(bar.high),
+                Value::Real(bar.low),
+                Value::Real(bar.close),
+                Value::Real(bar.volume),
+            ]);
+            if rows.len() >= MAX_BATCH_PARAMETERS / COLUMNS {
+                flush_insert_batch(tx, INSERT_PREFIX, COLUMNS, &mut rows).await?;
+            }
         }
     }
-    Ok(())
+    flush_insert_batch(tx, INSERT_PREFIX, COLUMNS, &mut rows).await
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1702,12 +1789,8 @@ fn build_regime_points(bars: &[Bar]) -> Vec<RegimePoint> {
 
 fn build_regime_performance_iter(
     account_history: &[(DateTime<Utc>, Account)],
-    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    regime_points: &[RegimePoint],
 ) -> Vec<RegimePerformanceRow> {
-    let Some((_, bars)) = bars_by_symbol.iter().next() else {
-        return Vec::new();
-    };
-    let regime_points = build_regime_points(bars);
     if regime_points.is_empty() {
         return Vec::new();
     }
@@ -1722,7 +1805,7 @@ fn build_regime_performance_iter(
             .map(|value| *value * 100.0)
             .unwrap_or(point.market_return_pct);
         buckets
-            .entry((point.vol_regime, point.trend_regime))
+            .entry((point.vol_regime.clone(), point.trend_regime.clone()))
             .and_modify(|(sum, count)| {
                 *sum += strategy_return;
                 *count += 1;
@@ -1745,12 +1828,8 @@ fn build_regime_performance_iter(
 
 fn build_regime_performance_polars(
     account_history: &[(DateTime<Utc>, Account)],
-    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    regime_points: &[RegimePoint],
 ) -> PolarsResult<Vec<RegimePerformanceRow>> {
-    let Some((_, bars)) = bars_by_symbol.iter().next() else {
-        return Ok(Vec::new());
-    };
-    let regime_points = build_regime_points(bars);
     if regime_points.is_empty() {
         return Ok(Vec::new());
     }
@@ -1762,8 +1841,8 @@ fn build_regime_performance_polars(
     let mut returns = Vec::with_capacity(regime_points.len());
 
     for point in regime_points {
-        vol_regimes.push(point.vol_regime);
-        trend_regimes.push(point.trend_regime);
+        vol_regimes.push(point.vol_regime.clone());
+        trend_regimes.push(point.trend_regime.clone());
         returns.push(
             equity_return_by_time
                 .get(&point.timestamp)
@@ -1817,30 +1896,30 @@ fn build_regime_performance(
     account_history: &[(DateTime<Utc>, Account)],
     bars_by_symbol: &HashMap<String, Vec<Bar>>,
 ) -> Vec<RegimePerformanceRow> {
-    build_regime_performance_polars(account_history, bars_by_symbol)
-        .unwrap_or_else(|_| build_regime_performance_iter(account_history, bars_by_symbol))
+    let Some((_, bars)) = bars_by_symbol.iter().next() else {
+        return Vec::new();
+    };
+    let regime_points = build_regime_points(bars);
+    build_regime_performance_polars(account_history, &regime_points)
+        .unwrap_or_else(|_| build_regime_performance_iter(account_history, &regime_points))
 }
 
 fn regime_at_entry<'a>(
     regime_points: &'a [RegimePoint],
     entry_time: DateTime<Utc>,
 ) -> Option<&'a RegimePoint> {
-    regime_points
-        .iter()
-        .take_while(|point| point.timestamp <= entry_time)
-        .last()
-        .or_else(|| regime_points.first())
+    let insertion_index = regime_points.partition_point(|point| point.timestamp <= entry_time);
+    if insertion_index == 0 {
+        regime_points.first()
+    } else {
+        regime_points.get(insertion_index - 1)
+    }
 }
 
 fn build_strategy_regime_performance_iter(
     trips: &[RoundTripTrade],
-    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    regime_points_by_symbol: &HashMap<String, Vec<RegimePoint>>,
 ) -> Vec<StrategyRegimePerformanceRow> {
-    let regime_points_by_symbol: HashMap<String, Vec<RegimePoint>> = bars_by_symbol
-        .iter()
-        .map(|(symbol, bars)| (symbol.clone(), build_regime_points(bars)))
-        .filter(|(_, points)| !points.is_empty())
-        .collect();
     if regime_points_by_symbol.is_empty() {
         return Vec::new();
     }
@@ -1908,13 +1987,8 @@ fn build_strategy_regime_performance_iter(
 
 fn build_strategy_regime_performance_polars(
     trips: &[RoundTripTrade],
-    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    regime_points_by_symbol: &HashMap<String, Vec<RegimePoint>>,
 ) -> PolarsResult<Vec<StrategyRegimePerformanceRow>> {
-    let regime_points_by_symbol: HashMap<String, Vec<RegimePoint>> = bars_by_symbol
-        .iter()
-        .map(|(symbol, bars)| (symbol.clone(), build_regime_points(bars)))
-        .filter(|(_, points)| !points.is_empty())
-        .collect();
     if trips.is_empty() || regime_points_by_symbol.is_empty() {
         return Ok(Vec::new());
     }
@@ -2049,8 +2123,13 @@ fn build_strategy_regime_performance(
     trips: &[RoundTripTrade],
     bars_by_symbol: &HashMap<String, Vec<Bar>>,
 ) -> Vec<StrategyRegimePerformanceRow> {
-    build_strategy_regime_performance_polars(trips, bars_by_symbol)
-        .unwrap_or_else(|_| build_strategy_regime_performance_iter(trips, bars_by_symbol))
+    let regime_points_by_symbol: HashMap<String, Vec<RegimePoint>> = bars_by_symbol
+        .iter()
+        .map(|(symbol, bars)| (symbol.clone(), build_regime_points(bars)))
+        .filter(|(_, points)| !points.is_empty())
+        .collect();
+    build_strategy_regime_performance_polars(trips, &regime_points_by_symbol)
+        .unwrap_or_else(|_| build_strategy_regime_performance_iter(trips, &regime_points_by_symbol))
 }
 
 fn build_trade_mae(
@@ -2699,6 +2778,7 @@ pub async fn write_backtest_db(
     let mut conn = connect_database(dir_path).await?;
     init_schema(&conn).await?;
     let tx = conn.transaction().await.map_err(to_storage_err)?;
+    drop_secondary_indexes(&tx).await?;
     let insights: Vec<InsightSnapshot> = state.insight_snapshots.values().cloned().collect();
     insert_trade_log(&tx, &results.trade_log).await?;
     let round_trips = results.round_trip_trades();
@@ -2708,6 +2788,7 @@ pub async fn write_backtest_db(
     insert_insights(&tx, &insights).await?;
     insert_bars(&tx, state).await?;
     insert_analysis_tables(&tx, results, state, &round_trips).await?;
+    create_secondary_indexes(&tx).await?;
     tx.commit().await.map_err(to_storage_err)?;
     Ok(())
 }
@@ -2931,6 +3012,86 @@ mod tests {
         drop(rows);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn account_history_batches_rows_and_rebuilds_indexes() {
+        let dir = std::env::temp_dir().join(format!(
+            "aqe-backtest-batched-account-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let history = (0..250)
+            .map(|offset| {
+                (
+                    start + chrono::Duration::minutes(offset),
+                    test_account(10_000.0 + offset as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut conn = connect_database(&dir).await.unwrap();
+        init_schema(&conn).await.unwrap();
+        let tx = conn.transaction().await.unwrap();
+        drop_secondary_indexes(&tx).await.unwrap();
+        insert_account_history(&tx, &history).await.unwrap();
+        create_secondary_indexes(&tx).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let mut count_rows = conn
+            .query("SELECT COUNT(*) FROM account_history", ())
+            .await
+            .unwrap();
+        let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 250);
+
+        let mut index_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_account_history_event_at'",
+                (),
+            )
+            .await
+            .unwrap();
+        let index_count: i64 = index_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(index_count, 1);
+
+        drop(count_rows);
+        drop(index_rows);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn regime_lookup_uses_latest_point_at_or_before_entry() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let points = (0..4)
+            .map(|offset| RegimePoint {
+                timestamp: start + chrono::Duration::hours(offset * 2),
+                vol_regime: format!("vol-{offset}"),
+                trend_regime: format!("trend-{offset}"),
+                market_return_pct: offset as f64,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            regime_at_entry(&points, start - chrono::Duration::hours(1))
+                .unwrap()
+                .vol_regime,
+            "vol-0"
+        );
+        assert_eq!(
+            regime_at_entry(&points, start + chrono::Duration::hours(5))
+                .unwrap()
+                .vol_regime,
+            "vol-2"
+        );
+        assert_eq!(
+            regime_at_entry(&points, start + chrono::Duration::hours(20))
+                .unwrap()
+                .vol_regime,
+            "vol-3"
+        );
     }
 
     #[test]

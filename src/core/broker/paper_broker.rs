@@ -161,20 +161,21 @@ impl PaperBroker {
             current_time
         );
         self.set_time(current_time);
+        let now_ts = current_time.timestamp() as u64;
 
         // 1. Process pending orders (market/limit/stop fills)
         debug!("PaperBroker::process_step pending_orders phase");
-        self.process_pending_orders(bars);
+        self.process_pending_orders(bars, current_time, now_ts);
 
         // 2. Process active orders (bracket legs: TP/SL checks)
         debug!("PaperBroker::process_step active_orders phase");
-        self.process_active_orders(bars);
+        self.process_active_orders(bars, current_time, now_ts);
 
         // 3. Process deferred close/update queues
         debug!("PaperBroker::process_step close_queue phase");
-        self.process_close_queue(bars);
+        self.process_close_queue(bars, current_time, now_ts);
         debug!("PaperBroker::process_step update_queue phase");
-        self.process_update_queue();
+        self.process_update_queue(now_ts);
 
         // 4. Update account balance with current prices
         debug!("PaperBroker::process_step account_update phase");
@@ -199,7 +200,7 @@ impl PaperBroker {
             queued_requests
         );
         self.set_time(current_time);
-        self.process_close_queue(bars);
+        self.process_close_queue(bars, current_time, current_time.timestamp() as u64);
         self.update_account_balance(bars);
         debug!("PaperBroker::process_close_queue_at exit");
         queued_requests
@@ -209,7 +210,12 @@ impl PaperBroker {
 
     /// Process pending orders against the current bar.
     /// Market orders fill at open, Limit/Stop fill if bar range crosses the trigger price.
-    fn process_pending_orders(&self, bars: &HashMap<String, Bar>) {
+    fn process_pending_orders(
+        &self,
+        bars: &HashMap<String, Bar>,
+        current_time: DateTime<Utc>,
+        now_ts: u64,
+    ) {
         let mut pending = self.pending_orders.lock();
         let mut remaining = VecDeque::new();
 
@@ -228,8 +234,6 @@ impl PaperBroker {
                 let fill_result = self.try_fill_order(&order, bar);
 
                 if let Some(fill_price) = fill_result {
-                    let _now_ts = self.current_time_ts();
-
                     if let Some(reason) = self.insufficient_funds_reason(
                         &order.side,
                         order.qty,
@@ -238,7 +242,7 @@ impl PaperBroker {
                     ) {
                         order.status = TradeUpdateEvent::Rejected;
                         order.rejection_reason = Some(reason);
-                        order.updated_at = _now_ts;
+                        order.updated_at = now_ts;
                         self.emit_trade_event(&order, TradeUpdateEvent::Rejected);
                         self.mark_order_terminal_for_release(&order_id);
                         continue;
@@ -248,8 +252,8 @@ impl PaperBroker {
                     order.status = TradeUpdateEvent::Filled;
                     order.filled_qty = order.qty;
                     order.filled_price = Some(fill_price);
-                    order.filled_at = Some(_now_ts);
-                    order.updated_at = _now_ts;
+                    order.filled_at = Some(now_ts);
+                    order.updated_at = now_ts;
                     order.commission = Some(order.asset.fees.entry_commission_for_side(
                         &order.side,
                         fill_price,
@@ -259,14 +263,14 @@ impl PaperBroker {
 
                     // Build bracket legs if order_class is Bracket
                     if order.order_class == OrderClass::Bracket {
-                        self.create_bracket_legs(&mut order, _now_ts);
+                        self.create_bracket_legs(&mut order, now_ts);
                     }
 
                     // Open/update position
                     self.open_position(&order, fill_price);
 
                     // Record trade
-                    self.record_entry_trade(&order, fill_price);
+                    self.record_entry_trade(&order, fill_price, current_time);
 
                     // Emit Filled trade event
                     self.emit_trade_event(&order, TradeUpdateEvent::Filled);
@@ -413,7 +417,12 @@ impl PaperBroker {
     // ─────────────────────── Active Orders (Bracket Legs) ───────────────────────
 
     /// Check active orders' bracket legs (TP/SL) against the current bar.
-    fn process_active_orders(&self, bars: &HashMap<String, Bar>) {
+    fn process_active_orders(
+        &self,
+        bars: &HashMap<String, Bar>,
+        current_time: DateTime<Utc>,
+        now_ts: u64,
+    ) {
         let mut to_remove = Vec::new();
 
         for entry in self.active_orders.iter() {
@@ -431,7 +440,6 @@ impl PaperBroker {
                 if let Some(ref mut legs) = order.legs {
                     let mut closed = false;
                     let mut close_price = 0.0;
-                    let now_ts = self.current_time_ts();
 
                     if let Some(ref mut trailing) = legs.trailing_stop {
                         if trailing.status != TradeUpdateEvent::Filled {
@@ -494,8 +502,12 @@ impl PaperBroker {
                     }
 
                     if closed {
-                        let close_result =
-                            self.close_position_for_order(&order, close_price, order.qty);
+                        let close_result = self.close_position_for_order(
+                            &order,
+                            close_price,
+                            order.qty,
+                            current_time,
+                        );
                         order.status = TradeUpdateEvent::Closed;
                         order.updated_at = now_ts;
                         order.filled_price = Some(close_price);
@@ -584,6 +596,7 @@ impl PaperBroker {
         order: &Order,
         close_price: f64,
         close_qty: f64,
+        current_time: DateTime<Utc>,
     ) -> Option<ClosePositionResult> {
         let symbol = &order.asset.symbol;
         let order_id = &order.order_id;
@@ -614,7 +627,7 @@ impl PaperBroker {
                     requested_qty,
                     order.asset.contract_size,
                     order.asset.min_price_increment,
-                    self.swap_days_for_order(order),
+                    Self::swap_days_for_order(order, current_time.timestamp() as u64),
                 );
 
                 // Calculate realized P&L
@@ -641,7 +654,7 @@ impl PaperBroker {
                 // Record exit trade
                 if let Some(ref state) = self.backtest_state {
                     state.write().record_trade(TradeRecord {
-                        date: *self.current_time.read(),
+                        date: current_time,
                         symbol: symbol.clone(),
                         side: order.side.clone(),
                         qty: requested_qty,
@@ -698,20 +711,20 @@ impl PaperBroker {
     /// Update account equity and unrealized P&L based on current prices.
     fn update_account_balance(&self, bars: &HashMap<String, Bar>) {
         let mut total_unrealized_pnl = 0.0;
-        let mut _total_market_value = 0.0;
+        let mut total_margin_held = 0.0;
+        let mut mae_updates = Vec::new();
 
         for entry in self.positions.iter() {
-            let symbol = entry.key();
-            if let Some(bar) = bars.get(symbol) {
-                let symbol_positions = entry.value();
-                for mut pos in symbol_positions.iter_mut() {
+            let bar = bars.get(entry.key());
+            for mut pos in entry.value().iter_mut() {
+                if let Some(bar) = bar {
                     pos.current_price = bar.close;
                     pos.market_value = bar.close * pos.qty;
                     pos.unrealized_pnl = match pos.side {
                         OrderSide::Buy => (bar.close - pos.avg_entry_price) * pos.qty,
                         OrderSide::Sell => (pos.avg_entry_price - bar.close) * pos.qty,
                     };
-                    if let Some(ref state) = self.backtest_state {
+                    if self.backtest_state.is_some() {
                         let mae_pct = if pos.avg_entry_price.abs() > f64::EPSILON {
                             match pos.side {
                                 OrderSide::Buy => {
@@ -724,32 +737,35 @@ impl PaperBroker {
                         } else {
                             0.0
                         };
-                        state.write().record_trade_mae(pos.key(), mae_pct);
+                        mae_updates.push((pos.key().clone(), mae_pct));
                     }
                     total_unrealized_pnl += pos.unrealized_pnl;
-                    _total_market_value += pos.market_value;
                 }
+                total_margin_held += pos.margin_required.unwrap_or(pos.cost_basis);
+            }
+        }
+
+        if !mae_updates.is_empty()
+            && let Some(ref state) = self.backtest_state
+        {
+            let mut state = state.write();
+            for (order_id, mae_pct) in mae_updates {
+                state.record_trade_mae(&order_id, mae_pct);
             }
         }
 
         let mut account = self.account.write();
-        account.equity = account.cash + total_unrealized_pnl + self.total_margin_held();
-    }
-
-    /// Calculate total margin held across all positions.
-    fn total_margin_held(&self) -> f64 {
-        let mut total = 0.0;
-        for entry in self.positions.iter() {
-            for pos in entry.value().iter() {
-                total += pos.margin_required.unwrap_or(pos.cost_basis);
-            }
-        }
-        total
+        account.equity = account.cash + total_unrealized_pnl + total_margin_held;
     }
 
     // ─────────────────────── Deferred Queues ───────────────────────
 
-    fn process_close_queue(&self, bars: &HashMap<String, Bar>) {
+    fn process_close_queue(
+        &self,
+        bars: &HashMap<String, Bar>,
+        current_time: DateTime<Utc>,
+        now_ts: u64,
+    ) {
         let mut queue = self.close_orders_queue.lock();
         debug!(
             "PaperBroker::process_close_queue start queued_requests={}",
@@ -767,7 +783,8 @@ impl PaperBroker {
                         "PaperBroker::process_close_queue closing order_id={} symbol={} fill_price={:.4}",
                         order_id, order.asset.symbol, fill_price
                     );
-                    let close_result = self.close_position_for_order(&order, fill_price, qty);
+                    let close_result =
+                        self.close_position_for_order(&order, fill_price, qty, current_time);
                     let fully_closed = close_result
                         .map(|result| result.fully_closed)
                         .unwrap_or(false);
@@ -781,7 +798,7 @@ impl PaperBroker {
 
                     let mut terminal_close = fully_closed;
                     if let Some(mut o) = self.orders.get_mut(&order_id) {
-                        o.updated_at = self.current_time_ts();
+                        o.updated_at = now_ts;
                         o.filled_price = Some(fill_price);
                         o.filled_qty = close_qty;
                         let remaining_qty = (o.qty - close_qty).max(0.0);
@@ -825,22 +842,22 @@ impl PaperBroker {
         debug!("PaperBroker::process_close_queue end");
     }
 
-    fn process_update_queue(&self) {
+    fn process_update_queue(&self, now_ts: u64) {
         let mut queue = self.update_orders_queue.lock();
         while let Some((order_id, status)) = queue.pop_front() {
             if let Some(mut order) = self.orders.get_mut(&order_id) {
                 order.status = status;
-                order.updated_at = self.current_time_ts();
+                order.updated_at = now_ts;
             }
         }
     }
 
     // ─────────────────────── Trade Recording ───────────────────────
 
-    fn record_entry_trade(&self, order: &Order, fill_price: f64) {
+    fn record_entry_trade(&self, order: &Order, fill_price: f64, current_time: DateTime<Utc>) {
         if let Some(ref state) = self.backtest_state {
             state.write().record_trade(TradeRecord {
-                date: *self.current_time.read(),
+                date: current_time,
                 symbol: order.asset.symbol.clone(),
                 side: order.side.clone(),
                 qty: order.filled_qty,
@@ -1048,11 +1065,10 @@ impl PaperBroker {
     }
 
     #[inline]
-    fn swap_days_for_order(&self, order: &Order) -> f64 {
+    fn swap_days_for_order(order: &Order, current: u64) -> f64 {
         let Some(opened_at) = order.filled_at else {
             return 0.0;
         };
-        let current = self.current_time_ts();
         if current <= opened_at {
             return 0.0;
         }

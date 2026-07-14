@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,30 @@ fn is_terminal_insight_state(state: &str) -> bool {
         state.trim().to_ascii_lowercase().as_str(),
         "closed" | "cancelled" | "rejected"
     )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScheduledMarketStream {
+    timestamp: DateTime<Utc>,
+    key: MarketStreamKey,
+    timeframe_label: String,
+    index: usize,
+}
+
+impl Ord for ScheduledMarketStream {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.key.symbol.cmp(&other.key.symbol))
+            .then_with(|| self.timeframe_label.cmp(&other.timeframe_label))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for ScheduledMarketStream {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Shared state for backtesting. Held behind `Arc<parking_lot::RwLock<BacktestState>>`
@@ -55,6 +80,10 @@ pub struct BacktestState {
 
     executed_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
+    market_scheduler: BinaryHeap<Reverse<ScheduledMarketStream>>,
+    market_scheduler_initialized: bool,
+    total_event_bars: usize,
+    processed_event_bars: usize,
 }
 
 impl BacktestState {
@@ -76,6 +105,10 @@ impl BacktestState {
             backtest_end: None,
             executed_at: Utc::now(),
             finished_at: None,
+            market_scheduler: BinaryHeap::new(),
+            market_scheduler_initialized: false,
+            total_event_bars: 0,
+            processed_event_bars: 0,
         }
     }
 
@@ -95,6 +128,8 @@ impl BacktestState {
         self.event_stream_bars.insert(key.clone(), bars);
         self.event_streams.insert(key, stream);
         self.total_bars = self.total_bars.max(len);
+        self.market_scheduler.clear();
+        self.market_scheduler_initialized = false;
     }
 
     pub fn set_backtest_window(&mut self, start: DateTime<Utc>, end: DateTime<Utc>) {
@@ -131,16 +166,32 @@ impl BacktestState {
     }
 
     pub fn next_market_step(&mut self) -> Option<BacktestMarketStep> {
-        let timestamp = self
-            .event_stream_indices
-            .iter()
-            .filter_map(|(key, &idx)| {
-                self.event_stream_bars
-                    .get(key)
-                    .and_then(|bars| bars.get(idx))
-                    .map(|bar| bar.timestamp)
-            })
-            .min()?;
+        self.initialize_market_scheduler();
+
+        let first = loop {
+            let Reverse(scheduled) = self.market_scheduler.pop()?;
+            if self.is_current_schedule_entry(&scheduled) {
+                break scheduled;
+            }
+            self.schedule_current_stream(&scheduled.key);
+        };
+        let timestamp = first.timestamp;
+        let mut scheduled_keys = HashSet::from([first.key.clone()]);
+        let mut scheduled_streams = vec![first];
+        while self
+            .market_scheduler
+            .peek()
+            .is_some_and(|Reverse(next)| next.timestamp == timestamp)
+        {
+            let Reverse(scheduled) = self.market_scheduler.pop().expect("peeked schedule entry");
+            if self.is_current_schedule_entry(&scheduled)
+                && scheduled_keys.insert(scheduled.key.clone())
+            {
+                scheduled_streams.push(scheduled);
+            } else {
+                self.schedule_current_stream(&scheduled.key);
+            }
+        }
 
         self.previous_time = Some(self.current_time);
         self.current_time = timestamp;
@@ -149,23 +200,12 @@ impl BacktestState {
         let mut execution_bars = HashMap::new();
         let mut has_tradable_events = false;
 
-        let mut keys: Vec<MarketStreamKey> = self.event_stream_indices.keys().cloned().collect();
-        keys.sort_by(|left, right| {
-            left.symbol.cmp(&right.symbol).then(
-                left.timeframe
-                    .compact_label()
-                    .cmp(&right.timeframe.compact_label()),
-            )
-        });
-
-        for key in keys {
-            let Some(&idx) = self.event_stream_indices.get(&key) else {
-                continue;
-            };
+        for scheduled in scheduled_streams {
+            let key = scheduled.key;
             let Some(bar) = self
                 .event_stream_bars
                 .get(&key)
-                .and_then(|bars| bars.get(idx))
+                .and_then(|bars| bars.get(scheduled.index))
                 .filter(|bar| bar.timestamp == timestamp)
                 .cloned()
             else {
@@ -208,8 +248,17 @@ impl BacktestState {
                 event.context.timeframe,
             );
             if let Some(idx) = self.event_stream_indices.get_mut(&key) {
-                *idx += 1;
+                let stream_len = self
+                    .event_stream_bars
+                    .get(&key)
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                if *idx < stream_len {
+                    *idx += 1;
+                    self.processed_event_bars += 1;
+                }
             }
+            self.schedule_current_stream(&key);
             if !event.context.is_feature {
                 if let Some(idx) = self.bar_indices.get_mut(&event.context.symbol) {
                     *idx += 1;
@@ -219,6 +268,9 @@ impl BacktestState {
     }
 
     pub fn is_market_stream_complete(&self) -> bool {
+        if self.market_scheduler_initialized {
+            return self.processed_event_bars >= self.total_event_bars;
+        }
         self.event_stream_indices.iter().all(|(key, &idx)| {
             self.event_stream_bars
                 .get(key)
@@ -228,12 +280,14 @@ impl BacktestState {
     }
 
     pub fn progress_snapshot(&self) -> BacktestProgressSnapshot {
-        let total_steps = self
-            .event_stream_bars
-            .values()
-            .map(|bars| bars.len())
-            .sum::<usize>();
-        let processed_steps = self.event_stream_indices.values().copied().sum::<usize>();
+        let (total_steps, processed_steps) = if self.market_scheduler_initialized {
+            (self.total_event_bars, self.processed_event_bars)
+        } else {
+            (
+                self.event_stream_bars.values().map(Vec::len).sum(),
+                self.event_stream_indices.values().copied().sum(),
+            )
+        };
         let progress_pct = if total_steps > 0 {
             (processed_steps.min(total_steps) as f64 / total_steps as f64) * 100.0
         } else {
@@ -252,6 +306,62 @@ impl BacktestState {
             stream_count: self.event_stream_bars.len(),
             tradable_stream_count,
         }
+    }
+
+    fn initialize_market_scheduler(&mut self) {
+        if self.market_scheduler_initialized {
+            return;
+        }
+
+        self.market_scheduler.clear();
+        self.total_event_bars = self.event_stream_bars.values().map(Vec::len).sum();
+        self.processed_event_bars = self
+            .event_stream_indices
+            .iter()
+            .map(|(key, index)| {
+                (*index).min(
+                    self.event_stream_bars
+                        .get(key)
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                )
+            })
+            .sum();
+
+        let keys: Vec<_> = self.event_stream_indices.keys().cloned().collect();
+        for key in keys {
+            self.schedule_current_stream(&key);
+        }
+        self.market_scheduler_initialized = true;
+    }
+
+    fn schedule_current_stream(&mut self, key: &MarketStreamKey) {
+        let Some(&index) = self.event_stream_indices.get(key) else {
+            return;
+        };
+        let Some(timestamp) = self
+            .event_stream_bars
+            .get(key)
+            .and_then(|bars| bars.get(index))
+            .map(|bar| bar.timestamp)
+        else {
+            return;
+        };
+        self.market_scheduler.push(Reverse(ScheduledMarketStream {
+            timestamp,
+            key: key.clone(),
+            timeframe_label: key.timeframe.compact_label(),
+            index,
+        }));
+    }
+
+    fn is_current_schedule_entry(&self, scheduled: &ScheduledMarketStream) -> bool {
+        self.event_stream_indices.get(&scheduled.key) == Some(&scheduled.index)
+            && self
+                .event_stream_bars
+                .get(&scheduled.key)
+                .and_then(|bars| bars.get(scheduled.index))
+                .is_some_and(|bar| bar.timestamp == scheduled.timestamp)
     }
 
     /// Advance all symbols to the next bar.
@@ -1502,6 +1612,8 @@ impl BacktestResults {
 mod tests {
     use super::*;
     use crate::core::broker::types::AccountType;
+    use crate::core::events::{EventStreamType, ResolvedEventStream};
+    use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
     use chrono::TimeZone;
 
     struct TestDir {
@@ -1548,6 +1660,76 @@ mod tests {
         assert!(!is_terminal_insight_state("Filled"));
         assert!(!is_terminal_insight_state("Executed"));
         assert!(!is_terminal_insight_state(""));
+    }
+
+    #[test]
+    fn market_scheduler_preserves_timestamp_and_stream_order() {
+        let mut state = BacktestState::new();
+        let main_timeframe = TimeFrame::new(5, TimeFrameUnit::Minute);
+        let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 9, 30, 0).unwrap();
+        let bar = |symbol: &str, timestamp| Bar {
+            symbol: symbol.to_string(),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1_000.0,
+            timestamp,
+        };
+
+        state.load_event_stream_bars(
+            ResolvedEventStream::new(
+                EventStreamType::Bar,
+                "AAPL",
+                main_timeframe,
+                main_timeframe,
+                true,
+            ),
+            vec![
+                bar("AAPL", start),
+                bar("AAPL", start + chrono::Duration::minutes(10)),
+            ],
+        );
+        state.load_event_stream_bars(
+            ResolvedEventStream::new(
+                EventStreamType::Bar,
+                "AAPL",
+                feature_timeframe,
+                main_timeframe,
+                false,
+            ),
+            vec![bar("AAPL", start)],
+        );
+        state.load_event_stream_bars(
+            ResolvedEventStream::new(
+                EventStreamType::Bar,
+                "MSFT",
+                main_timeframe,
+                main_timeframe,
+                true,
+            ),
+            vec![bar("MSFT", start + chrono::Duration::minutes(5))],
+        );
+
+        let first = state.next_market_step().unwrap();
+        assert_eq!(first.timestamp, start);
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.events[0].context.timeframe, feature_timeframe);
+        assert_eq!(first.events[1].context.timeframe, main_timeframe);
+        state.advance_market_step(&first);
+
+        let second = state.next_market_step().unwrap();
+        assert_eq!(second.timestamp, start + chrono::Duration::minutes(5));
+        assert_eq!(second.events[0].context.symbol, "MSFT");
+        state.advance_market_step(&second);
+
+        let third = state.next_market_step().unwrap();
+        assert_eq!(third.timestamp, start + chrono::Duration::minutes(10));
+        state.advance_market_step(&third);
+
+        assert!(state.is_market_stream_complete());
+        assert_eq!(state.progress_snapshot().processed_steps, 4);
     }
 
     #[test]

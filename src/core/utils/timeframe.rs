@@ -35,7 +35,7 @@ impl TimeFrameUnit {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TimeFrame {
     amount: u8,
     unit: TimeFrameUnit,
@@ -63,10 +63,10 @@ impl TimeFrame {
         Self::validate_time_frame(&amount, &unit).unwrap()
     }
     pub fn get_amount(&self) -> u8 {
-        self.amount.clone()
+        self.amount
     }
     pub fn get_unit(&self) -> TimeFrameUnit {
-        self.unit.clone()
+        self.unit
     }
 
     pub fn compact_label(&self) -> String {
@@ -248,11 +248,6 @@ impl TimeFrame {
     }
 }
 
-impl PartialEq for TimeFrame {
-    fn eq(&self, other: &Self) -> bool {
-        self.amount == other.amount && self.unit == other.unit
-    }
-}
 impl std::fmt::Display for TimeFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.compact_label())

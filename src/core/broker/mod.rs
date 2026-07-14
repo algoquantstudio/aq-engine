@@ -24,11 +24,26 @@ pub enum DataStreamMode {
 
 use crate::core::events::{BacktestMarketStep, ResolvedEventStream};
 use crate::core::utils::timeframe::TimeFrame;
+use futures::{StreamExt, TryStreamExt, stream};
 use log::{debug, info};
 use parking_lot::RwLock;
 use polars::prelude::*;
 use std::sync::Arc;
 use types::{AccountType, Asset, Bar, BrokerError, Order};
+
+const MAX_CONCURRENT_HISTORY_LOADS: usize = 8;
+
+pub(crate) fn block_on_broker_future<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(|| handle.block_on(future));
+    }
+    futures::executor::block_on(future)
+}
 
 // ─────────────────────── UnifiedBroker ───────────────────────
 
@@ -190,7 +205,7 @@ where
     pub fn cancel_order_sync(&self, order_id: &str) -> Result<bool, BrokerError> {
         // PaperBroker's cancel_order doesn't actually await anything,
         // so blocking here is safe and zero-cost.
-        futures::executor::block_on(self.execution.cancel_order(order_id))
+        block_on_broker_future(self.execution.cancel_order(order_id))
     }
 
     /// Synchronous order update — used by insight pipes to modify broker-side legs.
@@ -200,7 +215,7 @@ where
         price: f64,
         qty: f64,
     ) -> Result<bool, BrokerError> {
-        futures::executor::block_on(self.execution.update_order(order_id, price, qty))
+        block_on_broker_future(self.execution.update_order(order_id, price, qty))
     }
 
     pub fn update_stop_loss_sync(
@@ -209,7 +224,7 @@ where
         price: f64,
         qty: f64,
     ) -> Result<bool, BrokerError> {
-        futures::executor::block_on(self.execution.update_stop_loss(order_id, price, qty))
+        block_on_broker_future(self.execution.update_stop_loss(order_id, price, qty))
     }
 
     /// Synchronous close — safe when the underlying broker is PaperBroker.
@@ -219,15 +234,15 @@ where
         qty: f64,
         price: Option<f64>,
     ) -> Result<bool, BrokerError> {
-        futures::executor::block_on(self.execution.close_position(order_id, qty, price))
+        block_on_broker_future(self.execution.close_position(order_id, qty, price))
     }
 
     pub fn get_position_sync(&self, symbol: &str) -> Result<types::Position, BrokerError> {
-        futures::executor::block_on(self.execution.get_position(symbol))
+        block_on_broker_future(self.execution.get_position(symbol))
     }
 
     pub fn get_positions_sync(&self) -> Result<Vec<types::Position>, BrokerError> {
-        futures::executor::block_on(self.execution.get_positions())
+        block_on_broker_future(self.execution.get_positions())
     }
 }
 
@@ -416,35 +431,39 @@ where
         let state = self.backtest_state.as_ref().unwrap().clone();
         state.write().set_backtest_window(start, end);
 
-        for symbol in symbols {
-            info!(
-                "Loading backtest history for symbol={} timeframe={:?} start={} end={}",
-                symbol, time_frame, start, end
-            );
-            // Fetch history via the data feed (works with any provider: Yahoo, MT5, IB, etc.)
-            let df = self
-                .data
-                .get_history(symbol, start, end, time_frame.clone())
-                .await?;
-            debug!("Fetched dataframe for {} shape={:?}", symbol, df.shape());
-
-            // Convert DataFrame to Vec<Bar> for fast indexed access in BacktestState
-            let bars = Self::dataframe_to_bars(symbol, &df)?;
-            if bars.is_empty() {
-                return Err(BrokerError::DataFeedError(format!(
-                    "Backtest history request returned 0 bars for {} timeframe={:?} start={} end={}",
+        let data = &self.data;
+        let mut histories = stream::iter(symbols.iter().cloned().enumerate())
+            .map(|(index, symbol)| async move {
+                info!(
+                    "Loading backtest history for symbol={} timeframe={:?} start={} end={}",
                     symbol, time_frame, start, end
-                )));
-            }
-            info!("Loaded {} bars for {}", bars.len(), symbol);
+                );
+                let df = data.get_history(&symbol, start, end, time_frame).await?;
+                debug!("Fetched dataframe for {} shape={:?}", symbol, df.shape());
 
+                let bars = Self::dataframe_to_bars(&symbol, &df)?;
+                if bars.is_empty() {
+                    return Err(BrokerError::DataFeedError(format!(
+                        "Backtest history request returned 0 bars for {} timeframe={:?} start={} end={}",
+                        symbol, time_frame, start, end
+                    )));
+                }
+                info!("Loaded {} bars for {}", bars.len(), symbol);
+                Ok((index, symbol, bars))
+            })
+            .buffer_unordered(MAX_CONCURRENT_HISTORY_LOADS)
+            .try_collect::<Vec<_>>()
+            .await?;
+        histories.sort_unstable_by_key(|(index, _, _)| *index);
+
+        for (_, symbol, bars) in histories {
             let mut state_guard = state.write();
             state_guard.load_bars(symbol.clone(), bars);
 
             // Set initial time from the first bar
             if let Some(first_bar) = state_guard
                 .historical_bars
-                .get(symbol)
+                .get(&symbol)
                 .and_then(|v| v.first())
             {
                 if state_guard.previous_time.is_none() {
@@ -472,39 +491,47 @@ where
         let state = self.backtest_state.as_ref().unwrap().clone();
         state.write().set_backtest_window(start, end);
 
-        for stream in streams {
+        let data = &self.data;
+        let mut histories = stream::iter(streams.iter().cloned().enumerate())
+            .map(|(index, stream)| async move {
+                let symbol = stream.key.symbol.clone();
+                let time_frame = stream.key.timeframe;
+                info!(
+                    "Loading backtest stream symbol={} history_key={} timeframe={} feature={} allow_trading={} start={} end={}",
+                    &symbol,
+                    stream.history_key,
+                    time_frame,
+                    stream.is_feature,
+                    stream.allow_trading,
+                    start,
+                    end
+                );
+
+                let df = data.get_history(&symbol, start, end, time_frame).await?;
+                debug!(
+                    "Fetched dataframe for {} {} shape={:?}",
+                    &symbol,
+                    time_frame,
+                    df.shape()
+                );
+
+                let bars = Self::dataframe_to_bars(&symbol, &df)?;
+                if bars.is_empty() {
+                    return Err(BrokerError::DataFeedError(format!(
+                        "Backtest history request returned 0 bars for {} timeframe={} start={} end={}",
+                        &symbol, time_frame, start, end
+                    )));
+                }
+
+                Ok((index, stream, bars))
+            })
+            .buffer_unordered(MAX_CONCURRENT_HISTORY_LOADS)
+            .try_collect::<Vec<_>>()
+            .await?;
+        histories.sort_unstable_by_key(|(index, _, _)| *index);
+
+        for (_, stream, bars) in histories {
             let symbol = &stream.key.symbol;
-            let time_frame = stream.key.timeframe;
-            info!(
-                "Loading backtest stream symbol={} history_key={} timeframe={} feature={} allow_trading={} start={} end={}",
-                symbol,
-                stream.history_key,
-                time_frame,
-                stream.is_feature,
-                stream.allow_trading,
-                start,
-                end
-            );
-
-            let df = self
-                .data
-                .get_history(symbol, start, end, time_frame)
-                .await?;
-            debug!(
-                "Fetched dataframe for {} {} shape={:?}",
-                symbol,
-                time_frame,
-                df.shape()
-            );
-
-            let bars = Self::dataframe_to_bars(symbol, &df)?;
-            if bars.is_empty() {
-                return Err(BrokerError::DataFeedError(format!(
-                    "Backtest history request returned 0 bars for {} timeframe={} start={} end={}",
-                    symbol, time_frame, start, end
-                )));
-            }
-
             let mut state_guard = state.write();
             state_guard.load_event_stream_bars(stream.clone(), bars.clone());
             if !stream.is_feature {

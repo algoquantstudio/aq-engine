@@ -33,6 +33,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_QUEUE_LEN: usize = 10_000;
 const MAX_TRADE_EVENT_QUEUE_LEN: usize = 20_000;
+const MAX_SEEN_EVENT_IDS: usize = 50_000;
 
 static SHARED_MT5_BRIDGE: OnceLock<Arc<Mt5Bridge>> = OnceLock::new();
 
@@ -121,6 +122,7 @@ fn parse_symbol_map(value: Option<String>) -> HashMap<String, String> {
 #[derive(Clone)]
 pub struct Mt5Bridge {
     config: Mt5BridgeConfig,
+    reverse_symbol_map: Arc<HashMap<String, String>>,
     session_id: Arc<RwLock<String>>,
     state: Arc<RwLock<Mt5BridgeState>>,
     rpc_queue: Arc<Mutex<VecDeque<Mt5RpcRequest>>>,
@@ -147,6 +149,7 @@ struct Mt5BridgeState {
     latest_intrabar_bars: HashMap<(String, String), Bar>,
     history: HashMap<String, Vec<Bar>>,
     seen_event_ids: HashSet<String>,
+    seen_event_order: VecDeque<String>,
     active_sessions: HashMap<String, DateTime<Utc>>,
     last_rpc_poll_attempt: Option<DateTime<Utc>>,
     last_rpc_poll: Option<DateTime<Utc>>,
@@ -264,8 +267,16 @@ impl Mt5Bridge {
     }
 
     pub fn new(config: Mt5BridgeConfig) -> Self {
+        let reverse_symbol_map = Arc::new(
+            config
+                .symbol_map
+                .iter()
+                .map(|(aqe, mt5)| (mt5.clone(), aqe.clone()))
+                .collect(),
+        );
         Self {
             config,
+            reverse_symbol_map,
             session_id: Arc::new(RwLock::new(Uuid::new_v4().to_string())),
             state: Arc::new(RwLock::new(Mt5BridgeState::default())),
             rpc_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -283,6 +294,13 @@ impl Mt5Bridge {
 
     pub fn config(&self) -> &Mt5BridgeConfig {
         &self.config
+    }
+
+    pub fn aqe_symbol(&self, mt5_symbol: &str) -> String {
+        self.reverse_symbol_map
+            .get(mt5_symbol)
+            .cloned()
+            .unwrap_or_else(|| mt5_symbol.to_string())
     }
 
     pub fn set_session_id(&self, session_id: impl Into<String>) {
@@ -333,6 +351,7 @@ impl Mt5Bridge {
         state.latest_intrabar_bars.clear();
         state.history.clear();
         state.seen_event_ids.clear();
+        state.seen_event_order.clear();
         state.active_sessions.clear();
         state.last_rpc_poll_attempt = None;
         state.last_rpc_poll = None;
@@ -542,11 +561,13 @@ impl Mt5Bridge {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(shutdown) = self.server_shutdown.lock().take() {
+        let shutdown = { self.server_shutdown.lock().take() };
+        if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
         }
 
-        if let Some(mut handle) = self.server_handle.lock().take() {
+        let server_handle = { self.server_handle.lock().take() };
+        if let Some(mut handle) = server_handle {
             match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) if error.is_cancelled() => {}
@@ -755,7 +776,7 @@ impl Mt5Bridge {
             )
             .await?;
         let mut quote = deserialize_payload::<Quote>(payload, "MT5 quote")?;
-        quote.symbol = self.config.aqe_symbol(&quote.symbol);
+        quote.symbol = self.aqe_symbol(&quote.symbol);
         self.state
             .write()
             .latest_quotes
@@ -781,7 +802,7 @@ impl Mt5Bridge {
             )
             .await?;
         let mut bar = deserialize_payload::<Bar>(payload, "MT5 bar")?;
-        bar.symbol = self.config.aqe_symbol(&bar.symbol);
+        bar.symbol = self.aqe_symbol(&bar.symbol);
         self.state
             .write()
             .latest_bars
@@ -828,13 +849,11 @@ impl Mt5Bridge {
             .await?;
         let mut bars = deserialize_payload::<Vec<Bar>>(payload, "MT5 history")?;
         for bar in &mut bars {
-            bar.symbol = self.config.aqe_symbol(&bar.symbol);
+            bar.symbol = self.aqe_symbol(&bar.symbol);
         }
-        self.state
-            .write()
-            .history
-            .insert(symbol.to_string(), bars.clone());
-        bars_to_frame(bars)
+        let frame = bars_to_frame(&bars)?;
+        self.state.write().history.insert(symbol.to_string(), bars);
+        Ok(frame)
     }
 
     pub async fn request_order_action(
@@ -1060,8 +1079,9 @@ impl Mt5Bridge {
 
     fn current_subscription_specs(&self) -> Vec<Mt5SubscriptionSpec> {
         let session_id = self.session_id();
+        let subscribers = self.bar_subscribers.lock().clone();
         let mut specs = HashSet::new();
-        for subscriber in self.bar_subscribers.lock().iter() {
+        for subscriber in &subscribers {
             if subscriber.session_id != session_id {
                 continue;
             }
@@ -1212,24 +1232,26 @@ impl Mt5Bridge {
     fn apply_market_data(&self, session_id: &str, payload: Mt5MarketDataPayload) {
         let mut quotes = payload.quotes;
         let mut stream_bars = payload.bars;
+        let history = payload.history;
 
         {
             let mut state = self.state.write();
             for quote in &mut quotes {
-                quote.symbol = self.config.aqe_symbol(&quote.symbol);
+                quote.symbol = self.aqe_symbol(&quote.symbol);
                 state
                     .latest_quotes
                     .insert(quote.symbol.clone(), quote.clone());
             }
-            for bar in &payload.history {
+            for mut bar in history {
+                bar.symbol = self.aqe_symbol(&bar.symbol);
                 state
                     .history
                     .entry(bar.symbol.clone())
                     .or_insert_with(Vec::new)
-                    .push(bar.clone());
+                    .push(bar);
             }
             for stream_bar in &mut stream_bars {
-                stream_bar.bar.symbol = self.config.aqe_symbol(&stream_bar.bar.symbol);
+                stream_bar.bar.symbol = self.aqe_symbol(&stream_bar.bar.symbol);
                 let timeframe = stream_bar
                     .timeframe
                     .clone()
@@ -1249,11 +1271,11 @@ impl Mt5Bridge {
             }
         }
 
-        let subscribers = self.bar_subscribers.lock();
+        let subscribers = self.bar_subscribers.lock().clone();
 
         for stream_bar in stream_bars {
             let timeframe_code = stream_bar.timeframe.as_deref().unwrap_or("PERIOD_M1");
-            for subscriber in subscribers.iter() {
+            for subscriber in &subscribers {
                 if subscriber.session_id == session_id
                     && subscriber.symbol == stream_bar.bar.symbol
                     && subscriber.timeframe_code == timeframe_code
@@ -1265,7 +1287,7 @@ impl Mt5Bridge {
         }
 
         for quote in quotes {
-            for subscriber in subscribers.iter() {
+            for subscriber in &subscribers {
                 if subscriber.session_id != session_id
                     || subscriber.symbol != quote.symbol
                     || subscriber.mode != DataStreamMode::Intrabar
@@ -1325,22 +1347,47 @@ impl Mt5Bridge {
     fn enqueue_trade_event(&self, sequence: u64, order: Order, event: TradeUpdateEvent) {
         let order = self.upsert_order(order);
         let subscriber_event = (order.clone(), event.clone());
-        {
+        let dropped_event = {
             let mut queue = self.event_queue.lock();
-            if queue.len() >= MAX_TRADE_EVENT_QUEUE_LEN {
+            let dropped = if queue.len() >= MAX_TRADE_EVENT_QUEUE_LEN {
                 queue.pop_front();
-                self.state.write().dropped_trade_event_count += 1;
-            }
+                true
+            } else {
+                false
+            };
             queue.push_back(QueuedTradeEvent {
                 sequence,
                 order,
                 event,
             });
+            dropped
+        };
+        let mut state = self.state.write();
+        if dropped_event {
+            state.dropped_trade_event_count += 1;
         }
-        self.state.write().last_trade_event_sequence = Some(sequence);
-        for subscriber in self.trade_subscribers.lock().iter() {
+        state.last_trade_event_sequence = Some(sequence);
+        drop(state);
+
+        let subscribers = self.trade_subscribers.lock().clone();
+        for subscriber in subscribers {
             subscriber(subscriber_event.clone());
         }
+    }
+
+    fn mark_event_seen(&self, event_key: String) -> bool {
+        let mut state = self.state.write();
+        if state.seen_event_ids.contains(&event_key) {
+            return false;
+        }
+        if state.seen_event_order.len() >= MAX_SEEN_EVENT_IDS {
+            if let Some(expired) = state.seen_event_order.pop_front() {
+                state.seen_event_ids.remove(&expired);
+            }
+        }
+        state.seen_event_ids.insert(event_key.clone());
+        state.seen_event_order.push_back(event_key);
+        true
     }
 
     fn apply_trade_event(
@@ -1359,11 +1406,8 @@ impl Mt5Bridge {
             .map(|native_id| format!("{}:{}", session_id, native_id))
             .unwrap_or_else(|| format!("{}:seq:{}", session_id, sequence));
 
-        {
-            let mut state = self.state.write();
-            if !state.seen_event_ids.insert(event_key) {
-                return;
-            }
+        if !self.mark_event_seen(event_key) {
+            return;
         }
 
         let mut order = payload.order;
@@ -1392,7 +1436,7 @@ impl Mt5Bridge {
     }
 
     fn map_asset_to_aqe(&self, asset: &mut Asset) {
-        asset.symbol = self.config.aqe_symbol(&asset.symbol);
+        asset.symbol = self.aqe_symbol(&asset.symbol);
         asset.id = asset.symbol.clone();
     }
 
@@ -1746,9 +1790,7 @@ async fn poll_rpc(
             .config
             .poll_interval
             .clamp(Duration::from_millis(50), Duration::from_millis(200));
-        if tokio::time::timeout(hold_timeout, notified).await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let _ = tokio::time::timeout(hold_timeout, notified).await;
         (requests, queued_remaining) = bridge.drain_rpc_requests(max_requests);
     }
     bridge.record_rpc_poll_delivery(&requests);
@@ -1917,7 +1959,7 @@ fn mt5_timeframe_code(time_frame: TimeFrame) -> Result<String, BrokerError> {
     Ok(code.to_string())
 }
 
-fn bars_to_frame(bars: Vec<Bar>) -> Result<DataFrame, BrokerError> {
+fn bars_to_frame(bars: &[Bar]) -> Result<DataFrame, BrokerError> {
     DataFrame::new(vec![
         Column::new(
             "symbol".into(),
@@ -1961,6 +2003,7 @@ mod tests {
     use crate::core::broker::types::{
         OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, TimeInForce,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn test_bridge(token: &str) -> Mt5Bridge {
         Mt5Bridge::new(Mt5BridgeConfig {
@@ -2127,6 +2170,105 @@ mod tests {
                 .iter()
                 .all(|(_, event)| *event == TradeUpdateEvent::Filled)
         );
+    }
+
+    #[test]
+    fn trade_event_dedupe_evicts_oldest_ids_at_capacity() {
+        let bridge = test_bridge("test-token");
+        for index in 0..=MAX_SEEN_EVENT_IDS {
+            assert!(bridge.mark_event_seen(format!("event-{index}")));
+        }
+
+        let state = bridge.state.read();
+        assert_eq!(state.seen_event_ids.len(), MAX_SEEN_EVENT_IDS);
+        assert_eq!(state.seen_event_order.len(), MAX_SEEN_EVENT_IDS);
+        assert!(!state.seen_event_ids.contains("event-0"));
+        assert!(
+            state
+                .seen_event_ids
+                .contains(&format!("event-{MAX_SEEN_EVENT_IDS}"))
+        );
+    }
+
+    #[test]
+    fn reverse_symbol_mapping_uses_precomputed_index() {
+        let mut config = test_bridge("test-token").config().clone();
+        config
+            .symbol_map
+            .insert("XAUUSD".to_string(), "GOLD.cash".to_string());
+        let bridge = Mt5Bridge::new(config);
+
+        assert_eq!(bridge.aqe_symbol("GOLD.cash"), "XAUUSD");
+        assert_eq!(bridge.aqe_symbol("EURUSD"), "EURUSD");
+    }
+
+    #[test]
+    fn trade_callbacks_can_clear_subscribers_reentrantly() {
+        let bridge = Arc::new(test_bridge("test-token"));
+        let callback_bridge = bridge.clone();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        bridge.subscribe_trade_stream(Arc::new(move |_event| {
+            callback_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
+            callback_bridge.clear_trade_subscribers();
+        }));
+
+        bridge.emit_order_event(
+            trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled),
+            TradeUpdateEvent::Filled,
+        );
+
+        assert_eq!(callback_count.load(AtomicOrdering::Relaxed), 1);
+        assert!(bridge.trade_subscribers.lock().is_empty());
+    }
+
+    #[test]
+    fn bar_callbacks_can_unsubscribe_reentrantly() {
+        let bridge = Arc::new(test_bridge("test-token"));
+        let session_id = bridge.session_id();
+        let timeframe = TimeFrame::new(1, TimeFrameUnit::Minute);
+        let callback_bridge = bridge.clone();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        bridge
+            .subscribe_bars(
+                vec!["AAPL".to_string()],
+                timeframe,
+                DataStreamMode::CompletedBar,
+                Arc::new(move |_bar| {
+                    callback_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
+                    callback_bridge
+                        .unsubscribe_bars(
+                            vec!["AAPL".to_string()],
+                            timeframe,
+                            DataStreamMode::CompletedBar,
+                        )
+                        .unwrap();
+                }),
+            )
+            .unwrap();
+
+        bridge.apply_market_data(
+            &session_id,
+            Mt5MarketDataPayload {
+                bars: vec![Mt5StreamBar {
+                    timeframe: Some("PERIOD_M1".to_string()),
+                    bar: Bar {
+                        symbol: "AAPL".to_string(),
+                        open: 100.0,
+                        high: 101.0,
+                        low: 99.0,
+                        close: 100.5,
+                        volume: 10.0,
+                        timestamp: Utc::now(),
+                    },
+                }],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(callback_count.load(AtomicOrdering::Relaxed), 1);
+        assert!(bridge.bar_subscribers.lock().is_empty());
     }
 
     #[test]

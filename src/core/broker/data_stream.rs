@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const INTRABAR_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+const COMPLETED_BAR_PUBLICATION_GRACE: Duration = Duration::from_secs(1);
 
 /// Type alias for the async fetch function that data feeds provide.
 /// Accepts (symbol, start, end, timeframe) and returns bars.
@@ -70,15 +75,23 @@ impl DataStreamManager {
         }
 
         let symbol_clone = symbol.clone();
-        let _subscriptions = self.subscriptions.clone();
 
         let handle = tokio::spawn(async move {
             let mut last_bar_timestamp: Option<DateTime<Utc>> = None;
+            let mut retry_after_error = false;
+            let mut bootstrap_completed_bar = mode == DataStreamMode::CompletedBar;
 
             loop {
-                // Poll frequently (e.g. 10 seconds) to catch intrabar price movements
-                let sleep_duration = std::time::Duration::from_secs(10);
+                let sleep_duration = if retry_after_error {
+                    ERROR_RETRY_INTERVAL
+                } else if bootstrap_completed_bar {
+                    bootstrap_completed_bar = false;
+                    Duration::ZERO
+                } else {
+                    next_poll_delay(time_frame, mode, Utc::now())
+                };
                 tokio::time::sleep(sleep_duration).await;
+                retry_after_error = false;
 
                 // Fetch the latest bars (look back 2 intervals to catch edge cases)
                 let fetch_end = Utc::now();
@@ -100,12 +113,12 @@ impl DataStreamManager {
 
                         let candidate = match mode {
                             DataStreamMode::Intrabar => {
-                                bars.iter().rev().find(|bar| match last_bar_timestamp {
+                                bars.into_iter().rev().find(|bar| match last_bar_timestamp {
                                     Some(last_ts) => bar.timestamp >= last_ts,
                                     None => true,
                                 })
                             }
-                            DataStreamMode::CompletedBar => bars.iter().rev().find(|bar| {
+                            DataStreamMode::CompletedBar => bars.into_iter().rev().find(|bar| {
                                 bar.timestamp < current_increment
                                     && match last_bar_timestamp {
                                         Some(last_ts) => bar.timestamp > last_ts,
@@ -116,7 +129,7 @@ impl DataStreamManager {
 
                         if let Some(bar) = candidate {
                             last_bar_timestamp = Some(bar.timestamp);
-                            on_bar(bar.clone());
+                            on_bar(bar);
                         }
                     }
                     Err(e) => {
@@ -124,8 +137,7 @@ impl DataStreamManager {
                             "[DataStreamManager] Error fetching bars for {}: {:?}",
                             symbol_clone, e
                         );
-                        // On error, wait a bit before retrying
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        retry_after_error = true;
                     }
                 }
             }
@@ -169,6 +181,18 @@ impl DataStreamManager {
     pub fn active_count(&self) -> usize {
         let subs = self.subscriptions.lock().unwrap();
         subs.len()
+    }
+}
+
+fn next_poll_delay(time_frame: TimeFrame, mode: DataStreamMode, now: DateTime<Utc>) -> Duration {
+    match mode {
+        DataStreamMode::Intrabar => INTRABAR_POLL_INTERVAL,
+        DataStreamMode::CompletedBar => {
+            let until_boundary = (time_frame.get_next_time_increment(now) - now)
+                .to_std()
+                .unwrap_or_default();
+            until_boundary + COMPLETED_BAR_PUBLICATION_GRACE
+        }
     }
 }
 
@@ -216,5 +240,31 @@ mod tests {
         assert!(manager.is_subscribed("BTC"));
         manager.unsubscribe("BTC");
         assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
+    fn completed_bar_polling_aligns_to_timeframe_boundary() {
+        let now = DateTime::parse_from_rfc3339("2025-01-01T12:00:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let delay = next_poll_delay(
+            TimeFrame::new(15, TimeFrameUnit::Minute),
+            DataStreamMode::CompletedBar,
+            now,
+        );
+
+        assert_eq!(delay, Duration::from_secs(14 * 60 + 56));
+    }
+
+    #[test]
+    fn intrabar_polling_keeps_short_cadence() {
+        let now = Utc::now();
+        let delay = next_poll_delay(
+            TimeFrame::new(15, TimeFrameUnit::Minute),
+            DataStreamMode::Intrabar,
+            now,
+        );
+
+        assert_eq!(delay, INTRABAR_POLL_INTERVAL);
     }
 }
