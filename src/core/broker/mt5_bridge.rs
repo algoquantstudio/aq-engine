@@ -1783,16 +1783,9 @@ async fn poll_rpc(
     bridge.record_rpc_poll(&session_id);
 
     let max_requests = envelope.payload.max_requests.unwrap_or(32).clamp(1, 256);
-    let notified = bridge.rpc_queue_notify.notified();
-    let (mut requests, mut queued_remaining) = bridge.drain_rpc_requests(max_requests);
-    if requests.is_empty() {
-        let hold_timeout = bridge
-            .config
-            .poll_interval
-            .clamp(Duration::from_millis(50), Duration::from_millis(200));
-        let _ = tokio::time::timeout(hold_timeout, notified).await;
-        (requests, queued_remaining) = bridge.drain_rpc_requests(max_requests);
-    }
+    // MT5 WebRequest under Wine can block indefinitely on an empty long-poll.
+    // The EA already polls on a short timer, so acknowledge empty polls immediately.
+    let (requests, queued_remaining) = bridge.drain_rpc_requests(max_requests);
     bridge.record_rpc_poll_delivery(&requests);
     if !requests.is_empty() {
         debug!(

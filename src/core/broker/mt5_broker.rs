@@ -148,7 +148,20 @@ impl Mt5Broker {
                         filled_at: None,
                     })
                 }),
-                trailing_stop: None,
+                trailing_stop: insight.trailing_stop_price().map(|gap| OrderLeg {
+                    order_id: None,
+                    limit_price: None,
+                    trail_price: Some(gap),
+                    side: opposite_side.clone(),
+                    filled_price: None,
+                    order_type: OrderType::TrailingStop,
+                    status: TradeUpdateEvent::Pending,
+                    order_class: OrderClass::Bracket,
+                    created_at: now_ts,
+                    updated_at: now_ts,
+                    submitted_at: now_ts,
+                    filled_at: None,
+                }),
             })
         } else {
             None
@@ -259,6 +272,16 @@ impl OrderManagementProvider for Mt5Broker {
         }
         if let Some(stop_loss) = stop_loss.filter(|price| *price > 0.0) {
             payload["stopLoss"] = serde_json::json!(stop_loss);
+        }
+        if let Some(trailing_gap) = order
+            .legs
+            .as_ref()
+            .and_then(|legs| legs.trailing_stop.as_ref())
+            .and_then(|leg| leg.trail_price)
+            .filter(|gap| gap.is_finite() && *gap > 0.0)
+        {
+            payload["trailingStop"] =
+                serde_json::json!(dynamic_round_for_asset(trailing_gap, &order.asset));
         }
         self.bridge
             .request_order_action(Mt5RpcAction::SubmitOrder, Some(order), payload)
@@ -599,6 +622,42 @@ mod tests {
         assert_eq!(payload["symbol"], serde_json::json!("EURUSD"));
         assert_eq!(payload["stopLoss"], serde_json::json!(94.0));
         assert_eq!(payload["takeProfit"], serde_json::json!(120.0));
+    }
+
+    #[test]
+    fn order_from_insight_preserves_trailing_stop_gap() {
+        let bridge = Arc::new(Mt5Bridge::new(Mt5BridgeConfig {
+            bind_addr: "127.0.0.1:18080".parse().unwrap(),
+            token: "test".to_string(),
+            request_timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(100),
+            symbol_map: HashMap::new(),
+        }));
+        let broker = Mt5Broker::new(bridge);
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "EURUSD".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            100,
+            None,
+        );
+        insight
+            .set_quantity(Some(1.0))
+            .set_stop_loss(Some(1.05))
+            .set_trailing_stop_price(Some(0.0025));
+
+        let order = broker
+            .order_from_insight(insight)
+            .expect("trailing-stop insight should form an MT5 order");
+        let trailing = order
+            .legs
+            .as_ref()
+            .and_then(|legs| legs.trailing_stop.as_ref())
+            .expect("MT5 order should retain the trailing leg");
+        assert_eq!(trailing.order_type, OrderType::TrailingStop);
+        assert_eq!(trailing.trail_price, Some(0.0025));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

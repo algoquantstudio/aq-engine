@@ -3,7 +3,7 @@
 //| Local RPC bridge EA for AlgoQuant Engine MT5 runtime integration.|
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.303"
+#property version "1.305"
 
 #include <Trade/Trade.mqh>
 
@@ -62,10 +62,19 @@ struct PendingTradeEvent
    string payload;
 };
 
+// MT5 has no broker-native trailing-stop order. Keep the requested gap against
+// the position and monotonically tighten POSITION_SL from the EA timer.
+struct TrailingStopRoute
+{
+   string source_order_id;
+   double gap;
+};
+
 BridgeConnection g_bridges[];
 BridgeSubscription g_subscriptions[];
 OrderRoute g_order_routes[];
 PendingTradeEvent g_pending_trade_events[];
+TrailingStopRoute g_trailing_stop_routes[];
 int g_next_probe_bridge_index = 0;
 ulong g_trade_event_seq = 0;
 ulong g_trade_event_drop_count = 0;
@@ -1326,6 +1335,86 @@ ulong FindPositionTicketById(string order_id)
    return 0;
 }
 
+int FindTrailingStopRoute(string source_order_id)
+{
+   for(int i = 0; i < ArraySize(g_trailing_stop_routes); i++)
+   {
+      if(g_trailing_stop_routes[i].source_order_id == source_order_id)
+         return i;
+   }
+   return -1;
+}
+
+void RegisterTrailingStop(string source_order_id, double gap)
+{
+   if(source_order_id == "" || gap <= 0.0)
+      return;
+   int index = FindTrailingStopRoute(source_order_id);
+   if(index < 0)
+   {
+      index = ArraySize(g_trailing_stop_routes);
+      ArrayResize(g_trailing_stop_routes, index + 1);
+      g_trailing_stop_routes[index].source_order_id = source_order_id;
+   }
+   g_trailing_stop_routes[index].gap = gap;
+}
+
+void RemoveTrailingStopAt(int index)
+{
+   if(index < 0 || index >= ArraySize(g_trailing_stop_routes))
+      return;
+   for(int i = index; i < ArraySize(g_trailing_stop_routes) - 1; i++)
+      g_trailing_stop_routes[i] = g_trailing_stop_routes[i + 1];
+   ArrayResize(g_trailing_stop_routes, ArraySize(g_trailing_stop_routes) - 1);
+}
+
+void ProcessTrailingStops()
+{
+   for(int i = ArraySize(g_trailing_stop_routes) - 1; i >= 0; i--)
+   {
+      string source_order_id = g_trailing_stop_routes[i].source_order_id;
+      ulong position_ticket = FindPositionTicketById(source_order_id);
+      if(position_ticket == 0 || !PositionSelectByTicket(position_ticket))
+      {
+         ulong order_ticket = (ulong)StringToInteger(source_order_id);
+         // Keep protection registered while a stop/limit entry remains pending.
+         if(order_ticket > 0 && OrderSelect(order_ticket))
+            continue;
+         RemoveTrailingStopAt(i);
+         continue;
+      }
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long position_type = PositionGetInteger(POSITION_TYPE);
+      double current_sl = PositionGetDouble(POSITION_SL);
+      double current_tp = PositionGetDouble(POSITION_TP);
+      MqlTick tick;
+      SymbolInfoTick(symbol, tick);
+      double bid = tick.bid > 0.0 ? tick.bid : SymbolInfoDouble(symbol, SYMBOL_BID);
+      double ask = tick.ask > 0.0 ? tick.ask : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      double requested_sl = position_type == POSITION_TYPE_SELL
+         ? ask + g_trailing_stop_routes[i].gap
+         : bid - g_trailing_stop_routes[i].gap;
+      double next_sl = position_type == POSITION_TYPE_SELL
+         ? ClampSellStopLoss(symbol, requested_sl, ask)
+         : ClampBuyStopLoss(symbol, requested_sl, bid);
+      if(next_sl <= 0.0)
+         continue;
+
+      bool improves = position_type == POSITION_TYPE_SELL
+         ? (current_sl <= 0.0 || next_sl < current_sl)
+         : (current_sl <= 0.0 || next_sl > current_sl);
+      if(!improves)
+         continue;
+
+      trade.SetExpertMagicNumber(27042026);
+      if(!trade.PositionModify(position_ticket, next_sl, current_tp) || !IsTradeRetcodeSuccess(trade.ResultRetcode()))
+         Print("AQE bridge trailing stop update failed ticket=", position_ticket,
+               " sl=", DoubleToString(next_sl, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+               " retcode=", (int)trade.ResultRetcode());
+   }
+}
+
 string MarketPositionTicketAfterDeal(string symbol, ulong deal_ticket, ulong order_ticket)
 {
    ulong position_id = 0;
@@ -1651,6 +1740,7 @@ void ExecuteRpcRequest(int bridge_index, string json)
 
    double qty = ExtractNumber(json, "qty", 0.0);
    double price = ExtractNumber(json, "price", 0.0);
+   double trailing_stop = ExtractNumber(json, "trailingStop", 0.0);
    string side = ExtractString(json, "side");
    string order_type = ExtractString(json, "orderType");
    string order_id = ExtractString(json, "orderId");
@@ -1772,6 +1862,8 @@ void ExecuteRpcRequest(int bridge_index, string json)
       RememberOrderRouteMetadata(bridge_index, broker_id, client_order_id, insight_id, strategy_type);
       if(result_order > 0) RememberOrderRouteMetadata(bridge_index, IntegerToString((long)result_order), client_order_id, insight_id, strategy_type);
       if(result_deal > 0) RememberOrderRouteMetadata(bridge_index, IntegerToString((long)result_deal), client_order_id, insight_id, strategy_type);
+      if(ok && trailing_stop > 0.0)
+         RegisterTrailingStop(broker_id == "0" ? client_order_id : broker_id, trailing_stop);
       string status = ok ? (order_type == "Market" ? "Filled" : "Accepted") : "Rejected";
       string reason = ok ? "" : IntegerToString((int)result_retcode);
       string payload = OrderJson(broker_id == "0" ? client_order_id : broker_id, symbol, qty, side, order_type, status, result_price, reason, 0.0, false, insight_id, strategy_type);
@@ -1842,6 +1934,18 @@ void ExecuteRpcRequest(int bridge_index, string json)
             {
                modify_sl = 0.0;
             }
+         }
+
+         // MT5 represents the native trail and explicit stop as the same
+         // position SL. Once a trailing route has tightened it, a later
+         // stepped-stop request must never widen the live protection.
+         if(reason == "" && FindTrailingStopRoute(order_id) >= 0 && current_sl > 0.0 && modify_sl > 0.0)
+         {
+            bool would_loosen = position_type == POSITION_TYPE_SELL
+               ? modify_sl > current_sl
+               : modify_sl < current_sl;
+            if(would_loosen)
+               modify_sl = current_sl;
          }
 
          if(reason == "")
@@ -1949,6 +2053,7 @@ void ClearRuntimeState()
    ArrayResize(g_subscriptions, 0);
    ArrayResize(g_order_routes, 0);
    ArrayResize(g_pending_trade_events, 0);
+   ArrayResize(g_trailing_stop_routes, 0);
    g_next_probe_bridge_index = 0;
    g_trade_event_seq = 0;
    g_trade_event_drop_count = 0;
@@ -2074,6 +2179,19 @@ void ProbeOneDisconnectedBridge()
    int bridge_count = ArraySize(g_bridges);
    if(bridge_count <= 0)
       return;
+
+   // The primary InpBridgeUrl must always establish its first session. Until
+   // that first poll succeeds, PollConnectedBridges() skips it because it has
+   // no session id. Optional bridge connections remain opt-in probes.
+   if(!IsBridgeSessionActive(0) && IsBridgePollDue(0))
+   {
+      PollRpc(0, false);
+      return;
+   }
+
+   if(!InpProbeInactiveConnections)
+      return;
+
    if(g_next_probe_bridge_index < 0 || g_next_probe_bridge_index >= bridge_count)
       g_next_probe_bridge_index = 0;
 
@@ -2149,6 +2267,7 @@ void OnTimer()
    }
 
    PollConnectedBridges();
+   ProcessTrailingStops();
 
    for(int i = 0; i < ArraySize(g_bridges); i++)
    {

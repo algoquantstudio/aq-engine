@@ -1596,14 +1596,84 @@ impl BacktestResults {
             symbols,
         };
 
+        // Persist the database first. The metrics include its fingerprint, so this must
+        // happen only after the database transaction has committed and the file is closed.
+        crate::core::backtest_storage::write_backtest_db(dir_path, self, state).await?;
+
         // Save metrics to JSON. If the project has an `.aqmeta` file, attach the AQS
         // run metadata and copy the snapshot without requiring generated main.rs code.
         let mut metrics_json_value = serde_json::to_value(&metrics).map_err(|e| e.to_string())?;
         enrich_backtest_metrics_with_project_aqmeta(&mut metrics_json_value, dir_path, state);
+        let artifact_path = dir_path.join("backtest.db");
+        let artifact_size = std::fs::metadata(&artifact_path)
+            .map_err(|e| e.to_string())?
+            .len();
+        let mut reader = std::io::BufReader::with_capacity(
+            64 * 1024,
+            std::fs::File::open(&artifact_path).map_err(|e| e.to_string())?,
+        );
+        let mut header = [0_u8; 100];
+        std::io::Read::read_exact(&mut reader, &mut header).map_err(|e| e.to_string())?;
+        if &header[..16] != b"SQLite format 3\0" {
+            return Err("AQE produced an invalid SQLite backtest database".to_string());
+        }
+        let header_u32 = |offset: usize| {
+            u32::from_be_bytes(
+                header[offset..offset + 4]
+                    .try_into()
+                    .expect("validated SQLite header length"),
+            )
+        };
+        let encoded_page_size = u16::from_be_bytes([header[16], header[17]]);
+        let page_size = if encoded_page_size == 1 {
+            65_536_u32
+        } else {
+            u32::from(encoded_page_size)
+        };
+        let application_id = header_u32(68);
+        if application_id != crate::core::backtest_storage::BACKTEST_DB_APPLICATION_ID {
+            return Err("AQE backtest database application ID was not persisted".to_string());
+        }
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(header);
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read =
+                    std::io::Read::read(&mut reader, &mut buffer).map_err(|e| e.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            format!("{:x}", hasher.finalize())
+        };
+        metrics_json_value
+            .as_object_mut()
+            .ok_or("Backtest metrics must be a JSON object")?
+            .insert(
+                "backtest_db".to_string(),
+                serde_json::json!({
+                    "sha256": hash,
+                    "size_bytes": artifact_size,
+                    "sqlite_header": {
+                        "application_id": application_id,
+                        "user_version": header_u32(60),
+                        "page_size": page_size,
+                        "page_count": header_u32(28),
+                        "change_counter": header_u32(24),
+                        "schema_cookie": header_u32(40),
+                        "schema_format": header_u32(44),
+                        "encoding": header_u32(56),
+                        "version_valid_for": header_u32(92),
+                        "sqlite_version_number": header_u32(96),
+                    },
+                }),
+            );
         let metrics_json =
             serde_json::to_string_pretty(&metrics_json_value).map_err(|e| e.to_string())?;
         std::fs::write(dir_path.join("metrics.json"), metrics_json).map_err(|e| e.to_string())?;
-        crate::core::backtest_storage::write_backtest_db(dir_path, self, state).await?;
         Ok(())
     }
 }

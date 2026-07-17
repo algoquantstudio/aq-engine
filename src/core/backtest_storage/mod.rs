@@ -16,6 +16,8 @@ use crate::core::insight::InsightSnapshot;
 pub use types::BacktestTradeLogRow;
 
 pub const BACKTEST_DB_FILE: &str = "backtest.db";
+pub const BACKTEST_DB_APPLICATION_ID: u32 = 0x4151_4254; // "AQBT"
+pub const BACKTEST_DB_USER_VERSION: u32 = 1;
 
 fn to_storage_err<E: std::fmt::Display>(value: E) -> String {
     value.to_string()
@@ -33,6 +35,8 @@ async fn connect_database(dir_path: &Path) -> Result<Connection, String> {
 async fn init_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
+        PRAGMA application_id = 1095844436;
+        PRAGMA user_version = 1;
         CREATE TABLE IF NOT EXISTS trade_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_at TEXT NOT NULL,
@@ -272,6 +276,15 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .await
     .map_err(to_storage_err)?;
+    Ok(())
+}
+
+async fn checkpoint_database(conn: &Connection) -> Result<(), String> {
+    let mut rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .map_err(to_storage_err)?;
+    while rows.next().await.map_err(to_storage_err)?.is_some() {}
     Ok(())
 }
 
@@ -2790,6 +2803,7 @@ pub async fn write_backtest_db(
     insert_analysis_tables(&tx, results, state, &round_trips).await?;
     create_secondary_indexes(&tx).await?;
     tx.commit().await.map_err(to_storage_err)?;
+    checkpoint_database(&conn).await?;
     Ok(())
 }
 
@@ -2867,6 +2881,43 @@ mod tests {
             partial_filled_quantity: None,
             state_history: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn brands_backtest_database_as_an_aqe_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "aqe-backtest-application-id-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let connection = connect_database(&dir).await.unwrap();
+        init_schema(&connection).await.unwrap();
+        checkpoint_database(&connection).await.unwrap();
+
+        let mut application_id = connection.query("PRAGMA application_id", ()).await.unwrap();
+        assert_eq!(
+            application_id
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            i64::from(BACKTEST_DB_APPLICATION_ID)
+        );
+        let mut user_version = connection.query("PRAGMA user_version", ()).await.unwrap();
+        assert_eq!(
+            user_version
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            i64::from(BACKTEST_DB_USER_VERSION)
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

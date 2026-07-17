@@ -354,6 +354,66 @@ async fn test_paper_broker_trailing_stop_moves_and_closes_position() {
 }
 
 #[tokio::test]
+async fn test_paper_broker_trailing_stop_does_not_use_same_bar_extremes() {
+    let broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1);
+    let mut insight = Insight::new(
+        OrderSide::Buy,
+        "AAPL".to_string(),
+        StrategyType::Testing,
+        TimeFrame::new(1, TimeFrameUnit::Minute),
+        80,
+        None,
+    );
+    insight
+        .set_quantity(Some(1.0))
+        .set_trailing_stop_price(Some(5.0));
+    let order = broker.submit_order(insight).await.unwrap();
+
+    let entry_time = Utc::now();
+    let mut entry_bars = HashMap::new();
+    entry_bars.insert(
+        "AAPL".to_string(),
+        Bar {
+            symbol: "AAPL".to_string(),
+            open: 100.0,
+            high: 102.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1_000.0,
+            timestamp: entry_time,
+        },
+    );
+    broker.process_step(&entry_bars, entry_time);
+
+    // The bar reaches a new high and later contains a low below the newly
+    // calculated trail. OHLC does not establish that the high came first, so
+    // only the existing 97.0 stop may be evaluated this bar.
+    let mut ambiguous_bars = HashMap::new();
+    ambiguous_bars.insert(
+        "AAPL".to_string(),
+        Bar {
+            symbol: "AAPL".to_string(),
+            open: 104.0,
+            high: 110.0,
+            low: 104.0,
+            close: 109.0,
+            volume: 1_000.0,
+            timestamp: entry_time + chrono::Duration::minutes(1),
+        },
+    );
+    broker.process_step(&ambiguous_bars, entry_time + chrono::Duration::minutes(1));
+
+    let active_order = broker.get_order(&order.order_id).await.unwrap();
+    let trailing = active_order
+        .legs
+        .as_ref()
+        .and_then(|legs| legs.trailing_stop.as_ref())
+        .unwrap();
+    assert_eq!(active_order.status, TradeUpdateEvent::Filled);
+    assert_eq!(trailing.limit_price, Some(105.0));
+}
+
+#[tokio::test]
 async fn test_paper_broker_update_stop_loss_moves_active_stop_leg() {
     let broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1);
 

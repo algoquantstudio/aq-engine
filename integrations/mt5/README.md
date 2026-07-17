@@ -76,7 +76,7 @@ For multiple AQE live strategies from one MT5 terminal, either attach one EA per
 InpBridgeConnections = http://127.0.0.1:18081,http://127.0.0.1:18082
 ```
 
-Leave `InpProbeInactiveConnections` as `false` for normal single-EA multi-port use. With the default setting, the EA always services active bridge sessions first and then probes at most one inactive URL with a short timeout and cooldown. Set it to `true` only when every configured endpoint is expected to be online and faster inactive probing is preferred.
+Leave `InpProbeInactiveConnections` as `false` for normal single-EA use. The primary `InpBridgeUrl` always polls at startup to establish its first session, then remains actively serviced. Set this option to `true` only when optional URLs in `InpBridgeConnections` are also expected to be online and should be probed before they have a session.
 
 All configured bridge URLs use `InpBridgeToken`; per-endpoint tokens are not supported. Add every URL in `InpBridgeUrl` and `InpBridgeConnections` to the MT5 WebRequest allow-list.
 
@@ -120,6 +120,6 @@ Only run the order test on an account and symbol where `0.01` volume is valid.
 
 - MT5 is live-only in v1. Use Paper/Yahoo for backtests.
 - Bracket orders map to MT5 TP/SL values where possible.
-- Trailing stops are not implemented in v1.
+- Trailing stops are maintained by the EA timer after the related MT5 position is open.
 - The EA polls AQE for work and pushes subscribed bar/trade events back to AQE.
 - If the bridge disconnects, the EA continues polling and resumes once AQE is reachable again.

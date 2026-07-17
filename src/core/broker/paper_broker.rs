@@ -1000,11 +1000,24 @@ impl PaperBroker {
             OrderSide::Sell => bar.open + gap,
         });
 
+        // First evaluate the stop that existed at the start of this bar. A
+        // bar's high/low has no ordering information, so moving the trail
+        // from its favourable extreme and then triggering against the same
+        // bar's adverse extreme creates look-ahead fills.
+        let triggered = match parent_side {
+            OrderSide::Buy => bar.low <= current_stop,
+            OrderSide::Sell => bar.high >= current_stop,
+        };
+        if triggered {
+            return true;
+        }
+
+        // A favourable move becomes the active trailing level for the next
+        // bar. This is conservative and deterministic with OHLC data.
         let next_stop = match parent_side {
             OrderSide::Buy => current_stop.max(bar.high - gap),
             OrderSide::Sell => current_stop.min(bar.low + gap),
         };
-
         if (next_stop - current_stop).abs() > f64::EPSILON {
             trailing.limit_price = Some(next_stop);
             trailing.updated_at = now_ts;
@@ -1013,10 +1026,7 @@ impl PaperBroker {
             trailing.updated_at = now_ts;
         }
 
-        match parent_side {
-            OrderSide::Buy => bar.low <= next_stop,
-            OrderSide::Sell => bar.high >= next_stop,
-        }
+        false
     }
 
     fn mark_order_terminal_for_release(&self, order_id: &str) {
