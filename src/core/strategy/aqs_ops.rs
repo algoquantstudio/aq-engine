@@ -2051,6 +2051,7 @@ where
     /// This will register callbacks for trade events & bar streams,
     /// then loop via `tokio::select!` block listening on channels to drive the pipeline.
     pub async fn run_live(&mut self, auth: Option<AqsAuth>) -> Result<(), BrokerError> {
+        self.apply_hyper_parameters_from_process_args()?;
         let auth = auth.or_else(|| self.default_live_auth.clone());
         self.runtime_telemetry
             .start_tui(crate::core::tui::TuiConfig::from_process_args());

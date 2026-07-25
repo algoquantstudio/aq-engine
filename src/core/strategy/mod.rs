@@ -25,12 +25,13 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(feature = "runtime"))]
 type FxHashSet<T> = HashSet<T>;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::vec;
 use uuid::Uuid;
 mod aqs_ops;
 mod aqs_sync;
 mod aqs_types;
+pub mod hyperparameters;
 mod live_metrics;
 mod types;
 pub use types::{InsightPipeline, StrategyMode, StrategyStatus};
@@ -42,6 +43,10 @@ pub use crate::core::events::{
 };
 use crate::core::events::{MarketDataEvent, ResolvedEventStream};
 use crate::core::utils::timeframe::TimeFrame;
+pub use hyperparameters::{
+    HYPERPARAMETER_SEED_KEY, HYPERPARAMETER_VALUES_KEY, HyperParameter, HyperParameterConfig,
+    HyperParameterSelection,
+};
 pub use traits::{BrokerAccess, Strategy, StrategyContext, TeardownCleanupReport};
 
 pub use aqs_types::AqsAuth;
@@ -89,6 +94,16 @@ fn current_dir_with_aqmeta() -> Option<PathBuf> {
 }
 
 // ─────────────────────── StrategyState ───────────────────────
+
+#[derive(Clone, Debug)]
+struct HyperparameterSelection {
+    seed: String,
+    values: Value,
+    sweep_id: String,
+    strategy_fingerprint: String,
+    source_targets: Value,
+    is_sweep_run: bool,
+}
 
 pub struct StrategyState<S, E, D>
 where
@@ -144,6 +159,10 @@ where
     default_live_auth: Option<AqsAuth>,
     runtime_telemetry: RuntimeTelemetry,
     artifact_root: Option<PathBuf>,
+    backtest_result_dir: Option<PathBuf>,
+    last_backtest_result_path: Option<PathBuf>,
+    hyperparameter_config: Option<HyperParameterConfig>,
+    hyperparameter_selection: Option<HyperparameterSelection>,
 
     // Insight Pipeline
     pub insight_pipeline: InsightPipeline,
@@ -326,6 +345,10 @@ where
             default_live_auth: AqsAuth::from_process_args(),
             runtime_telemetry: RuntimeTelemetry::default(),
             artifact_root: None,
+            backtest_result_dir: None,
+            last_backtest_result_path: None,
+            hyperparameter_config: None,
+            hyperparameter_selection: None,
             insight_pipeline: Default::default(),
             timeframe,
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -343,6 +366,136 @@ where
     pub fn with_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.set_artifact_root(root);
         self
+    }
+
+    /// Attach optional hyperparameter definitions to this state.
+    ///
+    /// With a configuration, `run_backtest` and `run_live` resolve `--hyper-seed` themselves.
+    /// Without one, both methods preserve their existing behaviour.
+    pub fn set_hyper_parameter_config(&mut self, config: HyperParameterConfig) {
+        self.hyperparameter_config = Some(config);
+    }
+
+    pub fn with_hyper_parameter_config(mut self, config: HyperParameterConfig) -> Self {
+        self.set_hyper_parameter_config(config);
+        self
+    }
+
+    /// Apply an already-enumerated sweep member to this state. Full sweeps still require a
+    /// fresh state per seed because a completed state owns mutable broker and strategy state.
+    pub fn set_hyper_parameter_run(
+        &mut self,
+        selection: &HyperParameterSelection,
+        is_sweep_run: bool,
+    ) -> Result<(), String> {
+        if is_sweep_run {
+            let config = self
+                .hyperparameter_config
+                .clone()
+                .ok_or("Attach a HyperParameterConfig before selecting a sweep run")?;
+            self.set_hyper_parameter_sweep_seed(&config, selection)
+        } else {
+            self.set_hyper_parameter_seed(selection)
+        }
+    }
+
+    fn apply_hyper_parameters_from_process_args(&mut self) -> Result<(), BrokerError> {
+        if self.hyperparameter_selection.is_some() {
+            return Ok(());
+        }
+        let Some(config) = self.hyperparameter_config.clone() else {
+            return Ok(());
+        };
+        let args = std::env::args().collect::<Vec<_>>();
+        if config.is_sweep_requested(&args) {
+            let runner = match self.mode {
+                StrategyMode::Backtest => "run_backtest",
+                StrategyMode::Live => "run_live",
+            };
+            return Err(BrokerError::DataFeedError(format!(
+                "--hyper-sweep requires a fresh StrategyState for every seed; enumerate the sweep before calling {runner}"
+            )));
+        }
+        if let Some(selection) = config
+            .selection_from_process_args(&args)
+            .map_err(BrokerError::DataFeedError)?
+        {
+            self.set_hyper_parameter_seed(&selection)
+                .map_err(BrokerError::DataFeedError)?;
+        }
+        Ok(())
+    }
+
+    /// Override the next backtest result directory. Sweep runs use this so every seed
+    /// retains the ordinary `metrics.json` and `backtest.db` artifact pair in one group.
+    pub fn set_backtest_result_dir(&mut self, path: impl Into<PathBuf>) {
+        self.backtest_result_dir = Some(path.into());
+    }
+
+    pub fn last_backtest_result_path(&self) -> Option<&Path> {
+        self.last_backtest_result_path.as_deref()
+    }
+
+    /// Apply a saved hyperparameter seed to an ordinary run. The result is written to the
+    /// normal `backtests/<run-id>` location, while the exact seed and values are persisted in
+    /// its metrics for reproducibility.
+    pub fn set_hyper_parameter_seed(
+        &mut self,
+        selection: &HyperParameterSelection,
+    ) -> Result<(), String> {
+        self.apply_hyper_parameter_selection(None, selection, false)
+    }
+
+    /// Apply a seed as one member of a full sweep. Unlike [`Self::set_hyper_parameter_seed`],
+    /// this keeps the result in the sweep's `backtests/hyper/<sweep>/<seed>` folder.
+    pub fn set_hyper_parameter_sweep_seed(
+        &mut self,
+        config: &HyperParameterConfig,
+        selection: &HyperParameterSelection,
+    ) -> Result<(), String> {
+        self.apply_hyper_parameter_selection(Some(config), selection, true)
+    }
+
+    fn apply_hyper_parameter_selection(
+        &mut self,
+        config: Option<&HyperParameterConfig>,
+        selection: &HyperParameterSelection,
+        is_sweep_run: bool,
+    ) -> Result<(), String> {
+        selection.validate()?;
+        if let Some(config) = config.filter(|_| is_sweep_run) {
+            config.write_sweep_manifest(&self.artifact_root())?;
+        }
+        self.variables.insert(
+            HYPERPARAMETER_VALUES_KEY.to_string(),
+            selection.values.clone(),
+        );
+        self.variables.insert(
+            HYPERPARAMETER_SEED_KEY.to_string(),
+            Value::String(selection.seed.clone()),
+        );
+        self.hyperparameter_selection = Some(HyperparameterSelection {
+            seed: selection.seed.clone(),
+            values: selection.values.clone(),
+            sweep_id: config
+                .map(|config| config.sweep_id.clone())
+                .unwrap_or_default(),
+            strategy_fingerprint: config
+                .map(|config| config.strategy_fingerprint.clone())
+                .unwrap_or_default(),
+            source_targets: config
+                .map(|config| config.source_targets.clone())
+                .unwrap_or(Value::Null),
+            is_sweep_run,
+        });
+        self.backtest_result_dir = config.filter(|_| is_sweep_run).map(|config| {
+            self.artifact_root()
+                .join("backtests")
+                .join("hyper")
+                .join(&config.sweep_id)
+                .join(&selection.seed)
+        });
+        Ok(())
     }
 
     fn artifact_root(&self) -> PathBuf {
@@ -2082,7 +2235,7 @@ where
     S: Strategy,
     D: DataFeed + DataProvider,
 {
-    fn finalize_backtest_results(&self, results: &BacktestResults) -> Option<String> {
+    fn finalize_backtest_results(&mut self, results: &BacktestResults) -> Option<String> {
         info!("═══════════════════ Backtest Results ═══════════════════");
         let terminal_output_suspended = crate::core::tui::terminal_output_suspended();
         if !terminal_output_suspended {
@@ -2092,7 +2245,10 @@ where
         info!("Insights: {:#?}", self.insights.get_state_count());
 
         let run_id = Uuid::new_v4().to_string();
-        let out_dir = self.artifact_root().join("backtests").join(&run_id);
+        let out_dir = self
+            .backtest_result_dir
+            .clone()
+            .unwrap_or_else(|| self.artifact_root().join("backtests").join(&run_id));
 
         let Some(backtest_state) = self.broker.backtest_state.as_ref() else {
             warn!("Backtest completed but no backtest state was available for result persistence");
@@ -2108,6 +2264,17 @@ where
             return None;
         }
 
+        if let Some(selection) = self.hyperparameter_selection.as_ref() {
+            if let Err(error) = append_hyperparameter_metrics(&out_dir, selection, &self.timeframe)
+            {
+                warn!(
+                    "Backtest saved but hyperparameter metadata could not be persisted: {}",
+                    error
+                );
+            }
+        }
+
+        self.last_backtest_result_path = Some(out_dir.clone());
         if let Ok(abs_path) = std::fs::canonicalize(&out_dir) {
             if !terminal_output_suspended {
                 println!("RESULTS_SAVED_TO: {}", abs_path.display());
@@ -2139,6 +2306,7 @@ where
         end: chrono::DateTime<chrono::Utc>,
         time_frame: TimeFrame,
     ) -> Result<BacktestResults, BrokerError> {
+        self.apply_hyper_parameters_from_process_args()?;
         // Take strategy out to avoid split-borrow (self.strategy vs self as ctx)
         let mut strategy = self
             .strategy
@@ -2350,5 +2518,75 @@ where
         self.publish_runtime_snapshot("not configured", saved_result_path);
         self.runtime_telemetry.wait_for_tui_close();
         Ok(results)
+    }
+}
+
+fn append_hyperparameter_metrics(
+    result_dir: &Path,
+    selection: &HyperparameterSelection,
+    timeframe: &TimeFrame,
+) -> Result<(), String> {
+    let metrics_path = result_dir.join("metrics.json");
+    let content = std::fs::read_to_string(&metrics_path).map_err(|error| error.to_string())?;
+    let mut metrics: Value = serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    let object = metrics
+        .as_object_mut()
+        .ok_or_else(|| "Backtest metrics must be a JSON object".to_string())?;
+    let mut hyperparameter = serde_json::json!({
+        "seed": selection.seed,
+        "values": selection.values,
+        "source_targets": selection.source_targets,
+        "strategy_fingerprint": selection.strategy_fingerprint,
+        "datafeed": { "type": "configured", "timeframe": timeframe.to_string() },
+    });
+    if selection.is_sweep_run {
+        hyperparameter
+            .as_object_mut()
+            .expect("hyperparameter metadata is an object")
+            .insert(
+                "sweep_id".to_string(),
+                Value::String(selection.sweep_id.clone()),
+            );
+    }
+    object.insert("hyperparameter".to_string(), hyperparameter);
+    std::fs::write(
+        metrics_path,
+        serde_json::to_string_pretty(&metrics).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod hyperparameter_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_seed_metadata_has_no_sweep_id() {
+        let directory =
+            std::env::temp_dir().join(format!("aqe_hyperparameter_metrics_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("metrics.json"), "{}").unwrap();
+        let selection = HyperparameterSelection {
+            seed: "seed-id".into(),
+            values: serde_json::json!({ "period": 14 }),
+            sweep_id: "sweep-id".into(),
+            strategy_fingerprint: "fingerprint".into(),
+            source_targets: serde_json::json!([]),
+            is_sweep_run: false,
+        };
+
+        append_hyperparameter_metrics(
+            &directory,
+            &selection,
+            &TimeFrame::new(1, crate::core::utils::timeframe::TimeFrameUnit::Minute),
+        )
+        .unwrap();
+
+        let metrics: Value =
+            serde_json::from_str(&std::fs::read_to_string(directory.join("metrics.json")).unwrap())
+                .unwrap();
+        assert_eq!(metrics["hyperparameter"]["seed"], "seed-id");
+        assert_eq!(metrics["hyperparameter"]["values"]["period"], 14);
+        assert!(metrics["hyperparameter"].get("sweep_id").is_none());
     }
 }
