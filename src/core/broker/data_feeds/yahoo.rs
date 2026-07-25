@@ -6,10 +6,13 @@ use crate::core::broker::types::{
 };
 use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
 use chrono::{DateTime, TimeZone, Utc};
+use dashmap::DashMap;
+use log::{info, warn};
 use polars::prelude::*;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
@@ -20,6 +23,14 @@ pub struct YahooFinanceDataFeed {
     ticker_info: Arc<Mutex<HashMap<String, Asset>>>,
     crumb: Arc<Mutex<Option<String>>>,
     stream_manager: DataStreamManager,
+}
+
+/// Immutable, process-local normalized bar snapshots. Hyperparameter seeds deliberately create
+/// fresh brokers/strategies, but must not redownload or renormalize an identical market window.
+static HISTORICAL_BAR_CACHE: OnceLock<DashMap<String, Vec<Bar>>> = OnceLock::new();
+
+fn historical_bar_cache() -> &'static DashMap<String, Vec<Bar>> {
+    HISTORICAL_BAR_CACHE.get_or_init(DashMap::new)
 }
 
 impl YahooFinanceDataFeed {
@@ -161,6 +172,13 @@ impl YahooFinanceDataFeed {
         let start_ts = start.timestamp();
         let end_ts = end.timestamp();
         let interval = Self::chart_interval(time_frame);
+        let cache_key = format!("{symbol}|{start_ts}|{end_ts}|{interval}");
+        if let Some(bars) = historical_bar_cache().get(&cache_key) {
+            info!(
+                "Reusing immutable Yahoo bar snapshot for {symbol} {interval} ({start_ts}..{end_ts})"
+            );
+            return Ok(BarData::Bars(bars.clone()));
+        }
         let json = self
             .request_chart_json(symbol, start_ts, end_ts, &interval)
             .await?;
@@ -239,6 +257,7 @@ impl YahooFinanceDataFeed {
             });
         }
 
+        historical_bar_cache().insert(cache_key, bars.clone());
         Ok(BarData::Bars(bars))
     }
 }
@@ -287,16 +306,51 @@ impl DataProvider for YahooFinanceDataFeed {
             "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{}?crumb={}&modules=financialData,quoteType,defaultKeyStatistics,assetProfile,summaryDetail",
             symbol, crumb
         );
-        let response = self.client.get(&url).send().await?;
-        let json: Value = response.json().await?;
+        let fallback_asset = || Asset {
+            id: format!("yahoo:{}", symbol),
+            symbol: symbol.to_string(),
+            name: symbol.to_string(),
+            asset_type: AssetType::Stock,
+            status: AssetStatus::Active,
+            exchange: AssetExchange::NYSE,
+            tradable: true,
+            marginable: true,
+            shortable: true,
+            fractional: true,
+            min_order_size: Some(0.01),
+            quantity_base: Some(2),
+            max_order_size: None,
+            min_price_increment: Some(0.01),
+            price_base: Some(2),
+            contract_size: None,
+            fees: Default::default(),
+        };
 
-        let result =
-            json["quoteSummary"]["result"][0]
-                .as_object()
-                .ok_or(BrokerError::DataFeedError(format!(
-                    "Invalid Yahoo response for ticker info: {:?}",
-                    json["quoteSummary"]["error"]
-                )))?;
+        // Yahoo's quoteSummary endpoint is frequently entitlement-gated even while the chart
+        // endpoint (used for the actual backtest data) remains available. Metadata must not
+        // prevent an otherwise valid equity universe from reaching the chart request.
+        let json = match self.client.get(&url).send().await {
+            Ok(response) => response.json::<Value>().await.ok(),
+            Err(error) => {
+                warn!(
+                    "Yahoo metadata request failed for {symbol}; using fallback asset metadata: {error}"
+                );
+                None
+            }
+        };
+        let Some(result) = json
+            .as_ref()
+            .and_then(|json| json["quoteSummary"]["result"].get(0))
+            .and_then(Value::as_object)
+        else {
+            let asset = fallback_asset();
+            self.ticker_info
+                .lock()
+                .unwrap()
+                .insert(symbol.to_string(), asset.clone());
+            warn!("Yahoo metadata was unavailable for {symbol}; using fallback asset metadata");
+            return Ok(asset);
+        };
 
         let instrument_type = result["quoteType"]["quoteType"].as_str().unwrap();
         let exchange_name = result["quoteType"]["exchange"].as_str().unwrap();
@@ -307,7 +361,10 @@ impl DataProvider for YahooFinanceDataFeed {
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let is_tradable = result["summaryDetail"]["tradeable"].as_bool().unwrap();
+        // `summaryDetail.tradeable` is commonly false/missing for normal Yahoo equities.
+        // A configured Yahoo symbol is eligible for a historical backtest; the chart request
+        // below is the authoritative validation of whether data is available.
+        let is_tradable = true;
 
         let asset = Asset {
             id: asset_uuid,

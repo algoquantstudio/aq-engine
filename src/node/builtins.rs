@@ -16,6 +16,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "event_type".to_string(),
@@ -23,6 +24,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("Bar")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "timeframe_amount".to_string(),
@@ -30,6 +32,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(15)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "timeframe_unit".to_string(),
@@ -37,6 +40,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("Minute")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "allow_trading".to_string(),
@@ -44,12 +48,14 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(false)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![NodeOutput {
                 name: "on_start".to_string(),
                 output_type: OutputType::OnStart,
                 insight_state: None,
+                hyper_reference: None,
             }],
             source_file: Some("add_event".to_string()),
             lifecycle_phase: None,
@@ -70,6 +76,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "atr_period".to_string(),
@@ -77,6 +84,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(14)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "limit_entries".to_string(),
@@ -84,6 +92,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(false)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "max_spawn".to_string(),
@@ -91,6 +100,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(1)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "base_confidence_modifier_field".to_string(),
@@ -98,6 +108,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -105,16 +116,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "alpha_result".to_string(),
                     output_type: OutputType::AlphaResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "alpha_instance".to_string(),
                     output_type: OutputType::AlphaInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("built_in_test_entry".to_string()),
@@ -135,22 +149,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::New),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Executed),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("insight_submit".to_string()),
@@ -172,6 +190,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "start".to_string(),
@@ -179,6 +198,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("09:30")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "end".to_string(),
@@ -186,6 +206,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("16:00")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "days".to_string(),
@@ -193,6 +214,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(["0", "1", "2", "3", "4"])),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -200,16 +222,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("allow_trading_window".to_string()),
@@ -231,6 +256,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "insights_pipes".to_string(),
@@ -238,6 +264,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -245,16 +272,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("and_pipe".to_string()),
@@ -276,6 +306,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "insights_pipes".to_string(),
@@ -283,6 +314,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -290,16 +322,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("or_pipe".to_string()),
@@ -320,22 +355,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::New),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("cancel_opposite".to_string()),
@@ -356,22 +395,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::New),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("market_order_entry".to_string()),
@@ -393,6 +436,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "period_unfilled".to_string(),
@@ -400,6 +444,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(0)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "period_till_tp".to_string(),
@@ -407,6 +452,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(0)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -414,16 +460,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("insight_ttl_config".to_string()),
@@ -445,6 +494,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "atr_period".to_string(),
@@ -452,6 +502,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(14)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "ema_period".to_string(),
@@ -459,6 +510,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(14)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "base_confidence_modifier_field".to_string(),
@@ -466,6 +518,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -473,16 +526,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "alpha_result".to_string(),
                     output_type: OutputType::AlphaResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "alpha_instance".to_string(),
                     output_type: OutputType::AlphaInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("built_in_ema_price_crossover".to_string()),
@@ -504,6 +560,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "local_window".to_string(),
@@ -511,6 +568,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(36)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "divergance_window".to_string(),
@@ -518,6 +576,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(50)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "atr_period".to_string(),
@@ -525,6 +584,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(14)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "rsi_period".to_string(),
@@ -532,6 +592,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(14)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "base_confidence_modifier_field".to_string(),
@@ -539,6 +600,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -546,16 +608,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "alpha_result".to_string(),
                     output_type: OutputType::AlphaResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "alpha_instance".to_string(),
                     output_type: OutputType::AlphaInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("built_in_rsi_divergance_alpha".to_string()),
@@ -577,6 +642,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "maximum_cost_basis".to_string(),
@@ -584,6 +650,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(200000.0)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "minimum_cost_basis".to_string(),
@@ -591,6 +658,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(1000.0)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -598,16 +666,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("dynamic_quantity_to_risk".to_string()),
@@ -629,6 +700,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "risk_percent".to_string(),
@@ -636,6 +708,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(2)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -643,16 +716,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("percentage_risk_to_quantity".to_string()),
@@ -673,22 +749,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::New),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("full_account_quantity_to_risk".to_string()),
@@ -710,6 +790,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "minimum_rr".to_string(),
@@ -717,6 +798,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(2.0)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -724,16 +806,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("minimum_risk_to_reward".to_string()),
@@ -754,22 +839,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::New),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Rejected),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("reject_expired_insight".to_string()),
@@ -791,6 +880,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "dca_percentage".to_string(),
@@ -798,6 +888,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(0.01)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "dca_levels".to_string(),
@@ -805,6 +896,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(5)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -812,16 +904,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::New),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("percentage_dca_levels".to_string()),
@@ -842,22 +937,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::Filled),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("basic_stop_loss".to_string()),
@@ -878,22 +977,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::Filled),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("basic_take_profit".to_string()),
@@ -915,6 +1018,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "sell_off_percentage".to_string(),
@@ -922,6 +1026,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(0.5)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -929,16 +1034,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("scale_out".to_string()),
@@ -959,22 +1067,26 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: Some(InsightState::Filled),
+                hyper_reference: None,
             }],
             outputs: vec![
                 NodeOutput {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("close_market_changed".to_string()),
@@ -996,6 +1108,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: None,
                     is_public: true,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "minutes_before_end_of_day".to_string(),
@@ -1003,6 +1116,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!(15)),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeInput {
                     name: "end_of_day_time_utc".to_string(),
@@ -1010,6 +1124,7 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     value: Some(serde_json::json!("23:45")),
                     is_public: true,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             outputs: vec![
@@ -1017,16 +1132,19 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     name: "insights_out".to_string(),
                     output_type: OutputType::Insights,
                     insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_result".to_string(),
                     output_type: OutputType::InsightPipeResult,
                     insight_state: None,
+                    hyper_reference: None,
                 },
                 NodeOutput {
                     name: "pipe_instance".to_string(),
                     output_type: OutputType::InsightPipeInstance,
                     insight_state: None,
+                    hyper_reference: None,
                 },
             ],
             source_file: Some("end_of_day_close".to_string()),
@@ -1047,11 +1165,13 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: None,
+                hyper_reference: None,
             }],
             outputs: vec![NodeOutput {
                 name: "init".to_string(),
                 output_type: OutputType::Init,
                 insight_state: None,
+                hyper_reference: None,
             }],
             source_file: Some("preseed_warmup_history".to_string()),
             lifecycle_phase: Some(crate::node::LifecyclePhase::OnInit),
@@ -1071,11 +1191,13 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                 value: None,
                 is_public: true,
                 insight_state: None,
+                hyper_reference: None,
             }],
             outputs: vec![NodeOutput {
                 name: "on_teardown".to_string(),
                 output_type: OutputType::OnTeardown,
                 insight_state: None,
+                hyper_reference: None,
             }],
             source_file: Some("close_all_filled_positions".to_string()),
             lifecycle_phase: Some(crate::node::LifecyclePhase::OnTeardown),

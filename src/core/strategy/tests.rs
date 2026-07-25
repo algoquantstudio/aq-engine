@@ -25,7 +25,9 @@ mod tests {
     use crate::core::pipeline::insight_submit::InsightSubmitPipe;
     use crate::core::pipeline::scale_out::ScaleOutPipe;
     use crate::core::pipeline::{InsightPipe, InsightPipeResult, WrappedInsightPipe};
-    use crate::core::strategy::{EventStreamType, StrategyMode};
+    use crate::core::strategy::{
+        EventStreamType, HyperParameterConfig, HyperParameterSelection, StrategyMode,
+    };
     use crate::core::universe::{UniverseModel, UniverseModelBuilder, UniverseResult};
     use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
     use chrono::{TimeZone, Utc};
@@ -2426,6 +2428,49 @@ mod tests {
         fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
 
         fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
+    }
+
+    #[test]
+    fn selected_hyperparameter_seed_keeps_the_normal_backtest_directory() {
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        let broker = UnifiedBroker::new(execution, FixedScaleOutDataFeed::new());
+        let mut state = StrategyState::new(
+            "Hyperparameter directory test".to_string(),
+            "1.0".to_string(),
+            NoopStrategy,
+            broker,
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+        state.set_artifact_root(std::env::temp_dir().join("aqe_hyperparameter_directory_test"));
+        let config = HyperParameterConfig {
+            sweep_id: "sweep-id".to_string(),
+            strategy_fingerprint: "fingerprint".to_string(),
+            source_targets: json!([]),
+            definitions: json!([]),
+        };
+        let selection = HyperParameterSelection {
+            seed: "7e70013faaa45d1be79ddf10d27b5e5b3a81801e043273b6e90daa52c695c051".to_string(),
+            values: json!({ "period": 14 }),
+        };
+
+        state.set_hyper_parameter_seed(&selection).unwrap();
+        assert!(state.backtest_result_dir.is_none());
+        assert_eq!(state.variables().get("__HYPER__").unwrap()["period"], 14);
+        assert_eq!(
+            state.variables().get("__HYPER_SEED__").unwrap().as_str(),
+            Some("7e70013faaa45d1be79ddf10d27b5e5b3a81801e043273b6e90daa52c695c051")
+        );
+
+        state
+            .set_hyper_parameter_sweep_seed(&config, &selection)
+            .unwrap();
+        assert_eq!(
+            state.backtest_result_dir.as_ref().unwrap(),
+            &std::env::temp_dir()
+                .join("aqe_hyperparameter_directory_test")
+                .join("backtests/hyper/sweep-id/7e70013faaa45d1be79ddf10d27b5e5b3a81801e043273b6e90daa52c695c051")
+        );
     }
 
     fn test_asset(symbol: &str) -> Asset {

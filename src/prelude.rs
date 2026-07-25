@@ -6,6 +6,7 @@
 
 pub use chrono::Utc;
 pub use log::{debug, info};
+pub use serde_json::{self, Map as JsonMap, Value as JsonValue};
 pub use std::collections::HashSet;
 pub use uuid::Uuid;
 
@@ -26,8 +27,9 @@ pub use crate::core::lifecycle::{
 };
 pub use crate::core::pipeline::{InsightPipe, InsightPipeBuilder, InsightPipeResult};
 pub use crate::core::strategy::{
-    EventStreamRequest, EventStreamType, Strategy, StrategyContext, StrategyMode, StrategyState,
-    set_logging_level, traits::BrokerAccess,
+    EventStreamRequest, EventStreamType, HyperParameter, HyperParameterConfig,
+    HyperParameterSelection, Strategy,
+    StrategyContext, StrategyMode, StrategyState, set_logging_level, traits::BrokerAccess,
 };
 pub use crate::core::universe::UniverseModelBuilder;
 pub use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
