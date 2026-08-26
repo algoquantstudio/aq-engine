@@ -28,8 +28,8 @@ pub use crate::core::lifecycle::{
 pub use crate::core::pipeline::{InsightPipe, InsightPipeBuilder, InsightPipeResult};
 pub use crate::core::strategy::{
     EventStreamRequest, EventStreamType, HyperParameter, HyperParameterConfig,
-    HyperParameterSelection, Strategy,
-    StrategyContext, StrategyMode, StrategyState, set_logging_level, traits::BrokerAccess,
+    HyperParameterSelection, Strategy, StrategyContext, StrategyMode, StrategyState,
+    set_logging_level, traits::BrokerAccess,
 };
 pub use crate::core::universe::UniverseModelBuilder;
 pub use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};

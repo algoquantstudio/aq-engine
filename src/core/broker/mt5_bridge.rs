@@ -1953,40 +1953,43 @@ fn mt5_timeframe_code(time_frame: TimeFrame) -> Result<String, BrokerError> {
 }
 
 fn bars_to_frame(bars: &[Bar]) -> Result<DataFrame, BrokerError> {
-    DataFrame::new(vec![
-        Column::new(
-            "symbol".into(),
-            bars.iter()
-                .map(|bar| bar.symbol.clone())
-                .collect::<Vec<_>>(),
-        ),
-        Column::new(
-            "open".into(),
-            bars.iter().map(|bar| bar.open).collect::<Vec<_>>(),
-        ),
-        Column::new(
-            "high".into(),
-            bars.iter().map(|bar| bar.high).collect::<Vec<_>>(),
-        ),
-        Column::new(
-            "low".into(),
-            bars.iter().map(|bar| bar.low).collect::<Vec<_>>(),
-        ),
-        Column::new(
-            "close".into(),
-            bars.iter().map(|bar| bar.close).collect::<Vec<_>>(),
-        ),
-        Column::new(
-            "volume".into(),
-            bars.iter().map(|bar| bar.volume).collect::<Vec<_>>(),
-        ),
-        Column::new(
-            "timestamp".into(),
-            bars.iter()
-                .map(|bar| bar.timestamp.timestamp_millis())
-                .collect::<Vec<_>>(),
-        ),
-    ])
+    DataFrame::new(
+        bars.len(),
+        vec![
+            Column::new(
+                "symbol".into(),
+                bars.iter()
+                    .map(|bar| bar.symbol.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "open".into(),
+                bars.iter().map(|bar| bar.open).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "high".into(),
+                bars.iter().map(|bar| bar.high).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "low".into(),
+                bars.iter().map(|bar| bar.low).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "close".into(),
+                bars.iter().map(|bar| bar.close).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "volume".into(),
+                bars.iter().map(|bar| bar.volume).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "timestamp".into(),
+                bars.iter()
+                    .map(|bar| bar.timestamp.timestamp_millis())
+                    .collect::<Vec<_>>(),
+            ),
+        ],
+    )
     .map_err(|error| BrokerError::DataFeedError(error.to_string()))
 }
 

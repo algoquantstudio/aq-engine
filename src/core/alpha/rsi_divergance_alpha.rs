@@ -77,7 +77,7 @@ impl RsiDiverganceAlpha {
             .map_err(|e| format!("Missing column '{}': {}", column, e))?
             .f64()
             .map_err(|e| format!("Column '{}' is not Float64: {}", column, e))?
-            .into_iter()
+            .iter()
             .flatten()
             .collect())
     }
@@ -87,7 +87,7 @@ impl RsiDiverganceAlpha {
         indicator_column: &polars::prelude::Float64Chunked,
         column_name: &str,
     ) -> Result<(&'a [f64], Vec<f64>), String> {
-        let indicator_values: Vec<Option<f64>> = indicator_column.into_iter().collect();
+        let indicator_values: Vec<Option<f64>> = indicator_column.iter().collect();
         let first_valid_index = indicator_values
             .iter()
             .position(|value| value.is_some())
@@ -627,13 +627,16 @@ mod tests {
         rsi: Vec<Option<f64>>,
     ) -> DataFrame {
         let len = highs.len();
-        DataFrame::new(vec![
-            Column::new("high".into(), highs),
-            Column::new("low".into(), lows),
-            Column::new("close".into(), closes),
-            Column::new("ATRr_2".into(), vec![Some(1.0); len]),
-            Column::new("RSI_2".into(), rsi),
-        ])
+        DataFrame::new(
+            len,
+            vec![
+                Column::new("high".into(), highs),
+                Column::new("low".into(), lows),
+                Column::new("close".into(), closes),
+                Column::new("ATRr_2".into(), vec![Some(1.0); len]),
+                Column::new("RSI_2".into(), rsi),
+            ],
+        )
         .unwrap()
     }
 

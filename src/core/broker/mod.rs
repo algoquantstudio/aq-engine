@@ -596,12 +596,12 @@ where
             .map_err(|e| BrokerError::DataFeedError(format!("'timestamp' not i64: {}", e)))?;
 
         let rows = timestamp
-            .into_iter()
-            .zip(open.into_iter())
-            .zip(high.into_iter())
-            .zip(low.into_iter())
-            .zip(close.into_iter())
-            .zip(volume.into_iter());
+            .iter()
+            .zip(open.iter())
+            .zip(high.iter())
+            .zip(low.iter())
+            .zip(close.iter())
+            .zip(volume.iter());
 
         for (i, (((((ts_ms, open), high), low), close), volume)) in rows.enumerate() {
             let ts_ms = ts_ms.ok_or_else(|| {
@@ -938,15 +938,18 @@ pub mod traits {
                         .map(|b| b.timestamp.timestamp_millis())
                         .collect();
 
-                    DataFrame::new(vec![
-                        Column::new("symbol".into(), &symbols),
-                        Column::new("open".into(), &opens),
-                        Column::new("high".into(), &highs),
-                        Column::new("low".into(), &lows),
-                        Column::new("close".into(), &closes),
-                        Column::new("volume".into(), &volumes),
-                        Column::new("timestamp".into(), &timestamps),
-                    ])
+                    DataFrame::new(
+                        bars.len(),
+                        vec![
+                            Column::new("symbol".into(), &symbols),
+                            Column::new("open".into(), &opens),
+                            Column::new("high".into(), &highs),
+                            Column::new("low".into(), &lows),
+                            Column::new("close".into(), &closes),
+                            Column::new("volume".into(), &volumes),
+                            Column::new("timestamp".into(), &timestamps),
+                        ],
+                    )
                     .map_err(|e| e.to_string())
                 }
             }

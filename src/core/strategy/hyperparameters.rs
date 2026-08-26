@@ -44,7 +44,7 @@ impl HyperParameterSelection {
             return Err("Hyperparameter values cannot be empty".to_string());
         }
         let canonical = serde_json::to_vec(&values).map_err(|error| error.to_string())?;
-        let expected = format!("{:x}", Sha256::digest(canonical));
+        let expected = hex::encode(Sha256::digest(canonical));
         if self.seed != expected {
             return Err("Hyperparameter seed does not match its values".to_string());
         }
@@ -169,7 +169,7 @@ impl Iterator for HyperParameterRunIter {
         for ((name, domain), index) in self.domains.iter().zip(indices.iter()) {
             values.insert(name.clone(), domain[*index].clone());
         }
-        let seed = format!("{:x}", Sha256::digest(serde_json::to_vec(&values).ok()?));
+        let seed = hex::encode(Sha256::digest(serde_json::to_vec(&values).ok()?));
 
         // Advance as an odometer, with the final parameter changing fastest.
         let mut carry = true;
@@ -457,7 +457,7 @@ mod tests {
         let values = serde_json::json!({ "period": 14 });
         let mut map = BTreeMap::new();
         map.insert("period", JsonValue::from(14));
-        let seed = format!("{:x}", Sha256::digest(serde_json::to_vec(&map).unwrap()));
+        let seed = hex::encode(Sha256::digest(serde_json::to_vec(&map).unwrap()));
         let payload = serde_json::json!({ "seed": seed, "values": values }).to_string();
         let selection =
             HyperParameterSelection::from_process_args(&["--hyper-params-json".into(), payload])

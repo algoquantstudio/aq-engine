@@ -970,13 +970,16 @@ fn account_history_frame(account_history: &[(DateTime<Utc>, Account)]) -> Polars
         equities.push(account.equity);
     }
 
-    DataFrame::new(vec![
-        Column::new("timestamp_ms".into(), timestamp_ms.as_slice()),
-        Column::new("year".into(), years.as_slice()),
-        Column::new("month".into(), months.as_slice()),
-        Column::new("period".into(), periods.as_slice()),
-        Column::new("equity".into(), equities.as_slice()),
-    ])
+    DataFrame::new(
+        account_history.len(),
+        vec![
+            Column::new("timestamp_ms".into(), timestamp_ms.as_slice()),
+            Column::new("year".into(), years.as_slice()),
+            Column::new("month".into(), months.as_slice()),
+            Column::new("period".into(), periods.as_slice()),
+            Column::new("equity".into(), equities.as_slice()),
+        ],
+    )
 }
 
 fn round_trips_frame(trips: &[RoundTripTrade]) -> PolarsResult<DataFrame> {
@@ -1016,24 +1019,27 @@ fn round_trips_frame(trips: &[RoundTripTrade]) -> PolarsResult<DataFrame> {
         gross_loss_values.push(if trip.pnl < 0.0 { trip.pnl.abs() } else { 0.0 });
     }
 
-    DataFrame::new(vec![
-        Column::new("symbol".into(), symbols.as_slice()),
-        Column::new("side".into(), sides.as_slice()),
-        Column::new("strategy_type".into(), strategy_types.as_slice()),
-        Column::new("entry_day_of_week".into(), entry_day_of_week.as_slice()),
-        Column::new("entry_hour".into(), entry_hour.as_slice()),
-        Column::new("entry_ms".into(), entry_ms.as_slice()),
-        Column::new("exit_ms".into(), exit_ms.as_slice()),
-        Column::new("exit_date".into(), exit_dates.as_slice()),
-        Column::new("period".into(), periods.as_slice()),
-        Column::new("pnl".into(), pnl_values.as_slice()),
-        Column::new("return_pct".into(), return_pct_values.as_slice()),
-        Column::new("return_bps".into(), return_bps_values.as_slice()),
-        Column::new("is_win".into(), is_win_values.as_slice()),
-        Column::new("is_loss".into(), is_loss_values.as_slice()),
-        Column::new("gross_profit".into(), gross_profit_values.as_slice()),
-        Column::new("gross_loss".into(), gross_loss_values.as_slice()),
-    ])
+    DataFrame::new(
+        trips.len(),
+        vec![
+            Column::new("symbol".into(), symbols.as_slice()),
+            Column::new("side".into(), sides.as_slice()),
+            Column::new("strategy_type".into(), strategy_types.as_slice()),
+            Column::new("entry_day_of_week".into(), entry_day_of_week.as_slice()),
+            Column::new("entry_hour".into(), entry_hour.as_slice()),
+            Column::new("entry_ms".into(), entry_ms.as_slice()),
+            Column::new("exit_ms".into(), exit_ms.as_slice()),
+            Column::new("exit_date".into(), exit_dates.as_slice()),
+            Column::new("period".into(), periods.as_slice()),
+            Column::new("pnl".into(), pnl_values.as_slice()),
+            Column::new("return_pct".into(), return_pct_values.as_slice()),
+            Column::new("return_bps".into(), return_bps_values.as_slice()),
+            Column::new("is_win".into(), is_win_values.as_slice()),
+            Column::new("is_loss".into(), is_loss_values.as_slice()),
+            Column::new("gross_profit".into(), gross_profit_values.as_slice()),
+            Column::new("gross_loss".into(), gross_loss_values.as_slice()),
+        ],
+    )
 }
 
 fn month_period(timestamp: DateTime<Utc>) -> String {
@@ -1113,9 +1119,9 @@ fn build_monthly_returns_polars(
     let return_col = out.column("return_pct")?.f64()?;
 
     let rows = year_col
-        .into_iter()
-        .zip(month_col.into_iter())
-        .zip(return_col.into_iter())
+        .iter()
+        .zip(month_col.iter())
+        .zip(return_col.iter())
         .map(|((year, month), return_pct)| MonthlyReturnRow {
             year: year.unwrap_or_default(),
             month: month.unwrap_or_default().max(0) as u32,
@@ -1192,10 +1198,10 @@ fn build_time_performance_polars(
     let count_col = out.column("trade_count")?.i64()?;
 
     let rows = day_col
-        .into_iter()
-        .zip(hour_col.into_iter())
-        .zip(avg_col.into_iter())
-        .zip(count_col.into_iter())
+        .iter()
+        .zip(hour_col.iter())
+        .zip(avg_col.iter())
+        .zip(count_col.iter())
         .map(
             |(((day_of_week, hour), avg_return_bps), trade_count)| TimePerformanceRow {
                 day_of_week: day_of_week.unwrap_or_default().max(0) as u32,
@@ -1279,8 +1285,8 @@ fn build_account_drawdown_series_polars(
     let drawdown_col = out.column("drawdown_pct")?.f64()?;
 
     let rows = period_col
-        .into_iter()
-        .zip(drawdown_col.into_iter())
+        .iter()
+        .zip(drawdown_col.iter())
         .map(|(period, drawdown_pct)| DrawdownSeriesRow {
             strategy_name: "Portfolio Equity".to_string(),
             period: period.unwrap_or_default().to_string(),
@@ -1382,21 +1388,21 @@ fn build_strategy_drawdown_series_polars(
         .with_columns([
             col("return_pct")
                 .cum_sum(false)
-                .over([col("strategy_name")])
+                .over([col("strategy_name")])?
                 .alias("cumulative_return_pct"),
             col("pnl")
                 .cum_sum(false)
-                .over([col("strategy_name")])
+                .over([col("strategy_name")])?
                 .alias("cumulative_pnl"),
         ])
         .with_columns([
             col("cumulative_return_pct")
                 .cum_max(false)
-                .over([col("strategy_name")])
+                .over([col("strategy_name")])?
                 .alias("peak_return_pct"),
             col("cumulative_pnl")
                 .cum_max(false)
-                .over([col("strategy_name")])
+                .over([col("strategy_name")])?
                 .alias("peak_pnl"),
         ])
         .with_columns([
@@ -1427,12 +1433,12 @@ fn build_strategy_drawdown_series_polars(
     let drawdown_pnl_col = out.column("drawdown_pnl")?.f64()?;
 
     let rows = strategy_col
-        .into_iter()
-        .zip(period_col.into_iter())
-        .zip(drawdown_col.into_iter())
-        .zip(cumulative_pnl_col.into_iter())
-        .zip(cumulative_return_col.into_iter())
-        .zip(drawdown_pnl_col.into_iter())
+        .iter()
+        .zip(period_col.iter())
+        .zip(drawdown_col.iter())
+        .zip(cumulative_pnl_col.iter())
+        .zip(cumulative_return_col.iter())
+        .zip(drawdown_pnl_col.iter())
         .map(
             |(
                 ((((strategy_name, period), drawdown_pct), cumulative_pnl), cumulative_return_pct),
@@ -1583,11 +1589,14 @@ fn build_rolling_sharpe_polars(
         equities.push(account.equity);
     }
 
-    let df = DataFrame::new(vec![
-        Column::new("timestamp_ms".into(), timestamp_ms.as_slice()),
-        Column::new("period".into(), periods.as_slice()),
-        Column::new("equity".into(), equities.as_slice()),
-    ])?;
+    let df = DataFrame::new(
+        account_history.len(),
+        vec![
+            Column::new("timestamp_ms".into(), timestamp_ms.as_slice()),
+            Column::new("period".into(), periods.as_slice()),
+            Column::new("equity".into(), equities.as_slice()),
+        ],
+    )?;
 
     let returns_len = account_history.len().saturating_sub(1);
     if returns_len < 2 {
@@ -1664,8 +1673,8 @@ fn build_rolling_sharpe_polars(
     for window_days in windows {
         let sharpe_col = out.column(&format!("sharpe_{}d", window_days))?.f64()?;
         let latest_by_period: BTreeMap<String, f64> = period_col
-            .into_iter()
-            .zip(sharpe_col.into_iter())
+            .iter()
+            .zip(sharpe_col.iter())
             .filter_map(|(period, sharpe)| Some((period?.to_string(), sharpe?)))
             .collect();
         rows.extend(
@@ -1864,11 +1873,14 @@ fn build_regime_performance_polars(
         );
     }
 
-    let df = DataFrame::new(vec![
-        Column::new("vol_regime".into(), vol_regimes.as_slice()),
-        Column::new("trend_regime".into(), trend_regimes.as_slice()),
-        Column::new("strategy_return".into(), returns.as_slice()),
-    ])?;
+    let df = DataFrame::new(
+        regime_points.len(),
+        vec![
+            Column::new("vol_regime".into(), vol_regimes.as_slice()),
+            Column::new("trend_regime".into(), trend_regimes.as_slice()),
+            Column::new("strategy_return".into(), returns.as_slice()),
+        ],
+    )?;
     let out = df
         .lazy()
         .group_by([col("vol_regime"), col("trend_regime")])
@@ -1888,10 +1900,10 @@ fn build_regime_performance_polars(
     let count_col = out.column("bar_count")?.i64()?;
 
     let rows = vol_col
-        .into_iter()
-        .zip(trend_col.into_iter())
-        .zip(avg_col.into_iter())
-        .zip(count_col.into_iter())
+        .iter()
+        .zip(trend_col.iter())
+        .zip(avg_col.iter())
+        .zip(count_col.iter())
         .map(
             |(((vol_regime, trend_regime), avg_return_pct), bar_count)| RegimePerformanceRow {
                 vol_regime: vol_regime.unwrap_or_default().to_string(),
@@ -2036,16 +2048,19 @@ fn build_strategy_regime_performance_polars(
         return Ok(Vec::new());
     }
 
-    let df = DataFrame::new(vec![
-        Column::new("strategy_type".into(), strategy_types.as_slice()),
-        Column::new("vol_regime".into(), vol_regimes.as_slice()),
-        Column::new("trend_regime".into(), trend_regimes.as_slice()),
-        Column::new("pnl".into(), pnl_values.as_slice()),
-        Column::new("return_pct".into(), return_values.as_slice()),
-        Column::new("is_win".into(), is_win_values.as_slice()),
-        Column::new("gross_profit".into(), gross_profit_values.as_slice()),
-        Column::new("gross_loss".into(), gross_loss_values.as_slice()),
-    ])?;
+    let df = DataFrame::new(
+        strategy_types.len(),
+        vec![
+            Column::new("strategy_type".into(), strategy_types.as_slice()),
+            Column::new("vol_regime".into(), vol_regimes.as_slice()),
+            Column::new("trend_regime".into(), trend_regimes.as_slice()),
+            Column::new("pnl".into(), pnl_values.as_slice()),
+            Column::new("return_pct".into(), return_values.as_slice()),
+            Column::new("is_win".into(), is_win_values.as_slice()),
+            Column::new("gross_profit".into(), gross_profit_values.as_slice()),
+            Column::new("gross_loss".into(), gross_loss_values.as_slice()),
+        ],
+    )?;
     let out = df
         .lazy()
         .group_by([col("strategy_type"), col("vol_regime"), col("trend_regime")])
@@ -2080,15 +2095,15 @@ fn build_strategy_regime_performance_polars(
     let gross_loss_col = out.column("gross_loss")?.f64()?;
 
     let rows = strategy_col
-        .into_iter()
-        .zip(vol_col.into_iter())
-        .zip(trend_col.into_iter())
-        .zip(total_pnl_col.into_iter())
-        .zip(avg_return_col.into_iter())
-        .zip(trade_count_col.into_iter())
-        .zip(winning_col.into_iter())
-        .zip(gross_profit_col.into_iter())
-        .zip(gross_loss_col.into_iter())
+        .iter()
+        .zip(vol_col.iter())
+        .zip(trend_col.iter())
+        .zip(total_pnl_col.iter())
+        .zip(avg_return_col.iter())
+        .zip(trade_count_col.iter())
+        .zip(winning_col.iter())
+        .zip(gross_profit_col.iter())
+        .zip(gross_loss_col.iter())
         .map(
             |(
                 (
@@ -2296,14 +2311,17 @@ fn build_setup_performance_polars(
         }
     }
 
-    let df = DataFrame::new(vec![
-        Column::new("setup_name".into(), setup_names.as_slice()),
-        Column::new("pnl".into(), pnl_values.as_slice()),
-        Column::new("is_win".into(), is_win_values.as_slice()),
-        Column::new("is_loss".into(), is_loss_values.as_slice()),
-        Column::new("gross_profit".into(), gross_profit_values.as_slice()),
-        Column::new("gross_loss".into(), gross_loss_values.as_slice()),
-    ])?;
+    let df = DataFrame::new(
+        setup_names.len(),
+        vec![
+            Column::new("setup_name".into(), setup_names.as_slice()),
+            Column::new("pnl".into(), pnl_values.as_slice()),
+            Column::new("is_win".into(), is_win_values.as_slice()),
+            Column::new("is_loss".into(), is_loss_values.as_slice()),
+            Column::new("gross_profit".into(), gross_profit_values.as_slice()),
+            Column::new("gross_loss".into(), gross_loss_values.as_slice()),
+        ],
+    )?;
     let out = df
         .lazy()
         .group_by([col("setup_name")])
@@ -2336,13 +2354,13 @@ fn build_setup_performance_polars(
     let gross_loss_col = out.column("gross_loss")?.f64()?;
 
     let rows = setup_col
-        .into_iter()
-        .zip(total_pnl_col.into_iter())
-        .zip(trade_count_col.into_iter())
-        .zip(winning_col.into_iter())
-        .zip(losing_col.into_iter())
-        .zip(gross_profit_col.into_iter())
-        .zip(gross_loss_col.into_iter())
+        .iter()
+        .zip(total_pnl_col.iter())
+        .zip(trade_count_col.iter())
+        .zip(winning_col.iter())
+        .zip(losing_col.iter())
+        .zip(gross_profit_col.iter())
+        .zip(gross_loss_col.iter())
         .map(
             |(
                 (((((setup_name, total_pnl), trade_count), winners), losers), gross_profit),
@@ -2529,7 +2547,7 @@ fn build_strategy_correlations_polars(
 
     let strategy_col = daily_returns.column("strategy_type")?.str()?;
     let strategies = strategy_col
-        .into_iter()
+        .iter()
         .flatten()
         .map(str::to_string)
         .collect::<std::collections::BTreeSet<_>>();

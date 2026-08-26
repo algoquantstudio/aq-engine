@@ -1647,7 +1647,7 @@ impl BacktestResults {
                 }
                 hasher.update(&buffer[..read]);
             }
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
         metrics_json_value
             .as_object_mut()

@@ -200,7 +200,7 @@ pub struct HyperParameterRun {
 /// Stable identifier for one concrete parameter map, shared by AQS and AQE.
 pub fn canonical_hyperparameter_seed(values: &BTreeMap<String, Value>) -> Result<String, String> {
     let canonical = serde_json::to_vec(values).map_err(|error| error.to_string())?;
-    Ok(format!("{:x}", Sha256::digest(canonical)))
+    Ok(hex::encode(Sha256::digest(canonical)))
 }
 
 /// Expand parameter domains in a canonical order. The seed is a SHA-256 fingerprint of the
@@ -490,7 +490,9 @@ impl StrategyMeta {
                 ));
             };
             if canonical_hyperparameter_seed(values)? != seed {
-                return Err("default hyperparameter seed does not match its saved values".to_string());
+                return Err(
+                    "default hyperparameter seed does not match its saved values".to_string(),
+                );
             }
         }
         Ok(())

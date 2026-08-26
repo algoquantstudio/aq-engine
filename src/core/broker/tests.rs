@@ -74,15 +74,18 @@ impl DataProvider for MockDataFeed {
         _time_frame: TimeFrame,
     ) -> Result<DataFrame, BrokerError> {
         // Return empty DataFrame with correct schema
-        let df = DataFrame::new(vec![
-            Column::new("symbol".into(), Vec::<String>::new()),
-            Column::new("open".into(), Vec::<f64>::new()),
-            Column::new("high".into(), Vec::<f64>::new()),
-            Column::new("low".into(), Vec::<f64>::new()),
-            Column::new("close".into(), Vec::<f64>::new()),
-            Column::new("volume".into(), Vec::<f64>::new()),
-            Column::new("timestamp".into(), Vec::<i64>::new()),
-        ])
+        let df = DataFrame::new(
+            0,
+            vec![
+                Column::new("symbol".into(), Vec::<String>::new()),
+                Column::new("open".into(), Vec::<f64>::new()),
+                Column::new("high".into(), Vec::<f64>::new()),
+                Column::new("low".into(), Vec::<f64>::new()),
+                Column::new("close".into(), Vec::<f64>::new()),
+                Column::new("volume".into(), Vec::<f64>::new()),
+                Column::new("timestamp".into(), Vec::<i64>::new()),
+            ],
+        )
         .map_err(|e| BrokerError::DataFeedError(e.to_string()))?;
         Ok(df)
     }
@@ -157,15 +160,18 @@ impl DataProvider for ConcurrentHistoryFeed {
         self.active.fetch_sub(1, Ordering::SeqCst);
 
         let timestamp = (start + chrono::Duration::minutes(index)).timestamp_millis();
-        DataFrame::new(vec![
-            Column::new("symbol".into(), vec![symbol.to_string()]),
-            Column::new("open".into(), vec![100.0]),
-            Column::new("high".into(), vec![101.0]),
-            Column::new("low".into(), vec![99.0]),
-            Column::new("close".into(), vec![100.5]),
-            Column::new("volume".into(), vec![10.0]),
-            Column::new("timestamp".into(), vec![timestamp]),
-        ])
+        DataFrame::new(
+            1,
+            vec![
+                Column::new("symbol".into(), vec![symbol.to_string()]),
+                Column::new("open".into(), vec![100.0]),
+                Column::new("high".into(), vec![101.0]),
+                Column::new("low".into(), vec![99.0]),
+                Column::new("close".into(), vec![100.5]),
+                Column::new("volume".into(), vec![10.0]),
+                Column::new("timestamp".into(), vec![timestamp]),
+            ],
+        )
         .map_err(|error| BrokerError::DataFeedError(error.to_string()))
     }
 

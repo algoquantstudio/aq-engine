@@ -40,6 +40,7 @@ const LIVE_SYNC_QUERY_TIMEOUT_SECS: u64 = 10;
 const LIVE_SYNC_RECONCILE_SECS: u64 = 15 * 60;
 const LIVE_SYNC_RECONNECT_TIMEOUT_SECS: u64 = 40;
 const LIVE_SYNC_FLUSH_MS: u64 = 500;
+const LIVE_HEARTBEAT_SECS: u64 = 3;
 const LIVE_SYNC_MAX_INSIGHTS_PER_FLUSH: usize = 128;
 const LIVE_STARTUP_CLEANUP_MAX_CONCURRENT_BROKER_OPS: usize = 8;
 const LIVE_ACCOUNT_SYNC_SECS: u64 = 5;
@@ -876,7 +877,7 @@ where
             Duration::from_secs(LIVE_SYNC_STREAM_TIMEOUT_SECS),
             client
                 .query(
-                    "LIVE SELECT * FROM strategy_actions
+                    "LIVE SELECT id, action, status FROM strategy_actions
                      WHERE strategy_id = type::record('strategy', $strategy_id)
                        AND live_session_id = type::record('live_strategy_session', <uuid>$live_session_key)
                        AND status = 'pending'",
@@ -1238,6 +1239,45 @@ where
             .map(|_| ())
     }
 
+    async fn load_remote_active_insight_rows<C: surrealdb::Connection>(
+        client: &surrealdb::Surreal<C>,
+        auth: &AqsAuth,
+        live_session_key: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, surrealdb::Error> {
+        let session_filter = if live_session_key.is_some() {
+            " AND live_session_id = type::record('live_strategy_session', <uuid>$live_session_key)"
+        } else {
+            ""
+        };
+        let statement = |state: &str| {
+            format!(
+                "SELECT id, insight_id, symbol, state, side, order_id, live_session_id
+                 FROM insights
+                 WHERE strategy_id = type::record('strategy', $strategy_id){}
+                   AND state = '{}';",
+                session_filter, state
+            )
+        };
+        let query = ["New", "Executed", "Filled"]
+            .into_iter()
+            .map(statement)
+            .collect::<String>();
+        let mut query_builder = client
+            .query(query)
+            .bind(("strategy_id", auth.strategy_id.clone()));
+        if let Some(live_session_key) = live_session_key {
+            query_builder = query_builder.bind(("live_session_key", live_session_key.to_string()));
+        }
+
+        let mut result: IndexedResults = query_builder.await?;
+        let mut rows = Vec::new();
+        for statement_index in 0..3 {
+            let mut state_rows: Vec<serde_json::Value> = result.take(statement_index)?;
+            rows.append(&mut state_rows);
+        }
+        Ok(rows)
+    }
+
     async fn reconcile_remote_active_insights<C: surrealdb::Connection>(
         &self,
         client: &surrealdb::Surreal<C>,
@@ -1253,18 +1293,9 @@ where
             .map(|insight_id| insight_id.to_string())
             .collect::<HashSet<_>>();
 
-        let mut result: IndexedResults = client
-            .query(
-                "SELECT insight_id, symbol, state, side
-                 FROM insights
-                 WHERE strategy_id = type::record('strategy', $strategy_id)
-                   AND live_session_id = type::record('live_strategy_session', <uuid>$live_session_key)
-                   AND state IN ['New', 'Executed', 'Filled']",
-            )
-            .bind(("strategy_id", auth.strategy_id.clone()))
-            .bind(("live_session_key", live_session_key.clone()))
-            .await?;
-        let rows: Vec<serde_json::Value> = result.take(0)?;
+        let rows =
+            Self::load_remote_active_insight_rows(client, auth, Some(live_session_key.as_str()))
+                .await?;
         let mut reconciled = 0usize;
 
         for row in rows {
@@ -1382,16 +1413,7 @@ where
             .map(|insight_id| insight_id.to_string())
             .collect::<HashSet<_>>();
 
-        let mut result: IndexedResults = client
-            .query(
-                "SELECT insight_id, symbol, state, side, order_id, live_session_id
-                 FROM insights
-                 WHERE strategy_id = type::record('strategy', $strategy_id)
-                   AND state IN ['New', 'Executed', 'Filled']",
-            )
-            .bind(("strategy_id", auth.strategy_id.clone()))
-            .await?;
-        let rows: Vec<serde_json::Value> = result.take(0)?;
+        let rows = Self::load_remote_active_insight_rows(client, auth, None).await?;
         let mut remote_insights = Vec::new();
 
         for row in rows {
@@ -2051,6 +2073,7 @@ where
     /// This will register callbacks for trade events & bar streams,
     /// then loop via `tokio::select!` block listening on channels to drive the pipeline.
     pub async fn run_live(&mut self, auth: Option<AqsAuth>) -> Result<(), BrokerError> {
+        super::ensure_rustls_crypto_provider();
         self.apply_hyper_parameters_from_process_args()?;
         let auth = auth.or_else(|| self.default_live_auth.clone());
         self.runtime_telemetry
@@ -2276,12 +2299,15 @@ where
         let mut pipeline_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut live_sync_interval =
             tokio::time::interval(std::time::Duration::from_millis(LIVE_SYNC_FLUSH_MS));
+        let mut heartbeat_interval =
+            tokio::time::interval(std::time::Duration::from_secs(LIVE_HEARTBEAT_SECS));
         let mut reconcile_interval =
             tokio::time::interval(std::time::Duration::from_secs(LIVE_SYNC_RECONCILE_SECS));
         let mut local_metrics_interval = tokio::time::interval(std::time::Duration::from_secs(
             LOCAL_LIVE_METRICS_WRITE_SECS,
         ));
         live_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut force_full_reconcile = true;
         let mut live_sync_failure: Option<BrokerError> = None;
         let mut last_runtime_publish = Instant::now();
@@ -2451,6 +2477,42 @@ where
 
                     self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
                 }
+
+                    _ = heartbeat_interval.tick(), if auth.is_some() => {
+                        if let Some(a) = auth.as_ref() {
+                            if db.is_none() {
+                                reconnect_live_sync_or_stop!(a);
+                                force_full_reconcile = true;
+                            }
+
+                            if let Some(client) = db.as_ref() {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(LIVE_SYNC_QUERY_TIMEOUT_SECS),
+                                    self.persist_live_strategy_summary(client, a),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        error!(
+                                            "AQS heartbeat failed for live strategy {}: {}",
+                                            a.strategy_id, error
+                                        );
+                                        reconnect_live_sync_or_stop!(a);
+                                        force_full_reconcile = true;
+                                    }
+                                    Err(_) => {
+                                        error!(
+                                            "AQS heartbeat timed out for live strategy {} after {}s",
+                                            a.strategy_id, LIVE_SYNC_QUERY_TIMEOUT_SECS
+                                        );
+                                        reconnect_live_sync_or_stop!(a);
+                                        force_full_reconcile = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     _ = live_sync_interval.tick() => {
                         if let Some(artifacts) = local_live_artifacts.as_ref() {

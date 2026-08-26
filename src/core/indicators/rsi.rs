@@ -56,10 +56,10 @@ impl Indicator for RelativeStrengthIndex {
             .f64()
             .map_err(|e| format!("Column '{}' is not Float64: {}", self.target_column, e))?;
 
-        let values: Vec<Option<f64>> = s.into_iter().collect();
+        let values: Vec<Option<f64>> = s.iter().collect();
         let mut out = vec![None; values.len()];
         if values.len() <= self.period {
-            df.with_column(Series::new(self.name().into(), out))
+            df.with_column(Series::new(self.name().into(), out).into())
                 .map_err(|e| format!("Failed to append RSI column: {}", e))?;
             return Ok(());
         }
@@ -106,7 +106,7 @@ impl Indicator for RelativeStrengthIndex {
             });
         }
 
-        df.with_column(Series::new(self.name().into(), out))
+        df.with_column(Series::new(self.name().into(), out).into())
             .map_err(|e| format!("Failed to append RSI column: {}", e))?;
         Ok(())
     }

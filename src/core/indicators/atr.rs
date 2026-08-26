@@ -63,9 +63,9 @@ impl Indicator for AverageTrueRange {
             .f64()
             .map_err(|e| format!("Column 'close' is not Float64: {}", e))?;
 
-        let highs: Vec<Option<f64>> = highs.into_iter().collect();
-        let lows: Vec<Option<f64>> = lows.into_iter().collect();
-        let closes: Vec<Option<f64>> = closes.into_iter().collect();
+        let highs: Vec<Option<f64>> = highs.iter().collect();
+        let lows: Vec<Option<f64>> = lows.iter().collect();
+        let closes: Vec<Option<f64>> = closes.iter().collect();
 
         let mut true_ranges = Vec::with_capacity(df.height());
         let previous_closes = std::iter::once(None).chain(closes.iter().copied());
@@ -116,7 +116,7 @@ impl Indicator for AverageTrueRange {
             }
         }
 
-        df.with_column(Series::new(self.name().into(), atr_values))
+        df.with_column(Series::new(self.name().into(), atr_values).into())
             .map_err(|e| format!("Failed to add ATR column: {}", e))?;
 
         Ok(())
@@ -162,23 +162,20 @@ mod tests {
 
     #[test]
     fn computes_atr_column() {
-        let mut df = DataFrame::new(vec![
-            Series::new("high".into(), &[10.0, 12.0, 13.0, 14.0]).into(),
-            Series::new("low".into(), &[8.0, 9.0, 11.0, 12.0]).into(),
-            Series::new("close".into(), &[9.0, 11.0, 12.0, 13.0]).into(),
-        ])
+        let mut df = DataFrame::new(
+            4,
+            vec![
+                Series::new("high".into(), &[10.0, 12.0, 13.0, 14.0]).into(),
+                Series::new("low".into(), &[8.0, 9.0, 11.0, 12.0]).into(),
+                Series::new("close".into(), &[9.0, 11.0, 12.0, 13.0]).into(),
+            ],
+        )
         .unwrap();
 
         let mut atr = AverageTrueRange::new(3);
         atr.run(&mut df).unwrap();
 
-        let values: Vec<Option<f64>> = df
-            .column("ATRr_3")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .collect();
+        let values: Vec<Option<f64>> = df.column("ATRr_3").unwrap().f64().unwrap().iter().collect();
 
         assert_eq!(values[0], None);
         assert_eq!(values[1], None);
@@ -188,11 +185,14 @@ mod tests {
 
     #[test]
     fn computes_latest_atr_from_run_bar() {
-        let df = DataFrame::new(vec![
-            Series::new("high".into(), &[10.0, 12.0, 13.0]).into(),
-            Series::new("low".into(), &[8.0, 9.0, 11.0]).into(),
-            Series::new("close".into(), &[9.0, 11.0, 12.0]).into(),
-        ])
+        let df = DataFrame::new(
+            3,
+            vec![
+                Series::new("high".into(), &[10.0, 12.0, 13.0]).into(),
+                Series::new("low".into(), &[8.0, 9.0, 11.0]).into(),
+                Series::new("close".into(), &[9.0, 11.0, 12.0]).into(),
+            ],
+        )
         .unwrap();
 
         let mut atr = AverageTrueRange::new(3);

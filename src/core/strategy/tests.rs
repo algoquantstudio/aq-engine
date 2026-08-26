@@ -39,6 +39,14 @@ mod tests {
 
     static MT5_INTEGRATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[test]
+    fn installs_a_rustls_provider_when_multiple_backends_are_enabled() {
+        crate::core::strategy::ensure_rustls_crypto_provider();
+
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        let _ = rustls::ClientConfig::builder();
+    }
+
     fn assert_backtest_or_skip<T>(result: Result<T, BrokerError>, context: &str) -> Option<T> {
         match result {
             Ok(value) => Some(value),
@@ -62,82 +70,85 @@ mod tests {
     }
 
     fn fixed_scale_out_fixture_df() -> DataFrame {
-        DataFrame::new(vec![
-            Column::new("symbol".into(), vec!["AAPL"; 31]),
-            Column::new(
-                "open".into(),
-                vec![
-                    229.25, 237.21, 238.45, 240.00, 239.30, 237.00, 232.19, 226.88, 229.22, 237.00,
-                    237.18, 238.97, 239.97, 241.23, 248.30, 255.88, 255.22, 253.21, 254.10, 254.56,
-                    254.86, 255.04, 256.58, 254.67, 257.99, 256.81, 256.52, 257.81, 254.94, 249.38,
-                    246.60,
-                ],
-            ),
-            Column::new(
-                "high".into(),
-                vec![
-                    230.85, 238.85, 239.90, 241.32, 240.15, 238.78, 232.42, 230.45, 234.51, 238.19,
-                    241.22, 240.10, 241.20, 246.30, 256.64, 257.34, 255.74, 257.17, 257.60, 255.00,
-                    255.92, 258.79, 258.18, 259.24, 259.07, 257.40, 258.52, 258.00, 256.38, 249.69,
-                    248.85,
-                ],
-            ),
-            Column::new(
-                "low".into(),
-                vec![
-                    226.97, 234.36, 236.74, 238.49, 236.34, 233.36, 225.95, 226.65, 229.02, 235.03,
-                    236.32, 237.73, 236.65, 240.21, 248.12, 253.58, 251.04, 251.71, 253.78, 253.01,
-                    253.11, 254.93, 254.15, 253.95, 255.05, 255.43, 256.11, 253.14, 244.00, 245.56,
-                    244.70,
-                ],
-            ),
-            Column::new(
-                "close".into(),
-                vec![
-                    229.72, 238.47, 239.78, 239.69, 237.88, 234.35, 226.79, 230.03, 234.07, 236.70,
-                    238.15, 238.99, 237.88, 245.50, 256.08, 254.43, 252.31, 256.87, 255.46, 254.43,
-                    254.63, 255.45, 257.13, 258.02, 256.69, 256.48, 258.06, 254.04, 245.27, 247.66,
-                    247.77,
-                ],
-            ),
-            Column::new("volume".into(), vec![1_000_000.0; 31]),
-            Column::new(
-                "timestamp".into(),
-                vec![
-                    1756771200000i64,
-                    1756857600000,
-                    1756944000000,
-                    1757030400000,
-                    1757289600000,
-                    1757376000000,
-                    1757462400000,
-                    1757548800000,
-                    1757635200000,
-                    1757894400000,
-                    1757980800000,
-                    1758067200000,
-                    1758153600000,
-                    1758240000000,
-                    1758499200000,
-                    1758585600000,
-                    1758672000000,
-                    1758758400000,
-                    1758844800000,
-                    1759104000000,
-                    1759190400000,
-                    1759276800000,
-                    1759363200000,
-                    1759449600000,
-                    1759708800000,
-                    1759795200000,
-                    1759881600000,
-                    1759968000000,
-                    1760054400000,
-                    1760313600000,
-                    1760400000000,
-                ],
-            ),
-        ])
+        DataFrame::new(
+            31,
+            vec![
+                Column::new("symbol".into(), vec!["AAPL"; 31]),
+                Column::new(
+                    "open".into(),
+                    vec![
+                        229.25, 237.21, 238.45, 240.00, 239.30, 237.00, 232.19, 226.88, 229.22,
+                        237.00, 237.18, 238.97, 239.97, 241.23, 248.30, 255.88, 255.22, 253.21,
+                        254.10, 254.56, 254.86, 255.04, 256.58, 254.67, 257.99, 256.81, 256.52,
+                        257.81, 254.94, 249.38, 246.60,
+                    ],
+                ),
+                Column::new(
+                    "high".into(),
+                    vec![
+                        230.85, 238.85, 239.90, 241.32, 240.15, 238.78, 232.42, 230.45, 234.51,
+                        238.19, 241.22, 240.10, 241.20, 246.30, 256.64, 257.34, 255.74, 257.17,
+                        257.60, 255.00, 255.92, 258.79, 258.18, 259.24, 259.07, 257.40, 258.52,
+                        258.00, 256.38, 249.69, 248.85,
+                    ],
+                ),
+                Column::new(
+                    "low".into(),
+                    vec![
+                        226.97, 234.36, 236.74, 238.49, 236.34, 233.36, 225.95, 226.65, 229.02,
+                        235.03, 236.32, 237.73, 236.65, 240.21, 248.12, 253.58, 251.04, 251.71,
+                        253.78, 253.01, 253.11, 254.93, 254.15, 253.95, 255.05, 255.43, 256.11,
+                        253.14, 244.00, 245.56, 244.70,
+                    ],
+                ),
+                Column::new(
+                    "close".into(),
+                    vec![
+                        229.72, 238.47, 239.78, 239.69, 237.88, 234.35, 226.79, 230.03, 234.07,
+                        236.70, 238.15, 238.99, 237.88, 245.50, 256.08, 254.43, 252.31, 256.87,
+                        255.46, 254.43, 254.63, 255.45, 257.13, 258.02, 256.69, 256.48, 258.06,
+                        254.04, 245.27, 247.66, 247.77,
+                    ],
+                ),
+                Column::new("volume".into(), vec![1_000_000.0; 31]),
+                Column::new(
+                    "timestamp".into(),
+                    vec![
+                        1756771200000i64,
+                        1756857600000,
+                        1756944000000,
+                        1757030400000,
+                        1757289600000,
+                        1757376000000,
+                        1757462400000,
+                        1757548800000,
+                        1757635200000,
+                        1757894400000,
+                        1757980800000,
+                        1758067200000,
+                        1758153600000,
+                        1758240000000,
+                        1758499200000,
+                        1758585600000,
+                        1758672000000,
+                        1758758400000,
+                        1758844800000,
+                        1759104000000,
+                        1759190400000,
+                        1759276800000,
+                        1759363200000,
+                        1759449600000,
+                        1759708800000,
+                        1759795200000,
+                        1759881600000,
+                        1759968000000,
+                        1760054400000,
+                        1760313600000,
+                        1760400000000,
+                    ],
+                ),
+            ],
+        )
         .unwrap()
     }
 
@@ -208,7 +219,7 @@ mod tests {
                 .i64()
                 .map_err(|e| BrokerError::DataFeedError(e.to_string()))?;
             let mask: BooleanChunked = timestamps
-                .into_iter()
+                .iter()
                 .map(|ts| {
                     ts.map(|millis| {
                         let dt = Utc.timestamp_millis_opt(millis).unwrap();
@@ -415,15 +426,18 @@ mod tests {
                 }
             }
 
-            DataFrame::new(vec![
-                Column::new("symbol".into(), symbols),
-                Column::new("open".into(), open),
-                Column::new("high".into(), high),
-                Column::new("low".into(), low),
-                Column::new("close".into(), close),
-                Column::new("volume".into(), volume),
-                Column::new("timestamp".into(), timestamp),
-            ])
+            DataFrame::new(
+                symbols.len(),
+                vec![
+                    Column::new("symbol".into(), symbols),
+                    Column::new("open".into(), open),
+                    Column::new("high".into(), high),
+                    Column::new("low".into(), low),
+                    Column::new("close".into(), close),
+                    Column::new("volume".into(), volume),
+                    Column::new("timestamp".into(), timestamp),
+                ],
+            )
             .map_err(|error| BrokerError::DataFeedError(error.to_string()))
         }
 
@@ -809,15 +823,18 @@ mod tests {
                 }
             }
 
-            DataFrame::new(vec![
-                Column::new("symbol".into(), symbols),
-                Column::new("open".into(), open),
-                Column::new("high".into(), high),
-                Column::new("low".into(), low),
-                Column::new("close".into(), close),
-                Column::new("volume".into(), volume),
-                Column::new("timestamp".into(), timestamp),
-            ])
+            DataFrame::new(
+                symbols.len(),
+                vec![
+                    Column::new("symbol".into(), symbols),
+                    Column::new("open".into(), open),
+                    Column::new("high".into(), high),
+                    Column::new("low".into(), low),
+                    Column::new("close".into(), close),
+                    Column::new("volume".into(), volume),
+                    Column::new("timestamp".into(), timestamp),
+                ],
+            )
             .map_err(|error| BrokerError::DataFeedError(error.to_string()))
         }
 
@@ -1759,7 +1776,7 @@ mod tests {
         println!("  ✓ Lifecycle order verified: start → init → generate");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_preseed_warmup_history_runs_after_alpha_start_before_strategy_init() {
         struct WarmupAlpha;
 
@@ -1877,7 +1894,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_preseed_warmup_history_seeds_registered_feature_streams() {
         let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
 
@@ -3473,7 +3490,7 @@ mod tests {
                                 .get(&insight.symbol)
                                 .and_then(|df| {
                                     let c = df.column("close").ok()?;
-                                    let v: Vec<Option<f64>> = c.f64().ok()?.into_iter().collect();
+                                    let v: Vec<Option<f64>> = c.f64().ok()?.iter().collect();
                                     v.last().copied().flatten()
                                 })
                                 .unwrap_or(0.0);
@@ -3531,7 +3548,7 @@ mod tests {
 
         // MOCK TP 1 Hit
         let s = Series::new("close".into(), &[120.0f64]);
-        let df = DataFrame::new(vec![Column::from(s)]).unwrap();
+        let df = DataFrame::new(1, vec![Column::from(s)]).unwrap();
         state.history.insert("AAPL".to_string(), df);
 
         // Execute Pipeline natively checking close_position SideEffects
@@ -3551,7 +3568,7 @@ mod tests {
 
         // MOCK TP 2 Hit
         let s2 = Series::new("close".into(), &[150.0f64]);
-        let df2 = DataFrame::new(vec![Column::from(s2)]).unwrap();
+        let df2 = DataFrame::new(1, vec![Column::from(s2)]).unwrap();
         state.history.insert("AAPL".to_string(), df2);
 
         // Refresh insight clone for pipeline param
@@ -4043,7 +4060,7 @@ mod tests {
         assert_eq!(hist.height(), 2);
 
         let sma_col = hist.column("SMA_2_close").expect("Missing SMA column");
-        let sma_vals: Vec<Option<f64>> = sma_col.f64().unwrap().into_iter().collect();
+        let sma_vals: Vec<Option<f64>> = sma_col.f64().unwrap().iter().collect();
 
         assert_eq!(sma_vals[0], None);
         assert_eq!(sma_vals[1], Some(15.0)); // (10 + 20) / 2

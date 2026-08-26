@@ -44,6 +44,44 @@ pub struct LiveMetricsSnapshot {
     pub updated_at: DateTime<Utc>,
 }
 
+impl LiveMetricsSnapshot {
+    /// SurrealDB float fields and JSON cannot represent NaN or infinity. Keep
+    /// the persistence snapshot total even while very young live sessions can
+    /// temporarily produce unbounded annualized ratios.
+    fn sanitize_non_finite(mut self) -> Self {
+        for value in [
+            &mut self.starting_cash,
+            &mut self.final_equity,
+            &mut self.total_return,
+            &mut self.total_return_pct,
+            &mut self.win_rate,
+            &mut self.max_drawdown,
+            &mut self.cagr,
+            &mut self.annualized_volatility,
+            &mut self.sharpe_ratio,
+            &mut self.sortino_ratio,
+            &mut self.calmar_ratio,
+            &mut self.max_drawdown_duration_days,
+            &mut self.expectancy,
+            &mut self.profit_factor,
+            &mut self.payoff_ratio,
+            &mut self.avg_winner,
+            &mut self.avg_loser,
+            &mut self.avg_winner_pct,
+            &mut self.avg_loser_pct,
+            &mut self.best_trade,
+            &mut self.worst_trade,
+            &mut self.consistency_score,
+            &mut self.open_positions_unrealized_pnl,
+        ] {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LivePerformanceTracker {
     starting_cash: f64,
@@ -289,53 +327,56 @@ impl LivePerformanceTracker {
             0
         };
 
-        Some(LiveMetricsSnapshot {
-            starting_cash: self.starting_cash,
-            final_equity: self.current_equity,
-            total_return,
-            total_return_pct,
-            total_trades: self.total_trades,
-            winning_trades: self.winning_trades,
-            losing_trades: self.losing_trades,
-            win_rate,
-            max_drawdown: self.max_drawdown,
-            cagr: self.cagr(updated_at),
-            annualized_volatility: self.annualized_volatility(),
-            sharpe_ratio: self.sharpe_ratio(),
-            sortino_ratio: self.sortino_ratio(),
-            calmar_ratio: self.calmar_ratio(updated_at),
-            max_drawdown_duration_days: self.max_drawdown_duration_days(updated_at),
-            expectancy,
-            profit_factor,
-            payoff_ratio,
-            avg_winner,
-            avg_loser,
-            avg_winner_pct,
-            avg_loser_pct,
-            best_trade: if self.total_trades > 0 {
-                self.best_trade
-            } else {
-                0.0
-            },
-            worst_trade: if self.total_trades > 0 {
-                self.worst_trade
-            } else {
-                0.0
-            },
-            consistency_score,
-            longest_winning_trade_held_secs: self.longest_winning_trade_held_secs,
-            longest_losing_trade_held_secs: self.longest_losing_trade_held_secs,
-            average_trade_held_secs,
-            open_positions_count: self.open_positions_count,
-            open_insights_count: self.open_insights_count,
-            open_positions_unrealized_pnl: self.open_positions_unrealized_pnl,
-            open_positions_profitable_count: self.open_positions_profitable_count,
-            open_positions_losing_count: self.open_positions_losing_count,
-            symbols: self.symbols.clone(),
-            executed_at,
-            finished_at: self.finished_at,
-            updated_at,
-        })
+        Some(
+            LiveMetricsSnapshot {
+                starting_cash: self.starting_cash,
+                final_equity: self.current_equity,
+                total_return,
+                total_return_pct,
+                total_trades: self.total_trades,
+                winning_trades: self.winning_trades,
+                losing_trades: self.losing_trades,
+                win_rate,
+                max_drawdown: self.max_drawdown,
+                cagr: self.cagr(updated_at),
+                annualized_volatility: self.annualized_volatility(),
+                sharpe_ratio: self.sharpe_ratio(),
+                sortino_ratio: self.sortino_ratio(),
+                calmar_ratio: self.calmar_ratio(updated_at),
+                max_drawdown_duration_days: self.max_drawdown_duration_days(updated_at),
+                expectancy,
+                profit_factor,
+                payoff_ratio,
+                avg_winner,
+                avg_loser,
+                avg_winner_pct,
+                avg_loser_pct,
+                best_trade: if self.total_trades > 0 {
+                    self.best_trade
+                } else {
+                    0.0
+                },
+                worst_trade: if self.total_trades > 0 {
+                    self.worst_trade
+                } else {
+                    0.0
+                },
+                consistency_score,
+                longest_winning_trade_held_secs: self.longest_winning_trade_held_secs,
+                longest_losing_trade_held_secs: self.longest_losing_trade_held_secs,
+                average_trade_held_secs,
+                open_positions_count: self.open_positions_count,
+                open_insights_count: self.open_insights_count,
+                open_positions_unrealized_pnl: self.open_positions_unrealized_pnl,
+                open_positions_profitable_count: self.open_positions_profitable_count,
+                open_positions_losing_count: self.open_positions_losing_count,
+                symbols: self.symbols.clone(),
+                executed_at,
+                finished_at: self.finished_at,
+                updated_at,
+            }
+            .sanitize_non_finite(),
+        )
     }
 
     pub fn should_persist(&self) -> bool {
@@ -411,7 +452,8 @@ impl LivePerformanceTracker {
         if years <= f64::EPSILON {
             return (self.current_equity - self.starting_cash) / self.starting_cash;
         }
-        (self.current_equity / self.starting_cash).powf(1.0 / years) - 1.0
+        let cagr = (self.current_equity / self.starting_cash).powf(1.0 / years) - 1.0;
+        if cagr.is_finite() { cagr } else { 0.0 }
     }
 
     fn calmar_ratio(&self, updated_at: DateTime<Utc>) -> f64 {
@@ -419,7 +461,8 @@ impl LivePerformanceTracker {
         if max_drawdown_fraction <= f64::EPSILON {
             return 0.0;
         }
-        self.cagr(updated_at) / max_drawdown_fraction.abs()
+        let calmar = self.cagr(updated_at) / max_drawdown_fraction.abs();
+        if calmar.is_finite() { calmar } else { 0.0 }
     }
 
     fn max_drawdown_duration_days(&self, updated_at: DateTime<Utc>) -> f64 {
@@ -496,4 +539,37 @@ fn consistency_score(win_rate: f64, profit_factor: f64, payoff_ratio: f64) -> f6
     let pf_component = (profit_factor / 3.0).min(1.0);
     let payoff_component = (payoff_ratio / 3.0).min(1.0);
     ((win_rate + pf_component + payoff_component) / 3.0 * 100.0).clamp(0.0, 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeDelta;
+
+    #[test]
+    fn very_young_live_session_never_serializes_unbounded_metrics_as_null() {
+        let started_at = Utc::now();
+        let mut tracker = LivePerformanceTracker::default();
+        tracker.initialize(100.0, 100.0, started_at, ["SOLUSD".to_string()]);
+        tracker.update_equity(200.0, started_at + TimeDelta::seconds(1));
+        tracker.update_open_position_metrics(
+            1,
+            1,
+            f64::INFINITY,
+            1,
+            0,
+            vec!["SOLUSD".to_string()],
+            started_at + TimeDelta::seconds(1),
+        );
+
+        let snapshot = tracker.snapshot().expect("initialized live metrics");
+        assert!(snapshot.cagr.is_finite());
+        assert!(snapshot.calmar_ratio.is_finite());
+        assert!(snapshot.open_positions_unrealized_pnl.is_finite());
+
+        let json = serde_json::to_value(snapshot).expect("serializable live metrics");
+        assert!(json["cagr"].is_number());
+        assert!(json["calmar_ratio"].is_number());
+        assert!(json["open_positions_unrealized_pnl"].is_number());
+    }
 }

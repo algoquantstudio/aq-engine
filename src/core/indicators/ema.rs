@@ -62,7 +62,7 @@ impl Indicator for ExponentialMovingAverage {
         let mut seed_sum = 0.0;
         let mut seed_count = 0usize;
 
-        for value in s.into_iter() {
+        for value in s.iter() {
             match (value, ema) {
                 (Some(v), Some(prev)) => {
                     let next = ((v - prev) * multiplier) + prev;
@@ -85,7 +85,7 @@ impl Indicator for ExponentialMovingAverage {
             }
         }
 
-        df.with_column(Series::new(self.name().into(), out))
+        df.with_column(Series::new(self.name().into(), out).into())
             .map_err(|e| format!("Failed to append EMA column: {}", e))?;
         Ok(())
     }

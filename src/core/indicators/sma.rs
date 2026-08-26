@@ -64,7 +64,7 @@ impl Indicator for SimpleMovingAverage {
         let mut sma_values: Vec<Option<f64>> = Vec::with_capacity(floats.len());
         let period = self.period;
 
-        let values: Vec<Option<f64>> = floats.into_iter().collect();
+        let values: Vec<Option<f64>> = floats.iter().collect();
         let mut sum = 0.0;
         let mut valid_count = 0;
 
@@ -90,7 +90,7 @@ impl Indicator for SimpleMovingAverage {
         }
 
         let sma_series = Series::new(output_col.clone().into(), &sma_values);
-        df.with_column(sma_series)
+        df.with_column(sma_series.into())
             .map_err(|e| format!("Failed to add column '{}': {}", output_col, e))?;
 
         Ok(())

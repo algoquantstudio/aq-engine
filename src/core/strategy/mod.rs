@@ -53,6 +53,17 @@ pub use aqs_types::AqsAuth;
 use live_metrics::LivePerformanceTracker;
 use log::{debug, error, info, warn};
 
+/// Select AQE's TLS provider before any dependency constructs a Rustls client.
+///
+/// Polars' object-store stack can enable Ring while SurrealDB and Reqwest enable AWS-LC.
+/// Rustls deliberately refuses to choose automatically when both features are present.
+#[cfg(feature = "runtime")]
+fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub fn set_logging_level(level: impl AsRef<str>) -> Result<(), log::SetLoggerError> {
     let log_level = level.as_ref().trim().to_lowercase();
     let log_level = if log_level.is_empty() {
@@ -1324,7 +1335,7 @@ where
                 for (name, _ind) in self.indicators.iter() {
                     let null_series =
                         Series::full_null(name.into(), bar_df.height(), &DataType::Float64);
-                    let _ = bar_df.with_column(null_series);
+                    let _ = bar_df.with_column(null_series.into());
                 }
 
                 let current_time = self.broker.get_current_time();
@@ -1361,11 +1372,11 @@ where
                                 let Ok(values) = series.f64() else {
                                     continue;
                                 };
-                                let mut values = values.into_iter().collect::<Vec<Option<f64>>>();
+                                let mut values = values.iter().collect::<Vec<Option<f64>>>();
                                 if let Some(slot) = values.get_mut(row_index) {
                                     *slot = Some(value);
                                     let updated = Series::new(column_name.into(), values);
-                                    let _ = bar_df.with_column(updated);
+                                    let _ = bar_df.with_column(updated.into());
                                 }
                             }
                         }
@@ -2306,6 +2317,7 @@ where
         end: chrono::DateTime<chrono::Utc>,
         time_frame: TimeFrame,
     ) -> Result<BacktestResults, BrokerError> {
+        ensure_rustls_crypto_provider();
         self.apply_hyper_parameters_from_process_args()?;
         // Take strategy out to avoid split-borrow (self.strategy vs self as ctx)
         let mut strategy = self

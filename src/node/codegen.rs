@@ -833,10 +833,9 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         })
         .collect();
     if has_hyperparameters {
-        let sweep_id = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(meta).map_err(|error| error.to_string())?)
-        );
+        let sweep_id = hex::encode(Sha256::digest(
+            serde_json::to_vec(meta).map_err(|error| error.to_string())?,
+        ));
         let source_targets =
             serde_json::to_string(&hyper_source_targets).map_err(|error| error.to_string())?;
         src.push_str("    let mut hyperparameters = HyperParameterConfig::new();\n");

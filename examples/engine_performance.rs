@@ -487,14 +487,17 @@ fn synthetic_bars(rows: usize) -> DataFrame {
         timestamp.push(1_700_000_000_000_i64 + index as i64 * 60_000);
     }
 
-    DataFrame::new(vec![
-        Column::new("open".into(), open),
-        Column::new("high".into(), high),
-        Column::new("low".into(), low),
-        Column::new("close".into(), close),
-        Column::new("volume".into(), volume),
-        Column::new("timestamp".into(), timestamp),
-    ])
+    DataFrame::new(
+        open.len(),
+        vec![
+            Column::new("open".into(), open),
+            Column::new("high".into(), high),
+            Column::new("low".into(), low),
+            Column::new("close".into(), close),
+            Column::new("volume".into(), volume),
+            Column::new("timestamp".into(), timestamp),
+        ],
+    )
     .expect("synthetic benchmark frame should be valid")
 }
 
