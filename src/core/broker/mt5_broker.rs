@@ -198,7 +198,9 @@ impl Mt5Broker {
 impl Broker for Mt5Broker {
     async fn connect(&self) -> Result<bool, BrokerError> {
         self.bridge.start().await?;
-        self.bridge.wait_for_rpc_poll().await
+        self.bridge.wait_for_rpc_poll().await?;
+        self.bridge.recover_runtime_state().await?;
+        Ok(self.bridge.is_broker_connected())
     }
 
     async fn disconnect(&self) -> Result<bool, BrokerError> {
@@ -207,7 +209,7 @@ impl Broker for Mt5Broker {
     }
 
     fn is_connected(&self) -> bool {
-        self.bridge.is_connected()
+        self.bridge.is_broker_connected()
     }
 
     fn get_current_time(&self) -> DateTime<Utc> {

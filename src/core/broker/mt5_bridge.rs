@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -34,6 +34,9 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_QUEUE_LEN: usize = 10_000;
 const MAX_TRADE_EVENT_QUEUE_LEN: usize = 20_000;
 const MAX_SEEN_EVENT_IDS: usize = 50_000;
+const MT5_TRANSPORT_FRESH_SECS: i64 = 15;
+const MT5_MARKET_DATA_FRESH_SECS: i64 = 15;
+const MT5_RECOVERY_COOLDOWN_SECS: i64 = 5;
 
 static SHARED_MT5_BRIDGE: OnceLock<Arc<Mt5Bridge>> = OnceLock::new();
 
@@ -132,6 +135,8 @@ pub struct Mt5Bridge {
     local_trade_event_seq: Arc<AtomicU64>,
     trade_subscribers: Arc<Mutex<Vec<Arc<dyn Fn((Order, TradeUpdateEvent)) + Send + Sync>>>>,
     bar_subscribers: Arc<Mutex<Vec<Mt5BarSubscription>>>,
+    recovery_lock: Arc<AsyncMutex<()>>,
+    recovery_scheduled: Arc<AtomicBool>,
     server_started: Arc<AtomicBool>,
     server_shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     server_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -164,7 +169,13 @@ struct Mt5BridgeState {
     last_rpc_response_request_id: Option<String>,
     last_unknown_rpc_response_request_id: Option<String>,
     last_heartbeat: Option<DateTime<Utc>>,
+    last_market_data: Option<DateTime<Utc>>,
+    last_subscription_sync: Option<DateTime<Utc>>,
+    last_recovery: Option<DateTime<Utc>>,
     terminal_name: Option<String>,
+    heartbeat_account_id: Option<String>,
+    terminal_connected: Option<bool>,
+    terminal_trade_allowed: Option<bool>,
     dropped_trade_event_count: u64,
     last_trade_event_sequence: Option<u64>,
 }
@@ -196,6 +207,16 @@ pub struct Mt5BridgeDiagnostics {
     pub last_response_request_id: Option<String>,
     pub last_unknown_response_request_id: Option<String>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub last_market_data_at: Option<DateTime<Utc>>,
+    pub last_subscription_sync_at: Option<DateTime<Utc>>,
+    pub last_recovery_at: Option<DateTime<Utc>>,
+    pub terminal_name: Option<String>,
+    pub heartbeat_account_id: Option<String>,
+    pub terminal_connected: Option<bool>,
+    pub terminal_trade_allowed: Option<bool>,
+    pub transport_connected: bool,
+    pub broker_connected: bool,
+    pub datafeed_connected: bool,
     pub queued_trade_event_count: usize,
     pub dropped_trade_event_count: u64,
     pub last_trade_event_sequence: Option<u64>,
@@ -286,6 +307,8 @@ impl Mt5Bridge {
             local_trade_event_seq: Arc::new(AtomicU64::new(0)),
             trade_subscribers: Arc::new(Mutex::new(Vec::new())),
             bar_subscribers: Arc::new(Mutex::new(Vec::new())),
+            recovery_lock: Arc::new(AsyncMutex::new(())),
+            recovery_scheduled: Arc::new(AtomicBool::new(false)),
             server_started: Arc::new(AtomicBool::new(false)),
             server_shutdown: Arc::new(Mutex::new(None)),
             server_handle: Arc::new(Mutex::new(None)),
@@ -366,7 +389,13 @@ impl Mt5Bridge {
         state.last_rpc_response_request_id = None;
         state.last_unknown_rpc_response_request_id = None;
         state.last_heartbeat = None;
+        state.last_market_data = None;
+        state.last_subscription_sync = None;
+        state.last_recovery = None;
         state.terminal_name = None;
+        state.heartbeat_account_id = None;
+        state.terminal_connected = None;
+        state.terminal_trade_allowed = None;
         state.dropped_trade_event_count = 0;
         state.last_trade_event_sequence = None;
         self.local_trade_event_seq.store(0, Ordering::Relaxed);
@@ -387,6 +416,11 @@ impl Mt5Bridge {
         state.last_rpc_response_request_id = None;
         state.last_unknown_rpc_response_request_id = None;
         state.last_heartbeat = None;
+        state.last_market_data = None;
+        state.last_subscription_sync = None;
+        state.last_recovery = None;
+        state.terminal_connected = None;
+        state.terminal_trade_allowed = None;
     }
 
     fn record_rpc_poll_attempt(&self, session_id: &str) {
@@ -439,7 +473,7 @@ impl Mt5Bridge {
         self.state
             .read()
             .last_rpc_poll
-            .map(|poll| Utc::now() - poll < chrono::Duration::seconds(15))
+            .map(|poll| Utc::now() - poll < chrono::Duration::seconds(MT5_TRANSPORT_FRESH_SECS))
             .unwrap_or(false)
     }
 
@@ -458,6 +492,13 @@ impl Mt5Bridge {
             last_response_request_id,
             last_unknown_response_request_id,
             last_heartbeat_at,
+            last_market_data_at,
+            last_subscription_sync_at,
+            last_recovery_at,
+            terminal_name,
+            heartbeat_account_id,
+            terminal_connected,
+            terminal_trade_allowed,
             dropped_trade_event_count,
             last_trade_event_sequence,
         ) = {
@@ -476,6 +517,13 @@ impl Mt5Bridge {
                 state.last_rpc_response_request_id.clone(),
                 state.last_unknown_rpc_response_request_id.clone(),
                 state.last_heartbeat,
+                state.last_market_data,
+                state.last_subscription_sync,
+                state.last_recovery,
+                state.terminal_name.clone(),
+                state.heartbeat_account_id.clone(),
+                state.terminal_connected,
+                state.terminal_trade_allowed,
                 state.dropped_trade_event_count,
                 state.last_trade_event_sequence,
             )
@@ -498,6 +546,16 @@ impl Mt5Bridge {
             last_response_request_id,
             last_unknown_response_request_id,
             last_heartbeat_at,
+            last_market_data_at,
+            last_subscription_sync_at,
+            last_recovery_at,
+            terminal_name,
+            heartbeat_account_id,
+            terminal_connected,
+            terminal_trade_allowed,
+            transport_connected: self.is_transport_connected(),
+            broker_connected: self.is_broker_connected(),
+            datafeed_connected: self.is_datafeed_connected(),
             queued_trade_event_count: self.event_queue.lock().len(),
             dropped_trade_event_count,
             last_trade_event_sequence,
@@ -640,17 +698,153 @@ impl Mt5Bridge {
         }
     }
 
-    pub fn is_connected(&self) -> bool {
+    pub fn is_transport_connected(&self) -> bool {
         let state = self.state.read();
         let heartbeat_connected = state
             .last_heartbeat
-            .map(|heartbeat| Utc::now() - heartbeat < chrono::Duration::seconds(15))
+            .map(|heartbeat| {
+                Utc::now() - heartbeat < chrono::Duration::seconds(MT5_TRANSPORT_FRESH_SECS)
+            })
             .unwrap_or(false);
         let rpc_polling = state
             .last_rpc_poll
-            .map(|poll| Utc::now() - poll < chrono::Duration::seconds(15))
+            .map(|poll| Utc::now() - poll < chrono::Duration::seconds(MT5_TRANSPORT_FRESH_SECS))
             .unwrap_or(false);
         heartbeat_connected || rpc_polling
+    }
+
+    pub fn is_broker_connected(&self) -> bool {
+        if !self.is_transport_connected() {
+            return false;
+        }
+        self.state.read().terminal_connected.unwrap_or(true)
+    }
+
+    pub fn is_market_data_fresh(&self) -> bool {
+        if self.bar_subscribers.lock().is_empty() {
+            return true;
+        }
+
+        let state = self.state.read();
+        let freshness_anchor = state.last_market_data.or(state.last_subscription_sync);
+        freshness_anchor
+            .map(|timestamp| {
+                Utc::now() - timestamp < chrono::Duration::seconds(MT5_MARKET_DATA_FRESH_SECS)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn is_datafeed_connected(&self) -> bool {
+        self.is_broker_connected() && self.is_market_data_fresh()
+    }
+
+    /// Backwards-compatible aggregate connection state. Broker and datafeed
+    /// implementations use their more specific checks below.
+    pub fn is_connected(&self) -> bool {
+        self.is_broker_connected()
+    }
+
+    fn terminal_connection_error(&self) -> Option<BrokerError> {
+        let state = self.state.read();
+        (state.terminal_connected == Some(false)).then(|| {
+            BrokerError::ConnectionError(format!(
+                "MT5 terminal {} is reachable but disconnected from its broker account{}",
+                state.terminal_name.as_deref().unwrap_or("EA"),
+                state
+                    .heartbeat_account_id
+                    .as_deref()
+                    .map(|account| format!(" {account}"))
+                    .unwrap_or_default()
+            ))
+        })
+    }
+
+    async fn restore_runtime_state(&self, force: bool) -> Result<(), BrokerError> {
+        let _recovery_guard = self.recovery_lock.lock().await;
+        self.wait_for_rpc_poll().await?;
+        if let Some(error) = self.terminal_connection_error() {
+            return Err(error);
+        }
+
+        let recently_recovered = self
+            .state
+            .read()
+            .last_recovery
+            .map(|timestamp| {
+                Utc::now() - timestamp < chrono::Duration::seconds(MT5_RECOVERY_COOLDOWN_SECS)
+            })
+            .unwrap_or(false);
+        if recently_recovered && !force {
+            return Ok(());
+        }
+
+        let subscription_count = self.current_subscription_specs().len();
+        if subscription_count > 0 {
+            info!(
+                "MT5 bridge restoring {} bar subscription(s) after reconnect",
+                subscription_count
+            );
+            self.sync_bar_subscriptions().await?;
+        }
+
+        let (account, orders, positions) = tokio::join!(
+            self.request_account(),
+            self.request_orders(),
+            self.request_positions()
+        );
+        let mut refresh_errors = Vec::new();
+        if let Err(error) = account {
+            refresh_errors.push(format!("account: {error}"));
+        }
+        if let Err(error) = orders {
+            refresh_errors.push(format!("orders: {error}"));
+        }
+        if let Err(error) = positions {
+            refresh_errors.push(format!("positions: {error}"));
+        }
+        if !refresh_errors.is_empty() {
+            return Err(BrokerError::ConnectionError(format!(
+                "MT5 bridge reconnected but broker state refresh failed ({})",
+                refresh_errors.join("; ")
+            )));
+        }
+
+        self.state.write().last_recovery = Some(Utc::now());
+        info!(
+            "MT5 bridge recovery complete: subscriptions={} account/orders/positions refreshed",
+            subscription_count
+        );
+        Ok(())
+    }
+
+    pub async fn recover_runtime_state(&self) -> Result<(), BrokerError> {
+        self.restore_runtime_state(false).await
+    }
+
+    pub async fn recover_datafeed_state(&self) -> Result<(), BrokerError> {
+        let _recovery_guard = self.recovery_lock.lock().await;
+        self.wait_for_rpc_poll().await?;
+        if let Some(error) = self.terminal_connection_error() {
+            return Err(error);
+        }
+        if !self.current_subscription_specs().is_empty() {
+            self.sync_bar_subscriptions().await?;
+        }
+        Ok(())
+    }
+
+    fn schedule_runtime_recovery(self: &Arc<Self>, reason: &'static str) {
+        if self.recovery_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let bridge = Arc::clone(self);
+        tokio::spawn(async move {
+            warn!("MT5 bridge transport recovered ({reason}); restoring runtime state");
+            if let Err(error) = bridge.restore_runtime_state(true).await {
+                warn!("MT5 bridge automatic recovery failed: {error}");
+            }
+            bridge.recovery_scheduled.store(false, Ordering::SeqCst);
+        });
     }
 
     pub fn account(&self) -> Result<Account, BrokerError> {
@@ -1105,6 +1299,7 @@ impl Mt5Bridge {
             info!("MT5 bridge clearing bar subscriptions");
             self.request_rpc(Mt5RpcAction::UnsubscribeBars, serde_json::json!({}))
                 .await?;
+            self.state.write().last_subscription_sync = Some(Utc::now());
             return Ok(());
         }
 
@@ -1130,6 +1325,7 @@ impl Mt5Bridge {
             serde_json::json!({ "symbols": subscriptions }),
         )
         .await?;
+        self.state.write().last_subscription_sync = Some(Utc::now());
         Ok(())
     }
 
@@ -1236,6 +1432,7 @@ impl Mt5Bridge {
 
         {
             let mut state = self.state.write();
+            state.last_market_data = Some(Utc::now());
             for quote in &mut quotes {
                 quote.symbol = self.aqe_symbol(&quote.symbol);
                 state
@@ -1549,6 +1746,10 @@ pub struct Mt5HeartbeatPayload {
     pub terminal_name: Option<String>,
     pub account_id: Option<String>,
     pub server_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub terminal_connected: Option<bool>,
+    #[serde(default)]
+    pub terminal_trade_allowed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1609,6 +1810,9 @@ async fn health(
         Uuid::new_v4().to_string(),
         Some(serde_json::json!({
             "connected": bridge.is_connected(),
+            "transportConnected": bridge.is_transport_connected(),
+            "brokerConnected": bridge.is_broker_connected(),
+            "datafeedConnected": bridge.is_datafeed_connected(),
             "protocolVersion": PROTOCOL_VERSION,
             "diagnostics": diagnostics,
         })),
@@ -1629,11 +1833,20 @@ async fn heartbeat(
         );
     }
     let mut state = bridge.state.write();
+    let broker_reconnected = state.terminal_connected == Some(false)
+        && envelope.payload.terminal_connected == Some(true);
     state.last_heartbeat = Some(Utc::now());
     state
         .active_sessions
         .insert(envelope.session_id.clone(), Utc::now());
     state.terminal_name = envelope.payload.terminal_name;
+    state.heartbeat_account_id = envelope.payload.account_id;
+    state.terminal_connected = envelope.payload.terminal_connected;
+    state.terminal_trade_allowed = envelope.payload.terminal_trade_allowed;
+    drop(state);
+    if broker_reconnected {
+        bridge.schedule_runtime_recovery("MT5 terminal reconnected to its broker");
+    }
     let session_id = bridge.session_id();
     (
         StatusCode::OK,
@@ -1774,6 +1987,13 @@ async fn poll_rpc(
         );
     }
     let session_id = bridge.session_id();
+    let had_stale_transport = bridge
+        .state
+        .read()
+        .last_rpc_poll
+        .map(|poll| Utc::now() - poll >= chrono::Duration::seconds(MT5_TRANSPORT_FRESH_SECS))
+        .unwrap_or(false);
+    let ea_session_reset = !envelope.session_id.is_empty() && envelope.session_id != session_id;
     if !envelope.session_id.is_empty() && envelope.session_id != session_id {
         warn!(
             "MT5 EA polled with stale session {}; resetting to {}",
@@ -1781,6 +2001,13 @@ async fn poll_rpc(
         );
     }
     bridge.record_rpc_poll(&session_id);
+    if !bridge.bar_subscribers.lock().is_empty() && (had_stale_transport || ea_session_reset) {
+        bridge.schedule_runtime_recovery(if ea_session_reset {
+            "EA session reset"
+        } else {
+            "authorized polling resumed after a stale interval"
+        });
+    }
 
     let max_requests = envelope.payload.max_requests.unwrap_or(32).clamp(1, 256);
     // MT5 WebRequest under Wine can block indefinitely on an empty long-poll.
@@ -2196,6 +2423,108 @@ mod tests {
 
         assert_eq!(bridge.aqe_symbol("GOLD.cash"), "XAUUSD");
         assert_eq!(bridge.aqe_symbol("EURUSD"), "EURUSD");
+    }
+
+    #[test]
+    fn terminal_disconnect_is_distinct_from_bridge_transport() {
+        let bridge = test_bridge("test-token");
+        {
+            let mut state = bridge.state.write();
+            state.last_rpc_poll = Some(Utc::now());
+            state.terminal_connected = Some(false);
+        }
+
+        assert!(bridge.is_transport_connected());
+        assert!(!bridge.is_broker_connected());
+        assert!(!bridge.is_datafeed_connected());
+
+        bridge.state.write().terminal_connected = Some(true);
+        assert!(bridge.is_broker_connected());
+    }
+
+    #[test]
+    fn datafeed_connection_requires_fresh_market_data_for_active_subscriptions() {
+        let bridge = test_bridge("test-token");
+        bridge
+            .subscribe_bars(
+                vec!["AAPL".to_string()],
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+                DataStreamMode::CompletedBar,
+                Arc::new(|_bar| {}),
+            )
+            .unwrap();
+        {
+            let mut state = bridge.state.write();
+            state.last_rpc_poll = Some(Utc::now());
+            state.terminal_connected = Some(true);
+            state.last_subscription_sync = Some(Utc::now());
+        }
+
+        assert!(bridge.is_datafeed_connected());
+
+        bridge.state.write().last_subscription_sync =
+            Some(Utc::now() - chrono::Duration::seconds(MT5_MARKET_DATA_FRESH_SECS + 1));
+        assert!(!bridge.is_datafeed_connected());
+
+        bridge.state.write().last_market_data = Some(Utc::now());
+        assert!(bridge.is_datafeed_connected());
+    }
+
+    #[tokio::test]
+    async fn datafeed_recovery_replays_active_bar_subscriptions() {
+        let bridge = Arc::new(test_bridge("test-token"));
+        bridge
+            .subscribe_bars(
+                vec!["AAPL".to_string()],
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+                DataStreamMode::CompletedBar,
+                Arc::new(|_bar| {}),
+            )
+            .unwrap();
+        {
+            let mut state = bridge.state.write();
+            state.last_rpc_poll = Some(Utc::now());
+            state.terminal_connected = Some(true);
+        }
+
+        let recovering_bridge = Arc::clone(&bridge);
+        let recovery =
+            tokio::spawn(async move { recovering_bridge.recover_datafeed_state().await });
+        let request = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(request) = bridge.rpc_queue.lock().pop_front() {
+                    return request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription replay should queue an RPC request");
+
+        assert!(matches!(request.action, Mt5RpcAction::SubscribeBars));
+        bridge.apply_rpc_response(Mt5RpcResponsePayload {
+            request_id: request.request_id,
+            ok: true,
+            message: None,
+            payload: Some(serde_json::json!({})),
+        });
+
+        recovery.await.unwrap().unwrap();
+        assert!(bridge.state.read().last_subscription_sync.is_some());
+        assert!(bridge.is_datafeed_connected());
+    }
+
+    #[test]
+    fn older_ea_heartbeat_payloads_remain_compatible() {
+        let payload: Mt5HeartbeatPayload = serde_json::from_value(serde_json::json!({
+            "terminalName": "MetaTrader 5",
+            "accountId": "12345",
+            "serverTime": "2026-08-27T10:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(payload.terminal_connected, None);
+        assert_eq!(payload.terminal_trade_allowed, None);
     }
 
     #[test]

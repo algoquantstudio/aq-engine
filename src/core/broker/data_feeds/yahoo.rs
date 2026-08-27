@@ -9,20 +9,35 @@ use chrono::{DateTime, TimeZone, Utc};
 use dashmap::DashMap;
 use log::{info, warn};
 use polars::prelude::*;
-use reqwest::Client;
+use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
+
+const YAHOO_CHART_MAX_ATTEMPTS: usize = 4;
+const YAHOO_RETRY_BASE_DELAY_MS: u64 = 250;
+const YAHOO_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 pub struct YahooFinanceDataFeed {
     client: Client,
     connected: Arc<Mutex<bool>>,
     ticker_info: Arc<Mutex<HashMap<String, Asset>>>,
     crumb: Arc<Mutex<Option<String>>>,
+    session_generation: Arc<AtomicU64>,
+    session_refresh_lock: Arc<AsyncMutex<()>>,
     stream_manager: DataStreamManager,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum YahooRetryDecision {
+    Stop,
+    Retry,
+    RefreshSession,
 }
 
 /// Immutable, process-local normalized bar snapshots. Hyperparameter seeds deliberately create
@@ -48,8 +63,70 @@ impl YahooFinanceDataFeed {
             connected: Arc::new(Mutex::new(false)),
             ticker_info: Arc::new(Mutex::new(HashMap::new())),
             crumb: Arc::new(Mutex::new(None)),
+            session_generation: Arc::new(AtomicU64::new(0)),
+            session_refresh_lock: Arc::new(AsyncMutex::new(())),
             stream_manager: DataStreamManager::new(),
         }
+    }
+
+    fn set_connected(&self, connected: bool) {
+        *self.connected.lock().unwrap() = connected;
+    }
+
+    fn retry_decision(status: StatusCode, body: &str) -> YahooRetryDecision {
+        if Self::body_requires_session_refresh(body) {
+            return YahooRetryDecision::RefreshSession;
+        }
+        match status {
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS => {
+                YahooRetryDecision::Retry
+            }
+            status if status.is_server_error() => YahooRetryDecision::Retry,
+            _ => YahooRetryDecision::Stop,
+        }
+    }
+
+    fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+    }
+
+    fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+        let exponential = Duration::from_millis(
+            YAHOO_RETRY_BASE_DELAY_MS.saturating_mul(1_u64 << attempt.min(4)),
+        );
+        retry_after
+            .unwrap_or(exponential)
+            .min(YAHOO_RETRY_MAX_DELAY)
+    }
+
+    fn yahoo_error_description(json: &Value) -> Option<&str> {
+        json.pointer("/chart/error/description")
+            .or_else(|| json.pointer("/finance/error/description"))
+            .and_then(Value::as_str)
+    }
+
+    fn description_requires_session_refresh(description: &str) -> bool {
+        let description = description.to_ascii_lowercase();
+        description.contains("invalid crumb") || description.contains("invalid cookie")
+    }
+
+    fn json_requires_session_refresh(json: &Value) -> bool {
+        Self::yahoo_error_description(json)
+            .map(Self::description_requires_session_refresh)
+            .unwrap_or(false)
+    }
+
+    fn body_requires_session_refresh(body: &str) -> bool {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .as_ref()
+            .map(Self::json_requires_session_refresh)
+            .unwrap_or_else(|| Self::description_requires_session_refresh(body))
     }
 
     async fn get_crumb(&self) -> Result<String, BrokerError> {
@@ -58,21 +135,55 @@ impl YahooFinanceDataFeed {
             .get("https://query2.finance.yahoo.com/v1/test/getcrumb")
             .send()
             .await?;
+        let response = response.error_for_status().map_err(BrokerError::from)?;
         let crumb: String = response.text().await?;
-        if crumb.contains("Invalid Crumb") || crumb.contains("html") {
+        let normalized = crumb.trim();
+        let normalized_lower = normalized.to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized_lower.contains("invalid crumb")
+            || normalized_lower.contains("invalid cookie")
+            || normalized_lower.contains("too many requests")
+            || normalized_lower.contains("html")
+            || normalized_lower.starts_with("{\"finance\"")
+        {
             return Err(BrokerError::DataFeedConnectionError(
-                "Yahoo returned Invalid Crumb".to_string(),
+                "Yahoo did not return a usable crumb".to_string(),
             ));
         }
-        Ok(crumb)
+        Ok(normalized.to_string())
     }
 
     async fn refresh_session(&self) -> Result<(), BrokerError> {
+        let _refresh_guard = self.session_refresh_lock.lock().await;
+        self.refresh_session_locked().await
+    }
+
+    async fn refresh_session_for_generation(
+        &self,
+        observed_generation: u64,
+    ) -> Result<(), BrokerError> {
+        let _refresh_guard = self.session_refresh_lock.lock().await;
+        if self.session_generation.load(Ordering::Acquire) != observed_generation
+            && self.crumb.lock().unwrap().is_some()
+        {
+            return Ok(());
+        }
+        self.refresh_session_locked().await
+    }
+
+    async fn refresh_session_locked(&self) -> Result<(), BrokerError> {
         let _ = self.client.get("https://finance.yahoo.com").send().await;
         let _ = self.client.get("https://fc.yahoo.com").send().await;
-        let crumb = self.get_crumb().await?;
+        let crumb = match self.get_crumb().await {
+            Ok(crumb) => crumb,
+            Err(error) => {
+                self.set_connected(false);
+                return Err(error);
+            }
+        };
         *self.crumb.lock().unwrap() = Some(crumb);
-        *self.connected.lock().unwrap() = true;
+        self.session_generation.fetch_add(1, Ordering::Release);
+        self.set_connected(true);
         Ok(())
     }
 
@@ -102,40 +213,207 @@ impl YahooFinanceDataFeed {
     ) -> Result<Value, BrokerError> {
         let hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
         let mut last_error = None;
+        let mut observed_generation = self.session_generation.load(Ordering::Acquire);
+        let mut refreshed_after_host_failover = false;
+        let mut final_failure_disconnects = false;
 
-        for (index, host) in hosts.iter().enumerate() {
+        for attempt in 0..YAHOO_CHART_MAX_ATTEMPTS {
+            let host = hosts[attempt % hosts.len()];
             let url = Self::chart_url(host, symbol, start_ts, end_ts, interval);
             match self.client.get(&url).send().await {
                 Ok(response) => {
                     let status = response.status();
+                    let retry_after = Self::retry_after(&response);
+                    let body = match response.text().await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            final_failure_disconnects = true;
+                            last_error = Some(BrokerError::ConnectionError(format!(
+                                "Yahoo chart response body failed for {symbol} via {host}: {error}"
+                            )));
+                            if attempt + 1 < YAHOO_CHART_MAX_ATTEMPTS {
+                                let delay = Self::retry_delay(attempt, retry_after);
+                                tokio::time::sleep(delay).await;
+                            }
+                            continue;
+                        }
+                    };
                     if status.is_success() {
-                        return response.json::<Value>().await.map_err(BrokerError::from);
+                        match serde_json::from_str::<Value>(&body) {
+                            Ok(json) if Self::json_requires_session_refresh(&json) => {
+                                final_failure_disconnects = true;
+                                last_error = Some(BrokerError::DataFeedConnectionError(format!(
+                                    "Yahoo rejected the active cookie/crumb session for {symbol}"
+                                )));
+                                if let Err(error) = self
+                                    .refresh_session_for_generation(observed_generation)
+                                    .await
+                                {
+                                    last_error = Some(error);
+                                }
+                                observed_generation =
+                                    self.session_generation.load(Ordering::Acquire);
+                            }
+                            Ok(json) => {
+                                self.set_connected(true);
+                                return Ok(json);
+                            }
+                            Err(error) => {
+                                final_failure_disconnects = true;
+                                last_error = Some(BrokerError::ConnectionError(format!(
+                                    "Yahoo returned invalid chart JSON for {symbol} via {host}: {error}"
+                                )));
+                            }
+                        }
+                    } else {
+                        let decision = Self::retry_decision(status, &body);
+                        let yahoo_description =
+                            serde_json::from_str::<Value>(&body).ok().and_then(|json| {
+                                Self::yahoo_error_description(&json).map(ToString::to_string)
+                            });
+                        last_error = Some(BrokerError::ConnectionError(format!(
+                            "Yahoo chart request failed for {symbol} with status {status} via {host}{}",
+                            yahoo_description
+                                .map(|description| format!(": {description}"))
+                                .unwrap_or_default()
+                        )));
+
+                        if decision == YahooRetryDecision::Stop {
+                            return Err(last_error.expect("Yahoo status error was recorded"));
+                        }
+                        final_failure_disconnects = decision == YahooRetryDecision::RefreshSession
+                            || status != StatusCode::TOO_MANY_REQUESTS;
+                        if decision == YahooRetryDecision::RefreshSession {
+                            if let Err(error) = self
+                                .refresh_session_for_generation(observed_generation)
+                                .await
+                            {
+                                last_error = Some(error);
+                            }
+                            observed_generation = self.session_generation.load(Ordering::Acquire);
+                        }
                     }
 
-                    last_error = Some(BrokerError::ConnectionError(format!(
-                        "Yahoo chart request failed for {} with status {} via {}",
-                        symbol, status, host
-                    )));
+                    if attempt + 1 < YAHOO_CHART_MAX_ATTEMPTS {
+                        let delay = Self::retry_delay(attempt, retry_after);
+                        warn!(
+                            "Yahoo chart request for {symbol} failed on attempt {}/{} via {host}; retrying in {:?}",
+                            attempt + 1,
+                            YAHOO_CHART_MAX_ATTEMPTS,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 Err(error) => {
+                    final_failure_disconnects = true;
                     last_error = Some(BrokerError::ConnectionError(format!(
                         "error sending request for url ({}) -> {}",
                         url, error
                     )));
+                    if attempt + 1 < YAHOO_CHART_MAX_ATTEMPTS {
+                        let delay = Self::retry_delay(attempt, None);
+                        warn!(
+                            "Yahoo chart request for {symbol} failed on attempt {}/{} via {host}; retrying in {:?}: {error}",
+                            attempt + 1,
+                            YAHOO_CHART_MAX_ATTEMPTS,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
 
-            if index == 0 {
-                let _ = self.refresh_session().await;
+            if !refreshed_after_host_failover && attempt + 1 == hosts.len() {
+                if let Err(error) = self
+                    .refresh_session_for_generation(observed_generation)
+                    .await
+                {
+                    warn!("Yahoo session refresh during chart failover failed: {error}");
+                }
+                observed_generation = self.session_generation.load(Ordering::Acquire);
+                refreshed_after_host_failover = true;
             }
         }
 
+        if final_failure_disconnects {
+            self.set_connected(false);
+        }
         Err(last_error.unwrap_or_else(|| {
             BrokerError::ConnectionError(format!(
                 "Yahoo chart request failed for {} with unknown error",
                 symbol
             ))
         }))
+    }
+
+    async fn request_quote_summary_json(&self, symbol: &str) -> Option<Value> {
+        let mut observed_generation = self.session_generation.load(Ordering::Acquire);
+        for attempt in 0..2 {
+            let crumb = self.crumb.lock().unwrap().clone();
+            let Some(crumb) = crumb else {
+                if self
+                    .refresh_session_for_generation(observed_generation)
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+                observed_generation = self.session_generation.load(Ordering::Acquire);
+                continue;
+            };
+            let url = format!(
+                "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{}?crumb={}&modules=financialData,quoteType,defaultKeyStatistics,assetProfile,summaryDetail",
+                symbol, crumb
+            );
+            let response = match self.client.get(&url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(
+                        "Yahoo metadata request failed for {symbol}; using fallback asset metadata: {error}"
+                    );
+                    return None;
+                }
+            };
+            let status = response.status();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    warn!(
+                        "Yahoo metadata response failed for {symbol}; using fallback asset metadata: {error}"
+                    );
+                    return None;
+                }
+            };
+            let parsed = serde_json::from_str::<Value>(&body).ok();
+            let invalid_session = parsed
+                .as_ref()
+                .map(Self::json_requires_session_refresh)
+                .unwrap_or_else(|| Self::body_requires_session_refresh(&body));
+
+            if invalid_session && attempt == 0 {
+                if let Err(error) = self
+                    .refresh_session_for_generation(observed_generation)
+                    .await
+                {
+                    warn!(
+                        "Yahoo metadata session refresh failed for {symbol}; using fallback asset metadata: {error}"
+                    );
+                    return None;
+                }
+                observed_generation = self.session_generation.load(Ordering::Acquire);
+                continue;
+            }
+
+            if !status.is_success() {
+                warn!(
+                    "Yahoo metadata request returned {status} for {symbol}; using fallback asset metadata"
+                );
+                return None;
+            }
+            return parsed;
+        }
+        None
     }
 
     fn map_asset_type(&self, asset_type: &str) -> AssetType {
@@ -264,17 +542,7 @@ impl YahooFinanceDataFeed {
 
 impl DataFeed for YahooFinanceDataFeed {
     async fn connect(&self) -> Result<bool, BrokerError> {
-        let _ = self.client.get("https://finance.yahoo.com").send().await;
-        let _ = self.client.get("https://fc.yahoo.com").send().await;
-
-        let crumb = self.get_crumb().await?;
-        if crumb.is_empty() {
-            return Err(BrokerError::DataFeedConnectionError(
-                "Failed to get crumb".to_string(),
-            ));
-        }
-        *self.crumb.lock().unwrap() = Some(crumb);
-        *self.connected.lock().unwrap() = true;
+        self.refresh_session().await?;
         Ok(true)
     }
 
@@ -297,15 +565,6 @@ impl DataProvider for YahooFinanceDataFeed {
             return Ok(asset);
         }
 
-        let crumb = self.crumb.lock().unwrap().clone();
-        let crumb = crumb.ok_or(BrokerError::DataFeedConnectionError(
-            "Not connected to Yahoo Finance Data Feed".to_string(),
-        ))?;
-
-        let url = format!(
-            "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{}?crumb={}&modules=financialData,quoteType,defaultKeyStatistics,assetProfile,summaryDetail",
-            symbol, crumb
-        );
         let fallback_asset = || Asset {
             id: format!("yahoo:{}", symbol),
             symbol: symbol.to_string(),
@@ -329,15 +588,7 @@ impl DataProvider for YahooFinanceDataFeed {
         // Yahoo's quoteSummary endpoint is frequently entitlement-gated even while the chart
         // endpoint (used for the actual backtest data) remains available. Metadata must not
         // prevent an otherwise valid equity universe from reaching the chart request.
-        let json = match self.client.get(&url).send().await {
-            Ok(response) => response.json::<Value>().await.ok(),
-            Err(error) => {
-                warn!(
-                    "Yahoo metadata request failed for {symbol}; using fallback asset metadata: {error}"
-                );
-                None
-            }
-        };
+        let json = self.request_quote_summary_json(symbol).await;
         let Some(result) = json
             .as_ref()
             .and_then(|json| json["quoteSummary"]["result"].get(0))
@@ -526,6 +777,8 @@ impl DataProvider for YahooFinanceDataFeed {
             connected: self.connected.clone(),
             ticker_info: self.ticker_info.clone(),
             crumb: self.crumb.clone(),
+            session_generation: self.session_generation.clone(),
+            session_refresh_lock: self.session_refresh_lock.clone(),
             stream_manager: DataStreamManager::new(),
         });
         let fetch_fn: FetchBarsFn = Arc::new(move |symbol, start, end, tf| {
@@ -557,6 +810,62 @@ impl DataProvider for YahooFinanceDataFeed {
 mod tests {
     use super::*;
     use tokio;
+
+    #[test]
+    fn yahoo_retry_policy_only_refreshes_explicit_cookie_or_crumb_failures() {
+        let invalid_crumb = r#"{"finance":{"result":null,"error":{"code":"Unauthorized","description":"Invalid Crumb"}}}"#;
+        let invalid_cookie = r#"{"finance":{"result":null,"error":{"code":"Unauthorized","description":"Invalid Cookie"}}}"#;
+        let entitlement = r#"{"finance":{"result":null,"error":{"code":"Unauthorized","description":"User is unable to access this feature"}}}"#;
+
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(StatusCode::UNAUTHORIZED, invalid_crumb),
+            YahooRetryDecision::RefreshSession
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(StatusCode::UNAUTHORIZED, invalid_cookie),
+            YahooRetryDecision::RefreshSession
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(StatusCode::UNAUTHORIZED, entitlement),
+            YahooRetryDecision::Stop
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(StatusCode::NOT_FOUND, "symbol not found"),
+            YahooRetryDecision::Stop
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid period parameter",
+            ),
+            YahooRetryDecision::Stop
+        );
+    }
+
+    #[test]
+    fn yahoo_retry_policy_retries_throttling_and_transient_server_failures() {
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Edge: Too Many Requests",
+            ),
+            YahooRetryDecision::Retry
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_decision(StatusCode::BAD_GATEWAY, "upstream error"),
+            YahooRetryDecision::Retry
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_delay(10, None),
+            YAHOO_RETRY_MAX_DELAY.min(Duration::from_millis(
+                YAHOO_RETRY_BASE_DELAY_MS * (1_u64 << 4)
+            ))
+        );
+        assert_eq!(
+            YahooFinanceDataFeed::retry_delay(0, Some(Duration::from_secs(60))),
+            YAHOO_RETRY_MAX_DELAY
+        );
+    }
 
     #[tokio::test]
     async fn test_yahoo_connection() {

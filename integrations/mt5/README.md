@@ -56,19 +56,39 @@ export AQE_MT5_BRIDGE_BIND_ADDR="0.0.0.0:18080"
 ```
 
 6. Attach `AqeMt5BridgeEA` to one chart.
-7. Configure EA inputs:
+7. Configure the EA inputs. The values below are the defaults; the bridge token is the only value that must be supplied:
 
 ```text
-InpBridgeUrl        = http://127.0.0.1:18080
-InpBridgeToken      = same value as AQE_MT5_BRIDGE_TOKEN
+InpBridgeUrl         = http://127.0.0.1:18080
+InpBridgeToken       = same value as AQE_MT5_BRIDGE_TOKEN
 InpBridgeConnections = optional extra bridge URLs separated by commas
 InpProbeInactiveConnections = false
-InpInactiveProbeIntervalMs = 2000
-InpInactiveProbeTimeoutMs = 150
-InpInactiveProbeMaxCooldownMs = 5000
-InpPollIntervalMs   = 250
+InpInactiveProbeIntervalMs = 500
+InpInactiveProbeTimeoutMs = 100
+InpInactiveProbeMaxCooldownMs = 2000
+InpPollIntervalMs = 100
 InpRequestTimeoutMs = 5000
+InpTradeEventFlushIntervalMs = 10
+InpTradeEventPostTimeoutMs = 250
+InpTradeEventBatchSize = 32
+InpTradeEventQueueCapacity = 2048
 ```
+
+| Input | Purpose |
+| --- | --- |
+| `InpBridgeUrl` | Primary AQE HTTP bridge URL. It must exactly match an entry in the MT5 WebRequest allow-list. |
+| `InpBridgeToken` | Shared authentication secret. It must match `AQE_MT5_BRIDGE_TOKEN` and cannot be empty. |
+| `InpBridgeConnections` | Optional comma-separated additional bridge URLs for running multiple AQE strategies from one EA. |
+| `InpProbeInactiveConnections` | Probes additional URLs which do not yet have a session. Enable this when all configured bridge URLs should be discovered and kept available. |
+| `InpInactiveProbeIntervalMs` | Minimum interval between inactive-bridge probes. Lower values discover a newly started bridge sooner but cause more WebRequests. |
+| `InpInactiveProbeTimeoutMs` | WebRequest timeout used for an inactive probe. Keep this short so an unavailable optional bridge cannot stall active bridges. |
+| `InpInactiveProbeMaxCooldownMs` | Maximum retry backoff after repeated failures to reach an inactive bridge. |
+| `InpPollIntervalMs` | Base interval used to poll active AQE bridges for RPC work. |
+| `InpRequestTimeoutMs` | Timeout for ordinary active-bridge WebRequests. |
+| `InpTradeEventFlushIntervalMs` | Minimum interval between attempts to flush queued order and trade events. |
+| `InpTradeEventPostTimeoutMs` | Short WebRequest timeout used when posting trade-event batches. |
+| `InpTradeEventBatchSize` | Maximum number of queued trade events sent in one request. |
+| `InpTradeEventQueueCapacity` | Maximum number of trade events retained during a temporary disconnection. The oldest event is dropped when the queue is full. |
 
 For multiple AQE live strategies from one MT5 terminal, either attach one EA per bridge URL or set extra bridge endpoints in `InpBridgeConnections`, for example:
 
@@ -87,6 +107,34 @@ The EA keeps data subscriptions and trade events scoped to each AQE runtime sess
 8. Keep MT5 logged in and running before starting the AQE live strategy.
 
 If MT5 logs `initializing of AqeMt5BridgeEA failed with code 32767`, one of the EA inputs is invalid. The most common cause is an empty `InpBridgeToken`; it must be set to the same value as `AQE_MT5_BRIDGE_TOKEN`.
+
+## Connection Health and Automatic Recovery
+
+AQE tracks three separate connection states so an active HTTP poll is not mistaken for a healthy trading connection:
+
+- **Transport:** an authorized EA heartbeat or RPC poll reached AQE recently.
+- **Broker:** the transport is active and the MT5 terminal reports that it is connected to its broker account.
+- **Data feed:** the broker state is healthy and AQE is receiving current market-data posts for its active subscriptions.
+
+MT5 owns the broker login and reconnects its own terminal connection. AQE cannot reconnect the terminal to the broker on the user's behalf. Once MT5 reconnects, the EA heartbeat reports the transition and AQE automatically refreshes the account, open orders, and positions and restores the active bar subscriptions.
+
+AQE also restores runtime state when authorized polling resumes after a stale interval or the EA returns with a stale runtime session. If polling remains healthy but market-data posts stop, AQE marks only the data feed as disconnected and replays the active subscriptions. The running strategy process therefore remains alive while recovery is attempted instead of silently remaining in a stale state.
+
+The current EA heartbeat includes these diagnostic fields:
+
+- `terminalConnected`: whether MT5 currently has a broker-server connection.
+- `terminalTradeAllowed`: whether terminal and MQL trading permissions are enabled.
+- `terminalName` and `accountId`: identify the terminal and account reporting the status.
+
+Older EA builds remain protocol-compatible, but they do not report the two terminal status fields. Recompile and reload the current `AqeMt5BridgeEA.mq5` to enable broker-disconnection detection.
+
+You can inspect the bridge without placing an order:
+
+```bash
+curl http://127.0.0.1:18080/health
+```
+
+The response includes `transportConnected`, `brokerConnected`, `datafeedConnected`, the last heartbeat, poll, market-data, subscription-sync, and recovery timestamps, and the latest terminal status. When AQE recovers, its logs report the reconnect reason, subscription replay, and broker-state refresh result.
 
 ## Smoke Test
 
@@ -122,4 +170,4 @@ Only run the order test on an account and symbol where `0.01` volume is valid.
 - Bracket orders map to MT5 TP/SL values where possible.
 - Trailing stops are maintained by the EA timer after the related MT5 position is open.
 - The EA polls AQE for work and pushes subscribed bar/trade events back to AQE.
-- If the bridge disconnects, the EA continues polling and resumes once AQE is reachable again.
+- If the bridge disconnects, the EA continues polling and resumes once AQE is reachable again. AQE then restores subscriptions and refreshes broker state.

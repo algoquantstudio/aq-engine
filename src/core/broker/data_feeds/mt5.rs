@@ -39,7 +39,9 @@ impl Mt5DataFeed {
 impl DataFeed for Mt5DataFeed {
     async fn connect(&self) -> Result<bool, BrokerError> {
         self.bridge.start().await?;
-        self.bridge.wait_for_rpc_poll().await
+        self.bridge.wait_for_rpc_poll().await?;
+        self.bridge.recover_datafeed_state().await?;
+        Ok(self.bridge.is_datafeed_connected())
     }
 
     async fn disconnect(&self) -> Result<bool, BrokerError> {
@@ -48,7 +50,7 @@ impl DataFeed for Mt5DataFeed {
     }
 
     fn is_connected(&self) -> bool {
-        self.bridge.is_connected()
+        self.bridge.is_datafeed_connected()
     }
 }
 

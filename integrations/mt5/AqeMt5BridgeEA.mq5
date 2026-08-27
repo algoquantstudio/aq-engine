@@ -3,7 +3,7 @@
 //| Local RPC bridge EA for AlgoQuant Engine MT5 runtime integration.|
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.305"
+#property version "1.306"
 
 #include <Trade/Trade.mqh>
 
@@ -1526,6 +1526,8 @@ void SendHeartbeat(int bridge_index)
    string payload = "{"
       "\"terminalName\":\"" + JsonEscape(TerminalInfoString(TERMINAL_NAME)) + "\","
       "\"accountId\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\","
+      "\"terminalConnected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false") + ","
+      "\"terminalTradeAllowed\":" + ((TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED)) ? "true" : "false") + ","
       "\"serverTime\":\"" + IsoTime(BrokerNowUtc()) + "\","
       "\"queuedTradeEvents\":" + IntegerToString(ArraySize(g_pending_trade_events)) + ","
       "\"droppedTradeEvents\":" + IntegerToString((long)g_trade_event_drop_count) +
