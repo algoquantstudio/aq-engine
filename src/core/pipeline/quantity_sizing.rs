@@ -170,7 +170,7 @@ fn create_child_insight(
         .set_period_till_tp(parent.period_till_tp())
         .set_execution_depends(parent.execution_depends().clone());
 
-    parent.add_child_insight(child, ctx);
+    parent.add_child_insight(child, Some(true), ctx);
     Ok(())
 }
 
@@ -298,7 +298,7 @@ pub fn split_summary(result: &QuantitySplitResult) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::alpha::WrappedAlphaModel;
     use crate::core::broker::types::{
@@ -352,7 +352,7 @@ mod tests {
         }
     }
 
-    struct MockContext {
+    pub(crate) struct MockContext {
         universe: HashMap<String, Asset>,
         history: HashMap<String, DataFrame>,
         insights: InsightCollection,
@@ -362,7 +362,7 @@ mod tests {
     }
 
     impl MockContext {
-        fn new(asset: Asset) -> Self {
+        pub(crate) fn new(asset: Asset) -> Self {
             Self {
                 universe: HashMap::from([(asset.symbol.clone(), asset)]),
                 history: HashMap::new(),
@@ -514,7 +514,7 @@ mod tests {
         fn shutdown(&mut self) {}
     }
 
-    fn sample_asset() -> Asset {
+    pub(crate) fn sample_asset() -> Asset {
         Asset {
             id: "asset-1".to_string(),
             symbol: "BTCUSD".to_string(),
@@ -536,7 +536,7 @@ mod tests {
         }
     }
 
-    fn sample_insight() -> Insight {
+    pub(crate) fn sample_insight() -> Insight {
         let mut insight = Insight::new(
             OrderSide::Buy,
             "BTCUSD".to_string(),
@@ -578,6 +578,7 @@ mod tests {
         assert_eq!(insight.children.len(), 2);
         assert_eq!(insight.children[0].quantity(), Some(100.0));
         assert_eq!(insight.children[1].quantity(), Some(50.0));
+        assert!(insight.children.iter().all(Insight::is_split_insight));
         assert_eq!(insight.children[0].limit_price(), Some(100.0));
         assert_eq!(insight.children[0].stop_loss(), Some(90.0));
         assert_eq!(insight.children[0].take_profit_levels(), Some(vec![120.0]));

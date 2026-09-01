@@ -6,7 +6,6 @@ use std::collections::HashSet;
 mod tests {
     use super::*;
     use crate::core::alpha::{AlphaModel, AlphaResult, WrappedAlphaModel};
-    use crate::core::broker::DataStreamMode;
     use crate::core::broker::data_feeds::mt5::Mt5DataFeed;
     use crate::core::broker::data_feeds::yahoo::YahooFinanceDataFeed;
     use crate::core::broker::mt5_broker::Mt5Broker;
@@ -16,12 +15,15 @@ mod tests {
         AccountType, Asset, AssetExchange, AssetStatus, AssetType, Bar, BarData, BrokerError,
         OrderClass, OrderSide, OrderType, Quote, TradeUpdateEvent,
     };
+    use crate::core::broker::{BrokerFeature, DataStreamMode};
     use crate::core::insight::Insight;
     use crate::core::insight::types::{InsightState, StrategyType};
     use crate::core::lifecycle::{
         LifecycleResult, LifecycleTiming, OnInitLogic, OnInitLogicBuilder, OnStartLogic,
         OnStartLogicBuilder, OnTeardownLogic, OnTeardownLogicBuilder,
     };
+    use crate::core::pipeline::basic_stop_loss::BasicStopLossPipe;
+    use crate::core::pipeline::basic_take_profit::BasicTakeProfitPipe;
     use crate::core::pipeline::insight_submit::InsightSubmitPipe;
     use crate::core::pipeline::scale_out::ScaleOutPipe;
     use crate::core::pipeline::{InsightPipe, InsightPipeResult, WrappedInsightPipe};
@@ -34,7 +36,7 @@ mod tests {
     use polars::prelude::*;
     use rustc_hash::FxHashSet;
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     static MT5_INTEGRATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2516,20 +2518,33 @@ mod tests {
     struct TestExecutionBroker {
         events: Arc<Mutex<VecDeque<(crate::core::broker::types::Order, TradeUpdateEvent)>>>,
         close_requests: Arc<Mutex<Vec<String>>>,
+        close_quantities: Arc<Mutex<Vec<f64>>>,
         cancel_requests: Arc<Mutex<Vec<String>>>,
+        cancel_acknowledgements: Arc<Mutex<HashMap<String, crate::core::broker::types::Order>>>,
+        features: &'static [BrokerFeature],
     }
 
     impl TestExecutionBroker {
-        fn new() -> Self {
+        fn with_features(features: &'static [BrokerFeature]) -> Self {
             Self {
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 close_requests: Arc::new(Mutex::new(Vec::new())),
+                close_quantities: Arc::new(Mutex::new(Vec::new())),
                 cancel_requests: Arc::new(Mutex::new(Vec::new())),
+                cancel_acknowledgements: Arc::new(Mutex::new(HashMap::new())),
+                features,
             }
         }
 
         fn emit(&self, order: crate::core::broker::types::Order, event: TradeUpdateEvent) {
             self.events.lock().unwrap().push_back((order, event));
+        }
+
+        fn acknowledge_cancel(&self, order: crate::core::broker::types::Order) {
+            self.cancel_acknowledgements
+                .lock()
+                .unwrap()
+                .insert(order.order_id.clone(), order);
         }
     }
 
@@ -2557,6 +2572,10 @@ mod tests {
         fn get_account_type(&self) -> Result<AccountType, BrokerError> {
             Ok(AccountType::Paper)
         }
+
+        fn get_features(&self) -> &'static [BrokerFeature] {
+            self.features
+        }
     }
 
     impl OrderManagementProvider for TestExecutionBroker {
@@ -2578,6 +2597,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(order_id.to_string());
+            if let Some(mut order) = self
+                .cancel_acknowledgements
+                .lock()
+                .unwrap()
+                .remove(order_id)
+            {
+                order.status = TradeUpdateEvent::Cancelled;
+                self.emit(order, TradeUpdateEvent::Cancelled);
+            }
             Ok(true)
         }
 
@@ -2602,13 +2630,14 @@ mod tests {
         async fn close_position(
             &self,
             order_id: &str,
-            _qty: f64,
+            qty: f64,
             _price: Option<f64>,
         ) -> Result<bool, BrokerError> {
             self.close_requests
                 .lock()
                 .unwrap()
                 .push(order_id.to_string());
+            self.close_quantities.lock().unwrap().push(qty);
             Ok(true)
         }
 
@@ -2682,7 +2711,16 @@ mod tests {
         StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>,
         TestExecutionBroker,
     ) {
-        let execution = TestExecutionBroker::new();
+        trade_update_state_with_features(&[])
+    }
+
+    fn trade_update_state_with_features(
+        features: &'static [BrokerFeature],
+    ) -> (
+        StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>,
+        TestExecutionBroker,
+    ) {
+        let execution = TestExecutionBroker::with_features(features);
         let broker = UnifiedBroker::new(execution.clone(), YahooFinanceDataFeed::new());
         let mut state = StrategyState::new(
             "Mt5TradeUpdateTest".to_string(),
@@ -2730,6 +2768,177 @@ mod tests {
             rejection_reason: None,
             legs: None,
         }
+    }
+
+    struct CancelPendingPipe;
+
+    impl InsightPipe for CancelPendingPipe {
+        fn version(&self) -> &str {
+            "1.0"
+        }
+
+        fn run(
+            &mut self,
+            ctx: &mut dyn StrategyContext,
+            insight: &mut Insight,
+        ) -> InsightPipeResult {
+            insight.cancel(ctx);
+            InsightPipeResult::new(
+                false,
+                true,
+                Some("cancel requested".to_string()),
+                self.name().to_string(),
+            )
+        }
+    }
+
+    fn set_protection_test_history(
+        state: &mut StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>,
+        low: f64,
+        high: f64,
+    ) {
+        state.history.insert(
+            "AAPL".to_string(),
+            DataFrame::new(
+                1,
+                vec![
+                    Column::new("low".into(), [low]),
+                    Column::new("high".into(), [high]),
+                ],
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn pipeline_drains_synchronous_cancel_acknowledgement() {
+        let (mut state, execution) = trade_update_state();
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(CancelPendingPipe))
+                .target_state(InsightState::Executed)
+                .build(),
+        );
+
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(1.0));
+        insight.order_id = Some("pending-order".to_string());
+        insight.state = InsightState::Executed;
+        let insight_id = *insight.insight_id();
+
+        execution.acknowledge_cancel(test_order(
+            "pending-order",
+            &insight,
+            TradeUpdateEvent::Cancelled,
+            OrderSide::Buy,
+            None,
+        ));
+        state.insights.add_insight(insight);
+
+        state.run_insight_pipeline();
+
+        let updated = state.insights.get(&insight_id).unwrap();
+        assert_eq!(updated.state, InsightState::Cancelled);
+        assert!(!updated.cancelling);
+        assert_eq!(
+            execution.cancel_requests.lock().unwrap().as_slice(),
+            ["pending-order"]
+        );
+    }
+
+    #[test]
+    fn native_oco_skips_manual_take_profit_and_stop_loss_closes() {
+        let (mut state, execution) = trade_update_state_with_features(&[BrokerFeature::OcoOrder]);
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight
+            .set_quantity(Some(10.0))
+            .set_take_profit_levels(Some(vec![110.0]))
+            .set_stop_loss_levels(Some(vec![95.0]));
+        insight.order_id = Some("native-oco-position".to_string());
+        insight.filled_price = Some(100.0);
+        insight.state = InsightState::Filled;
+
+        let take_profit = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
+        let stop_loss = BasicStopLossPipe::new().run(&mut state, &mut insight);
+
+        assert!(take_profit.success && take_profit.passed);
+        assert!(stop_loss.success && stop_loss.passed);
+        assert!(execution.close_requests.lock().unwrap().is_empty());
+        assert!(!insight.closing);
+    }
+
+    #[test]
+    fn manual_take_profit_uses_half_of_remaining_quantity() {
+        let (mut state, execution) = trade_update_state_with_features(&[
+            BrokerFeature::MarketOrder,
+            BrokerFeature::PartialClose,
+        ]);
+        set_protection_test_history(&mut state, 100.0, 111.0);
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight
+            .set_quantity(Some(10.0))
+            .set_take_profit_levels(Some(vec![110.0, 120.0]));
+        insight.partial_filled_quantity = Some(4.0);
+        insight.order_id = Some("partial-position".to_string());
+        insight.filled_price = Some(100.0);
+        insight.state = InsightState::Filled;
+
+        let result = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
+
+        assert!(result.success);
+        assert!(!result.passed);
+        assert_eq!(execution.close_quantities.lock().unwrap().as_slice(), [3.0]);
+        assert_eq!(insight.take_profit_levels(), Some(vec![120.0]));
+        assert!(insight.closing);
+    }
+
+    #[test]
+    fn broker_without_partial_close_closes_remaining_quantity_at_first_target() {
+        let (mut state, execution) =
+            trade_update_state_with_features(&[BrokerFeature::MarketOrder]);
+        set_protection_test_history(&mut state, 100.0, 111.0);
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight
+            .set_quantity(Some(10.0))
+            .set_take_profit_levels(Some(vec![110.0, 120.0]));
+        insight.partial_filled_quantity = Some(4.0);
+        insight.order_id = Some("non-partial-position".to_string());
+        insight.filled_price = Some(100.0);
+        insight.state = InsightState::Filled;
+
+        let result = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
+
+        assert!(result.success);
+        assert!(!result.passed);
+        assert_eq!(execution.close_quantities.lock().unwrap().as_slice(), [6.0]);
+        assert!(insight.closing);
     }
 
     #[test]
@@ -3126,6 +3335,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parent_close_event_recursively_reconciles_nested_descendants() {
+        let (mut state, execution) = trade_update_state();
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        parent.order_id = Some("recursive-parent-position".to_string());
+        parent.state = InsightState::Filled;
+        parent.filled_price = Some(100.0);
+        let parent_id = *parent.insight_id();
+
+        let mut child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(parent_id),
+        );
+        child.set_quantity(Some(1.0));
+        child.order_id = Some("recursive-child-position".to_string());
+        child.state = InsightState::Filled;
+        child.filled_price = Some(99.0);
+        let child_id = *child.insight_id();
+
+        let mut split_grandchild = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            Some(child_id),
+        );
+        split_grandchild.is_split_insight = true;
+        split_grandchild.set_quantity(Some(1.0));
+        split_grandchild.order_id = Some("recursive-split-pending".to_string());
+        split_grandchild.state = InsightState::Executed;
+        let split_grandchild_id = *split_grandchild.insight_id();
+
+        state.insights.add_insight(parent.clone());
+        state.insights.add_insight(child);
+        state.insights.add_insight(split_grandchild);
+        execution.emit(
+            test_order(
+                "recursive-parent-position",
+                &parent,
+                TradeUpdateEvent::Closed,
+                OrderSide::Sell,
+                Some(101.0),
+            ),
+            TradeUpdateEvent::Closed,
+        );
+
+        state.on_trade_update();
+
+        assert!(state.insights.get(&child_id).unwrap().closing);
+        assert!(state.insights.get(&split_grandchild_id).unwrap().cancelling);
+        assert_eq!(
+            execution.close_requests.lock().unwrap().as_slice(),
+            ["recursive-child-position"]
+        );
+        assert_eq!(
+            execution.cancel_requests.lock().unwrap().as_slice(),
+            ["recursive-split-pending"]
+        );
+    }
+
+    #[test]
+    fn split_children_submit_with_parent_while_ordinary_children_wait_for_fill() {
+        let (mut state, execution) = trade_update_state();
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        let parent_id = *parent.insight_id();
+
+        let mut split_child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        split_child.set_quantity(Some(1.0));
+        let split_child_id = *split_child.insight_id();
+        parent.add_child_insight(split_child, Some(true), &mut state);
+
+        let mut ordinary_child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        ordinary_child.set_quantity(Some(1.0));
+        let ordinary_child_id = *ordinary_child.insight_id();
+        let mut nested_split_child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        nested_split_child.set_quantity(Some(1.0));
+        let nested_split_child_id = *nested_split_child.insight_id();
+        ordinary_child.add_child_insight(nested_split_child, Some(true), &mut state);
+        parent.add_child_insight(ordinary_child, None, &mut state);
+
+        parent.submit(&mut state);
+        state.add_insight(parent);
+
+        let parent = state.insights.get(&parent_id).unwrap();
+        assert_eq!(parent.state, InsightState::Executed);
+        let split_child = state.insights.get(&split_child_id).unwrap();
+        assert_eq!(split_child.parent_id(), Some(&parent_id));
+        assert!(split_child.is_split_insight());
+        assert_eq!(split_child.state, InsightState::Executed);
+        assert!(state.insights.get(&ordinary_child_id).is_none());
+        assert!(state.insights.get(&nested_split_child_id).is_none());
+
+        let parent = state.insights.get(&parent_id).unwrap().clone();
+        execution.emit(
+            test_order(
+                parent.order_id.as_deref().unwrap(),
+                &parent,
+                TradeUpdateEvent::Filled,
+                OrderSide::Buy,
+                Some(100.0),
+            ),
+            TradeUpdateEvent::Filled,
+        );
+        state.on_trade_update();
+
+        let ordinary_child = state.insights.get(&ordinary_child_id).unwrap();
+        assert!(!ordinary_child.is_split_insight());
+        assert_eq!(ordinary_child.state, InsightState::Executed);
+        let nested_split_child = state.insights.get(&nested_split_child_id).unwrap();
+        assert_eq!(nested_split_child.parent_id(), Some(&ordinary_child_id));
+        assert!(nested_split_child.is_split_insight());
+        assert_eq!(nested_split_child.state, InsightState::Executed);
+    }
+
     /// Test 5: Verify trade event: bracket order → SL triggers → insight becomes CLOSED.
     ///
     /// Strategy generates a BUY insight with quantity, SL (very tight), and TP (very wide).
@@ -3387,7 +3753,7 @@ mod tests {
                         None, // Setting parent ID via add_child_insight
                     );
 
-                    parent_insight.add_child_insight(child_insight, ctx);
+                    parent_insight.add_child_insight(child_insight, None, ctx);
 
                     let p_id = *parent_insight.insight_id();
                     *self.parent_id.lock().unwrap() = Some(p_id);
@@ -3641,8 +4007,10 @@ mod tests {
         let current_bar = Bar {
             symbol: "AAPL".to_string(),
             open: 109.0,
-            high: 111.0,
-            low: 108.0,
+            // Keep the broker-native TP untouched during entry; the fixture data feed's latest
+            // quote drives the explicit ScaleOutPipe trigger below.
+            high: 109.5,
+            low: 99.0,
             close: 111.0,
             volume: 1000.0,
             timestamp: Utc.with_ymd_and_hms(2025, 9, 3, 0, 0, 0).unwrap(),
@@ -3675,7 +4043,10 @@ mod tests {
         assert!(result.passed);
         assert_eq!(insight.take_profit_levels(), Some(vec![120.0]));
         assert_eq!(insight.stop_loss_levels(), Some(vec![95.0, 90.0]));
-        assert!(!insight.closing);
+        assert!(
+            insight.closing,
+            "a partial close stays in flight until its broker event is processed"
+        );
 
         println!("  ✓ Scale out pipe partial-close test passed!");
     }
@@ -3946,6 +4317,52 @@ mod tests {
                 .iter()
                 .any(|(_, state, _)| *state == InsightState::Rejected)
         );
+    }
+
+    #[test]
+    fn test_run_insight_pipeline_failure_keeps_filled_position_active() {
+        let mut state = pipeline_harness_state();
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(AlwaysFailPipe {
+                passed: false,
+                success: false,
+                message: "protection update temporarily failed",
+            }))
+            .target_state(InsightState::Filled)
+            .build(),
+        );
+
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".to_string(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.set_quantity(Some(1.0));
+        insight.state = InsightState::Filled;
+        insight.order_id = Some("filled-order".to_string());
+        insight.filled_price = Some(123.45);
+        insight.set_first_on_fill(true);
+        let insight_id = *insight.insight_id();
+        state.add_insight(insight);
+
+        state.run_insight_pipeline();
+
+        let insight = state
+            .insights
+            .get(&insight_id)
+            .expect("filled insight should remain tracked after a pipe failure");
+        assert_eq!(insight.state, InsightState::Filled);
+        assert!(insight.first_on_fill());
+        assert!(insight.state_history.iter().any(|(_, state, message)| {
+            *state == InsightState::Filled
+                && message.as_deref().is_some_and(|value| {
+                    value.contains("position remains active")
+                        && value.contains("protection update temporarily failed")
+                })
+        }));
     }
 
     #[test]
@@ -4639,6 +5056,562 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Mt5ProtectionEntryKind {
+        Market,
+        PendingLimit,
+    }
+
+    #[derive(Default)]
+    struct Mt5ProtectionShared {
+        insight_id: Option<uuid::Uuid>,
+        order_id: Option<String>,
+        final_take_profit: Option<f64>,
+        final_stop_loss: Option<f64>,
+        persisted_update_cycles: usize,
+        cleanup_acknowledged: bool,
+        failure: Option<String>,
+    }
+
+    fn round_mt5_test_price(price: f64, step: f64) -> f64 {
+        if !price.is_finite() || !step.is_finite() || step <= 0.0 {
+            return price;
+        }
+        (price / step).round() * step
+    }
+
+    fn verify_mt5_test_level(
+        label: &str,
+        levels: Option<Vec<f64>>,
+        expected: f64,
+        step: f64,
+    ) -> Result<(), String> {
+        let actual = levels
+            .and_then(|levels| levels.first().copied())
+            .ok_or_else(|| format!("{label} is missing; expected {expected}"))?;
+        let tolerance = (step.abs() / 2.0).max(f64::EPSILON);
+        if (actual - expected).abs() > tolerance {
+            return Err(format!(
+                "{label} mismatch: expected {expected}, received {actual}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_and_persist_mt5_protection_updates(
+        ctx: &mut dyn StrategyContext,
+        mut insight: Insight,
+        take_profits: [f64; 3],
+        stop_losses: [f64; 3],
+        price_step: f64,
+        shared: &Arc<Mutex<Mt5ProtectionShared>>,
+    ) -> Result<(), String> {
+        let insight_id = *insight.insight_id();
+        let order_id = insight
+            .order_id
+            .clone()
+            .ok_or_else(|| "submitted insight has no broker order id".to_string())?;
+        let mut expected_take_profit = insight
+            .take_profit_levels()
+            .and_then(|levels| levels.first().copied())
+            .ok_or_else(|| "submitted insight has no initial take profit".to_string())?;
+        let mut expected_stop_loss = insight
+            .stop_loss_levels()
+            .and_then(|levels| levels.first().copied())
+            .ok_or_else(|| "submitted insight has no initial stop loss".to_string())?;
+
+        for index in 0..3 {
+            // Read the last values back from the managed insight before issuing the next RPC.
+            verify_mt5_test_level(
+                "pre-update local take profit",
+                insight.take_profit_levels(),
+                expected_take_profit,
+                price_step,
+            )?;
+            verify_mt5_test_level(
+                "pre-update local stop loss",
+                insight.stop_loss_levels(),
+                expected_stop_loss,
+                price_step,
+            )?;
+
+            let take_profit = take_profits[index];
+            if !insight.update_take_profit(ctx, Some(vec![take_profit])) {
+                let detail = insight
+                    .state_history
+                    .last()
+                    .and_then(|(_, _, message)| message.as_deref())
+                    .unwrap_or("no insight error detail");
+                return Err(format!(
+                    "take-profit update {} was not acknowledged for order {}: {}",
+                    index + 1,
+                    order_id,
+                    detail
+                ));
+            }
+            verify_mt5_test_level(
+                "updated insight take profit",
+                insight.take_profit_levels(),
+                take_profit,
+                price_step,
+            )?;
+
+            let stop_loss = stop_losses[index];
+            if !insight.update_stop_loss(ctx, Some(vec![stop_loss])) {
+                let detail = insight
+                    .state_history
+                    .last()
+                    .and_then(|(_, _, message)| message.as_deref())
+                    .unwrap_or("no insight error detail");
+                return Err(format!(
+                    "stop-loss update {} was not acknowledged for order {}: {}",
+                    index + 1,
+                    order_id,
+                    detail
+                ));
+            }
+            verify_mt5_test_level(
+                "updated insight stop loss",
+                insight.stop_loss_levels(),
+                stop_loss,
+                price_step,
+            )?;
+
+            // Persist into StrategyState, then read it back before allowing the next update.
+            ctx.add_insight(insight.clone());
+            let persisted = ctx
+                .insights()
+                .get(&insight_id)
+                .cloned()
+                .ok_or_else(|| format!("local insight {insight_id} was not persisted"))?;
+            verify_mt5_test_level(
+                "persisted take profit",
+                persisted.take_profit_levels(),
+                take_profit,
+                price_step,
+            )?;
+            verify_mt5_test_level(
+                "persisted stop loss",
+                persisted.stop_loss_levels(),
+                stop_loss,
+                price_step,
+            )?;
+
+            expected_take_profit = take_profit;
+            expected_stop_loss = stop_loss;
+            insight = persisted;
+            let mut shared = shared.lock().unwrap();
+            shared.persisted_update_cycles = index + 1;
+            shared.final_take_profit = Some(take_profit);
+            shared.final_stop_loss = Some(stop_loss);
+            println!(
+                "[MT5 Protection] cycle={} state={:?} order_id={} tp={} sl={} broker_ack=true local_readback=true",
+                index + 1,
+                insight.state(),
+                order_id,
+                take_profit,
+                stop_loss
+            );
+        }
+
+        Ok(())
+    }
+
+    struct Mt5ProtectionUpdateStrategy {
+        symbol: String,
+        entry_kind: Mt5ProtectionEntryKind,
+        completed: bool,
+        bars_waited: usize,
+        quantity: f64,
+        price_step: f64,
+        shared: Arc<Mutex<Mt5ProtectionShared>>,
+    }
+
+    impl Mt5ProtectionUpdateStrategy {
+        fn fail(&self, ctx: &mut dyn StrategyContext, message: impl Into<String>) {
+            let message = message.into();
+            eprintln!("[MT5 Protection] {message}");
+            self.shared.lock().unwrap().failure = Some(message);
+            ctx.shutdown();
+        }
+
+        fn update_ready_insight(
+            &self,
+            ctx: &mut dyn StrategyContext,
+            insight: Insight,
+            reference_price: f64,
+        ) -> Result<(), String> {
+            let entry_price = insight
+                .filled_price
+                .or(insight.limit_price())
+                .unwrap_or(reference_price);
+            let take_profits = [1.18, 1.16, 1.14]
+                .map(|multiple| round_mt5_test_price(entry_price * multiple, self.price_step));
+            let stop_losses = [0.82, 0.84, 0.86]
+                .map(|multiple| round_mt5_test_price(entry_price * multiple, self.price_step));
+            apply_and_persist_mt5_protection_updates(
+                ctx,
+                insight,
+                take_profits,
+                stop_losses,
+                self.price_step,
+                &self.shared,
+            )
+        }
+    }
+
+    impl Strategy for Mt5ProtectionUpdateStrategy {
+        fn name(&self) -> &str {
+            match self.entry_kind {
+                Mt5ProtectionEntryKind::Market => "Mt5FilledMarketProtectionUpdates",
+                Mt5ProtectionEntryKind::PendingLimit => "Mt5PendingLimitProtectionUpdates",
+            }
+        }
+
+        fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+            println!(
+                "[MT5 Protection] starting {:?} strategy on {} timeframe={:?}",
+                self.entry_kind,
+                self.symbol,
+                ctx.timeframe()
+            );
+        }
+
+        fn init(&mut self, _ctx: &mut dyn StrategyContext, asset: &Asset) {
+            self.quantity = asset.min_order_size.unwrap_or(0.01).max(0.01);
+            self.price_step = asset
+                .min_price_increment
+                .or_else(|| asset.price_base.map(|base| 1.0 / base.max(1) as f64))
+                .unwrap_or(0.01)
+                .max(0.00001);
+        }
+
+        fn universe(&self, _ctx: &mut dyn StrategyContext) -> HashSet<String> {
+            HashSet::from([self.symbol.clone()])
+        }
+
+        fn on_bar(&mut self, ctx: &mut dyn StrategyContext, symbol: &str, _bar: &BarData) {
+            if self.completed {
+                return;
+            }
+            let quote = match ctx.latest_quote(symbol) {
+                Ok(quote) => quote,
+                Err(error) => {
+                    self.fail(ctx, format!("failed to load quote for {symbol}: {error}"));
+                    return;
+                }
+            };
+            let reference_price = quote.ask.max(quote.last.unwrap_or(quote.ask));
+            if !reference_price.is_finite() || reference_price <= 0.0 {
+                self.fail(
+                    ctx,
+                    format!("received invalid reference price {reference_price} for {symbol}"),
+                );
+                return;
+            }
+
+            let existing = self
+                .shared
+                .lock()
+                .unwrap()
+                .insight_id
+                .and_then(|id| ctx.insights().get(&id).cloned());
+            let insight = if let Some(insight) = existing {
+                self.bars_waited += 1;
+                insight
+            } else {
+                let entry_price = match self.entry_kind {
+                    Mt5ProtectionEntryKind::Market => reference_price,
+                    Mt5ProtectionEntryKind::PendingLimit => {
+                        round_mt5_test_price(reference_price * 0.80, self.price_step)
+                    }
+                };
+                let initial_take_profit = round_mt5_test_price(entry_price * 1.20, self.price_step);
+                let initial_stop_loss = round_mt5_test_price(entry_price * 0.80, self.price_step);
+                let mut insight = Insight::new(
+                    OrderSide::Buy,
+                    symbol.to_string(),
+                    StrategyType::Testing,
+                    ctx.timeframe().clone(),
+                    100,
+                    None,
+                );
+                insight
+                    .set_quantity(Some(self.quantity))
+                    .set_take_profit_levels(Some(vec![initial_take_profit]))
+                    .set_stop_loss_levels(Some(vec![initial_stop_loss]));
+                if self.entry_kind == Mt5ProtectionEntryKind::PendingLimit {
+                    insight.set_limit_price(Some(entry_price));
+                }
+                insight.submit(ctx);
+                {
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.insight_id = Some(*insight.insight_id());
+                    shared.order_id = insight.order_id.clone();
+                }
+                println!(
+                    "[MT5 Protection] submitted {:?} insight={} order_id={:?} state={:?} entry={} initial_tp={} initial_sl={}",
+                    self.entry_kind,
+                    insight.insight_id(),
+                    insight.order_id,
+                    insight.state(),
+                    entry_price,
+                    initial_take_profit,
+                    initial_stop_loss
+                );
+                insight
+            };
+
+            if matches!(
+                insight.state(),
+                InsightState::Rejected | InsightState::Cancelled
+            ) {
+                self.fail(
+                    ctx,
+                    format!(
+                        "{:?} entry reached unexpected state {:?}",
+                        self.entry_kind,
+                        insight.state()
+                    ),
+                );
+                return;
+            }
+
+            let ready = match self.entry_kind {
+                Mt5ProtectionEntryKind::Market => insight.state() == &InsightState::Filled,
+                Mt5ProtectionEntryKind::PendingLimit => insight.state() == &InsightState::Executed,
+            };
+            if !ready {
+                if self.entry_kind == Mt5ProtectionEntryKind::PendingLimit
+                    && insight.state() == &InsightState::Filled
+                {
+                    self.fail(ctx, "pending limit unexpectedly filled before its updates");
+                    return;
+                }
+                ctx.add_insight(insight);
+                if self.bars_waited >= 2 {
+                    self.fail(
+                        ctx,
+                        format!(
+                            "timed out waiting for {:?} entry state; expected {:?}",
+                            self.entry_kind,
+                            match self.entry_kind {
+                                Mt5ProtectionEntryKind::Market => InsightState::Filled,
+                                Mt5ProtectionEntryKind::PendingLimit => InsightState::Executed,
+                            }
+                        ),
+                    );
+                }
+                return;
+            }
+
+            if let Err(error) = self.update_ready_insight(ctx, insight, reference_price) {
+                self.fail(ctx, error);
+                return;
+            }
+            self.completed = true;
+            ctx.shutdown();
+        }
+
+        fn generate_insights(&mut self, _ctx: &mut dyn StrategyContext, _symbol: &str) {}
+
+        fn insight_pipeline(&mut self, _ctx: &mut dyn StrategyContext, _insight: &Insight) {}
+
+        fn on_teardown(&mut self, ctx: &mut dyn StrategyContext) {
+            println!(
+                "[MT5 Protection] tearing down {:?} strategy",
+                self.entry_kind
+            );
+            let snapshot = self
+                .shared
+                .lock()
+                .unwrap()
+                .insight_id
+                .and_then(|id| ctx.insights().get(&id).cloned());
+            let Some(insight) = snapshot else {
+                self.shared.lock().unwrap().failure =
+                    Some("protection test insight was missing during teardown".to_string());
+                return;
+            };
+            let Some(order_id) = insight.order_id.clone() else {
+                self.shared.lock().unwrap().failure =
+                    Some("protection test order id was missing during teardown".to_string());
+                return;
+            };
+            let cleanup_result = match self.entry_kind {
+                Mt5ProtectionEntryKind::Market => ctx.close_position(
+                    &order_id,
+                    insight.remaining_quantity().max(self.quantity),
+                    None,
+                ),
+                Mt5ProtectionEntryKind::PendingLimit => ctx.cancel_order(&order_id),
+            };
+            match cleanup_result {
+                Ok(true) => {
+                    self.shared.lock().unwrap().cleanup_acknowledged = true;
+                    println!(
+                        "[MT5 Protection] {:?} cleanup acknowledged for order {}",
+                        self.entry_kind, order_id
+                    );
+                }
+                Ok(false) => {
+                    self.shared.lock().unwrap().failure = Some(format!(
+                        "{:?} cleanup returned false for order {}",
+                        self.entry_kind, order_id
+                    ));
+                }
+                Err(error) => {
+                    self.shared.lock().unwrap().failure = Some(format!(
+                        "{:?} cleanup failed for order {}: {}",
+                        self.entry_kind, order_id, error
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn run_live_mt5_protection_update_strategy(entry_kind: Mt5ProtectionEntryKind) {
+        init_test_logger("info");
+        if std::env::var("AQE_MT5_BRIDGE_TOKEN").is_err() {
+            println!(
+                "Skipping MT5 protection update test: AQE_MT5_BRIDGE_TOKEN is required. See integrations/mt5/README.md."
+            );
+            return;
+        }
+
+        let symbol = std::env::var("AQE_MT5_PROTECTION_TEST_SYMBOL")
+            .ok()
+            .map(|symbol| symbol.trim().to_string())
+            .filter(|symbol| !symbol.is_empty())
+            .unwrap_or_else(|| "BNBUSD".to_string());
+
+        let preflight = Mt5Broker::from_env().expect("failed to create MT5 preflight broker");
+        preflight
+            .connect()
+            .await
+            .expect("failed to start MT5 protection preflight bridge");
+        if let Ok(stale_order_id) = std::env::var("AQE_MT5_PROTECTION_CLEANUP_ORDER_ID") {
+            let stale_order_id = stale_order_id.trim();
+            if !stale_order_id.is_empty() {
+                preflight
+                    .cancel_order(stale_order_id)
+                    .await
+                    .expect("failed to cancel the explicitly selected stale protection test order");
+                println!(
+                    "[MT5 Protection] cancelled explicitly selected stale order {}",
+                    stale_order_id
+                );
+            }
+        }
+        let positions = preflight
+            .get_positions()
+            .await
+            .expect("failed to load MT5 positions before protection test");
+        let orders = preflight
+            .get_orders()
+            .await
+            .expect("failed to load MT5 orders before protection test");
+        let _ = preflight.disconnect().await;
+        assert!(
+            !positions
+                .iter()
+                .any(|position| position.asset.symbol == symbol && position.qty.abs() > 0.0),
+            "MT5 protection test requires no pre-existing {symbol} position"
+        );
+        assert!(
+            !orders.iter().any(|order| order.asset.symbol == symbol),
+            "MT5 protection test requires no pre-existing {symbol} order"
+        );
+
+        let shared = Arc::new(Mutex::new(Mt5ProtectionShared::default()));
+        let execution = Mt5Broker::from_env().expect("failed to create MT5 protection broker");
+        let data = Mt5DataFeed::from_env().expect("failed to create MT5 protection datafeed");
+        let broker = UnifiedBroker::new(execution, data);
+        let mut state = StrategyState::new(
+            format!("Mt5ProtectionUpdates-{entry_kind:?}"),
+            "1.0".into(),
+            Mt5ProtectionUpdateStrategy {
+                symbol: symbol.clone(),
+                entry_kind,
+                completed: false,
+                bars_waited: 0,
+                quantity: 0.01,
+                price_step: 0.01,
+                shared: shared.clone(),
+            },
+            broker,
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+
+        let run_result =
+            tokio::time::timeout(std::time::Duration::from_secs(180), state.run_live(None)).await;
+
+        match run_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("MT5 protection strategy failed: {error:?}"),
+            Err(_) => panic!("MT5 protection strategy timed out after 180s"),
+        }
+
+        let shared = shared.lock().unwrap();
+        assert!(
+            shared.failure.is_none(),
+            "MT5 protection strategy failed: {:?}",
+            shared.failure
+        );
+        assert_eq!(
+            shared.persisted_update_cycles, 3,
+            "the local insight did not persist all three TP/SL update cycles"
+        );
+        assert!(
+            shared.cleanup_acknowledged,
+            "MT5 did not acknowledge the strategy teardown cleanup"
+        );
+        let insight_id = shared
+            .insight_id
+            .expect("MT5 protection strategy did not record an insight id");
+        let expected_take_profit = shared
+            .final_take_profit
+            .expect("MT5 protection strategy did not record its final take profit");
+        let expected_stop_loss = shared
+            .final_stop_loss
+            .expect("MT5 protection strategy did not record its final stop loss");
+        drop(shared);
+
+        let persisted = state
+            .insights
+            .get(&insight_id)
+            .expect("MT5 protection insight should remain in local strategy state");
+        verify_mt5_test_level(
+            "final local take profit",
+            persisted.take_profit_levels(),
+            expected_take_profit,
+            0.00001,
+        )
+        .expect("final local take profit should match the third update");
+        verify_mt5_test_level(
+            "final local stop loss",
+            persisted.stop_loss_levels(),
+            expected_stop_loss,
+            0.00001,
+        )
+        .expect("final local stop loss should match the third update");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "places a real MT5 market order and updates its TP/SL three times; requires AqeMt5BridgeEA and bridge env vars configured"]
+    async fn test_run_live_mt5_filled_market_updates_tp_sl_three_times() {
+        let _mt5_guard = MT5_INTEGRATION_TEST_LOCK.lock().await;
+        run_live_mt5_protection_update_strategy(Mt5ProtectionEntryKind::Market).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "places a real MT5 pending limit order and updates its TP/SL three times; requires AqeMt5BridgeEA and bridge env vars configured"]
+    async fn test_run_live_mt5_executed_limit_updates_tp_sl_three_times() {
+        let _mt5_guard = MT5_INTEGRATION_TEST_LOCK.lock().await;
+        run_live_mt5_protection_update_strategy(Mt5ProtectionEntryKind::PendingLimit).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "places and cleans up real MT5 parent/child orders; requires AqeMt5BridgeEA and bridge env vars configured"]
     async fn test_run_live_mt5_child_insights_market_and_limit() {
@@ -4889,8 +5862,8 @@ mod tests {
                     let parent_id = *parent.insight_id();
                     let market_child_id = *market_child.insight_id();
                     let limit_child_id = *limit_child.insight_id();
-                    parent.add_child_insight(market_child, ctx);
-                    parent.add_child_insight(limit_child, ctx);
+                    parent.add_child_insight(market_child, None, ctx);
+                    parent.add_child_insight(limit_child, None, ctx);
 
                     {
                         let mut shared = self.shared.lock().unwrap();

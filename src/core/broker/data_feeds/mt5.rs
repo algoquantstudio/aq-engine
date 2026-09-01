@@ -1,6 +1,6 @@
 use crate::core::broker::traits::{DataFeed, DataProvider};
 use crate::core::broker::types::{Account, Asset, Bar, BrokerError, Quote};
-use crate::core::broker::{DataStreamMode, mt5_bridge::Mt5Bridge};
+use crate::core::broker::{DataFeedFeature, DataStreamMode, mt5_bridge::Mt5Bridge};
 use crate::core::utils::timeframe::TimeFrame;
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
@@ -51,6 +51,16 @@ impl DataFeed for Mt5DataFeed {
 
     fn is_connected(&self) -> bool {
         self.bridge.is_datafeed_connected()
+    }
+
+    fn get_features(&self) -> &'static [DataFeedFeature] {
+        &[
+            DataFeedFeature::HistoricalCandles,
+            DataFeedFeature::LatestCandle,
+            DataFeedFeature::LatestQuote,
+            DataFeedFeature::CandleStream,
+            DataFeedFeature::IntraCandleStream,
+        ]
     }
 }
 

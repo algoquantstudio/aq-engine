@@ -157,6 +157,29 @@ fn hyper_argument_source(input: &crate::node::NodeInput) -> String {
     }
 }
 
+fn insight_pipe_scope_variant(node: &Node) -> &'static str {
+    let Some(scope) = node
+        .inputs
+        .iter()
+        .find(|input| input.name == "insight_scope")
+        .and_then(|input| input.value.as_ref())
+        .and_then(serde_json::Value::as_str)
+    else {
+        return "ParentOnly";
+    };
+
+    match scope
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ' '], "")
+        .as_str()
+    {
+        "childonly" | "child" | "children" => "ChildOnly",
+        "both" | "parentandchild" | "all" => "Both",
+        _ => "ParentOnly",
+    }
+}
+
 fn timeframe_unit_variant(unit: &str) -> &'static str {
     match unit.trim().to_ascii_lowercase().as_str() {
         "second" | "seconds" | "s" => "Second",
@@ -415,6 +438,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
         // Skip trigger inputs, data inputs, and non-public state fields
         for input in node.inputs.iter().filter(|i| {
             i.is_public
+                && !(node.node_type == NodeType::Pipe && i.name == "insight_scope")
                 && !matches!(
                     i.input_type,
                     crate::node::InputType::Trigger
@@ -469,6 +493,10 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                         target_state_modifier = format!(".target_state(InsightState::{:?})", state);
                     }
                 }
+                let insight_scope_modifier = format!(
+                    ".insight_scope(InsightPipeScope::{})",
+                    insight_pipe_scope_variant(node)
+                );
 
                 if let Some(ref src) = node.source_file {
                     let child_var_name = format!("pipe_{}", node.id.replace("-", "_"));
@@ -491,12 +519,13 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                             allowed_alphas_constraint.clone(),
                             target_state_modifier.clone(),
                         ));
+                        let builtin_instance = format!("{}::new({})", builtin_struct, final_args);
                         format!(
-                            "InsightPipeBuilder::new(Box::new({}::new({}))){}{}.build()",
-                            builtin_struct,
-                            final_args,
+                            "InsightPipeBuilder::new(Box::new({})){}{}{}.build()",
+                            builtin_instance,
                             allowed_alphas_constraint,
-                            target_state_modifier
+                            target_state_modifier,
+                            insight_scope_modifier
                         )
                     } else {
                         let mod_name = source_file_to_mod_name(src);
@@ -509,12 +538,13 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                             src.clone(),
                         ));
                         format!(
-                            "InsightPipeBuilder::new(Box::new({}::{}::new({}))){}{}.build()",
+                            "InsightPipeBuilder::new(Box::new({}::{}::new({}))){}{}{}.build()",
                             mod_name,
                             struct_name,
                             final_args,
                             allowed_alphas_constraint,
-                            target_state_modifier
+                            target_state_modifier,
+                            insight_scope_modifier
                         )
                     };
 
@@ -1374,6 +1404,74 @@ mod tests {
     }
 
     #[test]
+    fn generated_allow_trading_window_uses_compact_builtin_configuration() {
+        let mut meta = StrategyMeta::new("Trading Window Pipe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        meta.nodes.push(custom_node(
+            "trading-window",
+            NodeType::Pipe,
+            "allow_trading_window",
+            "allow_trading_window",
+            vec![
+                NodeInput {
+                    name: "insights".to_string(),
+                    input_type: InputType::Insights,
+                    value: None,
+                    is_public: true,
+                    insight_state: Some(InsightState::New),
+                    hyper_reference: None,
+                },
+                NodeInput {
+                    name: "start_utc".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("06:00")),
+                    is_public: true,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
+                NodeInput {
+                    name: "end_utc".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("20:00")),
+                    is_public: true,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
+                NodeInput {
+                    name: "allowed_days".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("0,1,2,3,4,5,6")),
+                    is_public: true,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
+            ],
+            Vec::new(),
+        ));
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "insight_pipeline".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "trading-window".to_string(),
+                port: "insights".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains(
+            "use aq_engine::core::pipeline::allow_trading_window::AllowTradingWindowPipe;"
+        ));
+        assert!(src.contains(
+            "AllowTradingWindowPipe::new(\"06:00\".to_string(), \"20:00\".to_string(), \"0,1,2,3,4,5,6\".to_string())"
+        ));
+        assert!(!src.contains("mod allow_trading_window;"));
+    }
+
+    #[test]
     fn generated_end_of_day_close_uses_builtin_pipe() {
         let mut meta = StrategyMeta::new("End Of Day Close Pipe Test");
         meta.nodes
@@ -1485,6 +1583,14 @@ mod tests {
                     insight_state: None,
                     hyper_reference: None,
                 },
+                NodeInput {
+                    name: "insight_scope".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("Both")),
+                    is_public: true,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
             ],
             vec![
                 NodeOutput {
@@ -1526,7 +1632,121 @@ mod tests {
             )
         );
         assert!(src.contains("InsightTtlConfigPipe::new(5, 10)"));
+        assert!(src.contains(".insight_scope(InsightPipeScope::Both)"));
         assert!(src.contains(".target_state(InsightState::New)"));
+    }
+
+    #[test]
+    fn generated_reject_expired_insight_defaults_to_parent_only_scope() {
+        let mut meta = StrategyMeta::new("Reject Expired Insight Pipe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        meta.nodes.push(custom_node(
+            "reject-expired",
+            NodeType::Pipe,
+            "reject_expired_insight",
+            "reject_expired_insight",
+            vec![NodeInput {
+                name: "insights".to_string(),
+                input_type: InputType::Insights,
+                value: None,
+                is_public: true,
+                insight_state: Some(InsightState::Executed),
+                hyper_reference: None,
+            }],
+            vec![
+                NodeOutput {
+                    name: "insights_out".to_string(),
+                    output_type: OutputType::Insights,
+                    insight_state: Some(InsightState::Cancelled),
+                    hyper_reference: None,
+                },
+                NodeOutput {
+                    name: "pipe_result".to_string(),
+                    output_type: OutputType::InsightPipeResult,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
+                NodeOutput {
+                    name: "pipe_instance".to_string(),
+                    output_type: OutputType::InsightPipeInstance,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
+            ],
+        ));
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "insight_pipeline".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "reject-expired".to_string(),
+                port: "insights".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains(
+            "use aq_engine::core::pipeline::reject_expired_insight::RejectExpiredInsightPipe;"
+        ));
+        assert!(src.contains("RejectExpiredInsightPipe::new()"));
+        assert!(src.contains(".insight_scope(InsightPipeScope::ParentOnly)"));
+        assert!(src.contains(".target_state(InsightState::Executed)"));
+    }
+
+    #[test]
+    fn generated_custom_pipe_uses_generic_child_only_scope() {
+        let mut meta = StrategyMeta::new("Custom Scoped Pipe Test");
+        meta.nodes
+            .push(StrategyMeta::create_strategy_node(&meta.name));
+        meta.nodes.push(custom_node(
+            "custom-scope",
+            NodeType::Pipe,
+            "ScopeAware",
+            "src/scope_aware.pipe.rs",
+            vec![
+                NodeInput {
+                    name: "insights".to_string(),
+                    input_type: InputType::Insights,
+                    value: None,
+                    is_public: true,
+                    insight_state: Some(InsightState::Filled),
+                    hyper_reference: None,
+                },
+                NodeInput {
+                    name: "insight_scope".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("ChildOnly")),
+                    is_public: true,
+                    insight_state: None,
+                    hyper_reference: None,
+                },
+            ],
+            vec![NodeOutput {
+                name: "insights_out".to_string(),
+                output_type: OutputType::Insights,
+                insight_state: Some(InsightState::Filled),
+                hyper_reference: None,
+            }],
+        ));
+        meta.connections.push(Connection {
+            from: ConnectionEndpoint {
+                node_id: "strategy_root".to_string(),
+                port: "insight_pipeline".to_string(),
+            },
+            to: ConnectionEndpoint {
+                node_id: "custom-scope".to_string(),
+                port: "insights".to_string(),
+            },
+        });
+
+        let src = generate_main_rs(&meta).unwrap();
+
+        assert!(src.contains("scope_aware::ScopeAware::new()"));
+        assert!(src.contains(".insight_scope(InsightPipeScope::ChildOnly)"));
+        assert!(!src.contains("ScopeAware::new(\"ChildOnly\".to_string())"));
     }
 
     #[test]

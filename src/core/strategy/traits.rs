@@ -1,8 +1,10 @@
 use crate::core::alpha::WrappedAlphaModel;
-use crate::core::broker::UnifiedBroker;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
 use crate::core::broker::types::BrokerError;
 use crate::core::broker::types::{Account, Asset, BarData, Quote};
+use crate::core::broker::{
+    BrokerFeature, DataFeedFeature, UnifiedBroker, effective_buying_power_from,
+};
 use crate::core::events::{EventStreamRequest, EventStreamType, StrategyEventContext};
 use crate::core::indicators::Indicator;
 use crate::core::insight::{Insight, InsightCollection};
@@ -76,6 +78,49 @@ pub trait StrategyContext {
     fn tools(&self) -> Box<dyn TradingTools + '_>;
     fn max_history_rows(&self) -> usize;
     fn set_max_history_rows(&mut self, rows: usize);
+
+    /// Native execution capabilities exposed by the configured broker.
+    fn broker_features(&self) -> &'static [BrokerFeature] {
+        &[]
+    }
+
+    /// Market-data capabilities exposed by the configured data feed.
+    fn datafeed_features(&self) -> &'static [DataFeedFeature] {
+        &[]
+    }
+
+    fn has_broker_feature(&self, feature: BrokerFeature) -> bool {
+        self.broker_features().contains(&feature)
+    }
+
+    fn has_broker_features(&self, features: &[BrokerFeature]) -> bool {
+        features
+            .iter()
+            .all(|feature| self.has_broker_feature(*feature))
+    }
+
+    /// Return sizing buying power with the configured broker's leverage representation applied.
+    ///
+    /// This is the preferred helper for strategy and pipe code that already loaded an account
+    /// snapshot. It never applies leverage to a non-marginable asset and never double-applies it
+    /// when the broker advertises [`BrokerFeature::BuyingPowerLeveraged`].
+    fn effective_buying_power(&self, account: &Account, asset: &Asset) -> f64 {
+        effective_buying_power_from(
+            account,
+            asset,
+            self.has_broker_feature(BrokerFeature::BuyingPowerLeveraged),
+        )
+    }
+
+    fn has_datafeed_feature(&self, feature: DataFeedFeature) -> bool {
+        self.datafeed_features().contains(&feature)
+    }
+
+    fn has_datafeed_features(&self, features: &[DataFeedFeature]) -> bool {
+        features
+            .iter()
+            .all(|feature| self.has_datafeed_feature(*feature))
+    }
 
     /// Get the current warm-up period (number of bars to skip before generating signals).
     fn warm_up_bars(&self) -> i32;

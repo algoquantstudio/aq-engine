@@ -1,6 +1,6 @@
 # AQE MT5 Bridge
 
-AQE talks to MetaTrader 5 through a local HTTP bridge:
+AQE talks to MetaTrader 5 through a local Actix Web HTTP bridge:
 
 - AQE starts an HTTP server on `127.0.0.1:18080` by default.
 - `AqeMt5BridgeEA.mq5` runs inside a logged-in MT5 terminal.
@@ -62,16 +62,14 @@ export AQE_MT5_BRIDGE_BIND_ADDR="0.0.0.0:18080"
 InpBridgeUrl         = http://127.0.0.1:18080
 InpBridgeToken       = same value as AQE_MT5_BRIDGE_TOKEN
 InpBridgeConnections = optional extra bridge URLs separated by commas
-InpProbeInactiveConnections = false
-InpInactiveProbeIntervalMs = 500
-InpInactiveProbeTimeoutMs = 100
-InpInactiveProbeMaxCooldownMs = 2000
 InpPollIntervalMs = 100
 InpRequestTimeoutMs = 5000
 InpTradeEventFlushIntervalMs = 10
-InpTradeEventPostTimeoutMs = 250
+InpTradeEventPostTimeoutMs = 100
 InpTradeEventBatchSize = 32
 InpTradeEventQueueCapacity = 2048
+InpMarketDataIntervalMs = 50
+InpMarketDataPostTimeoutMs = 100
 ```
 
 | Input | Purpose |
@@ -79,16 +77,14 @@ InpTradeEventQueueCapacity = 2048
 | `InpBridgeUrl` | Primary AQE HTTP bridge URL. It must exactly match an entry in the MT5 WebRequest allow-list. |
 | `InpBridgeToken` | Shared authentication secret. It must match `AQE_MT5_BRIDGE_TOKEN` and cannot be empty. |
 | `InpBridgeConnections` | Optional comma-separated additional bridge URLs for running multiple AQE strategies from one EA. |
-| `InpProbeInactiveConnections` | Probes additional URLs which do not yet have a session. Enable this when all configured bridge URLs should be discovered and kept available. |
-| `InpInactiveProbeIntervalMs` | Minimum interval between inactive-bridge probes. Lower values discover a newly started bridge sooner but cause more WebRequests. |
-| `InpInactiveProbeTimeoutMs` | WebRequest timeout used for an inactive probe. Keep this short so an unavailable optional bridge cannot stall active bridges. |
-| `InpInactiveProbeMaxCooldownMs` | Maximum retry backoff after repeated failures to reach an inactive bridge. |
 | `InpPollIntervalMs` | Base interval used to poll active AQE bridges for RPC work. |
 | `InpRequestTimeoutMs` | Timeout for ordinary active-bridge WebRequests. |
-| `InpTradeEventFlushIntervalMs` | Minimum interval between attempts to flush queued order and trade events. |
+| `InpTradeEventFlushIntervalMs` | Minimum interval between attempts to flush queued order and trade events. This also drives the EA's high-resolution timer. |
 | `InpTradeEventPostTimeoutMs` | Short WebRequest timeout used when posting trade-event batches. |
-| `InpTradeEventBatchSize` | Maximum number of queued trade events sent in one request. |
-| `InpTradeEventQueueCapacity` | Maximum number of trade events retained during a temporary disconnection. The oldest event is dropped when the queue is full. |
+| `InpTradeEventBatchSize` | Maximum number of queued trade events sent in one request. Events remain FIFO within each bridge; a failed front batch is retried before later batches. |
+| `InpTradeEventQueueCapacity` | Maximum number of trade events retained during a temporary disconnection. If the queue is full, the newest event is rejected so retained events cannot be reordered. |
+| `InpMarketDataIntervalMs` | Target interval for subscribed quotes/intrabar updates and detection of newly completed bars. |
+| `InpMarketDataPostTimeoutMs` | Short WebRequest timeout used when posting quotes and completed bars. |
 
 For multiple AQE live strategies from one MT5 terminal, either attach one EA per bridge URL or set extra bridge endpoints in `InpBridgeConnections`, for example:
 
@@ -96,13 +92,21 @@ For multiple AQE live strategies from one MT5 terminal, either attach one EA per
 InpBridgeConnections = http://127.0.0.1:18081,http://127.0.0.1:18082
 ```
 
-Leave `InpProbeInactiveConnections` as `false` for normal single-EA use. The primary `InpBridgeUrl` always polls at startup to establish its first session, then remains actively serviced. Set this option to `true` only when optional URLs in `InpBridgeConnections` are also expected to be online and should be probed before they have a session.
+The EA automatically discovers every URL in `InpBridgeConnections`. A configured endpoint without an AQE server is probed one at a time with a short timeout and adaptive backoff; it does not participate in the fast active polling loop until it establishes a session. If an active bridge disappears, it returns to this discovery state and reconnects automatically when the AQE server is available again.
+
+AQE cannot initiate this connection because the EA exposes no listening server: MT5 `WebRequest` is client-initiated and AQE is the HTTP listener. Some periodic discovery request is therefore required for a stopped AQE endpoint to become visible later. The discovery timing is now an internal implementation detail instead of an EA input.
 
 All configured bridge URLs use `InpBridgeToken`; per-endpoint tokens are not supported. Add every URL in `InpBridgeUrl` and `InpBridgeConnections` to the MT5 WebRequest allow-list.
 
 AQE and AQS use UTC internally. The EA converts incoming UTC history request windows to MT5 broker-server time before calling `CopyRates`, then converts MT5 quote and bar timestamps back to UTC before sending data to AQE.
 
 The EA keeps data subscriptions and trade events scoped to each AQE runtime session. Trade events are routed back to the bridge that submitted the order; manual MT5 trades are not broadcast to every strategy. Multi-strategy trade routing is reliable for hedging accounts with separate order/position tickets. MT5 netting accounts can merge same-symbol positions, so same-symbol strategy attribution is limited there.
+
+MetaTrader serializes an EA's event handlers and `WebRequest` is synchronous. The bridge therefore does not perform history lookups, JSON construction, or HTTP inside `OnTradeTransaction`. It copies the three native MT5 transaction structures into a preallocated FIFO ring buffer and returns. A high-resolution timer expands those structures, then prioritizes one trade-event batch, market-data update, or RPC request per turn. This keeps the terminal's 1,024-entry transaction callback queue free while retaining the immutable AQE event sequence across retries. For strict isolation between several latency-sensitive strategies, one EA instance per bridge URL still provides a separate MetaTrader EA execution thread.
+
+On AQE, Actix only performs authentication, JSON decoding, and bounded-queue admission in the request path. Ordered trade batches and market-data callbacks run on independent ingress workers, so a slow bar callback cannot delay a fill acknowledgement and a slow trade callback cannot block an RPC poll. The trade ingress queue is FIFO and never intentionally coalesces events. The market-data ingress queue is deliberately small: if AQE falls behind it responds with `503 Service Unavailable`, causing the EA to retain completed candles and retry with its newest quote snapshot instead of building an unbounded stale-price backlog. The Actix listener keeps HTTP connections alive when the MT5 client supports reuse.
+
+Completed bars are marked delivered only after AQE acknowledges the market-data request. A timeout keeps the candle pending for retry; AQE deduplicates a retried completed candle by symbol, timeframe, and timestamp. Intrabar quotes retain MT5's millisecond tick timestamp and unchanged ticks are not emitted twice. Trade-event retries likewise retain the original event sequence, and AQE applies each batch in sequence order.
 
 8. Keep MT5 logged in and running before starting the AQE live strategy.
 
@@ -128,13 +132,17 @@ The current EA heartbeat includes these diagnostic fields:
 
 Older EA builds remain protocol-compatible, but they do not report the two terminal status fields. Recompile and reload the current `AqeMt5BridgeEA.mq5` to enable broker-disconnection detection.
 
+EA version `1.307` and later also recovers position-modification requests when AQE retained the original entry-order ticket instead of MT5's current position ticket. Resolution is attempted by exact ticket/position identifier first, then the position's historical entry-order ticket, and finally a unique routed insight id. Ambiguous insight matches are rejected rather than modifying the wrong position. Recompile and reload the EA to enable this fallback.
+
+EA version `1.312` and later supports AQE's broker-neutral startup reconciliation. In one RPC batch, MT5 resolves persisted order ids against pending orders, currently open positions, and order/deal history. AQE cancels confirmed pending orphan orders, closes confirmed orphan positions, and applies confirmed terminal states. An unavailable or inconclusive lookup is preserved instead of being guessed as cancelled. Other broker integrations receive the same lifecycle request through `OrderManagementProvider` and can override the default active-order lookup when they expose richer position or history identity.
+
 You can inspect the bridge without placing an order:
 
 ```bash
 curl http://127.0.0.1:18080/health
 ```
 
-The response includes `transportConnected`, `brokerConnected`, `datafeedConnected`, the last heartbeat, poll, market-data, subscription-sync, and recovery timestamps, and the latest terminal status. When AQE recovers, its logs report the reconnect reason, subscription replay, and broker-state refresh result.
+The response includes `transportConnected`, `brokerConnected`, `datafeedConnected`, the last heartbeat, poll, market-data, subscription-sync, and recovery timestamps, the latest terminal status, and the current ordered trade and market-data ingress depths. When AQE recovers, its logs report the reconnect reason, subscription replay, and broker-state refresh result.
 
 ## Smoke Test
 

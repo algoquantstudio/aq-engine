@@ -1,4 +1,4 @@
-use crate::core::broker::types::OrderSide;
+use crate::core::broker::{BrokerFeature, types::OrderSide};
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
 use crate::core::strategy::StrategyContext;
@@ -13,10 +13,10 @@ use super::InsightPipe;
 /// - None.
 ///
 /// Behaviour:
-/// Passes through insights without a stop loss. For open insights, it reads the latest `low` and
-/// `high` from strategy history: buy insights close when low is at or below stop loss, and sell
-/// insights close when high is at or above stop loss. Insights already being closed return
-/// `passed=false` without another close request.
+/// Passes through insights without a stop loss and leaves native OCO protection to the broker.
+/// For brokers without OCO, it reads the latest `low` and `high` from strategy history: buy
+/// insights close when low is at or below stop loss, and sell insights close when high is at or
+/// above stop loss. Insights already being closed do not issue another close request.
 pub struct BasicStopLossPipe;
 
 impl BasicStopLossPipe {
@@ -39,6 +39,14 @@ impl InsightPipe for BasicStopLossPipe {
                 self.name().to_string(),
             );
         };
+        if ctx.has_broker_feature(BrokerFeature::OcoOrder) {
+            return InsightPipeResult::new(
+                true,
+                true,
+                Some("Stop loss is managed by the broker's native OCO protection".to_string()),
+                self.name().to_string(),
+            );
+        }
         if insight.closing {
             return InsightPipeResult::new(
                 false,

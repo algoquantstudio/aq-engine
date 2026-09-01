@@ -1450,11 +1450,23 @@ impl BacktestResults {
     pub fn save_to_disk(&self, dir_path: &Path, state: &BacktestState) -> Result<(), String> {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                // Polars' async execution layer uses `tokio::task::block_in_place`
+                // while materialising some analysis tables. Tokio only supports
+                // that operation on its multi-thread runtime, so a current-thread
+                // persistence runtime panics after an otherwise successful
+                // backtest when Polars-backed artifacts are written.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("aqe-backtest-persistence")
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
-                runtime.block_on(self.save_to_disk_async(dir_path, state))
+                let result = runtime.block_on(self.save_to_disk_async(dir_path, state));
+                // A synchronous caller owns this temporary runtime. Never let
+                // lingering third-party blocking tasks keep its destructor (and
+                // therefore the completed backtest process) alive indefinitely.
+                runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+                result
             });
 
             handle
@@ -1879,6 +1891,70 @@ mod tests {
         assert_eq!(alpha_models.len(), 1);
         assert_eq!(alpha_models[0]["label"], serde_json::json!("Entry Alpha"));
         assert_eq!(metrics["insight_pipes"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn synchronous_backtest_persistence_supports_polars_async_execution() {
+        let output_dir = TestDir::new("polars_runtime");
+        let entry_time = Utc.with_ymd_and_hms(2026, 1, 1, 9, 30, 0).unwrap();
+        let exit_time = entry_time + chrono::Duration::minutes(5);
+        let account_history = vec![
+            (entry_time, test_account(10_000.0)),
+            (exit_time, test_account(10_010.0)),
+        ];
+        let trade_log = vec![
+            TradeRecord {
+                date: entry_time,
+                symbol: "AAPL".to_string(),
+                side: OrderSide::Buy,
+                qty: 1.0,
+                price: 100.0,
+                order_id: "order-1".to_string(),
+                insight_id: Some("insight-1".to_string()),
+                strategy_type: Some("RuntimeRegression".to_string()),
+                commission: 0.0,
+                swap: 0.0,
+                trade_type: TradeRecordType::Entry,
+            },
+            TradeRecord {
+                date: exit_time,
+                symbol: "AAPL".to_string(),
+                side: OrderSide::Buy,
+                qty: 1.0,
+                price: 110.0,
+                order_id: "order-1".to_string(),
+                insight_id: Some("insight-1".to_string()),
+                strategy_type: Some("RuntimeRegression".to_string()),
+                commission: 0.0,
+                swap: 0.0,
+                trade_type: TradeRecordType::Exit,
+            },
+        ];
+        let results = BacktestResults {
+            starting_cash: 10_000.0,
+            final_equity: 10_010.0,
+            total_return_pct: 0.1,
+            total_trades: 1,
+            winning_trades: 1,
+            losing_trades: 0,
+            win_rate: 1.0,
+            max_drawdown: 0.0,
+            trade_log: trade_log.clone(),
+            account_history: account_history.clone(),
+            executed_at: entry_time,
+            finished_at: exit_time,
+            backtest_start: Some(entry_time),
+            backtest_end: Some(exit_time),
+        };
+        let mut state = BacktestState::new();
+        state.trade_log = trade_log;
+        state.account_history = account_history;
+        state.set_backtest_window(entry_time, exit_time);
+
+        results.save_to_disk(&output_dir.path, &state).unwrap();
+
+        assert!(output_dir.path.join("backtest.db").is_file());
+        assert!(output_dir.path.join("metrics.json").is_file());
     }
 
     #[test]

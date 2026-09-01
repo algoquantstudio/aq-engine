@@ -1,3 +1,4 @@
+use super::BrokerFeature;
 use super::backtest_state::{BacktestResults, BacktestState};
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
@@ -1259,6 +1260,19 @@ impl Broker for PaperBroker {
 
     fn get_account_type(&self) -> Result<AccountType, BrokerError> {
         Ok(self.account_type.clone())
+    }
+
+    fn get_features(&self) -> &'static [BrokerFeature] {
+        &[
+            BrokerFeature::MarketOrder,
+            BrokerFeature::LimitOrder,
+            BrokerFeature::StopOrder,
+            BrokerFeature::StopLimitOrder,
+            BrokerFeature::OcoOrder,
+            BrokerFeature::TrailingOrder,
+            BrokerFeature::PartialClose,
+            BrokerFeature::BuyingPowerLeveraged,
+        ]
     }
 
     fn configure_asset_metadata(&self, asset: &Asset) -> Result<(), BrokerError> {

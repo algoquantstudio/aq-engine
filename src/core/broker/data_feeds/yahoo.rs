@@ -1,9 +1,9 @@
-use crate::core::broker::DataStreamMode;
 use crate::core::broker::data_stream::{DataStreamManager, FetchBarsFn};
 use crate::core::broker::traits::{DataFeed, DataProvider};
 use crate::core::broker::types::{
     Asset, AssetExchange, AssetStatus, AssetType, Bar, BarData, BrokerError, Quote,
 };
+use crate::core::broker::{DataFeedFeature, DataStreamMode};
 use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
 use chrono::{DateTime, TimeZone, Utc};
 use dashmap::DashMap;
@@ -556,6 +556,16 @@ impl DataFeed for YahooFinanceDataFeed {
 
     fn is_connected(&self) -> bool {
         *self.connected.lock().unwrap()
+    }
+
+    fn get_features(&self) -> &'static [DataFeedFeature] {
+        &[
+            DataFeedFeature::HistoricalCandles,
+            DataFeedFeature::LatestCandle,
+            DataFeedFeature::LatestQuote,
+            DataFeedFeature::CandleStream,
+            DataFeedFeature::IntraCandleStream,
+        ]
     }
 }
 

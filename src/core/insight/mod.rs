@@ -274,6 +274,39 @@ impl InsightCollection {
         ids
     }
 
+    /// Return every tracked descendant of the supplied parents, deepest generation first.
+    ///
+    /// Deepest-first ordering lets lifecycle cleanup close/cancel nested execution fragments
+    /// before their containing child insight. A visited set also makes malformed cyclic parent
+    /// references safe to reconcile.
+    pub fn descendant_ids_for_parents(&self, parent_ids: &FxHashSet<Uuid>) -> Vec<Uuid> {
+        let mut visited = parent_ids.clone();
+        let mut frontier = parent_ids.clone();
+        let mut generations = Vec::<Vec<Uuid>>::new();
+
+        while !frontier.is_empty() {
+            let mut generation = self
+                .insights
+                .iter()
+                .filter_map(|(id, insight)| {
+                    insight
+                        .parent_id()
+                        .is_some_and(|parent_id| frontier.contains(&parent_id))
+                        .then_some(*id)
+                })
+                .filter(|id| visited.insert(*id))
+                .collect::<Vec<_>>();
+            generation.sort_unstable();
+            if generation.is_empty() {
+                break;
+            }
+            frontier = generation.iter().copied().collect();
+            generations.push(generation);
+        }
+
+        generations.into_iter().rev().flatten().collect()
+    }
+
     pub fn candidate_insight_ids_for_trade_event(&self, order: &Order) -> Vec<Uuid> {
         let mut candidates = Vec::new();
 
@@ -628,6 +661,24 @@ mod tests {
 
         collection.prune_terminal_insight(&child_id);
         assert!(collection.child_ids_for_parents(&parent_ids).is_empty());
+    }
+
+    #[test]
+    fn descendant_ids_for_parents_returns_nested_children_deepest_first() {
+        let mut collection = InsightCollection::new();
+        let parent_id = collection.add_insight(test_insight("AAPL"));
+        let mut child = test_insight("AAPL");
+        child.parent_id = Some(parent_id);
+        let child_id = collection.add_insight(child);
+        let mut grandchild = test_insight("AAPL");
+        grandchild.parent_id = Some(child_id);
+        let grandchild_id = collection.add_insight(grandchild);
+
+        let parent_ids = FxHashSet::from_iter([parent_id]);
+        assert_eq!(
+            collection.descendant_ids_for_parents(&parent_ids),
+            vec![grandchild_id, child_id]
+        );
     }
 }
 

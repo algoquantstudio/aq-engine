@@ -3,6 +3,7 @@
 pub mod backtest_state;
 pub mod data_feeds;
 pub mod data_stream;
+pub mod features;
 pub mod mt5_bridge;
 pub mod mt5_broker;
 pub mod paper_broker;
@@ -30,6 +31,10 @@ use parking_lot::RwLock;
 use polars::prelude::*;
 use std::sync::Arc;
 use types::{AccountType, Asset, Bar, BrokerError, Order};
+
+pub use features::{
+    BrokerFeature, DataFeedFeature, UnifiedBrokerFeature, effective_buying_power_from,
+};
 
 const MAX_CONCURRENT_HISTORY_LOADS: usize = 8;
 
@@ -142,6 +147,26 @@ where
     pub fn is_datafeed_connected(&self) -> bool {
         self.data.is_connected()
     }
+
+    /// Return whether the execution broker or data feed supports one feature.
+    /// The feature type selects the correct side of the unified broker.
+    pub fn has_feature<F>(&self, feature: F) -> bool
+    where
+        F: UnifiedBrokerFeature,
+    {
+        feature.is_supported_by(self)
+    }
+
+    /// Return true only when every requested feature is supported.
+    pub fn has_features<F>(&self, features: &[F]) -> bool
+    where
+        F: UnifiedBrokerFeature,
+    {
+        features
+            .iter()
+            .copied()
+            .all(|feature| self.has_feature(feature))
+    }
 }
 
 impl Default for UnifiedBroker<paper_broker::PaperBroker, data_feeds::yahoo::YahooFinanceDataFeed> {
@@ -186,6 +211,10 @@ where
     }
     fn get_account_type(&self) -> Result<AccountType, BrokerError> {
         self.execution.get_account_type()
+    }
+
+    fn get_features(&self) -> &'static [BrokerFeature] {
+        self.execution.get_features()
     }
 
     fn configure_asset_metadata(&self, asset: &Asset) -> Result<(), BrokerError> {
@@ -299,6 +328,13 @@ where
         self.execution.get_orders().await
     }
 
+    async fn reconcile_order_lifecycle(
+        &self,
+        order_ids: &[String],
+    ) -> Result<Vec<types::OrderLifecycleSnapshot>, BrokerError> {
+        self.execution.reconcile_order_lifecycle(order_ids).await
+    }
+
     async fn get_order(&self, order_id: &str) -> Result<Order, BrokerError> {
         self.execution.get_order(order_id).await
     }
@@ -359,6 +395,10 @@ where
 
     fn is_connected(&self) -> bool {
         self.data.is_connected()
+    }
+
+    fn get_features(&self) -> &'static [DataFeedFeature] {
+        self.data.get_features()
     }
 }
 
@@ -767,9 +807,10 @@ where
 // ─────────────────────── Trait Definitions ───────────────────────
 
 pub mod traits {
+    use super::features::{BrokerFeature, DataFeedFeature};
     use super::types::{
         Account, AccountType, Asset, BAR_DATAFRAME_COLUMNS, Bar, BarData, BrokerError, Order,
-        Position, Quote, TradeUpdateEvent,
+        OrderLifecycleSnapshot, OrderLifecycleStatus, Position, Quote, TradeUpdateEvent,
     };
     use crate::core::insight::Insight;
     use crate::core::utils::timeframe::TimeFrame;
@@ -787,6 +828,11 @@ pub mod traits {
         }
         fn get_name(&self) -> String;
         fn get_account_type(&self) -> Result<AccountType, BrokerError>;
+
+        /// Native execution features supported by this broker.
+        fn get_features(&self) -> &'static [BrokerFeature] {
+            &[]
+        }
 
         fn configure_live_session(&self, _session_id: &str) -> Result<(), BrokerError> {
             Ok(())
@@ -823,6 +869,56 @@ pub mod traits {
 
         // Order Management
         async fn get_orders(&self) -> Result<Vec<Order>, BrokerError>;
+
+        /// Resolve a batch of broker order IDs after a process restart.
+        ///
+        /// The default implementation uses `get_orders()` and never infers that a filled order's
+        /// position is closed. Brokers with native position and order-history identity should
+        /// override this method and return `PositionOpen` or a confirmed terminal state.
+        async fn reconcile_order_lifecycle(
+            &self,
+            order_ids: &[String],
+        ) -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+            let orders = self.get_orders().await?;
+            let orders_by_id = orders
+                .into_iter()
+                .map(|order| (order.order_id.clone(), order))
+                .collect::<std::collections::HashMap<_, _>>();
+            Ok(order_ids
+                .iter()
+                .map(|order_id| {
+                    let (status, symbol) = orders_by_id
+                        .get(order_id)
+                        .map(|order| {
+                            let status = match order.status {
+                                TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled => {
+                                    OrderLifecycleStatus::Filled
+                                }
+                                TradeUpdateEvent::Closed => OrderLifecycleStatus::Closed,
+                                TradeUpdateEvent::Cancelled => OrderLifecycleStatus::Cancelled,
+                                TradeUpdateEvent::Rejected => OrderLifecycleStatus::Rejected,
+                                TradeUpdateEvent::Expired => OrderLifecycleStatus::Expired,
+                                TradeUpdateEvent::Accepted
+                                | TradeUpdateEvent::New
+                                | TradeUpdateEvent::PendingNew
+                                | TradeUpdateEvent::Pending
+                                | TradeUpdateEvent::Replaced => OrderLifecycleStatus::Pending,
+                            };
+                            (status, Some(order.asset.symbol.clone()))
+                        })
+                        .unwrap_or((OrderLifecycleStatus::Unknown, None));
+                    OrderLifecycleSnapshot {
+                        order_id: order_id.clone(),
+                        status,
+                        position_id: None,
+                        position_qty: None,
+                        symbol,
+                        detail: None,
+                    }
+                })
+                .collect())
+        }
+
         async fn get_order(&self, order_id: &str) -> Result<Order, BrokerError>;
         async fn get_positions(&self) -> Result<Vec<Position>, BrokerError>;
         async fn get_position(&self, symbol: &str) -> Result<Position, BrokerError>;
@@ -863,6 +959,11 @@ pub mod traits {
         async fn connect(&self) -> Result<bool, BrokerError>;
         async fn disconnect(&self) -> Result<bool, BrokerError>;
         fn is_connected(&self) -> bool;
+
+        /// Market-data features supported by this data feed.
+        fn get_features(&self) -> &'static [DataFeedFeature] {
+            &[]
+        }
     }
 
     pub trait DataProvider: DataFeed {

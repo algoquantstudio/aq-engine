@@ -2,7 +2,7 @@ use crate::node::{InputType, InsightState, Node, NodeInput, NodeOutput, OutputTy
 
 /// Retrieve all supported Built-In Engine components to dynamically render in visually connected tools (like Tauri Studio).
 pub fn get_builtin_nodes() -> Vec<Node> {
-    vec![
+    let mut nodes = vec![
         Node {
             id: "builtin_add_event".to_string(),
             node_type: crate::node::NodeType::Trigger,
@@ -193,25 +193,25 @@ pub fn get_builtin_nodes() -> Vec<Node> {
                     hyper_reference: None,
                 },
                 NodeInput {
-                    name: "start".to_string(),
+                    name: "start_utc".to_string(),
                     input_type: InputType::Str,
-                    value: Some(serde_json::json!("09:30")),
+                    value: Some(serde_json::json!("06:00")),
                     is_public: true,
                     insight_state: None,
                     hyper_reference: None,
                 },
                 NodeInput {
-                    name: "end".to_string(),
+                    name: "end_utc".to_string(),
                     input_type: InputType::Str,
-                    value: Some(serde_json::json!("16:00")),
+                    value: Some(serde_json::json!("20:00")),
                     is_public: true,
                     insight_state: None,
                     hyper_reference: None,
                 },
                 NodeInput {
-                    name: "days".to_string(),
-                    input_type: InputType::Array,
-                    value: Some(serde_json::json!(["0", "1", "2", "3", "4"])),
+                    name: "allowed_days".to_string(),
+                    input_type: InputType::Str,
+                    value: Some(serde_json::json!("0,1,2,3,4,5,6")),
                     is_public: true,
                     insight_state: None,
                     hyper_reference: None,
@@ -1205,5 +1205,68 @@ pub fn get_builtin_nodes() -> Vec<Node> {
             can_fail: Some(true),
             undeletable: false,
         },
-    ]
+    ];
+
+    for node in nodes
+        .iter_mut()
+        .filter(|node| node.node_type == crate::node::NodeType::Pipe)
+    {
+        node.inputs.push(NodeInput {
+            name: "insight_scope".to_string(),
+            input_type: InputType::Str,
+            value: Some(serde_json::json!("ParentOnly")),
+            is_public: true,
+            insight_state: None,
+            hyper_reference: None,
+        });
+    }
+
+    nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_trading_window_exposes_compact_string_inputs() {
+        let nodes = get_builtin_nodes();
+        let node = nodes
+            .iter()
+            .find(|node| node.id == "builtin_allow_trading_window")
+            .unwrap();
+        let configurable_inputs = node
+            .inputs
+            .iter()
+            .filter(|input| input.name != "insights" && input.name != "insight_scope")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            configurable_inputs
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<Vec<_>>(),
+            ["start_utc", "end_utc", "allowed_days"]
+        );
+        assert!(
+            configurable_inputs
+                .iter()
+                .all(|input| matches!(input.input_type, InputType::Str))
+        );
+    }
+
+    #[test]
+    fn every_builtin_pipe_defaults_to_parent_only_scope() {
+        for node in get_builtin_nodes()
+            .into_iter()
+            .filter(|node| node.node_type == crate::node::NodeType::Pipe)
+        {
+            let scope = node
+                .inputs
+                .iter()
+                .find(|input| input.name == "insight_scope")
+                .unwrap_or_else(|| panic!("{} is missing insight_scope", node.label));
+            assert_eq!(scope.value, Some(serde_json::json!("ParentOnly")));
+        }
+    }
 }

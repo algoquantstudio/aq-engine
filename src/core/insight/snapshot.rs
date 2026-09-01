@@ -55,6 +55,8 @@ pub struct InsightLegsSnapshot {
 pub struct InsightSnapshot {
     pub insight_id: String,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub is_split_insight: bool,
     pub state: String,
     #[serde(default)]
     pub children: Vec<serde_json::Value>,
@@ -217,6 +219,7 @@ impl InsightSnapshot {
         Self {
             insight_id: insight.insight_id().to_string(),
             parent_id: insight.parent_id().map(|id| id.to_string()),
+            is_split_insight: insight.is_split_insight(),
             state: Self::insight_state_label(insight.state()).to_string(),
             children: Vec::new(),
             order_id: insight.order_id.clone(),

@@ -1,8 +1,9 @@
+use super::BrokerFeature;
 use super::mt5_bridge::{Mt5Bridge, Mt5RpcAction};
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
-    Account, AccountType, BrokerError, Order, OrderClass, OrderLeg, OrderLegs, OrderSide,
-    OrderType, Position, TimeInForce, TradeUpdateEvent,
+    Account, AccountType, BrokerError, Order, OrderClass, OrderLeg, OrderLegs,
+    OrderLifecycleSnapshot, OrderSide, OrderType, Position, TimeInForce, TradeUpdateEvent,
 };
 use crate::core::insight::Insight;
 use crate::core::utils::tools::dynamic_round_for_asset;
@@ -222,6 +223,17 @@ impl Broker for Mt5Broker {
 
     fn get_account_type(&self) -> Result<AccountType, BrokerError> {
         Ok(AccountType::Live)
+    }
+
+    fn get_features(&self) -> &'static [BrokerFeature] {
+        &[
+            BrokerFeature::MarketOrder,
+            BrokerFeature::LimitOrder,
+            BrokerFeature::StopOrder,
+            BrokerFeature::StopLimitOrder,
+            BrokerFeature::OcoOrder,
+            BrokerFeature::TrailingOrder,
+        ]
     }
 
     fn configure_live_session(&self, session_id: &str) -> Result<(), BrokerError> {
@@ -456,6 +468,34 @@ impl OrderManagementProvider for Mt5Broker {
         self.bridge.request_orders().await
     }
 
+    async fn reconcile_order_lifecycle(
+        &self,
+        order_ids: &[String],
+    ) -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+        if order_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let payload = self
+            .bridge
+            .request_rpc(
+                Mt5RpcAction::ReconcileOrders,
+                serde_json::json!({ "orderIds": order_ids }),
+            )
+            .await?;
+        let mut snapshots = serde_json::from_value::<Vec<OrderLifecycleSnapshot>>(payload)
+            .map_err(|error| {
+                BrokerError::OrderError(format!(
+                    "failed to decode MT5 order lifecycle reconciliation: {error}"
+                ))
+            })?;
+        for snapshot in &mut snapshots {
+            if let Some(symbol) = snapshot.symbol.as_mut() {
+                *symbol = self.bridge.aqe_symbol(symbol);
+            }
+        }
+        Ok(snapshots)
+    }
+
     async fn get_order(&self, order_id: &str) -> Result<Order, BrokerError> {
         self.bridge
             .request_orders()
@@ -611,6 +651,8 @@ mod tests {
 
         assert_eq!(payload["orderId"], serde_json::json!("order-1"));
         assert_eq!(payload["symbol"], serde_json::json!("EURUSD"));
+        assert_eq!(payload["insightId"], serde_json::json!("insight-1"));
+        assert_eq!(payload["strategyType"], serde_json::json!("Strategy"));
         assert_eq!(payload["takeProfit"], serde_json::json!(121.5));
         assert_eq!(payload["stopLoss"], serde_json::json!(95.0));
     }
@@ -624,6 +666,66 @@ mod tests {
         assert_eq!(payload["symbol"], serde_json::json!("EURUSD"));
         assert_eq!(payload["stopLoss"], serde_json::json!(94.0));
         assert_eq!(payload["takeProfit"], serde_json::json!(120.0));
+    }
+
+    #[test]
+    fn lifecycle_reconciliation_payload_decodes_broker_neutral_states() {
+        let snapshots = serde_json::from_value::<Vec<OrderLifecycleSnapshot>>(serde_json::json!([
+            {
+                "orderId": "1891391279",
+                "status": "PositionOpen",
+                "positionId": "1891391279",
+                "positionQty": 0.81,
+                "symbol": "ETHUSD",
+                "detail": "open_position"
+            },
+            {
+                "orderId": "1891390354",
+                "status": "Closed",
+                "positionId": "1891390354",
+                "positionQty": null,
+                "symbol": "ETHUSD",
+                "detail": "historical_filled_order_without_open_position"
+            }
+        ]))
+        .expect("MT5 lifecycle snapshots should use the broker-neutral wire format");
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0].status,
+            super::super::types::OrderLifecycleStatus::PositionOpen
+        );
+        assert_eq!(snapshots[0].position_qty, Some(0.81));
+        assert_eq!(
+            snapshots[1].status,
+            super::super::types::OrderLifecycleStatus::Closed
+        );
+    }
+
+    #[test]
+    fn mt5_declares_native_oco_but_not_partial_close() {
+        let bridge = Arc::new(Mt5Bridge::new(Mt5BridgeConfig {
+            bind_addr: "127.0.0.1:18080".parse().unwrap(),
+            token: "test".to_string(),
+            request_timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(100),
+            symbol_map: HashMap::new(),
+        }));
+        let broker = Mt5Broker::new(bridge);
+
+        assert!(broker.get_features().contains(&BrokerFeature::OcoOrder));
+        assert!(
+            broker
+                .get_features()
+                .contains(&BrokerFeature::TrailingOrder)
+        );
+        assert!(!broker.get_features().contains(&BrokerFeature::PartialClose));
+        assert!(
+            !broker
+                .get_features()
+                .contains(&BrokerFeature::BuyingPowerLeveraged)
+        );
     }
 
     #[test]

@@ -16,11 +16,11 @@ use super::InsightPipe;
 /// - None.
 ///
 /// Behaviour:
-/// Requires an entry price, stop loss, asset definition, and account snapshot. Marginable assets
-/// use account buying power; non-marginable assets use account cash. The pipe divides available
-/// capital by entry price, rounds with strategy tools according to whole/fractional asset rules,
-/// sets the parent insight quantity, and creates child insights when the target size exceeds the
-/// asset maximum single-entry quantity.
+/// Requires an entry price, stop loss, asset definition, and account snapshot. It uses effective
+/// buying power, including leverage only when the broker has not already included it and the asset
+/// is marginable. The pipe divides available capital by entry price, rounds with strategy tools
+/// according to whole/fractional asset rules, sets the parent insight quantity, and creates child
+/// insights when the target size exceeds the asset maximum single-entry quantity.
 pub struct FullAccountQuantityToRiskPipe;
 
 impl FullAccountQuantityToRiskPipe {
@@ -82,11 +82,7 @@ impl InsightPipe for FullAccountQuantityToRiskPipe {
             );
         };
 
-        let capital = if asset.marginable {
-            account.buying_power
-        } else {
-            account.cash
-        };
+        let capital = ctx.effective_buying_power(&account, asset);
         if capital <= 0.0 {
             return InsightPipeResult::new(
                 false,

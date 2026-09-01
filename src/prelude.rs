@@ -12,8 +12,9 @@ pub use uuid::Uuid;
 
 pub use crate::core::alpha::{AlphaModel, AlphaModelBuilder, AlphaResult};
 pub use crate::core::broker::{
-    UnifiedBroker,
+    BrokerFeature, DataFeedFeature, UnifiedBroker,
     data_feeds::{mt5::Mt5DataFeed, yahoo::YahooFinanceDataFeed},
+    effective_buying_power_from,
     mt5_broker::Mt5Broker,
     paper_broker::PaperBroker,
     types::{
@@ -25,7 +26,9 @@ pub use crate::core::insight::{Insight, InsightCollection, types::InsightState};
 pub use crate::core::lifecycle::{
     LifecycleTiming, OnInitLogicBuilder, OnStartLogicBuilder, OnTeardownLogicBuilder,
 };
-pub use crate::core::pipeline::{InsightPipe, InsightPipeBuilder, InsightPipeResult};
+pub use crate::core::pipeline::{
+    InsightPipe, InsightPipeBuilder, InsightPipeResult, InsightPipeScope,
+};
 pub use crate::core::strategy::{
     EventStreamRequest, EventStreamType, HyperParameter, HyperParameterConfig,
     HyperParameterSelection, Strategy, StrategyContext, StrategyMode, StrategyState,

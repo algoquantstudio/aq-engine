@@ -101,6 +101,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             insight_id TEXT NOT NULL UNIQUE,
             parent_id TEXT,
+            is_split_insight INTEGER NOT NULL DEFAULT 0,
             order_id TEXT,
             side TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -748,8 +749,8 @@ async fn insert_account_history(
 async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT OR REPLACE INTO insights (insight_id, parent_id, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
+            "INSERT OR REPLACE INTO insights (insight_id, parent_id, is_split_insight, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -757,6 +758,11 @@ async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> 
         stmt.execute(params![
             insight.insight_id.clone(),
             insight.parent_id.clone(),
+            if insight.is_split_insight {
+                1_i64
+            } else {
+                0_i64
+            },
             insight.order_id.clone(),
             insight.side.clone(),
             insight.symbol.clone(),
@@ -2855,6 +2861,7 @@ mod tests {
         InsightSnapshot {
             insight_id: insight_id.to_string(),
             parent_id: parent_id.map(str::to_string),
+            is_split_insight: false,
             state: "Closed".to_string(),
             children: Vec::new(),
             order_id: Some("order-1".to_string()),

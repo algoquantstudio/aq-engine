@@ -36,8 +36,8 @@ mod live_metrics;
 mod types;
 pub use types::{InsightPipeline, StrategyMode, StrategyStatus};
 pub mod traits;
-use crate::core::broker::UnifiedBroker;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
+use crate::core::broker::{BrokerFeature, DataFeedFeature, UnifiedBroker};
 pub use crate::core::events::{
     EventStreamOptions, EventStreamRequest, EventStreamType, MarketStreamKey, StrategyEventContext,
 };
@@ -49,7 +49,10 @@ pub use hyperparameters::{
 };
 pub use traits::{BrokerAccess, Strategy, StrategyContext, TeardownCleanupReport};
 
-pub use aqs_types::AqsAuth;
+pub use aqs_types::{
+    AqsAuth, StrategyActionKind, StrategyActionStatus, StrategyEventLevel, StrategyEventTitle,
+    StrategyEventType,
+};
 use live_metrics::LivePerformanceTracker;
 use log::{debug, error, info, warn};
 
@@ -167,6 +170,7 @@ where
     pub max_history_rows: usize,
     history_seed_anchor: Option<chrono::DateTime<chrono::Utc>>,
     live_metrics: LivePerformanceTracker,
+    live_metrics_cloud_write_enabled: bool,
     default_live_auth: Option<AqsAuth>,
     runtime_telemetry: RuntimeTelemetry,
     artifact_root: Option<PathBuf>,
@@ -353,6 +357,7 @@ where
             max_history_rows: 2000,
             history_seed_anchor: None,
             live_metrics: LivePerformanceTracker::default(),
+            live_metrics_cloud_write_enabled: true,
             default_live_auth: AqsAuth::from_process_args(),
             runtime_telemetry: RuntimeTelemetry::default(),
             artifact_root: None,
@@ -736,10 +741,16 @@ where
         }
         let mut insight = insight;
         self.bind_insight_context(&mut insight);
-        let children_to_submit = (!allow_during_teardown
-            && insight.state == InsightState::Filled
-            && !insight.children.is_empty())
-        .then(|| insight.children.clone());
+        let children_to_submit = (!allow_during_teardown && insight.state == InsightState::Filled)
+            .then(|| {
+                insight
+                    .children
+                    .iter()
+                    .filter(|child| !child.is_split_insight())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|children| !children.is_empty());
         self.insights.add_insight(insight);
 
         if let Some(children) = children_to_submit {
@@ -1502,6 +1513,11 @@ where
             };
 
             let state = insight.state.clone();
+            let expiration_managed_by_pipe = pipeline.pipeline.get(&state).is_some_and(|pipes| {
+                pipes.iter().any(|pipe| {
+                    pipe.controls_expiration() && pipe.matches_asset_and_alpha(&insight)
+                })
+            });
             let can_expire = insight.can_expire();
             let should_clear_first_on_fill =
                 state == InsightState::Filled && insight.first_on_fill();
@@ -1511,7 +1527,7 @@ where
                 None
             };
 
-            if can_expire && insight.has_expired(self) {
+            if can_expire && !expiration_managed_by_pipe && insight.has_expired(self) {
                 debug!(
                     "Skipping expired insight {} in state {:?}",
                     insight.insight_id(),
@@ -1570,12 +1586,15 @@ where
                     }
                 }
                 if failed {
-                    if !insight.state.is_inactive() {
-                        insight.order_rejected(
-                            rejection_reason
-                                .as_deref()
-                                .unwrap_or("Insight pipeline failed"),
-                        );
+                    let reason = rejection_reason
+                        .as_deref()
+                        .unwrap_or("Insight pipeline failed");
+                    if insight.state == InsightState::Filled {
+                        insight.state_log(Some(format!(
+                            "Filled insight pipeline failed; position remains active: {reason}"
+                        )));
+                    } else if !insight.state.is_inactive() {
+                        insight.order_rejected(reason);
                     }
                     if before_fingerprint
                         .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
@@ -1600,12 +1619,29 @@ where
             }
         }
 
+        // Split-order submission can register eager child insights through the strategy context
+        // while the main collection is temporarily moved out for pipeline execution. Merge those
+        // newly registered insights before restoring the collection so their broker events remain
+        // trackable.
+        let eager_insight_ids = self.insights.ids();
+        for insight_id in eager_insight_ids {
+            if let Some(insight) = self.insights.remove_insight(&insight_id) {
+                insights.add_insight(insight);
+            }
+        }
+
         // Put them back
         self.insight_pipeline = pipeline;
         self.insights = insights;
         for insight_id in touched_insight_ids {
             self.insights.refresh_runtime_tracking(&insight_id);
         }
+
+        // Pipes can synchronously submit, cancel, modify, or close orders. Brokers such as
+        // MT5 also enqueue a local acknowledgement for those RPC results. Drain those events
+        // only after the insight collection has been restored so the acknowledgement cannot
+        // be lost between the command and the asynchronous trade-stream notification.
+        self.on_trade_update();
     }
 
     fn sync_backtest_insight_snapshots(&mut self) {
@@ -1701,9 +1737,13 @@ where
                             if let Some(parent_id) = insight.parent_id {
                                 parents_to_reconcile.push(parent_id);
                             }
-                            if !insight.children.is_empty() {
-                                children_to_submit.extend(insight.children.clone());
-                            }
+                            children_to_submit.extend(
+                                insight
+                                    .children
+                                    .iter()
+                                    .filter(|child| !child.is_split_insight())
+                                    .cloned(),
+                            );
                             break;
                         }
                     }
@@ -1746,9 +1786,13 @@ where
                             }
 
                             // If this insight has children, queue them for submission
-                            if !insight.children.is_empty() {
-                                children_to_submit.extend(insight.children.clone());
-                            }
+                            children_to_submit.extend(
+                                insight
+                                    .children
+                                    .iter()
+                                    .filter(|child| !child.is_split_insight())
+                                    .cloned(),
+                            );
                             break;
                         }
                     }
@@ -1903,7 +1947,9 @@ where
                         .is_some_and(|parent| parent.state.is_inactive())
                 })
                 .collect::<FxHashSet<_>>();
-            let children_to_process = self.insights.child_ids_for_parents(&parents_to_reconcile);
+            let children_to_process = self
+                .insights
+                .descendant_ids_for_parents(&parents_to_reconcile);
 
             // Second pass: apply closures (requires mutable self)
             for id in children_to_process {
@@ -1988,6 +2034,7 @@ where
                     | TradeUpdateEvent::New
                     | TradeUpdateEvent::Pending => {
                         insight.order_accepted(&order.order_id);
+                        Self::sync_broker_managed_levels(insight, &order);
                     }
                     TradeUpdateEvent::Filled => {
                         insight.order_accepted(&order.order_id);
@@ -2106,6 +2153,14 @@ where
 
     fn set_max_history_rows(&mut self, rows: usize) {
         self.update_max_history_rows(rows);
+    }
+
+    fn broker_features(&self) -> &'static [BrokerFeature] {
+        self.broker.execution.get_features()
+    }
+
+    fn datafeed_features(&self) -> &'static [DataFeedFeature] {
+        self.broker.data.get_features()
     }
 
     fn tools(&self) -> Box<dyn TradingTools + '_> {
@@ -2246,7 +2301,7 @@ where
     S: Strategy,
     D: DataFeed + DataProvider,
 {
-    fn finalize_backtest_results(&mut self, results: &BacktestResults) -> Option<String> {
+    async fn finalize_backtest_results(&mut self, results: &BacktestResults) -> Option<String> {
         info!("═══════════════════ Backtest Results ═══════════════════");
         let terminal_output_suspended = crate::core::tui::terminal_output_suspended();
         if !terminal_output_suspended {
@@ -2261,19 +2316,26 @@ where
             .clone()
             .unwrap_or_else(|| self.artifact_root().join("backtests").join(&run_id));
 
-        let Some(backtest_state) = self.broker.backtest_state.as_ref() else {
+        let Some(backtest_state) = self.broker.backtest_state.clone() else {
             warn!("Backtest completed but no backtest state was available for result persistence");
             return None;
         };
 
         let state = backtest_state.read();
-        if let Err(error) = results.save_to_disk(&out_dir, &*state) {
+        let persistence_started = std::time::Instant::now();
+        info!("Persisting backtest artifacts to {}", out_dir.display());
+        if let Err(error) = results.save_to_disk_async(&out_dir, &*state).await {
             error!("Failed to save results to disk: {}", error);
             if !terminal_output_suspended {
                 eprintln!("Failed to save results to disk: {}", error);
             }
             return None;
         }
+        drop(state);
+        info!(
+            "Backtest artifacts persisted in {}ms",
+            persistence_started.elapsed().as_millis()
+        );
 
         if let Some(selection) = self.hyperparameter_selection.as_ref() {
             if let Err(error) = append_hyperparameter_metrics(&out_dir, selection, &self.timeframe)
@@ -2502,7 +2564,7 @@ where
 
         // ── 9. Results ──
         let results = self.broker.get_results();
-        let saved_result_path = self.finalize_backtest_results(&results);
+        let saved_result_path = self.finalize_backtest_results(&results).await;
         self.status = StrategyStatus::Completed;
         let open_insights_count = self.insights.active_insight_ids_unsorted().len();
         let mut summary_lines = results.metric_summary_lines();

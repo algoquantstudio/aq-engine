@@ -1,4 +1,4 @@
-use crate::core::broker::types::OrderSide;
+use crate::core::broker::{BrokerFeature, types::OrderSide};
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
 use crate::core::strategy::StrategyContext;
@@ -16,8 +16,9 @@ use super::InsightPipe;
 /// Behaviour:
 /// Runs only on filled insights with remaining quantity. It resolves the latest quote price,
 /// checks the first stop-loss and take-profit levels, and issues a partial close at the hit
-/// level. Final stop-loss or take-profit levels close the full remaining quantity; non-final
-/// levels close the configured fraction and remove the consumed level from the insight.
+/// level. Broker-native OCO handles final levels. Non-final levels use partial closes where the
+/// broker supports them; otherwise AQE waits for native final protection or closes the remaining
+/// position when no native OCO is available.
 pub struct ScaleOutPipe {
     sell_off_percentage: f64,
 }
@@ -112,7 +113,34 @@ impl InsightPipe for ScaleOutPipe {
 
         let is_final_tp = tp_hit.is_some() && tp_levels.len() == 1;
         let is_final_sl = sl_hit.is_some() && sl_levels.len() == 1;
-        let close_qty = if is_final_tp || is_final_sl {
+        let native_oco = ctx.has_broker_feature(BrokerFeature::OcoOrder);
+        let partial_close_supported = ctx.has_broker_feature(BrokerFeature::PartialClose);
+
+        if native_oco && (is_final_tp || is_final_sl) {
+            return InsightPipeResult::new(
+                true,
+                true,
+                Some(format!(
+                    "Final {} for {} is managed by the broker's native OCO protection",
+                    level_kind, insight.symbol
+                )),
+                self.name().to_string(),
+            );
+        }
+
+        if native_oco && !partial_close_supported {
+            return InsightPipeResult::new(
+                true,
+                true,
+                Some(format!(
+                    "Intermediate {} for {} requires partial-close support; waiting for broker-managed final protection",
+                    level_kind, insight.symbol
+                )),
+                self.name().to_string(),
+            );
+        }
+
+        let close_qty = if is_final_tp || is_final_sl || !partial_close_supported {
             remaining_qty
         } else {
             let scaled = ctx
@@ -125,7 +153,17 @@ impl InsightPipe for ScaleOutPipe {
             }
         };
 
-        insight.close_partial(ctx, close_qty, Some(level_price));
+        if !insight.try_close_partial(ctx, close_qty, Some(level_price)) {
+            return InsightPipeResult::new(
+                false,
+                false,
+                Some(format!(
+                    "Broker rejected scale out for {} qty {:.4}",
+                    insight.symbol, close_qty
+                )),
+                self.name().to_string(),
+            );
+        }
 
         if tp_hit.is_some() && !tp_levels.is_empty() {
             tp_levels.remove(0);
@@ -140,8 +178,16 @@ impl InsightPipe for ScaleOutPipe {
             true,
             false,
             Some(format!(
-                "Scale out triggered on {} for {} qty {:.4} @ {:.4}",
-                level_kind, insight.symbol, close_qty, level_price
+                "Scale out triggered on {} for {} qty {:.4} @ {:.4}{}",
+                level_kind,
+                insight.symbol,
+                close_qty,
+                level_price,
+                if partial_close_supported {
+                    ""
+                } else {
+                    "; broker does not support partial closes, so the remaining position was closed"
+                }
             )),
             self.name().to_string(),
         )

@@ -18,12 +18,12 @@ use super::InsightPipe;
 ///
 /// Behaviour:
 /// Requires an unset quantity, entry price, stop loss, asset definition, and account snapshot.
-/// Working capital comes from buying power for marginable assets or cash for non-marginable
-/// assets, scaled by insight confidence, bounded by the configured cost-basis limits, and then
-/// multiplied by `ctx.execution_risk()`. The pipe calculates quantity from stop-loss distance,
-/// caps it by what working capital can buy, applies asset rounding/contract-size rules, sets the
-/// parent insight quantity, and creates child insights when the target size exceeds the asset
-/// maximum single-entry quantity.
+/// Working capital comes from effective buying power (including leverage only when the broker has
+/// not already included it), scaled by insight confidence, bounded by the configured cost-basis
+/// limits, and then multiplied by `ctx.execution_risk()`. The pipe calculates quantity from
+/// stop-loss distance, caps it by what working capital can buy, applies asset
+/// rounding/contract-size rules, sets the parent insight quantity, and creates child insights when
+/// the target size exceeds the asset maximum single-entry quantity.
 pub struct DynamicQuantityToRiskPipe {
     maximum_cost_basis: f64,
     minimum_cost_basis: f64,
@@ -99,11 +99,8 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
             );
         };
 
-        let mut working_capital = if asset.marginable {
-            account.buying_power
-        } else {
-            account.cash
-        } * (insight.confidence as f64 / 100.0);
+        let mut working_capital =
+            ctx.effective_buying_power(&account, asset) * (insight.confidence as f64 / 100.0);
 
         if working_capital < self.minimum_cost_basis {
             insight.order_rejected(&format!(

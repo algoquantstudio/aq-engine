@@ -326,6 +326,37 @@ pub struct Position {
     pub margin_required: Option<f64>,
 }
 
+/// Broker-neutral lifecycle state used when reconciling persisted orders after a restart.
+///
+/// `Filled` means the broker confirms a fill but cannot prove whether its position remains open.
+/// `PositionOpen` is stronger: the broker resolved the order to a currently open position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum OrderLifecycleStatus {
+    Pending,
+    Filled,
+    PositionOpen,
+    Closed,
+    Cancelled,
+    Rejected,
+    Expired,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderLifecycleSnapshot {
+    pub order_id: String,
+    pub status: OrderLifecycleStatus,
+    #[serde(default)]
+    pub position_id: Option<String>,
+    #[serde(default)]
+    pub position_qty: Option<f64>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 // ─────────────────────── Order ───────────────────────
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

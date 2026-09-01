@@ -106,6 +106,7 @@ fn hash_order_leg<H: Hasher>(state: &mut H, leg: Option<InsightOrderLegFingerpri
 pub struct InsightSnapshotFingerprint<'a> {
     insight_id: Uuid,
     parent_id: Option<Uuid>,
+    is_split_insight: bool,
     state: &'a InsightState,
     children_len: usize,
     order_id: Option<&'a str>,
@@ -180,6 +181,10 @@ impl InsightStrategyContext {
 pub struct Insight {
     pub insight_id: Uuid,
     pub parent_id: Option<Uuid>,
+    /// True when this insight is a broker-size execution fragment of its direct parent.
+    /// Split insights are submitted alongside their parent and do not represent a separate
+    /// strategy/DCA decision.
+    pub is_split_insight: bool,
     // strategy: Strategy,
     pub state: InsightState,
     pub children: Vec<Insight>,
@@ -347,6 +352,7 @@ impl Insight {
         InsightSnapshotFingerprint {
             insight_id: self.insight_id,
             parent_id: self.parent_id,
+            is_split_insight: self.is_split_insight,
             state: &self.state,
             children_len: self.children.len(),
             order_id: self.order_id.as_deref(),
@@ -410,6 +416,7 @@ impl Insight {
 
         fingerprint.insight_id.hash(&mut state);
         fingerprint.parent_id.hash(&mut state);
+        fingerprint.is_split_insight.hash(&mut state);
         fingerprint.state.hash(&mut state);
         fingerprint.children_len.hash(&mut state);
         fingerprint.order_id.hash(&mut state);
@@ -571,6 +578,22 @@ impl Insight {
         info!("Submitting insight: {}", self.log_summary());
         ctx.submit_insight(self);
         self.update_state(self.state.clone(), Some("Insight submitted".to_string()));
+
+        // Broker-size split children are execution fragments of this order, so they must be
+        // submitted as one execution group instead of waiting for the parent to fill. Ordinary
+        // strategy children retain the existing fill-triggered submission semantics.
+        if self.submitted && !self.state.is_inactive() {
+            let split_children = self
+                .children
+                .iter()
+                .filter(|child| child.is_split_insight && !child.submitted)
+                .cloned()
+                .collect::<Vec<_>>();
+            for mut child in split_children {
+                child.submit(ctx);
+                ctx.add_insight(child);
+            }
+        }
         self
     }
 
@@ -686,6 +709,7 @@ impl Insight {
             close_order_id
         );
 
+        self.closing = false;
         self.partial_filled_quantity =
             Some(self.partial_filled_quantity.unwrap_or(0.0) + close_qty);
         if commission.is_some() {
@@ -783,10 +807,18 @@ impl Insight {
         self.cancelling = true;
 
         if let Some(order_id) = &self.order_id {
-            if let Err(e) = ctx.cancel_order(order_id) {
-                warn!("Failed to cancel order {}: {:?}", order_id, e);
-                self.cancelling = false;
-                return self;
+            match ctx.cancel_order(order_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("Failed to cancel order {}: broker returned false", order_id);
+                    self.cancelling = false;
+                    return self;
+                }
+                Err(e) => {
+                    warn!("Failed to cancel order {}: {:?}", order_id, e);
+                    self.cancelling = false;
+                    return self;
+                }
             }
         } else {
             self.cancelling = false;
@@ -794,7 +826,10 @@ impl Insight {
         }
 
         debug!("Cancel requested for insight: {}", self.log_summary());
-        self.update_state(self.state.clone(), Some("Insight cancelled".to_string()));
+        self.update_state(
+            self.state.clone(),
+            Some("Cancellation requested; awaiting broker confirmation".to_string()),
+        );
         self
     }
     pub fn cancel_order_by_id(
@@ -803,10 +838,18 @@ impl Insight {
         ctx: &mut dyn StrategyContext,
     ) -> &mut Self {
         self.cancelling = true;
-        if let Err(e) = ctx.cancel_order(&order_id) {
-            warn!("Failed to cancel order {}: {:?}", order_id, e);
-            self.cancelling = false;
-            return self;
+        match ctx.cancel_order(&order_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("Failed to cancel order {}: broker returned false", order_id);
+                self.cancelling = false;
+                return self;
+            }
+            Err(e) => {
+                warn!("Failed to cancel order {}: {:?}", order_id, e);
+                self.cancelling = false;
+                return self;
+            }
         }
         debug!(
             "Cancel requested by order id for insight: {} order_id={}",
@@ -815,7 +858,10 @@ impl Insight {
         );
         self.update_state(
             self.state.clone(),
-            Some(format!("Insight cancelled by order id {}", order_id)),
+            Some(format!(
+                "Cancellation requested for order {}; awaiting broker confirmation",
+                order_id
+            )),
         );
         self
     }
@@ -834,10 +880,21 @@ impl Insight {
             return self;
         };
         self.cancel_active_legs(ctx);
-        if let Err(e) = ctx.close_position(&order_id, qty, None) {
-            warn!("Failed to close position for {}: {:?}", self.symbol, e);
-            self.closing = false;
-            return self;
+        match ctx.close_position(&order_id, qty, None) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "Failed to close position for {}: broker returned false",
+                    self.symbol
+                );
+                self.closing = false;
+                return self;
+            }
+            Err(e) => {
+                warn!("Failed to close position for {}: {:?}", self.symbol, e);
+                self.closing = false;
+                return self;
+            }
         }
         self.update_state(self.state.clone(), Some("Insight closed".to_string()));
         self
@@ -849,33 +906,74 @@ impl Insight {
         quantity: f64,
         price: Option<f64>,
     ) -> &mut Self {
-        if self.state == InsightState::Filled {
-            let remaining = self.remaining_quantity();
-            if quantity <= 0.0 || quantity > remaining {
-                warn!(
-                    "Failed to close partial position for {}: invalid quantity {:.4} with remaining {:.4}",
-                    self.symbol, quantity, remaining
+        self.try_close_partial(ctx, quantity, price);
+        self
+    }
+
+    /// Request a partial close and report whether the broker accepted the request.
+    ///
+    /// `closing` remains set until the broker's partial-fill event is processed. This prevents
+    /// a second candle or quote update from issuing the same scale-out while the first request
+    /// is still in flight.
+    pub fn try_close_partial(
+        &mut self,
+        ctx: &mut dyn StrategyContext,
+        quantity: f64,
+        price: Option<f64>,
+    ) -> bool {
+        if self.closing || self.state != InsightState::Filled {
+            return false;
+        }
+
+        let remaining = self.remaining_quantity();
+        if quantity <= 0.0 || quantity > remaining {
+            warn!(
+                "Failed to close partial position for {}: invalid quantity {:.4} with remaining {:.4}",
+                self.symbol, quantity, remaining
+            );
+            return false;
+        }
+        if (quantity - remaining).abs() <= f64::EPSILON {
+            self.close(ctx);
+            return self.closing;
+        }
+        let Some(order_id) = self.order_id.clone() else {
+            warn!(
+                "Failed to close partial position for {}: no filled order id is associated with the insight",
+                self.symbol
+            );
+            return false;
+        };
+
+        self.closing = true;
+        match ctx.close_position(&order_id, quantity, price) {
+            Ok(true) => {
+                self.update_state(
+                    self.state.clone(),
+                    Some(format!(
+                        "Partial close requested: {:.4} of {:.4} remaining",
+                        quantity, remaining
+                    )),
                 );
-                return self;
+                true
             }
-            if (quantity - remaining).abs() <= f64::EPSILON {
-                return self.close(ctx);
-            }
-            let Some(order_id) = self.order_id.clone() else {
+            Ok(false) => {
                 warn!(
-                    "Failed to close partial position for {}: no filled order id is associated with the insight",
+                    "Failed to close partial position for {}: broker returned false",
                     self.symbol
                 );
-                return self;
-            };
-            if let Err(e) = ctx.close_position(&order_id, quantity, price) {
+                self.closing = false;
+                false
+            }
+            Err(e) => {
                 warn!(
                     "Failed to close partial position for {}: {:?}",
                     self.symbol, e
                 );
+                self.closing = false;
+                false
             }
         }
-        self
     }
 
     pub fn get_pl(&self, current_price: Option<f64>, include_partial_closes: bool) -> f64 {
@@ -963,12 +1061,14 @@ impl Insight {
     pub fn add_child_insight(
         &mut self,
         mut child_insight: Insight,
+        is_split_order: Option<bool>,
         _ctx: &mut dyn StrategyContext,
     ) -> &mut Self {
         // self.children_ids.push(insight_id);
         child_insight.strategy_type =
             StrategyType::Custom(format!("{}-CHILD", self.strategy_type.to_string()));
         child_insight.parent_id = Some(self.insight_id);
+        child_insight.is_split_insight = is_split_order.unwrap_or(false);
         if child_insight.quantity.is_none() {
             child_insight.quantity = self.quantity;
         }
@@ -1298,21 +1398,23 @@ impl Insight {
                 )
             })
             .and_then(|leg| leg.order_id.clone());
+        let entry_order_can_hold_protection =
+            matches!(self.state, InsightState::Executed | InsightState::Filled);
         let broker_order_id = tp_leg_order_id.or_else(|| {
-            if self.state == InsightState::Filled && active_tp_leg_without_order_id {
+            if entry_order_can_hold_protection && active_tp_leg_without_order_id {
                 self.order_id.clone()
             } else {
                 None
             }
         });
 
-        if self.state == InsightState::Filled
+        if entry_order_can_hold_protection
             && active_tp_leg_without_order_id
             && broker_order_id.is_none()
         {
             self.update_state(
                 self.state.clone(),
-                Some("Failed to update take profit: filled insight has no broker order id".into()),
+                Some("Failed to update take profit: active insight has no broker order id".into()),
             );
             return false;
         }
@@ -1452,21 +1554,23 @@ impl Insight {
                 )
             })
             .and_then(|leg| leg.order_id.clone());
+        let entry_order_can_hold_protection =
+            matches!(self.state, InsightState::Executed | InsightState::Filled);
         let broker_order_id = sl_leg_order_id.or_else(|| {
-            if self.state == InsightState::Filled && active_sl_leg_without_order_id {
+            if entry_order_can_hold_protection && active_sl_leg_without_order_id {
                 self.order_id.clone()
             } else {
                 None
             }
         });
 
-        if self.state == InsightState::Filled
+        if entry_order_can_hold_protection
             && active_sl_leg_without_order_id
             && broker_order_id.is_none()
         {
             self.update_state(
                 self.state.clone(),
-                Some("Failed to update stop loss: filled insight has no broker order id".into()),
+                Some("Failed to update stop loss: active insight has no broker order id".into()),
             );
             return false;
         }
@@ -1741,6 +1845,9 @@ impl Insight {
     pub fn first_on_fill(&self) -> bool {
         self.first_on_fill
     }
+    pub fn is_split_insight(&self) -> bool {
+        self.is_split_insight
+    }
     pub fn set_first_on_fill(&mut self, first_on_fill: bool) -> &mut Self {
         if self.first_on_fill == first_on_fill {
             return self;
@@ -1757,6 +1864,26 @@ impl Insight {
     fn update_state(&mut self, new_state: InsightState, message: Option<String>) {
         let at = self.current_time();
         self.updated_at = at;
+        if self.state == InsightState::Filled
+            && matches!(new_state, InsightState::Cancelled | InsightState::Rejected)
+        {
+            let attempted_state = format!("{:?}", new_state);
+            let detail = message
+                .as_deref()
+                .unwrap_or("No transition reason was provided");
+            warn!(
+                "Ignoring invalid Filled -> {} transition for insight {}: {}",
+                attempted_state, self.insight_id, detail
+            );
+            self.state_history.push((
+                at,
+                InsightState::Filled,
+                Some(format!(
+                    "Ignored invalid Filled -> {attempted_state} transition: {detail}"
+                )),
+            ));
+            return;
+        }
         if matches!(new_state, InsightState::Filled) {
             self.cancelling = false;
         }
@@ -1811,6 +1938,7 @@ impl Default for Insight {
             insight_id: Uuid::new_v4(),
             // strategy: None,
             parent_id: None,
+            is_split_insight: false,
             children: Vec::new(),
             state: InsightState::New,
 
@@ -2227,6 +2355,94 @@ mod tests {
     }
 
     #[test]
+    fn update_take_profit_on_executed_insight_updates_entry_order_and_local_leg() {
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let update_time = created_at + Duration::minutes(5);
+        let mut ctx = MockStrategyContext::new(update_time);
+        let mut insight = sample_insight(created_at);
+        let leg_ts = created_at.timestamp().max(0) as u64;
+        insight.state = InsightState::Executed;
+        insight.order_id = Some("pending-entry-order-1".to_string());
+        insight.set_quantity(Some(1.5));
+        insight.set_take_profit_levels(Some(vec![110.0]));
+        insight.legs.take_profit = Some(OrderLeg {
+            order_id: None,
+            limit_price: Some(110.0),
+            trail_price: None,
+            side: OrderSide::Sell,
+            filled_price: None,
+            order_type: OrderType::Limit,
+            status: TradeUpdateEvent::Pending,
+            order_class: OrderClass::OTO,
+            created_at: leg_ts,
+            updated_at: leg_ts,
+            submitted_at: leg_ts,
+            filled_at: None,
+        });
+
+        assert!(insight.update_take_profit(&mut ctx, Some(vec![112.5])));
+
+        assert_eq!(
+            ctx.updated_orders.borrow().as_slice(),
+            &[("pending-entry-order-1".to_string(), 112.5, 1.5)]
+        );
+        assert_eq!(insight.state(), &InsightState::Executed);
+        assert_eq!(insight.take_profit_levels(), Some(vec![112.5]));
+        assert_eq!(
+            insight
+                .legs
+                .take_profit
+                .as_ref()
+                .and_then(|leg| leg.limit_price),
+            Some(112.5)
+        );
+    }
+
+    #[test]
+    fn update_stop_loss_on_executed_insight_updates_entry_order_and_local_leg() {
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let update_time = created_at + Duration::minutes(5);
+        let mut ctx = MockStrategyContext::new(update_time);
+        let mut insight = sample_insight(created_at);
+        let leg_ts = created_at.timestamp().max(0) as u64;
+        insight.state = InsightState::Executed;
+        insight.order_id = Some("pending-entry-order-1".to_string());
+        insight.set_quantity(Some(1.5));
+        insight.set_stop_loss_levels(Some(vec![95.0]));
+        insight.legs.stop_loss = Some(OrderLeg {
+            order_id: None,
+            limit_price: Some(95.0),
+            trail_price: None,
+            side: OrderSide::Sell,
+            filled_price: None,
+            order_type: OrderType::Stop,
+            status: TradeUpdateEvent::Pending,
+            order_class: OrderClass::OTO,
+            created_at: leg_ts,
+            updated_at: leg_ts,
+            submitted_at: leg_ts,
+            filled_at: None,
+        });
+
+        assert!(insight.update_stop_loss(&mut ctx, Some(vec![92.5])));
+
+        assert_eq!(
+            ctx.updated_stop_losses.borrow().as_slice(),
+            &[("pending-entry-order-1".to_string(), 92.5, 1.5)]
+        );
+        assert_eq!(insight.state(), &InsightState::Executed);
+        assert_eq!(insight.stop_loss_levels(), Some(vec![92.5]));
+        assert_eq!(
+            insight
+                .legs
+                .stop_loss
+                .as_ref()
+                .and_then(|leg| leg.limit_price),
+            Some(92.5)
+        );
+    }
+
+    #[test]
     fn state_log_records_message_without_changing_state() {
         let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
         let log_time = created_at + Duration::minutes(1);
@@ -2264,16 +2480,37 @@ mod tests {
             None,
         );
 
-        parent.add_child_insight(child, &mut ctx);
+        parent.add_child_insight(child, None, &mut ctx);
 
         assert_eq!(parent.children.len(), 1);
         assert_eq!(parent.children[0].parent_id, Some(parent_id));
+        assert!(!parent.children[0].is_split_insight());
         assert_eq!(parent.children[0].quantity, parent.quantity);
         assert!(matches!(
             parent.children[0].strategy_type,
             StrategyType::Custom(ref value) if value == "Testing-CHILD"
         ));
         assert_eq!(parent.state_history.len(), parent_history_len);
+    }
+
+    #[test]
+    fn add_child_insight_marks_only_the_attached_execution_fragment_as_split() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let mut ctx = MockStrategyContext::new(now);
+        let mut parent = sample_insight(now);
+        let parent_id = *parent.insight_id();
+        let mut main_child = sample_insight(now);
+        let main_child_id = *main_child.insight_id();
+        let split_fragment = sample_insight(now);
+
+        main_child.add_child_insight(split_fragment, Some(true), &mut ctx);
+        parent.add_child_insight(main_child, None, &mut ctx);
+
+        let main_child = &parent.children[0];
+        assert_eq!(main_child.parent_id, Some(parent_id));
+        assert!(!main_child.is_split_insight());
+        assert_eq!(main_child.children[0].parent_id, Some(main_child_id));
+        assert!(main_child.children[0].is_split_insight());
     }
 
     #[test]
@@ -2295,6 +2532,22 @@ mod tests {
             .set_first_on_fill(false);
 
         assert_eq!(insight.state_history.len(), history_len);
+    }
+
+    #[test]
+    fn filled_insight_cannot_be_rejected_or_cancelled() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+        let mut insight = sample_insight(now);
+        insight.position_filled(1.15, 1.0, "filled-order", None);
+
+        insight.order_rejected("duplicate protection update returned no changes");
+        assert_eq!(insight.state, InsightState::Filled);
+
+        insight.order_cancelled("missing from a transient local snapshot");
+        assert_eq!(insight.state, InsightState::Filled);
+        assert!(!insight.state_history.iter().any(|(_, state, _)| {
+            matches!(state, InsightState::Rejected | InsightState::Cancelled)
+        }));
     }
 
     #[test]

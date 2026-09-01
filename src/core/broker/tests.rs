@@ -4,7 +4,10 @@ use super::types::{
     AssetStatus, AssetSwapFees, AssetType, Bar, BrokerError, OrderSide, OrderType, Quote,
     TradeUpdateEvent,
 };
-use super::{DataStreamMode, UnifiedBroker, block_on_broker_future, paper_broker::PaperBroker};
+use super::{
+    BrokerFeature, DataFeedFeature, DataStreamMode, UnifiedBroker, block_on_broker_future,
+    data_feeds::yahoo::YahooFinanceDataFeed, paper_broker::PaperBroker,
+};
 use crate::core::insight::Insight;
 use crate::core::insight::types::StrategyType;
 use crate::core::utils::timeframe::TimeFrame;
@@ -20,6 +23,31 @@ use std::time::Duration;
 #[test]
 fn broker_future_bridge_runs_without_a_runtime() {
     assert_eq!(block_on_broker_future(async { 42 }), 42);
+}
+
+#[test]
+fn unified_broker_routes_typed_feature_checks() {
+    let broker = UnifiedBroker::new(
+        PaperBroker::new(AccountType::Paper, 100_000.0, 1),
+        YahooFinanceDataFeed::new(),
+    );
+
+    assert!(broker.has_features(&[
+        BrokerFeature::MarketOrder,
+        BrokerFeature::LimitOrder,
+        BrokerFeature::OcoOrder,
+        BrokerFeature::TrailingOrder,
+        BrokerFeature::PartialClose,
+        BrokerFeature::BuyingPowerLeveraged,
+    ]));
+    assert!(broker.has_features(&[
+        DataFeedFeature::HistoricalCandles,
+        DataFeedFeature::LatestCandle,
+        DataFeedFeature::LatestQuote,
+        DataFeedFeature::CandleStream,
+        DataFeedFeature::IntraCandleStream,
+    ]));
+    assert!(!broker.has_feature(DataFeedFeature::QuoteStream));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
