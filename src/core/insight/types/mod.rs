@@ -1,5 +1,54 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsightHistoryKind {
+    StateTransition,
+    Configuration,
+    Execution,
+    #[default]
+    Diagnostic,
+}
+
+impl InsightHistoryKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StateTransition => "state_transition",
+            Self::Configuration => "configuration",
+            Self::Execution => "execution",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct InsightStrategyContext {
+    current_time_fn: std::sync::Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for InsightStrategyContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InsightStrategyContext")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InsightStrategyContext {
+    pub fn new<F>(current_time_fn: F) -> Self
+    where
+        F: Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static,
+    {
+        Self {
+            current_time_fn: std::sync::Arc::new(current_time_fn),
+        }
+    }
+
+    pub fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
+        (self.current_time_fn)()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum InsightState {
     New,
@@ -45,7 +94,7 @@ impl std::fmt::Display for StrategyType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StrategyDependentConfirmation {
     None,
     HighRelativeVolumeConfirmationModel,

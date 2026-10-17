@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use surrealdb::types::SurrealValue;
 
-use super::live_metrics::{LiveMetricsCheckpoint, LiveMetricsSnapshot};
+use super::types::live_metrics::{LiveMetricsCheckpoint, LiveMetricsSnapshot};
 use crate::core::broker::types::{
     Asset, AssetExchange, AssetFee, AssetFees, AssetStatus, AssetType,
 };
@@ -127,6 +127,18 @@ impl std::fmt::Display for StrategyEventLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SurrealValue)]
 #[surreal(untagged)]
 pub enum StrategyEventTitle {
+    #[serde(rename = "Strategy starting")]
+    #[surreal(rename = "Strategy starting")]
+    StrategyStarting,
+    #[serde(rename = "Strategy stopping")]
+    #[surreal(rename = "Strategy stopping")]
+    StrategyStopping,
+    #[serde(rename = "Strategy failed")]
+    #[surreal(rename = "Strategy failed")]
+    StrategyFailed,
+    #[serde(rename = "Strategy teardown progress")]
+    #[surreal(rename = "Strategy teardown progress")]
+    StrategyTeardownProgress,
     #[serde(rename = "AQS live sync connected")]
     #[surreal(rename = "AQS live sync connected")]
     AqsLiveSyncConnected,
@@ -172,12 +184,19 @@ pub enum StrategyEventTitle {
     #[serde(rename = "Insight Rejected")]
     #[surreal(rename = "Insight Rejected")]
     InsightRejected,
+    #[serde(rename = "Insight reconciliation completed")]
+    #[surreal(rename = "Insight reconciliation completed")]
+    InsightReconciliationCompleted,
 }
 
 impl StrategyEventTitle {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::StrategyStarting => "Strategy starting",
+            Self::StrategyStopping => "Strategy stopping",
+            Self::StrategyFailed => "Strategy failed",
             Self::AqsLiveSyncConnected => "AQS live sync connected",
+            Self::StrategyTeardownProgress => "Strategy teardown progress",
             Self::AccountSnapshotRecorded => "Account snapshot recorded",
             Self::LiveMetricsReset => "Live metrics reset",
             Self::StaleInsightCancelled => "Stale insight cancelled",
@@ -192,6 +211,7 @@ impl StrategyEventTitle {
             Self::InsightClosed => "Insight Closed",
             Self::InsightCancelled => "Insight Cancelled",
             Self::InsightRejected => "Insight Rejected",
+            Self::InsightReconciliationCompleted => "Insight reconciliation completed",
         }
     }
 
@@ -227,6 +247,18 @@ pub struct AqsAuth {
 }
 
 impl AqsAuth {
+    pub(crate) fn from_launch(config: &crate::launch_config::CloudConfig) -> Self {
+        Self {
+            access_method: config.access_method.clone(),
+            session_id: config.session_id.clone(),
+            session_secret: config.session_secret.clone(),
+            strategy_id: config.strategy_id.clone(),
+            user_id: config.user_id.clone(),
+            node_id: Some(config.node_id.clone()),
+            live_session_id: None,
+            url: Some(config.url.clone()),
+        }
+    }
     pub const DEFAULT_URL: &'static str =
         "wss://certain-squirre-06echdjfsdvq70hkk9g8bb2s0k.aws-euw1.surreal.cloud";
 
@@ -310,19 +342,6 @@ pub fn shutdown_signal_file_from_process_args() -> Option<PathBuf> {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct StrategyAccountSnapshotRecord {
-    pub account_id: String,
-    pub account_type: String,
-    pub equity: f64,
-    pub cash: f64,
-    pub currency: String,
-    pub buying_power: f64,
-    pub accrued_commission: f64,
-    pub shorting_enabled: bool,
-    pub leverage: i64,
-}
-
 #[derive(Debug, Clone, Serialize, SurrealValue)]
 pub struct StrategyUniverseAssetRecord {
     pub id: String,
@@ -338,9 +357,11 @@ pub struct StrategyUniverseAssetRecord {
     pub min_order_size: Option<f64>,
     pub quantity_base: Option<i64>,
     pub max_order_size: Option<f64>,
+    pub max_total_size: Option<f64>,
     pub min_price_increment: Option<f64>,
     pub price_base: Option<i64>,
     pub contract_size: Option<i64>,
+    pub trading_calendar: Option<String>,
     pub fees: StrategyUniverseAssetFeesRecord,
 }
 
@@ -392,9 +413,11 @@ impl From<&Asset> for StrategyUniverseAssetRecord {
             min_order_size: value.min_order_size,
             quantity_base: value.quantity_base,
             max_order_size: value.max_order_size,
+            max_total_size: value.max_total_size,
             min_price_increment: value.min_price_increment,
             price_base: value.price_base,
             contract_size: value.contract_size,
+            trading_calendar: value.trading_calendar.clone(),
             fees: StrategyUniverseAssetFeesRecord::from(&value.fees),
         }
     }
@@ -455,16 +478,6 @@ impl From<&AssetFee> for StrategyUniverseAssetFeeRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StrategyEquityPointRecord {
-    pub account_id: String,
-    pub currency: String,
-    pub equity: f64,
-    pub cash: f64,
-    pub buying_power: f64,
-    pub accrued_commission: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct StrategyEventRecord {
     pub event_type: StrategyEventType,
     pub level: StrategyEventLevel,
@@ -520,6 +533,19 @@ pub struct StrategyLiveMetricsRecord {
 #[cfg(test)]
 mod enum_tests {
     use super::*;
+
+    #[test]
+    fn producer_calendar_survives_asset_and_lifecycle_conversion() {
+        let calendar=r#"{"kind":"continuous","source":"mt5_weekly_trade_sessions","weekly_seconds":[[[0,86400]]],"observed_utc_offset_seconds":7200,"holiday_exceptions_recorded":false}"#;
+        let mut raw=serde_json::json!({"id":"fixture","symbol":"BTCUSD","name":"Fixture","asset_type":"Crypto","status":"Active","exchange":{"UNKNOWN":"MT5"},"tradable":true,"marginable":true,"shortable":true,"fractional":true,"trading_calendar":calendar});
+        let asset:crate::core::broker::types::Asset=serde_json::from_value(raw.clone()).unwrap();
+        let record=StrategyUniverseAssetRecord::from(&asset);
+        assert_eq!(record.trading_calendar.as_deref(),Some(calendar));
+        let saved=serde_json::to_value(record).unwrap();
+        assert_eq!(saved["trading_calendar"],calendar);
+        raw.as_object_mut().unwrap().remove("trading_calendar");
+        assert!(serde_json::from_value::<crate::core::broker::types::Asset>(raw).unwrap().trading_calendar.is_none());
+    }
 
     #[test]
     fn parses_complete_live_auth_args() {
@@ -757,6 +783,50 @@ pub fn action_id_from_value(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nonterminal_and_failed_lifecycle_titles_round_trip() {
+        use surrealdb::types::SurrealValue;
+        for title in [
+            super::StrategyEventTitle::StrategyStarting,
+            super::StrategyEventTitle::StrategyStopping,
+            super::StrategyEventTitle::StrategyFailed,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<super::StrategyEventTitle>(
+                    &serde_json::to_string(&title).unwrap()
+                )
+                .unwrap(),
+                title
+            );
+            assert_eq!(
+                super::StrategyEventTitle::from_value(surrealdb::types::Value::String(
+                    title.as_str().into()
+                ))
+                .unwrap(),
+                title
+            );
+        }
+    }
+    #[test]
+    fn teardown_progress_title_round_trips() {
+        use surrealdb::types::SurrealValue;
+        let title = super::StrategyEventTitle::StrategyTeardownProgress;
+        assert_eq!(title.as_str(), "Strategy teardown progress");
+        assert_eq!(
+            serde_json::from_str::<super::StrategyEventTitle>(
+                &serde_json::to_string(&title).unwrap()
+            )
+            .unwrap(),
+            title
+        );
+        assert_eq!(
+            super::StrategyEventTitle::from_value(surrealdb::types::Value::String(
+                title.as_str().into()
+            ))
+            .unwrap(),
+            title
+        );
+    }
     use super::*;
 
     #[test]
@@ -842,20 +912,5 @@ mod tests {
             level.into_value(),
             surrealdb::types::Value::String("info".into())
         );
-    }
-
-    #[test]
-    fn equity_history_payload_keeps_account_identity_and_currency() {
-        let payload = serde_json::to_value(StrategyEquityPointRecord {
-            account_id: " broker-42 ".trim().to_string(),
-            currency: "gbp".to_uppercase(),
-            equity: 101_000.0,
-            cash: 100_000.0,
-            buying_power: 200_000.0,
-            accrued_commission: 12.5,
-        })
-        .unwrap();
-        assert_eq!(payload["account_id"], "broker-42");
-        assert_eq!(payload["currency"], "GBP");
     }
 }

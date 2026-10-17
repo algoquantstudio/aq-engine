@@ -59,7 +59,7 @@ impl EndOfDayClosePipe {
 
         let (hour, minute) = if let Some((hour, minute)) = trimmed.split_once(':') {
             (hour.trim(), minute.trim())
-        } else if trimmed.len() == 4 {
+        } else if trimmed.len() == 4 && trimmed.is_ascii() {
             (&trimmed[0..2], &trimmed[2..4])
         } else {
             return None;
@@ -108,6 +108,9 @@ impl InsightPipe for EndOfDayClosePipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
+        if insight.has_pending_close() {
+            return InsightPipeResult::from_exit_mutation(insight.close(ctx), self.name());
+        }
         if insight.state() != &InsightState::Filled {
             return InsightPipeResult::new(true, true, None, self.name().to_string());
         }
@@ -133,16 +136,7 @@ impl InsightPipe for EndOfDayClosePipe {
             return InsightPipeResult::new(true, true, None, self.name().to_string());
         }
 
-        insight.close(ctx);
-        InsightPipeResult::new(
-            false,
-            true,
-            Some(format!(
-                "Closing {} before configured end of day {} UTC",
-                insight.symbol, self.end_of_day_time_utc
-            )),
-            self.name().to_string(),
-        )
+        InsightPipeResult::from_exit_mutation(insight.close(ctx), self.name())
     }
 }
 
@@ -230,9 +224,11 @@ mod tests {
                 min_order_size: Some(0.001),
                 quantity_base: Some(3),
                 max_order_size: None,
+                max_total_size: None,
                 min_price_increment: Some(0.01),
                 price_base: Some(2),
                 contract_size: None,
+                trading_calendar: None,
                 fees: Default::default(),
             };
 
@@ -243,6 +239,7 @@ mod tests {
                 variables: DashMap::new(),
                 account: Account {
                     account_id: "paper".to_string(),
+                    max_total_orders: None,
                     account_type: AccountType::Paper,
                     equity: 10_000.0,
                     cash: 10_000.0,
@@ -260,6 +257,32 @@ mod tests {
     }
 
     impl StrategyContext for MockContext {
+        fn enqueue_broker_command(
+            &mut self,
+            insight_id: uuid::Uuid,
+            action: crate::core::broker::commands::BrokerCommandAction,
+            group: Option<crate::core::broker::commands::BrokerOperationGroup>,
+        ) -> Result<
+            crate::core::broker::commands::BrokerCommandReceipt,
+            crate::core::broker::commands::BrokerCommandError,
+        > {
+            let crate::core::broker::commands::BrokerCommandAction::Close {
+                order_id,
+                quantity,
+                price,
+            } = action
+            else {
+                panic!("Expected an end-of-day close request");
+            };
+            self.closed_positions
+                .borrow_mut()
+                .push((order_id, quantity, price));
+            Ok(crate::core::broker::commands::BrokerCommandReceipt {
+                id: crate::core::broker::commands::BrokerCommandId("end-of-day-close".into()),
+                insight_id: insight_id.to_string(),
+                group,
+            })
+        }
         fn universe(&self) -> &HashMap<String, Asset> {
             &self.universe
         }
@@ -279,8 +302,6 @@ mod tests {
         fn add_insight(&mut self, insight: Insight) {
             self.insights.add_insight(insight);
         }
-
-        fn submit_insight(&mut self, _insight: &mut Insight) {}
 
         fn register_indicator(&mut self, _indicator: Box<dyn Indicator>) {}
 
@@ -355,40 +376,6 @@ mod tests {
             })
         }
 
-        fn cancel_order(&self, _order_id: &str) -> Result<bool, BrokerError> {
-            Ok(true)
-        }
-
-        fn update_order(
-            &self,
-            _order_id: &str,
-            _price: f64,
-            _qty: f64,
-        ) -> Result<bool, BrokerError> {
-            Ok(true)
-        }
-
-        fn update_stop_loss_order(
-            &self,
-            _order_id: &str,
-            _price: f64,
-            _qty: f64,
-        ) -> Result<bool, BrokerError> {
-            Ok(true)
-        }
-
-        fn close_position(
-            &self,
-            order_id: &str,
-            qty: f64,
-            price: Option<f64>,
-        ) -> Result<bool, BrokerError> {
-            self.closed_positions
-                .borrow_mut()
-                .push((order_id.to_string(), qty, price));
-            Ok(true)
-        }
-
         fn shutdown(&mut self) {}
     }
 
@@ -435,6 +422,10 @@ mod tests {
 
         assert!(!result.passed);
         assert!(result.success);
+        assert!(
+            result.deferred.is_some(),
+            "Queue admission is not broker completion"
+        );
         assert!(insight.closing);
         assert_eq!(
             ctx.closed_positions.borrow().as_slice(),

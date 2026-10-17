@@ -1,10 +1,10 @@
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
-use crate::core::pipeline::quantity_sizing::{
-    AssetQuantityLimits, apply_max_order_size_with_child_legs, entry_price,
-    round_whole_or_fractional_quantity, split_summary,
-};
 use crate::core::strategy::StrategyContext;
+use crate::core::utils::quantity_sizing::{
+    AssetQuantityLimits, apply_max_order_size_with_child_legs, contract_multiplier, entry_price,
+    round_whole_or_fractional_quantity, split_summary, validate_stop_for_side,
+};
 
 use super::InsightPipe;
 
@@ -18,8 +18,8 @@ use super::InsightPipe;
 /// Behaviour:
 /// Requires an entry price, stop loss, asset definition, and account snapshot. It uses effective
 /// buying power, including leverage only when the broker has not already included it and the asset
-/// is marginable. The pipe divides available capital by entry price, rounds with strategy tools
-/// according to whole/fractional asset rules, sets the parent insight quantity, and creates child
+/// is marginable. The pipe divides available capital by the entry price and contract multiplier,
+/// rounds down according to whole/fractional asset rules, sets the parent quantity, and creates child
 /// insights when the target size exceeds the asset maximum single-entry quantity.
 pub struct FullAccountQuantityToRiskPipe;
 
@@ -36,7 +36,7 @@ impl InsightPipe for FullAccountQuantityToRiskPipe {
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
         let entry = match entry_price(ctx, insight) {
-            Ok(value) if value > 0.0 => value,
+            Ok(value) if value.is_finite() && value > 0.0 => value,
             Ok(_) => {
                 return InsightPipeResult::new(
                     false,
@@ -45,14 +45,7 @@ impl InsightPipe for FullAccountQuantityToRiskPipe {
                     self.name().to_string(),
                 );
             }
-            Err(_) => {
-                return InsightPipeResult::new(
-                    false,
-                    false,
-                    Some("Insight does not have an entry price set.".to_string()),
-                    self.name().to_string(),
-                );
-            }
+            Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
         };
         if insight.stop_loss().is_none() {
             return InsightPipeResult::new(
@@ -61,6 +54,9 @@ impl InsightPipe for FullAccountQuantityToRiskPipe {
                 Some("Insight does not have stop loss set.".to_string()),
                 self.name().to_string(),
             );
+        }
+        if let Err(message) = validate_stop_for_side(insight, entry, insight.stop_loss().unwrap()) {
+            return InsightPipeResult::new(false, false, Some(message), self.name().into());
         }
 
         let Some(asset) = self.get_asset(ctx, &insight.symbol) else {
@@ -73,17 +69,13 @@ impl InsightPipe for FullAccountQuantityToRiskPipe {
         };
         let limits = AssetQuantityLimits::from_asset(asset);
         let fractional = asset.fractional;
-        let Ok(account) = ctx.account() else {
-            return InsightPipeResult::new(
-                false,
-                false,
-                Some("Failed to load account".to_string()),
-                self.name().to_string(),
-            );
+        let account = match ctx.account() {
+            Ok(account) => account,
+            Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
         };
 
         let capital = ctx.effective_buying_power(&account, asset);
-        if capital <= 0.0 {
+        if !capital.is_finite() || capital <= 0.0 {
             return InsightPipeResult::new(
                 false,
                 false,
@@ -95,7 +87,7 @@ impl InsightPipe for FullAccountQuantityToRiskPipe {
         let target_quantity = match round_whole_or_fractional_quantity(
             ctx,
             &insight.symbol,
-            capital / entry,
+            capital / (entry * contract_multiplier(asset)),
             fractional,
         ) {
             Ok(quantity) => quantity,

@@ -34,21 +34,27 @@ impl InsightPipe for MinimumRiskToRewardPipe {
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
         if let Some(minimum_rr) = self.minimum_rr {
+            if !minimum_rr.is_finite() || minimum_rr <= 0.0 {
+                return InsightPipeResult::new(
+                    false,
+                    false,
+                    Some("Minimum reward risk ratio must be finite and positive".into()),
+                    self.name().into(),
+                );
+            }
             ctx.set_min_reward_risk_ratio(minimum_rr);
         }
 
-        let entry = if let Some(entry) = insight.limit_price.or(insight.stop_price) {
-            entry
-        } else if let Ok(quote) = self.get_latest_quote(ctx, &insight.symbol) {
-            match insight.side {
-                crate::core::broker::types::OrderSide::Buy => quote.ask,
-                crate::core::broker::types::OrderSide::Sell => quote.bid,
-            }
-        } else {
-            0.0
+        let entry = match crate::core::utils::quantity_sizing::entry_price(ctx, insight) {
+            Ok(entry) => entry,
+            Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
         };
 
-        if entry <= 0.0 || insight.stop_loss().is_none() || insight.take_profit_levels().is_none() {
+        if !entry.is_finite()
+            || entry <= 0.0
+            || insight.stop_loss().is_none()
+            || insight.take_profit_levels().is_none()
+        {
             return InsightPipeResult::new(
                 false,
                 false,
@@ -60,7 +66,7 @@ impl InsightPipe for MinimumRiskToRewardPipe {
         }
 
         let minimum_rr = ctx.min_reward_risk_ratio();
-        if minimum_rr <= 0.0 {
+        if !minimum_rr.is_finite() || minimum_rr <= 0.0 {
             return InsightPipeResult::new(
                 false,
                 false,
@@ -70,6 +76,29 @@ impl InsightPipe for MinimumRiskToRewardPipe {
         }
 
         let stop_loss = insight.stop_loss().unwrap_or(entry);
+        if let Err(message) =
+            crate::core::utils::quantity_sizing::validate_stop_for_side(insight, entry, stop_loss)
+        {
+            return InsightPipeResult::new(false, false, Some(message), self.name().into());
+        }
+        if insight.take_profit_levels.as_ref().is_none_or(|levels| {
+            levels.is_empty()
+                || levels.iter().any(|level| {
+                    !level.is_finite()
+                        || *level <= 0.0
+                        || match insight.side {
+                            crate::core::broker::types::OrderSide::Buy => *level <= entry,
+                            crate::core::broker::types::OrderSide::Sell => *level >= entry,
+                        }
+                })
+        }) {
+            return InsightPipeResult::new(
+                false,
+                false,
+                Some("Take profit is invalid for the insight side".into()),
+                self.name().into(),
+            );
+        }
         let take_profit = insight
             .take_profit_levels
             .clone()

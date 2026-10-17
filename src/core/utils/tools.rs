@@ -1,11 +1,106 @@
+use super::quantity_sizing::{self, AssetQuantityLimits};
 use crate::core::broker::UnifiedBroker;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
 use crate::core::broker::types::{Asset, BrokerError, OrderSide, Position};
 use crate::core::insight::types::InsightState;
 use crate::core::insight::{Insight, InsightCollection};
+use crate::core::strategy::StrategyContext;
 use std::collections::HashMap;
 
 pub trait TradingTools {
+    /// Optional context for capacity-aware helpers. Custom tools can opt in.
+    fn sizing_context(&self) -> Result<&dyn StrategyContext, String> {
+        Err("Quantity sizing context is unavailable".into())
+    }
+
+    /// Round down to asset precision without exceeding the requested quantity.
+    fn floor_quantity(&self, quantity: f64, asset: &Asset) -> f64 {
+        quantity_sizing::floor_quantity(quantity, AssetQuantityLimits::from_asset(asset))
+    }
+
+    /// Plan broker-sized parts without allocating or submitting child insights.
+    fn plan_quantity_parts(
+        &self,
+        quantity: f64,
+        asset: &Asset,
+        max_parts: Option<usize>,
+    ) -> Result<Vec<f64>, String> {
+        quantity_sizing::plan_quantity_parts(
+            quantity,
+            AssetQuantityLimits::from_asset(asset),
+            max_parts,
+        )
+    }
+
+    fn available_asset_quantity(&self, insight: &Insight) -> Result<f64, String> {
+        let ctx = self.sizing_context()?;
+        let asset = ctx
+            .universe()
+            .get(insight.symbol())
+            .ok_or("Asset is not loaded")?;
+        quantity_sizing::available_asset_quantity(ctx, insight, asset.max_total_size)
+    }
+
+    /// Active and queued quantities, deduplicated across nested child insights.
+    fn total_insight_quantity_size(
+        &self,
+        symbol: &str,
+    ) -> Result<crate::core::insight::InsightQuantitySize<'_>, String> {
+        Ok(self
+            .sizing_context()?
+            .insights()
+            .total_insight_quantity_size(symbol))
+    }
+
+    fn available_pending_orders(&self, insight: &Insight) -> Result<Option<usize>, String> {
+        quantity_sizing::available_pending_orders(self.sizing_context()?, insight)
+    }
+
+    /// Reserve existing insights and cap this proposed stack proportionally.
+    /// Does not submit orders or reserve capacity across separate strategies.
+    fn cap_quantity_levels(
+        &self,
+        insight: &mut Insight,
+        quantities: &mut [f64],
+    ) -> Result<f64, String> {
+        let ctx = self.sizing_context()?;
+        let asset = ctx
+            .universe()
+            .get(insight.symbol())
+            .ok_or("Asset is not loaded")?;
+        quantity_sizing::cap_quantity_levels(
+            ctx,
+            insight,
+            quantities,
+            AssetQuantityLimits::from_asset(asset),
+        )
+    }
+
+    fn cap_asset_total_quantity(&self, insight: &mut Insight, desired: f64) -> Result<f64, String> {
+        let ctx = self.sizing_context()?;
+        let asset = ctx
+            .universe()
+            .get(insight.symbol())
+            .ok_or("Asset is not loaded")?;
+        quantity_sizing::cap_asset_total_quantity(
+            ctx,
+            insight,
+            desired,
+            AssetQuantityLimits::from_asset(asset),
+        )
+    }
+
+    fn validate_pending_tree_limits(&self, insight: &Insight) -> Result<(), String> {
+        quantity_sizing::validate_pending_tree_limits(self.sizing_context()?, insight)
+    }
+
+    fn entry_price(&self, insight: &Insight) -> Result<f64, BrokerError> {
+        quantity_sizing::entry_price(
+            self.sizing_context().map_err(BrokerError::DataFeedError)?,
+            insight,
+        )
+    }
+
     fn dynamic_round(&self, value: f64, symbol: &str) -> f64;
     fn quantity_round(&self, value: f64, symbol: &str) -> f64;
     fn calculate_time_to_live(&self, price: f64, entry: f64, atr: f64, additional: i32) -> i32;
@@ -22,6 +117,7 @@ where
     universe: &'a HashMap<String, Asset>,
     insights: &'a InsightCollection,
     broker: &'a UnifiedBroker<E, D>,
+    context: Option<&'a dyn StrategyContext>,
 }
 
 impl<'a, E, D> StrategyTools<'a, E, D>
@@ -38,7 +134,13 @@ where
             universe,
             insights,
             broker,
+            context: None,
         }
+    }
+
+    pub fn with_context(mut self, context: &'a dyn StrategyContext) -> Self {
+        self.context = Some(context);
+        self
     }
 }
 
@@ -103,6 +205,11 @@ where
     E: Broker + OrderManagementProvider,
     D: DataFeed + DataProvider,
 {
+    fn sizing_context(&self) -> Result<&dyn StrategyContext, String> {
+        self.context
+            .ok_or_else(|| "Quantity sizing context is unavailable".into())
+    }
+
     fn dynamic_round(&self, value: f64, symbol: &str) -> f64 {
         self.universe
             .get(symbol)
@@ -122,12 +229,16 @@ where
     }
 
     fn get_unrealized_pnl(&self, symbol: &str) -> Result<f64, BrokerError> {
-        let position = self.broker.get_position_sync(symbol)?;
-        Ok(unrealized_pnl_for_position(&position))
+        let positions = self.broker.positions_snapshot()?;
+        Ok(positions
+            .iter()
+            .filter(|position| position.asset.symbol == symbol)
+            .map(unrealized_pnl_for_position)
+            .sum())
     }
 
     fn get_all_unrealized_pnl(&self) -> Result<f64, BrokerError> {
-        let positions = self.broker.get_positions_sync()?;
+        let positions = self.broker.positions_snapshot()?;
         Ok(aggregate_unrealized_pnl(&positions))
     }
 
@@ -156,9 +267,11 @@ mod tests {
             min_order_size: Some(0.001),
             quantity_base: Some(3),
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(0.01),
             price_base: Some(2),
             contract_size: None,
+            trading_calendar: None,
             fees: Default::default(),
         }
     }

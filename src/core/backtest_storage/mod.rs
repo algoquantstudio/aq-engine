@@ -49,6 +49,9 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             strategy_type TEXT,
             commission REAL NOT NULL DEFAULT 0.0,
             swap REAL NOT NULL DEFAULT 0.0,
+            execution_cash_json TEXT,
+            account_notional REAL,
+            valuation_basis TEXT,
             trade_type TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS trade_log_rows (
@@ -139,6 +142,7 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
             closing INTEGER NOT NULL DEFAULT 0,
             first_on_fill INTEGER NOT NULL DEFAULT 0,
             partial_filled_quantity REAL,
+            entry_filled_quantity REAL,
             state_history_json TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS bars (
@@ -277,6 +281,40 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .await
     .map_err(to_storage_err)?;
+    // Saving into an existing artifact is additive; historical readers use a
+    // NULL fallback when this column predates cumulative entry-fill tracking.
+    let mut columns = conn
+        .query("PRAGMA table_info(insights)", ())
+        .await
+        .map_err(to_storage_err)?;
+    let mut has_entry_quantity = false;
+    while let Some(column) = columns.next().await.map_err(to_storage_err)? {
+        if column.get::<String>(1).map_err(to_storage_err)? == "entry_filled_quantity" {
+            has_entry_quantity = true;
+            break;
+        }
+    }
+    drop(columns);
+    if !has_entry_quantity {
+        conn.execute(
+            "ALTER TABLE insights ADD COLUMN entry_filled_quantity REAL",
+            (),
+        )
+        .await
+        .map_err(to_storage_err)?;
+    }
+    let mut columns = conn.query("PRAGMA table_info(trade_log)", ()).await.map_err(to_storage_err)?;
+    let mut existing = std::collections::HashSet::new();
+    while let Some(column) = columns.next().await.map_err(to_storage_err)? {
+        existing.insert(column.get::<String>(1).map_err(to_storage_err)?);
+    }
+    drop(columns);
+    // NULL is intentional: an old execution is not evidence of zero cash/cost.
+    for (name, kind) in [("execution_cash_json", "TEXT"), ("account_notional", "REAL"), ("valuation_basis", "TEXT")] {
+        if !existing.contains(name) {
+            conn.execute(format!("ALTER TABLE trade_log ADD COLUMN {name} {kind}"), ()).await.map_err(to_storage_err)?;
+        }
+    }
     Ok(())
 }
 
@@ -383,9 +421,21 @@ async fn flush_insert_batch(
 }
 
 async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Result<(), String> {
-    const COLUMNS: usize = 11;
+    const COLUMNS: usize = 14;
+    const INSERT: &str = "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type, execution_cash_json, account_notional, valuation_basis) VALUES";
     let mut rows = Vec::with_capacity(MAX_BATCH_PARAMETERS / COLUMNS);
     for record in trade_log {
+        if let Some(cash) = &record.execution_cash {
+            cash.validate().map_err(to_storage_err)?;
+            if record.valuation_basis.as_ref().is_none_or(|v| v.trim().is_empty() || v.len()>128 || v.chars().any(char::is_control)) {
+                return Err("Execution cash requires a declared valuation basis".into());
+            }
+        } else if record.account_notional.is_some() {
+            return Err("Execution notional requires declared cash currency".into());
+        }
+        if record.account_notional.is_some_and(|n| !n.is_finite() || n<0.) {
+            return Err("Invalid executed-side account notional".into());
+        }
         rows.push(vec![
             Value::Text(record.date.to_rfc3339()),
             Value::Text(record.symbol.clone()),
@@ -406,11 +456,14 @@ async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Re
             Value::Real(record.commission),
             Value::Real(record.swap),
             Value::Text(format!("{:?}", record.trade_type)),
+            record.execution_cash.as_ref().map(serde_json::to_string).transpose().map_err(to_storage_err)?.map(Value::Text).unwrap_or(Value::Null),
+            record.account_notional.map(Value::Real).unwrap_or(Value::Null),
+            record.valuation_basis.clone().map(Value::Text).unwrap_or(Value::Null),
         ]);
         if rows.len() >= MAX_BATCH_PARAMETERS / COLUMNS {
             flush_insert_batch(
                 tx,
-                "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type) VALUES",
+                INSERT,
                 COLUMNS,
                 &mut rows,
             )
@@ -419,7 +472,7 @@ async fn insert_trade_log(tx: &Transaction<'_>, trade_log: &[TradeRecord]) -> Re
     }
     flush_insert_batch(
         tx,
-        "INSERT INTO trade_log (event_at, symbol, side, qty, price, order_id, insight_id, strategy_type, commission, swap, trade_type) VALUES",
+        INSERT,
         COLUMNS,
         &mut rows,
     )
@@ -749,8 +802,8 @@ async fn insert_account_history(
 async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> Result<(), String> {
     let mut stmt = tx
         .prepare(
-            "INSERT OR REPLACE INTO insights (insight_id, parent_id, is_split_insight, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+            "INSERT OR REPLACE INTO insights (insight_id, parent_id, is_split_insight, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json, entry_filled_quantity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
         )
         .await
         .map_err(to_storage_err)?;
@@ -800,7 +853,8 @@ async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> 
             if insight.closing { 1_i64 } else { 0_i64 },
             if insight.first_on_fill { 1_i64 } else { 0_i64 },
             insight.partial_filled_quantity,
-            serde_json::to_string(&insight.state_history).map_err(to_storage_err)?
+            serde_json::to_string(&insight.state_history).map_err(to_storage_err)?,
+            insight.entry_filled_quantity,
         ])
         .await
         .map_err(to_storage_err)?;
@@ -2832,403 +2886,5 @@ pub async fn write_backtest_db(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::broker::types::{AccountType, OrderSide, TradeRecordType};
-    use crate::core::insight::snapshot::InsightLegsSnapshot;
-    use chrono::TimeZone;
-
-    fn test_account(equity: f64) -> Account {
-        Account {
-            account_id: "test".to_string(),
-            account_type: AccountType::Paper,
-            equity,
-            cash: equity,
-            currency: "USD".to_string(),
-            buying_power: equity,
-            accrued_commission: 0.0,
-            shorting_enabled: true,
-            leverage: 1,
-        }
-    }
-
-    fn test_snapshot(
-        insight_id: &str,
-        parent_id: Option<&str>,
-        strategy_type: &str,
-    ) -> InsightSnapshot {
-        let timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        InsightSnapshot {
-            insight_id: insight_id.to_string(),
-            parent_id: parent_id.map(str::to_string),
-            is_split_insight: false,
-            state: "Closed".to_string(),
-            children: Vec::new(),
-            order_id: Some("order-1".to_string()),
-            side: "Buy".to_string(),
-            symbol: "AAPL".to_string(),
-            quantity: Some(1.0),
-            contracts: None,
-            order_type: "Market".to_string(),
-            order_class: "Simple".to_string(),
-            limit_price: None,
-            stop_price: None,
-            take_profit_levels: None,
-            stop_loss_levels: None,
-            trailing_stop_price: None,
-            strategy_type: strategy_type.to_string(),
-            confidence: 100,
-            timeframe: serde_json::json!({ "amount": 1, "unit": "Day" }),
-            period_unfilled: None,
-            period_till_tp: None,
-            execution_depends: Vec::new(),
-            filled_price: Some(100.0),
-            close_order_id: None,
-            close_price: Some(110.0),
-            broker_realized_pnl: None,
-            commission: None,
-            swap: None,
-            partial_closes: Vec::new(),
-            created_at: timestamp,
-            updated_at: timestamp,
-            filled_at: Some(timestamp),
-            closed_at: Some(timestamp),
-            legs: InsightLegsSnapshot {
-                take_profit: None,
-                stop_loss: None,
-                trailing_stop: None,
-            },
-            market_changed: false,
-            submitted: true,
-            cancelling: false,
-            closing: false,
-            first_on_fill: false,
-            partial_filled_quantity: None,
-            state_history: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn brands_backtest_database_as_an_aqe_artifact() {
-        let dir = std::env::temp_dir().join(format!(
-            "aqe-backtest-application-id-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let connection = connect_database(&dir).await.unwrap();
-        init_schema(&connection).await.unwrap();
-        checkpoint_database(&connection).await.unwrap();
-
-        let mut application_id = connection.query("PRAGMA application_id", ()).await.unwrap();
-        assert_eq!(
-            application_id
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .get::<i64>(0)
-                .unwrap(),
-            i64::from(BACKTEST_DB_APPLICATION_ID)
-        );
-        let mut user_version = connection.query("PRAGMA user_version", ()).await.unwrap();
-        assert_eq!(
-            user_version
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .get::<i64>(0)
-                .unwrap(),
-            i64::from(BACKTEST_DB_USER_VERSION)
-        );
-        drop(connection);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn old_trade_log_rows_default_parent_child_fields() {
-        let row: BacktestTradeLogRow = serde_json::from_value(serde_json::json!({
-            "id": 1,
-            "symbol": "AAPL",
-            "side": "BUY",
-            "strategyType": "MeanReversion",
-            "insightId": "insight-1",
-            "entryTime": "2026-01-01 00:00:00",
-            "exitTime": null,
-            "qty": 1.0,
-            "entryPrice": 100.0,
-            "exitPrice": null,
-            "returnPct": null,
-            "pnl": null,
-            "status": "OPEN"
-        }))
-        .unwrap();
-
-        assert_eq!(row.parent_id, None);
-        assert!(!row.is_child);
-        assert_eq!(row.base_strategy_type, None);
-    }
-
-    #[test]
-    fn child_trade_log_rows_include_parent_and_base_strategy_type() {
-        let entry_time = Utc.with_ymd_and_hms(2026, 1, 1, 9, 30, 0).unwrap();
-        let exit_time = Utc.with_ymd_and_hms(2026, 1, 1, 10, 30, 0).unwrap();
-        let trades = vec![
-            TradeRecord {
-                date: entry_time,
-                symbol: "AAPL".to_string(),
-                side: OrderSide::Buy,
-                qty: 1.0,
-                price: 100.0,
-                order_id: "order-1".to_string(),
-                insight_id: Some("child-1".to_string()),
-                strategy_type: Some("MeanReversion-CHILD".to_string()),
-                commission: 0.0,
-                swap: 0.0,
-                trade_type: TradeRecordType::Entry,
-            },
-            TradeRecord {
-                date: exit_time,
-                symbol: "AAPL".to_string(),
-                side: OrderSide::Buy,
-                qty: 1.0,
-                price: 110.0,
-                order_id: "order-1".to_string(),
-                insight_id: Some("child-1".to_string()),
-                strategy_type: Some("MeanReversion-CHILD".to_string()),
-                commission: 0.0,
-                swap: 0.0,
-                trade_type: TradeRecordType::Exit,
-            },
-        ];
-        let insights = vec![test_snapshot(
-            "child-1",
-            Some("parent-1"),
-            "MeanReversion-CHILD",
-        )];
-
-        let rows = build_trade_log_rows(&trades, &insights);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].parent_id.as_deref(), Some("parent-1"));
-        assert!(rows[0].is_child);
-        assert_eq!(rows[0].base_strategy_type.as_deref(), Some("MeanReversion"));
-    }
-
-    #[tokio::test]
-    async fn feature_stream_bars_persist_history_key_metadata() {
-        use crate::core::broker::types::Bar;
-        use crate::core::events::{EventStreamType, ResolvedEventStream};
-        use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
-
-        let dir = std::env::temp_dir().join(format!("aqe-backtest-bars-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut state = BacktestState::new();
-        let timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 9, 30, 0).unwrap();
-        let main_timeframe = TimeFrame::new(5, TimeFrameUnit::Minute);
-        let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
-        let stream = ResolvedEventStream::new(
-            EventStreamType::Bar,
-            "AAPL",
-            feature_timeframe,
-            main_timeframe,
-            false,
-        );
-        state.load_event_stream_bars(
-            stream,
-            vec![Bar {
-                symbol: "AAPL".to_string(),
-                open: 100.0,
-                high: 101.0,
-                low: 99.0,
-                close: 100.5,
-                volume: 1_000.0,
-                timestamp,
-            }],
-        );
-
-        let mut conn = connect_database(&dir).await.unwrap();
-        init_schema(&conn).await.unwrap();
-        let tx = conn.transaction().await.unwrap();
-        insert_bars(&tx, &state).await.unwrap();
-        tx.commit().await.unwrap();
-
-        let mut rows = conn
-            .query(
-                "SELECT symbol, history_key, timeframe_label, is_feature, allow_trading, open, high, low, close, volume, event_at FROM bars",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let symbol: String = row.get(0).unwrap();
-        let history_key: String = row.get(1).unwrap();
-        let timeframe_label: String = row.get(2).unwrap();
-        let is_feature: i64 = row.get(3).unwrap();
-        let allow_trading: i64 = row.get(4).unwrap();
-        let open: f64 = row.get(5).unwrap();
-        let high: f64 = row.get(6).unwrap();
-        let low: f64 = row.get(7).unwrap();
-        let close: f64 = row.get(8).unwrap();
-        let volume: f64 = row.get(9).unwrap();
-        let event_at: String = row.get(10).unwrap();
-
-        assert_eq!(symbol, "AAPL");
-        assert_eq!(history_key, "AAPL:15m");
-        assert_eq!(timeframe_label, "15m");
-        assert_eq!(is_feature, 1);
-        assert_eq!(allow_trading, 0);
-        assert_eq!(open, 100.0);
-        assert_eq!(high, 101.0);
-        assert_eq!(low, 99.0);
-        assert_eq!(close, 100.5);
-        assert_eq!(volume, 1_000.0);
-        assert_eq!(event_at, timestamp.to_rfc3339());
-
-        drop(rows);
-        drop(conn);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn account_history_batches_rows_and_rebuilds_indexes() {
-        let dir = std::env::temp_dir().join(format!(
-            "aqe-backtest-batched-account-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let history = (0..250)
-            .map(|offset| {
-                (
-                    start + chrono::Duration::minutes(offset),
-                    test_account(10_000.0 + offset as f64),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let mut conn = connect_database(&dir).await.unwrap();
-        init_schema(&conn).await.unwrap();
-        let tx = conn.transaction().await.unwrap();
-        drop_secondary_indexes(&tx).await.unwrap();
-        insert_account_history(&tx, &history).await.unwrap();
-        create_secondary_indexes(&tx).await.unwrap();
-        tx.commit().await.unwrap();
-
-        let mut count_rows = conn
-            .query("SELECT COUNT(*) FROM account_history", ())
-            .await
-            .unwrap();
-        let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 250);
-
-        let mut index_rows = conn
-            .query(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_account_history_event_at'",
-                (),
-            )
-            .await
-            .unwrap();
-        let index_count: i64 = index_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(index_count, 1);
-
-        drop(count_rows);
-        drop(index_rows);
-        drop(conn);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn regime_lookup_uses_latest_point_at_or_before_entry() {
-        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let points = (0..4)
-            .map(|offset| RegimePoint {
-                timestamp: start + chrono::Duration::hours(offset * 2),
-                vol_regime: format!("vol-{offset}"),
-                trend_regime: format!("trend-{offset}"),
-                market_return_pct: offset as f64,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            regime_at_entry(&points, start - chrono::Duration::hours(1))
-                .unwrap()
-                .vol_regime,
-            "vol-0"
-        );
-        assert_eq!(
-            regime_at_entry(&points, start + chrono::Duration::hours(5))
-                .unwrap()
-                .vol_regime,
-            "vol-2"
-        );
-        assert_eq!(
-            regime_at_entry(&points, start + chrono::Duration::hours(20))
-                .unwrap()
-                .vol_regime,
-            "vol-3"
-        );
-    }
-
-    #[test]
-    fn drawdown_series_contains_portfolio_and_realized_strategy_rows() {
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let t1 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
-        let t2 = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
-        let account_history = vec![
-            (t0, test_account(10_000.0)),
-            (t1, test_account(9_500.0)),
-            (t2, test_account(10_250.0)),
-        ];
-        let trips = vec![
-            RoundTripTrade {
-                order_id: "alpha-1".to_string(),
-                symbol: "AAPL".to_string(),
-                side: OrderSide::Buy,
-                insight_id: Some("alpha-insight".to_string()),
-                strategy_type: Some("Alpha".to_string()),
-                entry_time: t0,
-                exit_time: t1,
-                entry_price: 100.0,
-                exit_price: 95.0,
-                qty: 1.0,
-                pnl: -5.0,
-                commission: 0.0,
-                swap: 0.0,
-                return_pct: -5.0,
-                hold_secs: 86_400,
-            },
-            RoundTripTrade {
-                order_id: "beta-1".to_string(),
-                symbol: "MSFT".to_string(),
-                side: OrderSide::Buy,
-                insight_id: Some("beta-insight".to_string()),
-                strategy_type: Some("Beta-CHILD".to_string()),
-                entry_time: t0,
-                exit_time: t2,
-                entry_price: 100.0,
-                exit_price: 105.0,
-                qty: 1.0,
-                pnl: 5.0,
-                commission: 0.0,
-                swap: 0.0,
-                return_pct: 5.0,
-                hold_secs: 172_800,
-            },
-        ];
-
-        let rows = build_drawdown_series(&account_history, &trips);
-        let names = rows
-            .iter()
-            .map(|row| row.strategy_name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert!(names.contains("Portfolio Equity"));
-        assert!(names.contains("Alpha"));
-        assert!(names.contains("Beta"));
-        assert!(
-            rows.iter()
-                .any(|row| row.series_type == "strategy_realized")
-        );
-    }
-}
+#[path = "tests.rs"]
+mod tests;

@@ -1,11 +1,12 @@
 use super::BrokerFeature;
 use super::backtest_state::{BacktestResults, BacktestState};
+use super::commands::BrokerOrderRequest;
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
-    Account, AccountType, Asset, AssetFees, Bar, BrokerError, Order, OrderClass, OrderLeg,
-    OrderLegs, OrderSide, OrderType, Position, TradeRecord, TradeRecordType, TradeUpdateEvent,
+    Account, AccountType, Asset, AssetFees, Bar, BrokerError, BrokerLifecycleSnapshot, Order,
+    OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, Position, TradeRecord, TradeRecordType,
+    TradeUpdateEvent,
 };
-use crate::core::insight::Insight;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use log::debug;
@@ -13,6 +14,8 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
+
+mod valuation;
 
 fn is_terminal_leg_status(status: &TradeUpdateEvent) -> bool {
     matches!(
@@ -54,6 +57,7 @@ struct ClosePositionResult {
 ///
 /// Position tracking uses `DashMap<symbol, DashMap<order_id, Position>>` to support
 /// DCA and per-order position management (mirrors Python `Positions[symbol][orderId]`).
+#[derive(Clone)]
 pub struct PaperBroker {
     name: String,
     account_type: AccountType,
@@ -88,6 +92,11 @@ pub struct PaperBroker {
 
     // Time management for backtest
     current_time: Arc<RwLock<DateTime<Utc>>>,
+    // A bounded analytics read cannot observe half a paper execution step.
+    // Readers use try_read; trading never waits for an analytics RPC or I/O.
+    valuation_gate: Arc<RwLock<()>>,
+    valuation_as_of_us: Arc<RwLock<Option<i64>>>,
+    valuation_mark_times: Arc<DashMap<String, i64>>,
 
     // Optional shared backtest state (set by UnifiedBroker)
     backtest_state: Option<Arc<RwLock<BacktestState>>>,
@@ -104,6 +113,7 @@ impl PaperBroker {
             asset_fees: AssetFees::default(),
             asset_metadata: Arc::new(DashMap::new()),
             account: Arc::new(RwLock::new(Account {
+                max_total_orders: None,
                 account_id: Uuid::new_v4().to_string(),
                 account_type: account_type.clone(),
                 equity: cash,
@@ -124,6 +134,9 @@ impl PaperBroker {
             trade_events: Arc::new(Mutex::new(VecDeque::new())),
             trade_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
             current_time: Arc::new(RwLock::new(Utc::now())),
+            valuation_gate: Arc::new(RwLock::new(())),
+            valuation_as_of_us: Arc::new(RwLock::new(None)),
+            valuation_mark_times: Arc::new(DashMap::new()),
             backtest_state: None,
         }
     }
@@ -156,6 +169,7 @@ impl PaperBroker {
     /// Process one bar step: pending orders → active orders → close orders → update account.
     /// Called by `UnifiedBroker::step()` with the current bars for each symbol.
     pub fn process_step(&self, bars: &HashMap<String, Bar>, current_time: DateTime<Utc>) {
+        let _valuation_step = self.valuation_gate.write();
         debug!(
             "PaperBroker::process_step enter bars={} current_time={}",
             bars.len(),
@@ -181,6 +195,7 @@ impl PaperBroker {
         // 4. Update account balance with current prices
         debug!("PaperBroker::process_step account_update phase");
         self.update_account_balance(bars);
+        *self.valuation_as_of_us.write() = Some(current_time.timestamp_micros());
         debug!("PaperBroker::process_step exit");
     }
 
@@ -194,6 +209,8 @@ impl PaperBroker {
             return 0;
         }
 
+        let _valuation_step = self.valuation_gate.write();
+
         debug!(
             "PaperBroker::process_close_queue_at enter bars={} current_time={} queued_requests={}",
             bars.len(),
@@ -203,6 +220,7 @@ impl PaperBroker {
         self.set_time(current_time);
         self.process_close_queue(bars, current_time, current_time.timestamp() as u64);
         self.update_account_balance(bars);
+        *self.valuation_as_of_us.write() = Some(current_time.timestamp_micros());
         debug!("PaperBroker::process_close_queue_at exit");
         queued_requests
     }
@@ -665,6 +683,14 @@ impl PaperBroker {
                         strategy_type: order.strategy_type.clone(),
                         commission: exit_commission,
                         swap,
+                        execution_cash: Some(aqe_live_protocol::ExecutionFillCash {
+                            currency: account.currency.clone(),
+                            gross_pnl: Some(gross_pnl),
+                            commission: Some(exit_commission),
+                            carry: Some(swap),
+                        }),
+                        account_notional: Some((close_price * requested_qty).abs()),
+                        valuation_basis: Some("paper_price_units".into()),
                         trade_type: TradeRecordType::Exit,
                     });
                 }
@@ -701,6 +727,7 @@ impl PaperBroker {
             drop(symbol_positions);
             if empty {
                 self.positions.remove(symbol);
+                self.valuation_mark_times.remove(symbol);
             }
             return Some(fully_closed);
         }
@@ -714,9 +741,17 @@ impl PaperBroker {
         let mut total_unrealized_pnl = 0.0;
         let mut total_margin_held = 0.0;
         let mut mae_updates = Vec::new();
+        let observed_at = *self.current_time.read();
 
         for entry in self.positions.iter() {
             let bar = bars.get(entry.key());
+            if let Some(bar) = bar {
+                if bar.close.is_finite() && bar.timestamp <= observed_at {
+                    self.valuation_mark_times.insert(entry.key().clone(), bar.timestamp.timestamp_micros());
+                } else {
+                    self.valuation_mark_times.remove(entry.key());
+                }
+            }
             for mut pos in entry.value().iter_mut() {
                 if let Some(bar) = bar {
                     pos.current_price = bar.close;
@@ -740,8 +775,10 @@ impl PaperBroker {
                         };
                         mae_updates.push((pos.key().clone(), mae_pct));
                     }
-                    total_unrealized_pnl += pos.unrealized_pnl;
                 }
+                // A sparse live update for one symbol must not drop the open
+                // P&L of every other symbol from account equity.
+                total_unrealized_pnl += pos.unrealized_pnl;
                 total_margin_held += pos.margin_required.unwrap_or(pos.cost_basis);
             }
         }
@@ -784,14 +821,16 @@ impl PaperBroker {
                         "PaperBroker::process_close_queue closing order_id={} symbol={} fill_price={:.4}",
                         order_id, order.asset.symbol, fill_price
                     );
-                    let close_result =
-                        self.close_position_for_order(&order, fill_price, qty, current_time);
-                    let fully_closed = close_result
-                        .map(|result| result.fully_closed)
-                        .unwrap_or(false);
-                    let close_qty = close_result
-                        .map(|result| result.qty)
-                        .unwrap_or_else(|| if qty <= 0.0 { order.filled_qty } else { qty });
+                    let Some(close_result) =
+                        self.close_position_for_order(&order, fill_price, qty, current_time)
+                    else {
+                        // A missing position is not evidence of a newly executed
+                        // exit. In particular, duplicated close requests must not
+                        // synthesize another partial/terminal fill.
+                        continue;
+                    };
+                    let fully_closed = close_result.fully_closed;
+                    let close_qty = close_result.qty;
                     debug!(
                         "PaperBroker::process_close_queue close_position_for_order returned fully_closed={} close_qty={:.4}",
                         fully_closed, close_qty
@@ -800,20 +839,18 @@ impl PaperBroker {
                     let mut terminal_close = fully_closed;
                     if let Some(mut o) = self.orders.get_mut(&order_id) {
                         o.updated_at = now_ts;
-                        o.filled_price = Some(fill_price);
-                        o.filled_qty = close_qty;
                         let remaining_qty = (o.qty - close_qty).max(0.0);
                         terminal_close = fully_closed || remaining_qty <= f64::EPSILON;
-                        if let Some(result) = close_result {
-                            let previous_realized = o.realized_pnl.unwrap_or(0.0);
-                            o.realized_pnl = Some(previous_realized + result.net_pnl);
-                            let previous_commission = o.commission.unwrap_or(0.0);
-                            o.commission = Some(previous_commission + result.exit_commission);
-                            let previous_swap = o.swap.unwrap_or(0.0);
-                            o.swap = Some(previous_swap + result.swap);
-                        }
+                        let previous_realized = o.realized_pnl.unwrap_or(0.0);
+                        o.realized_pnl = Some(previous_realized + close_result.net_pnl);
+                        let previous_commission = o.commission.unwrap_or(0.0);
+                        o.commission = Some(previous_commission + close_result.exit_commission);
+                        let previous_swap = o.swap.unwrap_or(0.0);
+                        o.swap = Some(previous_swap + close_result.swap);
 
                         if terminal_close {
+                            o.filled_price = Some(fill_price);
+                            o.filled_qty = close_qty;
                             o.qty = 0.0;
                             o.status = TradeUpdateEvent::Closed;
                             self.cancel_remaining_legs(&mut o);
@@ -825,12 +862,27 @@ impl PaperBroker {
                             self.mark_order_terminal_for_release(&order_id);
                         } else {
                             o.qty = remaining_qty;
-                            o.status = TradeUpdateEvent::PartialFilled;
+                            o.filled_qty = remaining_qty;
+                            o.status = TradeUpdateEvent::Filled;
+                            // The stored order still describes the open entry.
+                            // Emit a distinct opposite-side exit identity so a
+                            // partial close cannot be confused with a delayed
+                            // partial-entry snapshot, or counted twice on replay.
+                            let mut exit = o.clone();
+                            exit.order_id = Uuid::new_v4().to_string();
+                            exit.side = match o.side {
+                                OrderSide::Buy => OrderSide::Sell,
+                                OrderSide::Sell => OrderSide::Buy,
+                            };
+                            exit.qty = close_qty;
+                            exit.filled_qty = close_qty;
+                            exit.filled_price = Some(fill_price);
+                            exit.status = TradeUpdateEvent::PartialFilled;
                             debug!(
                                 "PaperBroker::process_close_queue emitting PartialFilled for order_id={} remaining_qty={:.4}",
                                 order_id, o.qty
                             );
-                            self.emit_trade_event(&o, TradeUpdateEvent::PartialFilled);
+                            self.emit_trade_event(&exit, TradeUpdateEvent::PartialFilled);
                         }
                     }
 
@@ -857,6 +909,8 @@ impl PaperBroker {
 
     fn record_entry_trade(&self, order: &Order, fill_price: f64, current_time: DateTime<Utc>) {
         if let Some(ref state) = self.backtest_state {
+            // Match the account-before-backtest lock order used by exit settlement.
+            let currency = self.account.read().currency.clone();
             state.write().record_trade(TradeRecord {
                 date: current_time,
                 symbol: order.asset.symbol.clone(),
@@ -868,6 +922,14 @@ impl PaperBroker {
                 strategy_type: order.strategy_type.clone(),
                 commission: order.commission.unwrap_or(0.0),
                 swap: 0.0,
+                execution_cash: Some(aqe_live_protocol::ExecutionFillCash {
+                    currency,
+                    gross_pnl: Some(0.0),
+                    commission: Some(order.commission.unwrap_or(0.0)),
+                    carry: Some(0.0),
+                }),
+                account_notional: Some((fill_price * order.filled_qty).abs()),
+                valuation_basis: Some("paper_price_units".into()),
                 trade_type: TradeRecordType::Entry,
             });
         }
@@ -1233,6 +1295,16 @@ impl PaperBroker {
 
 // ─────────────────────── Broker Trait ───────────────────────
 
+#[async_trait::async_trait]
+impl super::traits::OrderLifecycleReconciler for PaperBroker {
+    async fn reconcile(
+        &self,
+        order_ids: &[String],
+    ) -> Result<Vec<super::types::OrderLifecycleSnapshot>, BrokerError> {
+        <Self as OrderManagementProvider>::reconcile_order_lifecycle(self, order_ids).await
+    }
+}
+
 impl Broker for PaperBroker {
     async fn connect(&self) -> Result<bool, BrokerError> {
         let mut connected = self.connected.lock();
@@ -1271,7 +1343,13 @@ impl Broker for PaperBroker {
             BrokerFeature::OcoOrder,
             BrokerFeature::TrailingOrder,
             BrokerFeature::PartialClose,
+            BrokerFeature::AmendLimitPrice,
+            BrokerFeature::AmendStopPrice,
             BrokerFeature::BuyingPowerLeveraged,
+            BrokerFeature::TradeEventStream,
+            BrokerFeature::AccountStream,
+            BrokerFeature::OrderLifecycleSnapshot,
+            BrokerFeature::BrokerManagedOco,
         ]
     }
 
@@ -1279,18 +1357,47 @@ impl Broker for PaperBroker {
         self.register_asset_metadata(asset);
         Ok(())
     }
+
+    fn get_cached_lifecycle_snapshot(&self) -> Option<BrokerLifecycleSnapshot> {
+        let orders = self
+            .orders
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let positions = self
+            .positions
+            .iter()
+            .filter_map(|entry| self.get_aggregate_position(entry.key()))
+            .collect();
+        Some(BrokerLifecycleSnapshot {
+            orders,
+            positions,
+            terminal_history: Vec::new(),
+            snapshot_complete: true,
+            captured_at: self.get_current_time(),
+        })
+    }
 }
 
 // ─────────────────────── OrderManagementProvider Trait ───────────────────────
 
 impl OrderManagementProvider for PaperBroker {
+    fn position_valuation_reader(
+        &self,
+    ) -> Option<Arc<dyn super::position_valuation::PositionValuationReader>> {
+        Some(Arc::new(self.clone()))
+    }
+    fn lifecycle_reconciler(&self) -> Option<Arc<dyn super::traits::OrderLifecycleReconciler>> {
+        Some(Arc::new(self.clone()))
+    }
+
     fn process_live_bar(&self, bar: &Bar) {
         let mut bars = HashMap::new();
         bars.insert(bar.symbol.clone(), bar.clone());
         self.process_step(&bars, bar.timestamp);
     }
 
-    async fn submit_order(&self, insight: Insight) -> Result<Order, BrokerError> {
+    async fn submit_order(&self, insight: BrokerOrderRequest) -> Result<Order, BrokerError> {
         let qty = insight.quantity.ok_or_else(|| {
             BrokerError::OrderError(format!(
                 "Cannot submit order for {} without a quantity",
@@ -1304,7 +1411,7 @@ impl OrderManagementProvider for PaperBroker {
             )));
         }
 
-        let order_id = Uuid::new_v4().to_string();
+        let order_id = insight.client_order_id.clone();
         let now_ts = self.current_time_ts();
 
         let asset = self
@@ -1329,9 +1436,11 @@ impl OrderManagementProvider for PaperBroker {
                 min_order_size: None,
                 quantity_base: None,
                 max_order_size: None,
+                max_total_size: None,
                 min_price_increment: None,
                 price_base: None,
                 contract_size: None,
+                trading_calendar: None,
                 fees: self.asset_fees.clone(),
             });
 
@@ -1420,6 +1529,7 @@ impl OrderManagementProvider for PaperBroker {
             submitted_at: now_ts,
             filled_at: None,
             realized_pnl: None,
+            position_accounting: None,
             commission: None,
             swap: None,
             rejection_reason: None,
@@ -1437,14 +1547,31 @@ impl OrderManagementProvider for PaperBroker {
                 let mut rejected_order = order.clone();
                 rejected_order.status = TradeUpdateEvent::Rejected;
                 rejected_order.rejection_reason = Some(reason);
-                self.orders.insert(order_id.clone(), rejected_order.clone());
+                match self.orders.entry(order_id.clone()) {
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(rejected_order.clone());
+                    }
+                    dashmap::mapref::entry::Entry::Occupied(_) => {
+                        return Err(BrokerError::OrderError("Client order identity already exists; reconcile instead of resubmitting".into()));
+                    }
+                }
                 self.emit_trade_event(&rejected_order, TradeUpdateEvent::Rejected);
                 self.mark_order_terminal_for_release(&order_id);
                 return Ok(rejected_order);
             }
         }
 
-        self.orders.insert(order_id.clone(), order);
+        match self.orders.entry(order_id.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(order);
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(BrokerError::OrderError(
+                    "Client order identity already exists; reconcile instead of resubmitting"
+                        .into(),
+                ));
+            }
+        }
         self.pending_orders.lock().push_back(order_id.clone());
 
         let created_order =
@@ -1524,96 +1651,172 @@ impl OrderManagementProvider for PaperBroker {
         }
     }
 
-    async fn update_order(
+    async fn amend_entry_prices(
+        &self,
+        order_id: &str,
+        limit_price: Option<f64>,
+        stop_price: Option<f64>,
+    ) -> Result<bool, BrokerError> {
+        let mut order = self
+            .orders
+            .get_mut(order_id)
+            .ok_or_else(|| BrokerError::UnsupportedOperation("Pending entry not found".into()))?;
+        if order.filled_qty > 0.0
+            || !matches!(
+                order.status,
+                TradeUpdateEvent::New
+                    | TradeUpdateEvent::PendingNew
+                    | TradeUpdateEvent::Pending
+                    | TradeUpdateEvent::Accepted
+                    | TradeUpdateEvent::Replaced
+            )
+        {
+            return Err(BrokerError::UnsupportedOperation(
+                "Entry has filled or is no longer pending".into(),
+            ));
+        }
+        if (limit_price.is_none() && stop_price.is_none())
+            || limit_price
+                .into_iter()
+                .chain(stop_price)
+                .any(|p| !p.is_finite() || p <= 0.0)
+            || (limit_price.is_some()
+                && !matches!(order.order_type, OrderType::Limit | OrderType::StopLimit))
+            || (stop_price.is_some()
+                && !matches!(order.order_type, OrderType::Stop | OrderType::StopLimit))
+        {
+            return Err(BrokerError::UnsupportedOperation(
+                "Invalid entry price amendment".into(),
+            ));
+        }
+        if let Some(price) = limit_price {
+            order.limit_price = Some(price);
+        }
+        if let Some(price) = stop_price {
+            order.stop_price = Some(price);
+        }
+        order.updated_at = self.current_time_ts();
+        Ok(true)
+    }
+
+    async fn replace_order(
         &self,
         order_id: &str,
         price: f64,
         qty: f64,
     ) -> Result<bool, BrokerError> {
-        let now_ts = self.current_time_ts();
-        if let Some(mut order) = self.orders.get_mut(order_id) {
-            if matches!(
-                order.status,
-                TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled
-            ) {
-                if let Some(legs) = order.legs.as_mut() {
-                    if let Some(tp) = legs.take_profit.as_mut() {
-                        if is_terminal_leg_status(&tp.status) {
-                            return Err(BrokerError::OrderError(format!(
-                                "Take profit leg is not active for filled order {}",
-                                order_id
-                            )));
-                        }
-                        tp.limit_price = Some(price);
-                        tp.updated_at = now_ts;
-                        order.qty = qty;
-                        order.updated_at = now_ts;
-                        return Ok(true);
-                    }
+        let mut order = self
+            .orders
+            .get_mut(order_id)
+            .ok_or_else(|| BrokerError::OrderError("Order not found".into()))?;
+        if !matches!(
+            order.status,
+            TradeUpdateEvent::New
+                | TradeUpdateEvent::PendingNew
+                | TradeUpdateEvent::Pending
+                | TradeUpdateEvent::Accepted
+                | TradeUpdateEvent::Replaced
+        ) {
+            return Err(BrokerError::OrderError(
+                "Only a pending entry can be replaced".into(),
+            ));
+        }
+        if !price.is_finite() || price <= 0.0 || !qty.is_finite() || qty <= 0.0 {
+            return Err(BrokerError::OrderError(
+                "Invalid replacement price or quantity".into(),
+            ));
+        }
+        order.limit_price = Some(price);
+        order.qty = qty;
+        order.updated_at = self.current_time_ts();
+        Ok(true)
+    }
+
+    async fn update_take_profit(
+        &self,
+        order_id: &str,
+        price: f64,
+        _qty: f64,
+    ) -> Result<bool, BrokerError> {
+        if !price.is_finite() || price <= 0.0 {
+            return Err(BrokerError::OrderError("Invalid take profit price".into()));
+        }
+        let Some(mut order) = self.orders.get_mut(order_id) else {
+            let now = self.current_time_ts();
+            for mut order in self.orders.iter_mut() {
+                let Some(legs) = order.legs.as_mut() else {
+                    continue;
+                };
+                if update_order_leg(legs.take_profit.as_mut(), order_id, price, now) {
+                    order.updated_at = now;
+                    return Ok(true);
                 }
-                return Err(BrokerError::OrderError(format!(
-                    "Filled order {} has no active take profit leg to update",
-                    order_id
-                )));
             }
-            order.limit_price = Some(price);
-            order.qty = qty;
-            order.updated_at = now_ts;
-            return Ok(true);
+            return Err(BrokerError::OrderError(
+                "Take profit order not found".into(),
+            ));
+        };
+        if matches!(
+            order.status,
+            TradeUpdateEvent::Closed
+                | TradeUpdateEvent::Cancelled
+                | TradeUpdateEvent::Rejected
+                | TradeUpdateEvent::Expired
+        ) {
+            return Err(BrokerError::OrderError(
+                "Cannot modify a terminal order".into(),
+            ));
         }
-
-        for mut order in self.orders.iter_mut() {
-            let Some(legs) = order.legs.as_mut() else {
-                continue;
-            };
-
-            if update_order_leg(legs.take_profit.as_mut(), order_id, price, now_ts)
-                || update_order_leg(legs.stop_loss.as_mut(), order_id, price, now_ts)
-                || update_order_leg(legs.trailing_stop.as_mut(), order_id, price, now_ts)
-            {
-                order.qty = qty;
-                order.updated_at = now_ts;
-                return Ok(true);
-            }
+        let tp = order
+            .legs
+            .as_mut()
+            .and_then(|legs| legs.take_profit.as_mut())
+            .ok_or_else(|| BrokerError::OrderError("Order has no take profit leg".into()))?;
+        if is_terminal_leg_status(&tp.status) {
+            return Err(BrokerError::OrderError(
+                "Take profit leg is terminal".into(),
+            ));
         }
-
-        Err(BrokerError::OrderError("Order not found".into()))
+        let now = self.current_time_ts();
+        tp.limit_price = Some(price);
+        tp.updated_at = now;
+        order.updated_at = now;
+        // Updating a protective target must never alter the entry/position size.
+        Ok(true)
     }
 
     async fn update_stop_loss(
         &self,
         order_id: &str,
         price: f64,
-        qty: f64,
+        _qty: f64,
     ) -> Result<bool, BrokerError> {
+        if !price.is_finite() || price <= 0.0 {
+            return Err(BrokerError::OrderError("Invalid stop loss price".into()));
+        }
         let now_ts = self.current_time_ts();
         if let Some(mut order) = self.orders.get_mut(order_id) {
             if matches!(
                 order.status,
-                TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled
+                TradeUpdateEvent::Closed
+                    | TradeUpdateEvent::Cancelled
+                    | TradeUpdateEvent::Rejected
+                    | TradeUpdateEvent::Expired
             ) {
-                if let Some(legs) = order.legs.as_mut() {
-                    if let Some(sl) = legs.stop_loss.as_mut() {
-                        if is_terminal_leg_status(&sl.status) {
-                            return Err(BrokerError::OrderError(format!(
-                                "Stop loss leg is not active for filled order {}",
-                                order_id
-                            )));
-                        }
-                        sl.limit_price = Some(price);
-                        sl.updated_at = now_ts;
-                        order.qty = qty;
-                        order.updated_at = now_ts;
-                        return Ok(true);
-                    }
-                }
-                return Err(BrokerError::OrderError(format!(
-                    "Filled order {} has no active stop loss leg to update",
-                    order_id
-                )));
+                return Err(BrokerError::OrderError(
+                    "Cannot modify a terminal order".into(),
+                ));
             }
-            order.limit_price = Some(price);
-            order.qty = qty;
+            let sl = order
+                .legs
+                .as_mut()
+                .and_then(|legs| legs.stop_loss.as_mut())
+                .ok_or_else(|| BrokerError::OrderError("Order has no stop loss leg".into()))?;
+            if is_terminal_leg_status(&sl.status) {
+                return Err(BrokerError::OrderError("Stop loss leg is terminal".into()));
+            }
+            sl.limit_price = Some(price);
+            sl.updated_at = now_ts;
             order.updated_at = now_ts;
             return Ok(true);
         }
@@ -1624,7 +1827,6 @@ impl OrderManagementProvider for PaperBroker {
             };
 
             if update_order_leg(legs.stop_loss.as_mut(), order_id, price, now_ts) {
-                order.qty = qty;
                 order.updated_at = now_ts;
                 return Ok(true);
             }
@@ -1730,6 +1932,10 @@ impl OrderManagementProvider for PaperBroker {
     }
 
     async fn get_positions(&self) -> Result<Vec<Position>, BrokerError> {
+        Ok(self.get_cached_positions().unwrap_or_default())
+    }
+
+    fn get_cached_positions(&self) -> Option<Vec<Position>> {
         // Return aggregated positions (one per symbol)
         let mut result = Vec::new();
         for entry in self.positions.iter() {
@@ -1738,7 +1944,7 @@ impl OrderManagementProvider for PaperBroker {
                 result.push(agg);
             }
         }
-        Ok(result)
+        Some(result)
     }
 
     async fn get_position(&self, symbol: &str) -> Result<Position, BrokerError> {
@@ -1750,10 +1956,24 @@ impl OrderManagementProvider for PaperBroker {
         Ok(self.account.read().clone())
     }
 
-    fn drain_trade_events(&self) -> Vec<(Order, TradeUpdateEvent)> {
-        let events: Vec<(Order, TradeUpdateEvent)> = self.trade_events.lock().drain(..).collect();
-        self.release_terminal_orders();
+    fn get_cached_account(&self) -> Option<Account> {
+        Some(self.account.read().clone())
+    }
+
+    fn drain_trade_events_bounded(&self, max_events: usize) -> Vec<(Order, TradeUpdateEvent)> {
+        let mut queue = self.trade_events.lock();
+        let count = max_events.min(queue.len());
+        let events = queue.drain(..count).collect();
+        let drained = queue.is_empty();
+        drop(queue);
+        if drained && count != 0 {
+            self.release_terminal_orders();
+        }
         events
+    }
+
+    fn has_pending_trade_events(&self) -> bool {
+        !self.trade_events.lock().is_empty()
     }
 
     async fn subscribe_to_trade_stream(

@@ -19,12 +19,16 @@ use super::InsightPipe;
 /// pipe passes after collecting the child messages.
 pub struct AndPipe {
     pipes: Vec<WrappedInsightPipe>,
+    resumed: rustc_hash::FxHashMap<uuid::Uuid, (crate::core::insight::types::InsightState, usize)>,
 }
 
 impl AndPipe {
     pub fn new(pipes: Vec<WrappedInsightPipe>) -> Self {
         assert!(!pipes.is_empty(), "AndPipe requires at least one sub-pipe");
-        Self { pipes }
+        Self {
+            pipes,
+            resumed: Default::default(),
+        }
     }
 }
 
@@ -35,12 +39,23 @@ impl InsightPipe for AndPipe {
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
         let mut messages = Vec::new();
+        let id = insight.insight_id;
+        let state = insight.state.clone();
+        let start = self
+            .resumed
+            .remove(&id)
+            .filter(|(previous, _)| *previous == state)
+            .map_or(0, |(_, index)| index);
 
-        for pipe in self.pipes.iter_mut() {
+        for (index, pipe) in self.pipes.iter_mut().enumerate().skip(start) {
             if !pipe.should_run(insight) {
                 continue;
             }
             let result = pipe.run(ctx, insight);
+            if result.deferred.is_some() {
+                self.resumed.insert(id, (state, index));
+                return result;
+            }
             if let Some(msg) = &result.message {
                 messages.push(msg.clone());
             }
@@ -60,5 +75,66 @@ impl InsightPipe for AndPipe {
             Some(format!("All pipes passed: {:?}", messages)),
             self.name().to_string(),
         )
+    }
+
+    fn retain_active_insights(&mut self, active: &rustc_hash::FxHashSet<uuid::Uuid>) {
+        self.resumed.retain(|id, _| active.contains(id));
+        for pipe in &mut self.pipes {
+            pipe.retain_active_insights(active);
+        }
+    }
+
+    fn execution_checkpoint(&self, id: &uuid::Uuid) -> Option<super::PipeContinuationCheckpoint> {
+        let (state, index) = self.resumed.get(id)?;
+        Some(super::PipeContinuationCheckpoint {
+            state: state.clone(),
+            index: *index,
+            nested: self
+                .pipes
+                .get(*index)?
+                .inner
+                .execution_checkpoint(id)
+                .map(Box::new),
+        })
+    }
+
+    fn forget_insight_continuation(&mut self, id: &uuid::Uuid) {
+        if let Some((_, index)) = self.resumed.remove(id) {
+            if let Some(pipe) = self.pipes.get_mut(index) {
+                pipe.inner.forget_insight_continuation(id);
+            }
+        }
+    }
+
+    fn restore_execution_checkpoint(
+        &mut self,
+        id: uuid::Uuid,
+        checkpoint: Option<super::PipeContinuationCheckpoint>,
+    ) -> Result<(), String> {
+        let Some(checkpoint) = checkpoint else {
+            self.resumed.remove(&id);
+            return Ok(());
+        };
+        let pipe = self
+            .pipes
+            .get_mut(checkpoint.index)
+            .ok_or("saved composite pipe index is out of range")?;
+        pipe.inner
+            .restore_execution_checkpoint(id, checkpoint.nested.map(|nested| *nested))?;
+        self.resumed
+            .insert(id, (checkpoint.state, checkpoint.index));
+        Ok(())
+    }
+
+    fn recovery_layout(&self) -> String {
+        serde_json::to_string(&(
+            self.name(),
+            self.version(),
+            self.pipes
+                .iter()
+                .map(WrappedInsightPipe::recovery_layout)
+                .collect::<Vec<_>>(),
+        ))
+        .expect("composite layout contains only strings")
     }
 }

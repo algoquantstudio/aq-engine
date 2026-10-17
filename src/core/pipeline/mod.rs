@@ -1,4 +1,4 @@
-use crate::core::broker::types::{Asset, Quote};
+use crate::core::broker::types::{Asset, BrokerError, Quote};
 use crate::core::insight::Insight;
 use crate::core::insight::types::InsightState;
 use crate::core::strategy::StrategyContext;
@@ -11,7 +11,9 @@ const CHILD_ALPHA_SUFFIX: &str = "-CHILD";
 fn alpha_is_allowed(allowed_alphas: &HashSet<String>, strategy_name: &str) -> bool {
     let mut candidate = strategy_name;
     loop {
-        if allowed_alphas.contains(candidate) {
+        if allowed_alphas.contains(candidate)
+            || (candidate == "Testing" && allowed_alphas.contains("TestEntry"))
+        {
             return true;
         }
         let Some(parent_name) = candidate.strip_suffix(CHILD_ALPHA_SUFFIX) else {
@@ -30,6 +32,7 @@ pub mod cancel_opposite;
 pub mod close_market_changed;
 pub mod dynamic_quantity_to_risk;
 pub mod end_of_day_close;
+mod exit_trigger;
 pub mod full_account_quantity_to_risk;
 pub mod insight_submit;
 pub mod insight_ttl_config;
@@ -38,11 +41,37 @@ pub mod minimum_risk_to_reward;
 pub mod or_pipe;
 pub mod percentage_dca_levels;
 pub mod percentage_risk_to_quantity;
-pub mod quantity_sizing;
+// Compatibility for existing third-party strategy imports.
+pub use crate::core::utils::quantity_sizing;
 pub mod reject_expired_insight;
 pub mod scale_out;
 
+#[cfg(test)]
+mod builtin_regression_tests;
+
+/// Private-format continuation carried by the versioned execution checkpoint.
+/// Only the suspended branch is retained, not completed branches or Insight clones.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipeContinuationCheckpoint {
+    pub state: InsightState,
+    pub index: usize,
+    pub nested: Option<Box<PipeContinuationCheckpoint>>,
+}
+
 // ─────────────────────── InsightPipeResult ───────────────────────
+
+/// An unfinished dependency, not a validation failure. Command/group identity is
+/// retained so polling a resumed pipe never requires submitting the operation again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsightPipeDeferral {
+    BrokerCommand(crate::core::broker::commands::BrokerCommandReceipt),
+    BrokerOperationGroup(crate::core::broker::commands::BrokerOperationGroup),
+    BrokerQueueCapacity,
+    AccountSnapshot,
+    PositionSnapshot,
+    QuoteSnapshot { symbol: String },
+}
 
 /// Result returned by `InsightPipe::run()`.
 /// Mirrors Python's `ExecutorResults`.
@@ -56,9 +85,49 @@ pub struct InsightPipeResult {
     pub message: Option<String>,
     /// Name of the pipe that produced this result.
     pub pipe_name: String,
+    /// A deferred pipe has neither passed nor failed; later pipes must not run.
+    pub deferred: Option<InsightPipeDeferral>,
 }
 
 impl InsightPipeResult {
+    /// Preserve read dependencies through synchronous sizing and validation pipes.
+    pub fn from_read_error(error: BrokerError, pipe_name: impl Into<String>) -> Self {
+        use crate::core::broker::snapshots::SnapshotKind;
+        let name = pipe_name.into();
+        match error {
+            BrokerError::SnapshotUnavailable { kind, reason } => {
+                let dependency = match kind {
+                    SnapshotKind::Account => InsightPipeDeferral::AccountSnapshot,
+                    SnapshotKind::Positions => InsightPipeDeferral::PositionSnapshot,
+                    SnapshotKind::Quote { symbol } => InsightPipeDeferral::QuoteSnapshot { symbol },
+                };
+                let mut result = Self::deferred(dependency, name);
+                result.message = Some(reason.to_string());
+                result
+            }
+            error => Self::new(false, false, Some(error.to_string()), name),
+        }
+    }
+    /// Convert receipt-based operations without treating queue pressure or an
+    /// unfinished broker response as a validation failure.
+    pub fn from_mutation(
+        result: crate::core::insight::InsightMutationResult,
+        pipe_name: impl Into<String>,
+    ) -> Self {
+        use crate::core::broker::commands::BrokerCommandError;
+        use crate::core::insight::InsightMutationState;
+        let name = pipe_name.into();
+        match result {
+            Ok(InsightMutationState::Applied) => Self::new(true, true, None, name),
+            Ok(InsightMutationState::Pending(receipt)) => {
+                Self::deferred(InsightPipeDeferral::BrokerCommand(receipt), name)
+            }
+            Err(BrokerCommandError::QueueFull) => {
+                Self::deferred(InsightPipeDeferral::BrokerQueueCapacity, name)
+            }
+            Err(error) => Self::new(false, false, Some(error.to_string()), name),
+        }
+    }
     /// Convenience constructor (mirrors Python's `returnResults`).
     pub fn new(passed: bool, success: bool, message: Option<String>, pipe_name: String) -> Self {
         let (passed, success) = if passed {
@@ -73,7 +142,31 @@ impl InsightPipeResult {
             success,
             message,
             pipe_name,
+            deferred: None,
         }
+    }
+
+    pub fn deferred(dependency: InsightPipeDeferral, pipe_name: impl Into<String>) -> Self {
+        Self {
+            passed: false,
+            success: true,
+            message: None,
+            pipe_name: pipe_name.into(),
+            deferred: Some(dependency),
+        }
+    }
+
+    /// Exit acknowledgement ends this pipe turn while broker execution is still
+    /// pending. It must not let later stages issue another exit for that turn.
+    pub fn from_exit_mutation(
+        result: crate::core::insight::InsightMutationResult,
+        pipe_name: impl Into<String>,
+    ) -> Self {
+        let mut result = Self::from_mutation(result, pipe_name);
+        if result.success && result.deferred.is_none() {
+            result.passed = false;
+        }
+        result
     }
 }
 
@@ -102,6 +195,42 @@ pub trait InsightPipe {
     /// close is requested.
     fn controls_expiration(&self) -> bool {
         false
+    }
+
+    /// Release per-insight continuation state after terminal transitions/removal.
+    /// Composite pipes forward this to their children. No history is retained.
+    fn retain_active_insights(&mut self, _active: &rustc_hash::FxHashSet<uuid::Uuid>) {}
+
+    /// Release one suspended owner without rebuilding/scanning the active set.
+    /// Stateful composites forward this to their nested continuation owners.
+    /// Live periodic cleanup uses this per-ID hook in bounded pages, not the
+    /// full-set `retain_active_insights` hook. Custom pipes retaining deferred
+    /// per-insight state must release that state here without broker I/O.
+    fn forget_insight_continuation(&mut self, _id: &uuid::Uuid) {}
+
+    /// Recovery hooks for composite continuations. Custom stateful pipes may
+    /// override these; changed or unsupported state must fail closed, not replay.
+    #[doc(hidden)]
+    fn execution_checkpoint(&self, _id: &uuid::Uuid) -> Option<PipeContinuationCheckpoint> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn restore_execution_checkpoint(
+        &mut self,
+        _id: uuid::Uuid,
+        checkpoint: Option<PipeContinuationCheckpoint>,
+    ) -> Result<(), String> {
+        if checkpoint.is_some() {
+            Err("pipe does not support this saved continuation".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[doc(hidden)]
+    fn recovery_layout(&self) -> String {
+        format!("{}@{}", self.name(), self.version())
     }
 
     /// Execute logic on an insight (Python's `executor.run(insight)`).
@@ -137,11 +266,19 @@ pub trait InsightPipe {
         ctx.universe().get(symbol)
     }
 
-    fn get_latest_quote(&self, ctx: &dyn StrategyContext, symbol: &str) -> Result<Quote, String> {
-        ctx.latest_quote(symbol).map_err(|e| e.to_string())
+    fn get_latest_quote(
+        &self,
+        ctx: &dyn StrategyContext,
+        symbol: &str,
+    ) -> Result<Quote, BrokerError> {
+        ctx.latest_quote(symbol)
     }
 
-    fn get_previos_quote(&self, ctx: &dyn StrategyContext, symbol: &str) -> Result<Quote, String> {
+    fn get_previos_quote(
+        &self,
+        ctx: &dyn StrategyContext,
+        symbol: &str,
+    ) -> Result<Quote, BrokerError> {
         self.get_latest_quote(ctx, symbol)
     }
 }
@@ -247,6 +384,25 @@ pub struct WrappedInsightPipe {
 }
 
 impl WrappedInsightPipe {
+    pub(crate) fn recovery_layout(&self) -> String {
+        fn ordered(values: &Option<HashSet<String>>) -> Option<Vec<&str>> {
+            values.as_ref().map(|values| {
+                let mut values = values.iter().map(String::as_str).collect::<Vec<_>>();
+                values.sort_unstable();
+                values
+            })
+        }
+        serde_json::to_string(&(
+            self.inner.recovery_layout(),
+            &self.target_state,
+            self.allow_state_change,
+            ordered(&self.allowed_assets),
+            ordered(&self.allowed_alphas),
+            self.insight_scope,
+        ))
+        .expect("pipe layout contains only serializable configuration")
+    }
+
     pub fn builder(inner: Box<dyn InsightPipe>) -> InsightPipeBuilder {
         InsightPipeBuilder::new(inner)
     }
@@ -279,7 +435,7 @@ impl WrappedInsightPipe {
                 crate::core::insight::types::StrategyType::Custom(name) => {
                     alpha_is_allowed(set, name)
                 }
-                _ => true,
+                kind => alpha_is_allowed(set, &kind.to_string()),
             },
         };
         asset_ok && alpha_ok
@@ -300,6 +456,10 @@ impl WrappedInsightPipe {
             self.passed_count += 1;
         }
         result
+    }
+
+    pub(crate) fn retain_active_insights(&mut self, active: &rustc_hash::FxHashSet<uuid::Uuid>) {
+        self.inner.retain_active_insights(active);
     }
 }
 

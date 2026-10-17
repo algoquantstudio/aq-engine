@@ -1,5 +1,7 @@
 /target
 /backtests
+/.aqs
 /live
 
 **/.DS_Store
+integrations/mt5/*.ex5

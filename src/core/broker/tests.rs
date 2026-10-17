@@ -47,7 +47,81 @@ fn unified_broker_routes_typed_feature_checks() {
         DataFeedFeature::CandleStream,
         DataFeedFeature::IntraCandleStream,
     ]));
-    assert!(!broker.has_feature(DataFeedFeature::QuoteStream));
+    assert!(broker.has_feature(DataFeedFeature::QuoteStream));
+    assert!(broker.has_feature(DataFeedFeature::SyntheticQuotes));
+    assert!(!broker.has_feature(DataFeedFeature::NativeBidAsk));
+    assert!(!broker.has_feature(BrokerFeature::MaxTotalOrders));
+    assert!(!broker.has_feature(BrokerFeature::MaxTotalSize));
+    assert_eq!(broker.get_cached_account().unwrap().max_total_orders, None);
+}
+
+#[tokio::test]
+async fn quote_replay_uses_only_consumed_bars_and_exact_leases() {
+    let broker = UnifiedBroker::new_backtest(
+        PaperBroker::new(AccountType::Paper, 100_000.0, 1),
+        YahooFinanceDataFeed::new(),
+    );
+    assert!(broker.has_feature(DataFeedFeature::SyntheticQuotes));
+    assert!(!broker.has_feature(DataFeedFeature::NativeBidAsk));
+    assert!(broker.get_latest_quote("AAPL").await.is_err()); // Never fetch today's data.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    for id in ["one", "two"] {
+        let seen = seen.clone();
+        broker
+            .subscribe_to_quote_stream(
+                id.into(),
+                "AAPL".into(),
+                Arc::new(move |q| seen.lock().unwrap().push((id, q))),
+            )
+            .await
+            .unwrap();
+    }
+    broker.unsubscribe_from_quote_stream("one").await.unwrap();
+    let bar = Bar {
+        symbol: "AAPL".into(),
+        open: 99.0,
+        high: 102.0,
+        low: 98.0,
+        close: 100.0,
+        volume: 1234.0,
+        timestamp: Utc::now() - chrono::Duration::days(30),
+    };
+    broker.publish_replay_quotes(&HashMap::from([("AAPL".into(), bar.clone())]));
+    let quotes = seen.lock().unwrap();
+    assert_eq!(quotes.len(), 1);
+    assert_eq!(quotes[0].0, "two");
+    assert_eq!(quotes[0].1.timestamp, bar.timestamp);
+    assert_eq!(quotes[0].1.bid, 100.0);
+    assert_eq!(quotes[0].1.ask, 100.0);
+    assert_eq!(quotes[0].1.bid_size, 0.0);
+    assert_eq!(quotes[0].1.last_size, None);
+    drop(quotes);
+    assert_eq!(broker.get_latest_quote("AAPL").await.unwrap().bid, 100.0);
+    broker.unsubscribe_from_quote_stream("two").await.unwrap();
+    assert!(broker.replay_quotes.read().subscriptions.is_empty());
+}
+
+#[tokio::test]
+async fn quote_live_paper_delegates_to_feed_with_independent_lease_cleanup() {
+    let broker = UnifiedBroker::new(
+        PaperBroker::new(AccountType::Paper, 100_000.0, 1),
+        YahooFinanceDataFeed::new(),
+    );
+    broker
+        .subscribe_to_quote_stream("one".into(), "AAPL".into(), Arc::new(|_| {}))
+        .await
+        .unwrap();
+    broker
+        .subscribe_to_quote_stream("two".into(), "AAPL".into(), Arc::new(|_| {}))
+        .await
+        .unwrap();
+    broker.unsubscribe_from_quote_stream("one").await.unwrap();
+    broker.unsubscribe_from_quote_stream("two").await.unwrap();
+    broker
+        .unsubscribe_from_quote_stream("missing")
+        .await
+        .unwrap();
+    assert!(broker.replay_quotes.read().subscriptions.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -294,7 +368,7 @@ async fn test_paper_broker_trailing_stop_moves_and_closes_position() {
     insight.set_trailing_stop_price(Some(5.0));
 
     let order = broker
-        .submit_order(insight)
+        .submit_order(insight.into())
         .await
         .expect("paper broker should accept trailing-stop insight");
 
@@ -401,7 +475,7 @@ async fn test_paper_broker_trailing_stop_does_not_use_same_bar_extremes() {
     insight
         .set_quantity(Some(1.0))
         .set_trailing_stop_price(Some(5.0));
-    let order = broker.submit_order(insight).await.unwrap();
+    let order = broker.submit_order(insight.into()).await.unwrap();
 
     let entry_time = Utc::now();
     let mut entry_bars = HashMap::new();
@@ -464,7 +538,7 @@ async fn test_paper_broker_update_stop_loss_moves_active_stop_leg() {
     insight.set_take_profit_levels(Some(vec![120.0]));
 
     let order = broker
-        .submit_order(insight)
+        .submit_order(insight.into())
         .await
         .expect("paper broker should accept bracket insight");
 
@@ -556,7 +630,7 @@ async fn test_paper_broker_short_trailing_stop_moves_and_closes_position() {
     insight.set_trailing_stop_price(Some(5.0));
 
     let order = broker
-        .submit_order(insight)
+        .submit_order(insight.into())
         .await
         .expect("paper broker should accept short trailing-stop insight");
 
@@ -663,7 +737,7 @@ async fn test_paper_broker_rejects_market_order_when_fill_would_overdraw_cash() 
     insight.set_quantity(Some(2.0));
 
     let order = broker
-        .submit_order(insight)
+        .submit_order(insight.into())
         .await
         .expect("market order should enter the pending queue before fill-time validation");
     assert_eq!(order.status, TradeUpdateEvent::Pending);
@@ -735,7 +809,9 @@ async fn test_paper_broker_applies_side_specific_commission_and_swap_fees() {
         },
         ..AssetFees::default()
     };
-    let broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1).with_asset_fees(fees);
+    let mut broker = PaperBroker::new(AccountType::Paper, 10_000.0, 1).with_asset_fees(fees);
+    let saved = Arc::new(parking_lot::RwLock::new(super::backtest_state::BacktestState::new()));
+    broker.set_backtest_state(saved.clone());
     broker
         .configure_asset_metadata(&Asset {
             id: "asset-aapl".to_string(),
@@ -751,9 +827,11 @@ async fn test_paper_broker_applies_side_specific_commission_and_swap_fees() {
             min_order_size: None,
             quantity_base: None,
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(0.01),
             price_base: None,
             contract_size: Some(10),
+            trading_calendar: Some(r#"{"kind":"sessions","source":"fixture_feed","weekly_seconds":[[],[[32400,61200]]]}"#.into()),
             fees: AssetFees::default(),
         })
         .expect("paper broker should accept asset metadata");
@@ -769,9 +847,16 @@ async fn test_paper_broker_applies_side_specific_commission_and_swap_fees() {
     insight.set_quantity(Some(2.0));
 
     let order = broker
-        .submit_order(insight)
+        .submit_order(insight.into())
         .await
         .expect("paper broker should accept fee test insight");
+    // Paper execution must retain the feed's generic metadata, including when
+    // applying its own fee model. The same asset goes into lifecycle evidence.
+    let calendar = order.asset.trading_calendar.clone().expect("recorded feed calendar");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&calendar).unwrap()["source"],"fixture_feed");
+    let mut legacy=serde_json::to_value(&order.asset).unwrap();
+    legacy.as_object_mut().unwrap().remove("trading_calendar");
+    assert!(serde_json::from_value::<Asset>(legacy).unwrap().trading_calendar.is_none());
 
     let entry_time = Utc::now();
     let mut entry_bars = HashMap::new();
@@ -873,4 +958,57 @@ async fn test_paper_broker_applies_side_specific_commission_and_swap_fees() {
             &closed_order.asset,
         )
     );
+    let state = saved.read();
+    assert_eq!(state.trade_log.len(), 2);
+    let entry = &state.trade_log[0];
+    let exit = &state.trade_log[1];
+    assert_eq!(entry.execution_cash.as_ref().unwrap().net(), Some(-2.0));
+    assert_eq!(exit.execution_cash.as_ref().unwrap().gross_pnl, Some(20.0));
+    assert_eq!(entry.account_notional, Some(200.0));
+    assert_eq!(exit.account_notional, Some(220.0));
+    assert_eq!(exit.valuation_basis.as_deref(), Some("paper_price_units"));
+    let net: f64 = state.trade_log.iter().map(|r| r.execution_cash.as_ref().unwrap().net().unwrap()).sum();
+    assert!((net - expected_net_pnl).abs() < 1e-10, "entry fees must not be charged twice");
+    assert!((net - (account.cash - 10_000.0)).abs() < 1e-10);
+}
+
+#[tokio::test]
+async fn paper_fill_cash_records_partial_short_exits_without_recharging_entry_fees() {
+    let mut broker=PaperBroker::new(AccountType::Paper,10_000.,1).with_asset_fees(AssetFees {
+        commission:AssetCommissionFees {
+            entry:AssetSideFees {short:AssetFee::FixedFee(4.),..Default::default()},
+            exit:AssetSideFees {short:AssetFee::FixedFee(1.),..Default::default()},
+        },..Default::default()
+    });
+    let saved=Arc::new(parking_lot::RwLock::new(super::backtest_state::BacktestState::new()));
+    broker.set_backtest_state(saved.clone());
+    let mut insight=Insight::new(OrderSide::Sell,"CUSTOM".into(),StrategyType::Testing,TimeFrame::new(1,TimeFrameUnit::Minute),80,None);
+    insight.set_quantity(Some(2.));
+    let order=broker.submit_order(insight.into()).await.unwrap();
+    let start=Utc::now();
+    let step=|price:f64,minute:i64| {
+        let at=start+chrono::Duration::minutes(minute);
+        let bars=HashMap::from([("CUSTOM".into(),Bar {symbol:"CUSTOM".into(),open:price,high:price,low:price,close:price,volume:1000.,timestamp:at})]);
+        broker.process_step(&bars,at);
+    };
+    step(100.,0);
+    broker.close_position(&order.order_id,1.,Some(90.)).await.unwrap();
+    step(90.,1);
+    {
+        let state=saved.read();
+        assert_eq!(state.trade_log.len(),2);
+        assert_eq!(state.trade_log[0].execution_cash.as_ref().unwrap().net(),Some(-4.));
+        assert_eq!(state.trade_log[1].execution_cash.as_ref().unwrap().net(),Some(9.));
+        assert_eq!(state.trade_log[1].qty,1.);
+    }
+    broker.close_position(&order.order_id,0.,Some(95.)).await.unwrap();
+    step(95.,2);
+    let account=broker.get_account().await.unwrap();
+    let state=saved.read();
+    assert_eq!(state.trade_log.len(),3);
+    assert_eq!(state.trade_log[2].execution_cash.as_ref().unwrap().net(),Some(4.));
+    assert_eq!(state.trade_log.iter().map(|r|r.account_notional.unwrap()).sum::<f64>(),385.);
+    let net=state.trade_log.iter().map(|r|r.execution_cash.as_ref().unwrap().net().unwrap()).sum::<f64>();
+    assert_eq!(net,9.);
+    assert!((account.cash-10_000.-net).abs()<1e-10);
 }

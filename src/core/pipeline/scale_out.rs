@@ -1,4 +1,7 @@
-use crate::core::broker::{BrokerFeature, types::OrderSide};
+use crate::core::broker::{
+    BrokerFeature,
+    types::{BrokerError, OrderSide},
+};
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
 use crate::core::strategy::StrategyContext;
@@ -11,7 +14,7 @@ use super::InsightPipe;
 ///
 /// Inputs:
 /// - `sell_off_percentage`: Fraction of remaining quantity to close at each non-final level,
-///   clamped to `0.0..=1.0`.
+///   clamped to `0.0..=1.0` when finite. Zero and non-finite fractions do not trigger closes.
 ///
 /// Behaviour:
 /// Runs only on filled insights with remaining quantity. It resolves the latest quote price,
@@ -26,20 +29,32 @@ pub struct ScaleOutPipe {
 impl ScaleOutPipe {
     pub fn new(sell_off_percentage: f64) -> Self {
         Self {
-            sell_off_percentage: sell_off_percentage.clamp(0.0, 1.0),
+            sell_off_percentage: if sell_off_percentage.is_finite() {
+                sell_off_percentage.clamp(0.0, 1.0)
+            } else {
+                sell_off_percentage
+            },
         }
     }
 
-    fn quote_price(&self, ctx: &dyn StrategyContext, insight: &Insight) -> Result<f64, String> {
+    fn quote_price(
+        &self,
+        ctx: &dyn StrategyContext,
+        insight: &Insight,
+    ) -> Result<f64, BrokerError> {
         let quote = self.get_latest_quote(ctx, &insight.symbol)?;
-        quote
-            .last
-            .or(Some(match insight.side {
-                OrderSide::Buy => quote.bid,
-                OrderSide::Sell => quote.ask,
-            }))
-            .filter(|price| price.is_finite())
-            .ok_or_else(|| format!("No valid quote price available for {}", insight.symbol))
+        if quote.symbol != insight.symbol || !quote.valid_market_values() {
+            return Err(BrokerError::SnapshotUnavailable {
+                kind: crate::core::broker::snapshots::SnapshotKind::Quote {
+                    symbol: insight.symbol.clone(),
+                },
+                reason: crate::core::broker::snapshots::SnapshotUnavailable::Invalid,
+            });
+        }
+        Ok(match insight.side {
+            OrderSide::Buy => quote.bid,
+            OrderSide::Sell => quote.ask,
+        })
     }
 }
 
@@ -49,6 +64,16 @@ impl InsightPipe for ScaleOutPipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
+        if !insight.has_pending_close()
+            && (!self.sell_off_percentage.is_finite() || self.sell_off_percentage <= 0.0)
+        {
+            return InsightPipeResult::new(
+                false,
+                false,
+                Some("Scale-out fraction must be finite and greater than zero".into()),
+                self.name().into(),
+            );
+        }
         if insight.state != crate::core::insight::types::InsightState::Filled {
             return InsightPipeResult::new(
                 true,
@@ -58,7 +83,7 @@ impl InsightPipe for ScaleOutPipe {
             );
         }
 
-        if insight.closing {
+        if insight.closing && !insight.has_pending_close() {
             return InsightPipeResult::new(
                 false,
                 true,
@@ -77,10 +102,14 @@ impl InsightPipe for ScaleOutPipe {
             );
         }
 
-        let current_price = match self.quote_price(ctx, insight) {
+        let current_price = match insight
+            .pending_close_price()
+            .map(Ok)
+            .unwrap_or_else(|| self.quote_price(ctx, insight))
+        {
             Ok(price) => price,
             Err(error) => {
-                return InsightPipeResult::new(false, false, Some(error), self.name().to_string());
+                return InsightPipeResult::from_read_error(error, self.name());
             }
         };
 
@@ -143,29 +172,38 @@ impl InsightPipe for ScaleOutPipe {
         let close_qty = if is_final_tp || is_final_sl || !partial_close_supported {
             remaining_qty
         } else {
-            let scaled = ctx
-                .tools()
-                .quantity_round(remaining_qty * self.sell_off_percentage, &insight.symbol);
+            let Some(asset) = self.get_asset(ctx, &insight.symbol) else {
+                return InsightPipeResult::new(
+                    false,
+                    false,
+                    Some("Asset not found".into()),
+                    self.name().into(),
+                );
+            };
+            let scaled = crate::core::utils::quantity_sizing::floor_quantity(
+                remaining_qty * self.sell_off_percentage,
+                crate::core::utils::quantity_sizing::AssetQuantityLimits::from_asset(asset),
+            );
             if scaled <= 0.0 {
-                remaining_qty
+                return InsightPipeResult::new(
+                    true,
+                    true,
+                    Some("Scale-out quantity is below the asset quantity step".into()),
+                    self.name().into(),
+                );
             } else {
                 scaled.min(remaining_qty)
             }
         };
 
-        if !insight.try_close_partial(ctx, close_qty, Some(level_price)) {
-            return InsightPipeResult::new(
-                false,
-                false,
-                Some(format!(
-                    "Broker rejected scale out for {} qty {:.4}",
-                    insight.symbol, close_qty
-                )),
-                self.name().to_string(),
-            );
+        match insight.try_close_partial(ctx, close_qty, Some(level_price)) {
+            Ok(crate::core::insight::InsightMutationState::Applied) => {}
+            pending_or_error => {
+                return InsightPipeResult::from_mutation(pending_or_error, self.name());
+            }
         }
 
-        if tp_hit.is_some() && !tp_levels.is_empty() {
+        if sl_hit.is_none() && tp_hit.is_some() && !tp_levels.is_empty() {
             tp_levels.remove(0);
             insight.set_take_profit_levels(Some(tp_levels));
         }

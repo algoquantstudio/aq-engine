@@ -5,7 +5,7 @@
 //! when the strategy graph uses them.
 
 pub use chrono::Utc;
-pub use log::{debug, info};
+pub use log::{debug, error, info};
 pub use serde_json::{self, Map as JsonMap, Value as JsonValue};
 pub use std::collections::HashSet;
 pub use uuid::Uuid;
@@ -13,7 +13,7 @@ pub use uuid::Uuid;
 pub use crate::core::alpha::{AlphaModel, AlphaModelBuilder, AlphaResult};
 pub use crate::core::broker::{
     BrokerFeature, DataFeedFeature, UnifiedBroker,
-    data_feeds::{mt5::Mt5DataFeed, yahoo::YahooFinanceDataFeed},
+    data_feeds::{csv::CsvDataFeed, mt5::Mt5DataFeed, yahoo::YahooFinanceDataFeed},
     effective_buying_power_from,
     mt5_broker::Mt5Broker,
     paper_broker::PaperBroker,

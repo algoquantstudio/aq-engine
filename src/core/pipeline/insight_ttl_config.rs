@@ -153,8 +153,6 @@ mod tests {
             self.insights.add_insight(insight);
         }
 
-        fn submit_insight(&mut self, _insight: &mut Insight) {}
-
         fn register_indicator(&mut self, _indicator: Box<dyn Indicator>) {}
 
         fn add_alpha(&mut self, _alpha: WrappedAlphaModel) {}
@@ -208,6 +206,7 @@ mod tests {
         fn account(&self) -> Result<Account, BrokerError> {
             Ok(Account {
                 account_id: "paper".to_string(),
+                max_total_orders: None,
                 account_type: AccountType::Paper,
                 equity: 10_000.0,
                 cash: 10_000.0,
@@ -234,37 +233,6 @@ mod tests {
 
         fn cleanup_active_insights_for_teardown(&mut self) -> TeardownCleanupReport {
             TeardownCleanupReport::default()
-        }
-
-        fn cancel_order(&self, _order_id: &str) -> Result<bool, BrokerError> {
-            Ok(false)
-        }
-
-        fn update_order(
-            &self,
-            _order_id: &str,
-            _price: f64,
-            _qty: f64,
-        ) -> Result<bool, BrokerError> {
-            Ok(false)
-        }
-
-        fn update_stop_loss_order(
-            &self,
-            _order_id: &str,
-            _price: f64,
-            _qty: f64,
-        ) -> Result<bool, BrokerError> {
-            Ok(false)
-        }
-
-        fn close_position(
-            &self,
-            _order_id: &str,
-            _qty: f64,
-            _price: Option<f64>,
-        ) -> Result<bool, BrokerError> {
-            Ok(false)
         }
 
         fn shutdown(&mut self) {}

@@ -4,6 +4,12 @@ AlgoQuant Engine, or AQE, is the Rust runtime behind AlgoQuant Studio. It provid
 
 AQE is early alpha software. APIs can still change while the runtime, broker integrations, and AQS Cloud workflow mature.
 
+AQE is independently buildable: no AlgoQuant Studio checkout, private research
+crate, hosted gateway or AQS database schema is needed. The
+`live-sync-protocol/` crate contains public wire types; optional client-side sync
+is included here, while the AQS runtime host, server projector and deployment
+infrastructure live in the private Studio repository.
+
 ## What AQE Provides
 
 - A strategy lifecycle built around `on_start`, `universe`, `init`, `on_bar`, `generate_insights`, `insight_pipeline`, and `on_teardown`.
@@ -129,7 +135,7 @@ let auth = AqsAuth {
     strategy_id: "...".to_string(),
     user_id: "...".to_string(),
     node_id: None,
-    live_session_id: Some("...".to_string()),
+    live_session_id: None, // session_id is the canonical session identity
     url: None,
 };
 
@@ -154,14 +160,54 @@ AQS Cloud sync is optional. When enabled, AQE persists live strategy state, insi
 
 AQE reconnects transient Cloud websocket failures, but local strategy execution should not depend on Cloud availability. Local and offline execution are supported modes.
 
+### Protected AQS launch configuration
+
+Current AQS launches use `--live --launch-config <private-file>` instead of placing
+session/MT5/NATS credentials in command-line arguments or environment assignments.
+The versioned JSON file is restricted to its owner (Unix directory `0700`, file
+`0600`; owner-only Windows ACL). Invalid, oversized, shared or symlinked launch
+files fail closed before broker connection. Do not commit or share these files.
+Rebuild a strategy with current AQE before copying its new launch command; AQS
+checks binary support without executing a trading process.
+
+Managed launches retain their private NATS/runtime-host delivery. Copied commands
+run without a desktop dependency: an owned background sync worker registers with
+the configured event gateway, persists retryable work to a local outbox and
+forwards cloud controls. Its execution fence matches the run prepared by AQS;
+each protected copied launch is single-use. Stop/recover the previous run in AQS
+and copy a fresh command for a new run. The outbox/runtime identity is retained.
+Initial copied startup requires gateway admission before the broker connects;
+ordinary cloud outages after admission are handled by the background outbox.
+Standalone explicit hosted-sync APIs still support their existing restart flow.
+Gateway acknowledgement is not a claim
+of complete broker history. Do not delete an outbox with unresolved work.
+
+The legacy CLI `AqsAuth` arguments and MT5 environment variables still work for
+standalone code; `--access-method` remains an optional override defaulting to
+`aqe_live`. Do not combine cloud credential arguments with a launch file. The new
+AQS files carry one canonical session ID and always disable the obsolete duplicate
+Insight-state archive internally. Fill delivery is enabled by AQS and remains
+opt-in for ordinary standalone AQE. Live position-mark capture and export now
+default to **on** for both MT5 and Paper; standalone callers can opt out with
+`AQE_POSITION_MARK_CAPTURE=false` and `AQE_POSITION_MARK_EXPORT=false`.
+
+Copied processes detach from the terminal, disable the interactive TUI and write
+private `live.log` (and `live.err.log` on Windows) beside the launch config. They
+can be stopped through AQS Cloud, or by creating `stop.signal` beside that file
+for an offline graceful stop. They are not an installed auto-restart service.
+Existing running processes do not
+reload these settings and need not be restarted to prepare the next launch.
+
 ## Development
 
 Run checks from the AQE repository root:
 
 ```bash
 cargo check
+cargo check --features node --target wasm32-unknown-unknown
 cargo check --features runtime
 cargo test --features runtime
+cargo test --manifest-path live-sync-protocol/Cargo.toml
 ```
 
 When AQE is used as the `aq-engine` submodule inside AlgoQuant Studio, run checks from the AQS workspace root:
@@ -174,3 +220,27 @@ cargo test -p aq-engine --features runtime
 ## Status
 
 AQE is under active development. The public repository is intended for early adopters who are comfortable testing alpha trading infrastructure, reading release notes carefully, and validating broker behaviour before using any live execution path.
+
+## License and ownership
+
+AQE and its live protocol crate are owned by AlgoQuantStudio and made
+source-available under the [PolyForm Shield License 1.0.0](LICENSE), with the
+required attribution and protected line of business in [NOTICE](NOTICE).
+This is not an OSI-approved open-source license or a blanket non-commercial
+license. It has no scheduled conversion to MIT or Apache-2.0.
+
+You may use and modify AQE for your own research, backtesting and live trading,
+including internal commercial trading operations, subject to the license.
+The license does not require you to publish your private strategy code.
+Non-competing distributions must retain the license and required notices.
+
+You may not use AQE to provide a product or service that competes with AQE or
+with a product AlgoQuantStudio provides using AQE, including AlgoQuant Studio
+and AQS Cloud. This applies to desktop applications and hosted services, even
+if offered free of charge. Contact AlgoQuantStudio for separate written
+permission if your proposed use is competitive or you are unsure.
+
+The license text controls over this summary. It restricts competitive use of
+AQE; it is not a claim over independently written software. It does not license
+the private AQS application, gateway, runtime host, research implementation,
+hosted services or branding. Third-party dependencies retain their own licenses.

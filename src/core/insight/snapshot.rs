@@ -13,6 +13,12 @@ pub struct InsightStateHistorySnapshot {
     pub at: DateTime<Utc>,
     pub state: String,
     pub message: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub from_state: Option<String>,
+    #[serde(default)]
+    pub to_state: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -96,6 +102,8 @@ pub struct InsightSnapshot {
     pub cancelling: bool,
     pub closing: bool,
     pub first_on_fill: bool,
+    #[serde(default)]
+    pub entry_filled_quantity: Option<f64>,
     pub partial_filled_quantity: Option<f64>,
     pub state_history: Vec<InsightStateHistorySnapshot>,
 }
@@ -216,6 +224,25 @@ impl InsightSnapshot {
     }
 
     pub fn from_insight(insight: &Insight, _strategy_id: &str) -> Self {
+        Self::from_insight_with_history_offset(insight, 0)
+    }
+
+    /// Live split-history publication needs only the unsent suffix. Other callers
+    /// retain the full snapshot through `from_insight`.
+    pub(crate) fn from_insight_with_history_offset(
+        insight: &Insight,
+        history_offset: usize,
+    ) -> Self {
+        Self::from_insight_with_history_window(insight, history_offset, usize::MAX)
+    }
+
+    /// Copy only the prefix the live exporter can admit this turn, not the entire
+    /// remaining history on each micro-batch. Indices still refer to the source.
+    pub(crate) fn from_insight_with_history_window(
+        insight: &Insight,
+        history_offset: usize,
+        history_limit: usize,
+    ) -> Self {
         Self {
             insight_id: insight.insight_id().to_string(),
             parent_id: insight.parent_id().map(|id| id.to_string()),
@@ -290,14 +317,32 @@ impl InsightSnapshot {
             cancelling: insight.cancelling,
             closing: insight.closing,
             first_on_fill: insight.first_on_fill,
+            entry_filled_quantity: insight.entry_filled_quantity,
             partial_filled_quantity: insight.partial_filled_quantity,
             state_history: insight
                 .state_history
                 .iter()
-                .map(|(at, state, message)| InsightStateHistorySnapshot {
-                    at: *at,
-                    state: Self::insight_state_label(state).to_string(),
-                    message: message.clone(),
+                .enumerate()
+                .skip(history_offset)
+                .take(history_limit)
+                .map(|(index, (at, state, message))| {
+                    let kind = insight
+                        .state_history_kinds
+                        .get(index)
+                        .copied()
+                        .unwrap_or_default();
+                    let transition = message
+                        .as_deref()
+                        .and_then(|message| message.strip_prefix("State changed from "))
+                        .and_then(|rest| rest.split_once(" to "));
+                    InsightStateHistorySnapshot {
+                        at: *at,
+                        state: Self::insight_state_label(state).to_string(),
+                        message: message.clone(),
+                        kind: Some(kind.as_str().to_string()),
+                        from_state: transition.map(|(from, _)| from.to_string()),
+                        to_state: transition.map(|(_, to)| to.to_string()),
+                    }
                 })
                 .collect(),
         }

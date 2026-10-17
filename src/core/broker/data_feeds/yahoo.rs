@@ -31,6 +31,7 @@ pub struct YahooFinanceDataFeed {
     session_generation: Arc<AtomicU64>,
     session_refresh_lock: Arc<AsyncMutex<()>>,
     stream_manager: DataStreamManager,
+    quote_streams: Mutex<HashMap<String, DataStreamManager>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,11 +67,29 @@ impl YahooFinanceDataFeed {
             session_generation: Arc::new(AtomicU64::new(0)),
             session_refresh_lock: Arc::new(AsyncMutex::new(())),
             stream_manager: DataStreamManager::new(),
+            quote_streams: Mutex::new(HashMap::new()),
         }
     }
 
     fn set_connected(&self, connected: bool) {
         *self.connected.lock().unwrap() = connected;
+    }
+
+    fn stream_fetcher(&self) -> FetchBarsFn {
+        let fetcher = Arc::new(Self {
+            client: self.client.clone(),
+            connected: self.connected.clone(),
+            ticker_info: self.ticker_info.clone(),
+            crumb: self.crumb.clone(),
+            session_generation: self.session_generation.clone(),
+            session_refresh_lock: self.session_refresh_lock.clone(),
+            stream_manager: DataStreamManager::new(),
+            quote_streams: Mutex::new(HashMap::new()),
+        });
+        Arc::new(move |symbol, start, end, tf| {
+            let fetcher = fetcher.clone();
+            Box::pin(async move { fetcher.fetch_bars_raw(&symbol, start, end, tf).await })
+        })
     }
 
     fn retry_decision(status: StatusCode, body: &str) -> YahooRetryDecision {
@@ -451,7 +470,13 @@ impl YahooFinanceDataFeed {
         let end_ts = end.timestamp();
         let interval = Self::chart_interval(time_frame);
         let cache_key = format!("{symbol}|{start_ts}|{end_ts}|{interval}");
-        if let Some(bars) = historical_bar_cache().get(&cache_key) {
+        // Live rolling windows are mutable and have a new key on every poll. Never
+        // retain them indefinitely in the immutable backtest history cache.
+        let cacheable = end < Utc::now() - chrono::Duration::days(2);
+        if let Some(bars) = cacheable
+            .then(|| historical_bar_cache().get(&cache_key))
+            .flatten()
+        {
             info!(
                 "Reusing immutable Yahoo bar snapshot for {symbol} {interval} ({start_ts}..{end_ts})"
             );
@@ -535,7 +560,9 @@ impl YahooFinanceDataFeed {
             });
         }
 
-        historical_bar_cache().insert(cache_key, bars.clone());
+        if cacheable {
+            historical_bar_cache().insert(cache_key, bars.clone());
+        }
         Ok(BarData::Bars(bars))
     }
 }
@@ -547,6 +574,8 @@ impl DataFeed for YahooFinanceDataFeed {
     }
 
     async fn disconnect(&self) -> Result<bool, BrokerError> {
+        self.stream_manager.unsubscribe_all();
+        self.quote_streams.lock().unwrap().clear();
         let mut connected = self.connected.lock().unwrap();
         let mut crumb = self.crumb.lock().unwrap();
         *connected = false;
@@ -565,11 +594,67 @@ impl DataFeed for YahooFinanceDataFeed {
             DataFeedFeature::LatestQuote,
             DataFeedFeature::CandleStream,
             DataFeedFeature::IntraCandleStream,
+            DataFeedFeature::QuoteStream,
+            DataFeedFeature::SyntheticQuotes,
         ]
     }
 }
 
 impl DataProvider for YahooFinanceDataFeed {
+    async fn subscribe_to_quote_stream(
+        &self,
+        subscription_id: String,
+        symbol: String,
+        on_quote: crate::core::broker::QuoteCallback,
+    ) -> Result<(), BrokerError> {
+        if subscription_id.is_empty() || symbol.trim().is_empty() {
+            return Err(BrokerError::DataFeedError(
+                "Quote subscription requires an ID and symbol".into(),
+            ));
+        }
+        // Independent leases: removing a quote observer cannot unsubscribe candle users.
+        // Yahoo supplies polled, minute-bar approximations, NOT live bid/ask or tick data.
+        let manager = DataStreamManager::new();
+        let last = Mutex::new(None::<(DateTime<Utc>, f64)>);
+        manager.subscribe(
+            symbol,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            DataStreamMode::Intrabar,
+            Arc::new(move |bar| {
+                if !bar.close.is_finite() || bar.close <= 0.0 {
+                    return;
+                }
+                let key = (bar.timestamp, bar.close);
+                let changed = {
+                    let mut previous = last.lock().unwrap();
+                    if *previous == Some(key) {
+                        false
+                    } else {
+                        *previous = Some(key);
+                        true
+                    }
+                };
+                if changed {
+                    on_quote(Quote::from_bar_close(&bar));
+                }
+            }),
+            self.stream_fetcher(),
+        );
+        self.quote_streams
+            .lock()
+            .unwrap()
+            .insert(subscription_id, manager);
+        Ok(())
+    }
+
+    async fn unsubscribe_from_quote_stream(
+        &self,
+        subscription_id: &str,
+    ) -> Result<(), BrokerError> {
+        self.quote_streams.lock().unwrap().remove(subscription_id);
+        Ok(())
+    }
+
     async fn get_ticker_info(&self, symbol: &str) -> Result<Asset, BrokerError> {
         if let Some(asset) = self.ticker_info.lock().unwrap().get(symbol).cloned() {
             return Ok(asset);
@@ -589,9 +674,11 @@ impl DataProvider for YahooFinanceDataFeed {
             min_order_size: Some(0.01),
             quantity_base: Some(2),
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(0.01),
             price_base: Some(2),
             contract_size: None,
+            trading_calendar: None,
             fees: Default::default(),
         };
 
@@ -647,9 +734,11 @@ impl DataProvider for YahooFinanceDataFeed {
             min_order_size: Some(0.01),
             quantity_base: Some(2),
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(1.0 / 10f64.powf(price_hint as f64)),
             price_base: Some(price_hint),
             contract_size: None,
+            trading_calendar: Some(serde_json::json!({"kind":if instrument_type == "CRYPTOCURRENCY" {"continuous"} else {"sessions"},"source":"yahoo_quote_metadata","exchange":exchange_name}).to_string()),
             fees: Default::default(),
         };
 
@@ -678,16 +767,7 @@ impl DataProvider for YahooFinanceDataFeed {
 
     async fn get_latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
         let bar = self.get_latest_bar(symbol).await?;
-        Ok(Quote {
-            symbol: symbol.to_string(),
-            bid: bar.close,
-            ask: bar.close,
-            bid_size: 100.0,
-            ask_size: 100.0,
-            last: Some(bar.close),
-            last_size: Some(bar.volume),
-            timestamp: bar.timestamp,
-        })
+        Ok(Quote::from_bar_close(&bar))
     }
 
     async fn get_latest_bar(&self, symbol: &str) -> Result<Bar, BrokerError> {
@@ -782,19 +862,7 @@ impl DataProvider for YahooFinanceDataFeed {
     ) -> Result<(), BrokerError> {
         // Keep one shared fetcher alive for all polling tasks created by this call.
         // reqwest::Client clones share the same connection pool and cookie store.
-        let fetcher = Arc::new(YahooFinanceDataFeed {
-            client: self.client.clone(),
-            connected: self.connected.clone(),
-            ticker_info: self.ticker_info.clone(),
-            crumb: self.crumb.clone(),
-            session_generation: self.session_generation.clone(),
-            session_refresh_lock: self.session_refresh_lock.clone(),
-            stream_manager: DataStreamManager::new(),
-        });
-        let fetch_fn: FetchBarsFn = Arc::new(move |symbol, start, end, tf| {
-            let fetcher = fetcher.clone();
-            Box::pin(async move { fetcher.fetch_bars_raw(&symbol, start, end, tf).await })
-        });
+        let fetch_fn = self.stream_fetcher();
 
         for symbol in symbols {
             self.stream_manager.subscribe(

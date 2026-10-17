@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod snapshot_context_tests;
+#[cfg(test)]
 mod tests;
 use crate::core::alpha::WrappedAlphaModel;
 use crate::core::broker::backtest_state::BacktestResults;
@@ -28,12 +30,38 @@ type FxHashSet<T> = HashSet<T>;
 use std::path::{Path, PathBuf};
 use std::vec;
 use uuid::Uuid;
+mod aqs_actions;
+mod aqs_connection;
 mod aqs_ops;
-mod aqs_sync;
+mod aqs_reader;
 mod aqs_types;
+pub mod command_driver;
+mod execution_persistence;
+mod execution_recovery;
+mod execution_runtime;
 pub mod hyperparameters;
+mod insight_work;
+mod legacy_metrics_recovery;
+mod lifecycle_reconciliation;
+mod live_event_projection;
+mod live_evidence_export;
+mod live_execution;
+mod live_fill_history;
+mod live_position_marks;
 mod live_metrics;
+mod live_projection;
+mod live_quotes;
+mod local_live_artifacts;
+mod metrics_checkpoint_writer;
+mod metrics_continuity;
+mod metrics_continuity_lookup;
+mod order_reducer;
+mod pipeline_sweep;
+mod snapshot_dependencies;
+use order_reducer::{OrderEvidenceSource, OrderReduction};
 mod types;
+use types::HyperparameterSelection;
+pub(crate) use types::InsightPipelineCheckpoint;
 pub use types::{InsightPipeline, StrategyMode, StrategyStatus};
 pub mod traits;
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
@@ -62,9 +90,7 @@ use log::{debug, error, info, warn};
 /// Rustls deliberately refuses to choose automatically when both features are present.
 #[cfg(feature = "runtime")]
 fn ensure_rustls_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
+    crate::core::live_sync::install_default_rustls_provider();
 }
 
 pub fn set_logging_level(level: impl AsRef<str>) -> Result<(), log::SetLoggerError> {
@@ -109,16 +135,6 @@ fn current_dir_with_aqmeta() -> Option<PathBuf> {
 
 // ─────────────────────── StrategyState ───────────────────────
 
-#[derive(Clone, Debug)]
-struct HyperparameterSelection {
-    seed: String,
-    values: Value,
-    sweep_id: String,
-    strategy_fingerprint: String,
-    source_targets: Value,
-    is_sweep_run: bool,
-}
-
 pub struct StrategyState<S, E, D>
 where
     S: Strategy,
@@ -137,6 +153,12 @@ where
     pub history: HashMap<String, DataFrame>,
     pub universe: HashMap<String, Asset>,
     pub broker: UnifiedBroker<E, D>,
+    // At most one 256-event broker page is retained across reducer yields.
+    pending_broker_events: std::collections::VecDeque<(Order, TradeUpdateEvent)>,
+    command_driver: Option<command_driver::StrategyCommandDriver>,
+    execution_error: Option<crate::core::broker::commands::BrokerCommandError>,
+    insight_work: insight_work::InsightWorkQueue,
+    execution_persistence: execution_persistence::ExecutionPersistence,
 
     //
     pub status: StrategyStatus,
@@ -156,9 +178,13 @@ where
     // Market event streams
     event_stream_requests: Vec<EventStreamRequest>,
     event_context_stack: Vec<StrategyEventContext>,
+    // Native execution reads advance only when the owner accepts the next event,
+    // never when a concurrent polling worker observes a later price.
+    execution_quotes: live_quotes::ExecutionQuoteReads,
 
     // Indicators
     pub indicators: HashMap<String, Box<dyn Indicator>>,
+    indicator_order: Vec<String>,
 
     // Risk Management Parameters
     warm_up_bars: i32,
@@ -171,7 +197,11 @@ where
     history_seed_anchor: Option<chrono::DateTime<chrono::Utc>>,
     live_metrics: LivePerformanceTracker,
     live_metrics_cloud_write_enabled: bool,
+    metrics_checkpoint_writer: Option<metrics_checkpoint_writer::MetricsCheckpointWriter>,
+    legacy_metrics_recovery: legacy_metrics_recovery::LegacyMetricsRecovery,
+    legacy_metrics_recovery_needed: bool,
     default_live_auth: Option<AqsAuth>,
+    hosted_sync: Option<crate::core::live_sync::HostedSyncConfig>,
     runtime_telemetry: RuntimeTelemetry,
     artifact_root: Option<PathBuf>,
     backtest_result_dir: Option<PathBuf>,
@@ -184,6 +214,7 @@ where
 
     // Internal Shutdown
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    teardown_cleanup_requested: bool,
 }
 
 impl<S, E, D> StrategyState<S, E, D>
@@ -288,6 +319,17 @@ where
 
     fn sync_broker_managed_levels(insight: &mut Insight, order: &Order) {
         if let Some(legs) = &order.legs {
+            // A terminal leg carries execution evidence, not a new target. Some
+            // adapters only know the exit fill and use it as the leg limit.
+            // Preserve the last configured levels; keep the fill in `legs`.
+            if order.status == TradeUpdateEvent::Closed
+                || legs.take_profit.as_ref().is_some_and(|leg| leg.status == TradeUpdateEvent::Filled)
+                || legs.stop_loss.as_ref().is_some_and(|leg| leg.status == TradeUpdateEvent::Filled)
+                || legs.trailing_stop.as_ref().is_some_and(|leg| leg.status == TradeUpdateEvent::Filled)
+            {
+                insight.legs = legs.clone();
+                return;
+            }
             if let Some(tp) = legs.take_profit.as_ref().and_then(|leg| leg.limit_price) {
                 let should_sync_tp = insight
                     .take_profit_levels()
@@ -324,20 +366,29 @@ where
         name: String,
         version: String,
         strategy: S,
-        broker: UnifiedBroker<E, D>,
+        mut broker: UnifiedBroker<E, D>,
         mode: StrategyMode,
         timeframe: TimeFrame,
     ) -> Self {
+        if matches!(mode, StrategyMode::Backtest) && broker.backtest_state.is_none() {
+            broker.backtest_state = Some(Arc::new(parking_lot::RwLock::new(
+                crate::core::broker::backtest_state::BacktestState::new(),
+            )));
+        }
         Self {
             name,
             version,
             strategy: Some(strategy),
             broker,
+            pending_broker_events: std::collections::VecDeque::new(),
+            command_driver: None,
+            execution_error: None,
+            insight_work: Default::default(),
+            execution_persistence: Default::default(),
             mode,
             status: StrategyStatus::Initialised,
             strategy_id: Uuid::new_v4(),
-            insights: InsightCollection::new()
-                .with_order_id_index_enabled(matches!(mode, StrategyMode::Live)),
+            insights: InsightCollection::new(),
             history: Default::default(),
             universe: Default::default(),
             alpha_models: Vec::new(),
@@ -347,7 +398,9 @@ where
             universe_models: Vec::new(),
             event_stream_requests: Vec::new(),
             event_context_stack: Vec::new(),
+            execution_quotes: Default::default(),
             indicators: HashMap::new(),
+            indicator_order: Vec::new(),
             warm_up_bars: 0,
             warm_up_progress: HashMap::new(),
             execution_risk: 0.02,
@@ -358,7 +411,11 @@ where
             history_seed_anchor: None,
             live_metrics: LivePerformanceTracker::default(),
             live_metrics_cloud_write_enabled: true,
+            metrics_checkpoint_writer: None,
+            legacy_metrics_recovery: Default::default(),
+            legacy_metrics_recovery_needed: false,
             default_live_auth: AqsAuth::from_process_args(),
+            hosted_sync: None,
             runtime_telemetry: RuntimeTelemetry::default(),
             artifact_root: None,
             backtest_result_dir: None,
@@ -368,6 +425,7 @@ where
             insight_pipeline: Default::default(),
             timeframe,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            teardown_cleanup_requested: false,
         }
     }
 
@@ -384,10 +442,19 @@ where
         self
     }
 
-    /// Attach optional hyperparameter definitions to this state.
-    ///
-    /// With a configuration, `run_backtest` and `run_live` resolve `--hyper-seed` themselves.
-    /// Without one, both methods preserve their existing behaviour.
+    /// Opt live execution into the hosted gateway with an embedded background sync
+    /// worker. Backtests and unconfigured standalone live execution are unchanged.
+    pub fn set_hosted_sync(&mut self, config: crate::core::live_sync::HostedSyncConfig) {
+        self.hosted_sync = Some(config);
+    }
+
+    pub fn with_hosted_sync(mut self, config: crate::core::live_sync::HostedSyncConfig) -> Self {
+        self.set_hosted_sync(config);
+        self
+    }
+
+    /// Attach optional hyperparameter definitions. With this configuration,
+    /// `run_backtest` and `run_live` resolve `--hyper-seed` themselves.
     pub fn set_hyper_parameter_config(&mut self, config: HyperParameterConfig) {
         self.hyperparameter_config = Some(config);
     }
@@ -544,21 +611,22 @@ where
     }
 
     /// Register an indicator securely with deduplication (Python's TA registration).
-    pub fn register_indicator(&mut self, mut indicator: Box<dyn Indicator>) {
+    pub fn register_indicator(&mut self, indicator: Box<dyn Indicator>) {
         let name = indicator.name();
         if !self.indicators.contains_key(&name) {
-            // Apply `run` to all existing history DataFrames to backfill
-            for (_, df) in self.history.iter_mut() {
-                if df.height() > 0 {
-                    if let Err(e) = indicator.run(df) {
-                        warn!(
-                            "Failed to run indicator {} on existing history: {}",
-                            name, e
-                        );
-                    }
+            self.indicators.insert(name.clone(), indicator);
+            match crate::core::indicators::execution_order(&self.indicators) {
+                Ok(order) => self.indicator_order = order,
+                Err(error) => {
+                    self.indicators.remove(&name);
+                    warn!("Cannot register indicator {}: {}", name, error);
+                    return;
                 }
             }
-            self.indicators.insert(name, indicator);
+            // Registration is cold-path work. Reseed in dependency order so an indicator
+            // attached to another indicator's numeric output sees the completed backfill.
+            let keys: Vec<_> = self.history.keys().cloned().collect();
+            for key in keys { self.apply_indicators_to_history(&key); }
         }
     }
 
@@ -571,8 +639,14 @@ where
         }
 
         let current_time = self.broker.get_current_time();
-        for (name, indicator) in self.indicators.iter_mut() {
-            if let Err(error) = indicator.run(history_df) {
+        for name in &self.indicator_order {
+            let Some(indicator) = self.indicators.get_mut(name) else { continue; };
+            for output in indicator.output_columns() {
+                if history_df.column(&output).is_err() {
+                    let _ = history_df.with_column(Series::full_null(output.into(), history_df.height(), &DataType::Float64).into());
+                }
+            }
+            if let Err(error) = indicator.seed_stream(symbol, history_df) {
                 warn!(
                     "Failed to run indicator {} on seeded history for {}: {}",
                     name, symbol, error
@@ -669,62 +743,30 @@ where
     }
 
     fn cleanup_active_insights_for_teardown_internal(&mut self) -> TeardownCleanupReport {
+        self.teardown_cleanup_requested = true;
         let mut report = TeardownCleanupReport::default();
-        let insight_ids = self.insights.ids();
-
-        for id in insight_ids {
-            let Some(mut insight) = self.insights.remove_insight(&id) else {
+        for id in self.insights.active_insight_ids() {
+            let Some(insight) = self.insights.get(&id) else {
                 continue;
             };
-
             match insight.state {
-                InsightState::New => {
-                    insight.order_rejected("Teardown cleanup rejected new insight");
-                    report.rejected_new += 1;
-                }
-                InsightState::Executed => match insight.order_id.clone() {
-                    Some(order_id) => match self.broker.cancel_order_sync(&order_id) {
-                        Ok(true) => {
-                            insight.order_cancelled("Teardown cleanup cancelled executed insight");
-                            report.cancelled_executed += 1;
-                        }
-                        Ok(false) => report.failures.push(format!(
-                            "{} {} cancel request returned false for order {}",
-                            insight.symbol, insight.insight_id, order_id
-                        )),
-                        Err(error) => report.failures.push(format!(
-                            "{} {} failed to cancel order {}: {:?}",
-                            insight.symbol, insight.insight_id, order_id, error
-                        )),
-                    },
-                    None => report.failures.push(format!(
-                        "{} {} is executed but has no order id",
-                        insight.symbol, insight.insight_id
-                    )),
-                },
-                InsightState::Filled => {
-                    let had_order_id = insight.order_id.is_some();
-                    let remaining_quantity = insight.remaining_quantity();
-                    insight.close(self);
-                    if had_order_id && insight.closing {
-                        report.closed_filled += 1;
-                    } else {
-                        report.failures.push(format!(
-                            "{} {} failed to queue filled close for remaining quantity {:.4}",
-                            insight.symbol, insight.insight_id, remaining_quantity
-                        ));
-                    }
-                }
-                _ => {}
+                InsightState::New => report.rejected_new += 1,
+                InsightState::Executed => report.cancelled_executed += 1,
+                InsightState::Filled => report.closed_filled += 1,
+                _ => continue,
             }
-
-            self.add_insight_internal(insight, true);
+            self.schedule_insight_cleanup(id);
         }
-
+        // Counts describe requested work, not broker-confirmed closures.
+        self.process_insight_work(256, std::time::Duration::from_millis(5));
         report
     }
 
     fn begin_teardown(&mut self) {
+        if let Some(driver) = &self.command_driver {
+            driver.request_execution_stop();
+        }
+        self.teardown_cleanup_requested = false;
         if !self.status.is_finished() {
             self.status = StrategyStatus::Stopping;
         }
@@ -741,23 +783,10 @@ where
         }
         let mut insight = insight;
         self.bind_insight_context(&mut insight);
-        let children_to_submit = (!allow_during_teardown && insight.state == InsightState::Filled)
-            .then(|| {
-                insight
-                    .children
-                    .iter()
-                    .filter(|child| !child.is_split_insight())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .filter(|children| !children.is_empty());
+        let id = insight.insight_id;
         self.insights.add_insight(insight);
-
-        if let Some(children) = children_to_submit {
-            for mut child in children {
-                child.submit(self);
-                self.add_insight_internal(child, false);
-            }
+        if !allow_during_teardown {
+            self.schedule_insight_children(id);
         }
     }
 
@@ -815,8 +844,9 @@ where
         let mut logic_blocks = std::mem::take(&mut self.on_teardown_logic);
         for logic in logic_blocks.iter_mut() {
             if logic.timing() == timing {
-                debug!("Running on_teardown logic {}", logic.name());
+                info!("Starting teardown logic {}", logic.name());
                 logic.run(self);
+                info!("Finished teardown logic {}", logic.name());
             }
         }
         logic_blocks.append(&mut self.on_teardown_logic);
@@ -959,18 +989,21 @@ where
     }
 
     fn runtime_variable_snapshot(&self) -> Vec<crate::core::tui::RuntimeVariableSnapshot> {
-        let mut variables = self
+        let mut keys = self
             .variables
             .iter()
-            .map(|entry| {
-                let mut snapshot = summarise_value(entry.value());
-                snapshot.key = entry.key().clone();
-                snapshot
-            })
+            .map(|entry| entry.key().clone())
             .collect::<Vec<_>>();
-        variables.sort_by(|left, right| left.key.cmp(&right.key));
-        variables.truncate(64);
-        variables
+        keys.sort();
+        keys.into_iter()
+            .take(64)
+            .filter_map(|key| {
+                let entry = self.variables.get(&key)?;
+                let mut snapshot = summarise_value(entry.value());
+                snapshot.key = key;
+                Some(snapshot)
+            })
+            .collect()
     }
 
     fn runtime_insight_counts(&self) -> HashMap<String, usize> {
@@ -982,60 +1015,70 @@ where
     }
 
     fn runtime_active_insights(&self) -> Vec<RuntimeInsightSnapshot> {
-        let mut insights = self
+        // Bound expensive detail/history cloning, not just the final displayed vector.
+        let mut candidates = self
             .insights
             .active_insight_ids_unsorted()
             .into_iter()
-            .filter_map(|id| {
-                let insight = self.insights.get(&id)?;
-                Some(RuntimeInsightSnapshot {
-                    insight_id: insight.insight_id.to_string(),
-                    parent_id: insight.parent_id.map(|id| id.to_string()),
-                    symbol: insight.symbol.clone(),
-                    state: InsightSnapshot::insight_state_label(insight.state()).to_string(),
-                    side: InsightSnapshot::order_side_label(insight.side()).to_string(),
-                    strategy_type: InsightSnapshot::strategy_type_label(insight.strategy_type())
-                        .into_owned(),
-                    order_id: insight.order_id.clone(),
-                    close_order_id: insight.close_order_id.clone(),
-                    quantity: insight.quantity(),
-                    contracts: insight.contracts,
-                    order_type: InsightSnapshot::order_type_label(insight.order_type()).to_string(),
-                    order_class: InsightSnapshot::order_class_label(insight.order_class())
-                        .to_string(),
-                    limit_price: insight.limit_price(),
-                    stop_price: insight.stop_price(),
-                    take_profit_levels: insight.take_profit_levels(),
-                    stop_loss_levels: insight.stop_loss_levels(),
-                    filled_price: insight.filled_price,
-                    close_price: insight.close_price,
-                    confidence: insight.confidence(),
-                    created_at: Some(insight.created_at),
-                    updated_at: Some(insight.updated_at),
-                    filled_at: insight.filled_at,
-                    closed_at: insight.closed_at,
-                    state_history: insight
-                        .state_history
-                        .iter()
-                        .rev()
-                        .take(5)
-                        .map(|(at, state, message)| RuntimeInsightStateSnapshot {
-                            at: *at,
-                            state: InsightSnapshot::insight_state_label(state).to_string(),
-                            message: message.clone(),
-                        })
-                        .collect(),
-                })
-            })
+            .filter_map(|id| self.insights.get(&id))
             .collect::<Vec<_>>();
-        insights.sort_by(|left, right| {
-            left.symbol
-                .cmp(&right.symbol)
-                .then(left.updated_at.cmp(&right.updated_at))
+        candidates.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
                 .then(left.insight_id.cmp(&right.insight_id))
         });
-        insights.truncate(128);
-        insights
+        candidates
+            .into_iter()
+            .take(crate::core::tui::INSIGHT_PREVIEW_LIMIT)
+            .map(|insight| RuntimeInsightSnapshot {
+                insight_id: insight.insight_id.to_string(),
+                parent_id: insight.parent_id.map(|id| id.to_string()),
+                symbol: insight.symbol.clone(),
+                state: InsightSnapshot::insight_state_label(insight.state()).to_string(),
+                side: InsightSnapshot::order_side_label(insight.side()).to_string(),
+                strategy_type: InsightSnapshot::strategy_type_label(insight.strategy_type())
+                    .into_owned(),
+                order_id: insight.order_id.clone(),
+                close_order_id: insight.close_order_id.clone(),
+                quantity: insight.quantity(),
+                contracts: insight.contracts,
+                order_type: InsightSnapshot::order_type_label(insight.order_type()).to_string(),
+                order_class: InsightSnapshot::order_class_label(insight.order_class()).to_string(),
+                limit_price: insight.limit_price(),
+                stop_price: insight.stop_price(),
+                take_profit_levels: insight.take_profit_levels(),
+                stop_loss_levels: insight.stop_loss_levels(),
+                filled_price: insight.filled_price,
+                close_price: insight.close_price,
+                confidence: insight.confidence(),
+                created_at: Some(insight.created_at),
+                updated_at: Some(insight.updated_at),
+                filled_at: insight.filled_at,
+                closed_at: insight.closed_at,
+                state_history: insight
+                    .state_history
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .take(25)
+                    .map(
+                        |(index, (at, state, message))| RuntimeInsightStateSnapshot {
+                            at: *at,
+                            state: InsightSnapshot::insight_state_label(state).to_string(),
+                            message: message
+                                .as_ref()
+                                .map(|message| message.chars().take(512).collect()),
+                            kind: insight
+                                .state_history_kinds
+                                .get(index)
+                                .map(|kind| format!("{kind:?}"))
+                                .unwrap_or_else(|| "Diagnostic".into()),
+                        },
+                    )
+                    .collect(),
+            })
+            .collect()
     }
 
     fn runtime_live_metrics(&self) -> Option<RuntimeMetricsSnapshot> {
@@ -1048,7 +1091,29 @@ where
                 open_positions_count: snapshot.open_positions_count,
                 open_insights_count: snapshot.open_insights_count,
                 updated_at: Some(snapshot.updated_at),
-                summary_lines: Vec::new(),
+                summary_lines: vec![
+                    format!("Equity: {:.2}", snapshot.final_equity),
+                    format!("Return: {:.2}%", snapshot.total_return_pct),
+                    format!("Closed trades: {}", snapshot.total_trades),
+                    format!("Win rate: {:.2}%", snapshot.win_rate),
+                    format!("Max drawdown: {:.2}%", snapshot.max_drawdown),
+                    format!("Profit factor: {:.2}", snapshot.profit_factor),
+                    format!("Expectancy: {:.2}", snapshot.expectancy),
+                    format!("Open positions: {}", snapshot.open_positions_count),
+                    format!("Open insights: {}", snapshot.open_insights_count),
+                    format!(
+                        "Unrealized P&L: {:.2}",
+                        snapshot.open_positions_unrealized_pnl
+                    ),
+                    format!(
+                        "Winners / losers: {} / {}",
+                        snapshot.winning_trades, snapshot.losing_trades
+                    ),
+                    format!(
+                        "Metrics updated: {} UTC",
+                        snapshot.updated_at.format("%H:%M:%S")
+                    ),
+                ],
             })
     }
 
@@ -1089,6 +1154,16 @@ where
         }
         .to_string();
         let aqs_sync_status = aqs_sync_status.into();
+        let mut provider_capabilities =
+            crate::core::broker::traits::Broker::get_features(&self.broker)
+                .iter()
+                .map(|feature| format!("Broker: {feature:?}"))
+                .collect::<Vec<_>>();
+        provider_capabilities.extend(
+            crate::core::broker::traits::DataFeed::get_features(&self.broker)
+                .iter()
+                .map(|feature| format!("Feed: {feature:?}")),
+        );
 
         self.runtime_telemetry.update_snapshot(|snapshot| {
             snapshot.mode = mode;
@@ -1107,6 +1182,7 @@ where
             snapshot.aqs_sync_status = aqs_sync_status;
             snapshot.broker_status = broker_status;
             snapshot.datafeed_status = datafeed_status;
+            snapshot.provider_capabilities = provider_capabilities;
             if saved_result_path.is_some() {
                 snapshot.saved_result_path = saved_result_path;
             }
@@ -1137,7 +1213,13 @@ where
 
     /// Trigger strategy shutdown gracefully.
     pub fn shutdown(&mut self) {
-        let _ = self.shutdown_tx.send(true);
+        if let Some(driver) = &self.command_driver {
+            driver.request_execution_stop();
+        }
+        // A stop can arrive before the live/backtest listener subscribes.
+        // `send` discards the value when there are no receivers; retain it so a
+        // later startup/drain cannot accidentally continue entry processing.
+        self.shutdown_tx.send_replace(true);
     }
 
     /// Get the current timeframe.
@@ -1342,63 +1424,37 @@ where
 
             if let Ok(mut bar_df) = bar_df_res {
                 let appended_rows = bar_df.height();
-                // Pre-fill bar_df with Null values for indicators to match schema
-                for (name, _ind) in self.indicators.iter() {
-                    let null_series =
-                        Series::full_null(name.into(), bar_df.height(), &DataType::Float64);
-                    let _ = bar_df.with_column(null_series.into());
-                }
-
-                let current_time = self.broker.get_current_time();
-                for row_index in 0..appended_rows {
-                    for (_name, ind) in self.indicators.iter_mut() {
-                        let window_size = ind.window_size();
-                        let available_rows = history_df.height() + row_index + 1;
-                        if available_rows < window_size {
-                            ind.set_last_run_time(current_time);
-                            continue;
+                // Materialize every declared output, including multi-output MACD/bands/profile.
+                // Built-ins update bounded, per-history-key state once per incoming batch.
+                for name in &self.indicator_order {
+                    if let Some(indicator) = self.indicators.get(name) {
+                        for output in indicator.output_columns() {
+                            let null_series = Series::full_null(output.into(), appended_rows, &DataType::Float64);
+                            let _ = bar_df.with_column(null_series.into());
                         }
-
-                        // Indicators only need their bounded lookback. Build that window from the
-                        // retained history and the incoming rows, then write results into the small
-                        // incoming frame before appending it to the full history frame.
-                        let prior_rows_needed = window_size.saturating_sub(row_index + 1);
-                        let mut window = history_df.tail(Some(prior_rows_needed));
-                        let incoming = bar_df.slice(0, row_index + 1);
-                        if window.height() == 0 {
-                            window = incoming;
-                        } else if window.vstack_mut(&incoming).is_err() {
-                            ind.set_last_run_time(current_time);
-                            continue;
-                        }
-                        if window.height() > window_size {
-                            window = window.tail(Some(window_size));
-                        }
-
-                        if let Ok(result) = ind.run_bar(&window) {
-                            for (column_name, value) in result {
-                                let Ok(series) = bar_df.column(&column_name) else {
-                                    continue;
-                                };
-                                let Ok(values) = series.f64() else {
-                                    continue;
-                                };
-                                let mut values = values.iter().collect::<Vec<Option<f64>>>();
-                                if let Some(slot) = values.get_mut(row_index) {
-                                    *slot = Some(value);
-                                    let updated = Series::new(column_name.into(), values);
-                                    let _ = bar_df.with_column(updated.into());
-                                }
-                            }
-                        }
-                        ind.set_last_run_time(current_time);
                     }
+                }
+                let current_time = self.broker.get_current_time();
+                for name in &self.indicator_order {
+                    let Some(indicator) = self.indicators.get_mut(name) else { continue; };
+                    if let Err(error) = indicator.update_stream(&history_key, history_df, &mut bar_df) {
+                        warn!("Indicator {} update failed for {}: {}", name, history_key, error);
+                    }
+                    indicator.set_last_run_time(current_time);
                 }
 
                 if history_df.height() == 0 {
                     *history_df = bar_df;
                 } else {
-                    let _ = history_df.vstack_mut(&bar_df);
+                    // Registration/dependency order can differ from physical backfill order.
+                    // Align by name; Polars vstack requires identical physical column order.
+                    let appended = bar_df.select(history_df.get_column_names().into_iter().map(|s| s.as_str()))
+                        .and_then(|aligned| history_df.vstack_mut(&aligned).map(|_| ()));
+                    if let Err(error) = appended {
+                        warn!("Cannot append indicator history for {}: {}", history_key, error);
+                        self.event_context_stack.pop();
+                        return;
+                    }
                 }
                 if history_df.height() > max_history_rows {
                     *history_df = history_df.tail(Some(max_history_rows));
@@ -1499,149 +1555,265 @@ where
     /// Run insight pipeline: for each active insight, run pipes matching its state.
     /// Mirrors Python's `_insightListener` (the per-step portion).
     fn run_insight_pipeline(&mut self) {
-        // Take pipeline and insights out to avoid borrow conflicts
+        self.run_insight_pipeline_selected(None);
+    }
+
+    /// A completion resumes only its selected owners. A market-data turn still
+    /// supplies the full active set until feed-specific routing is installed.
+    fn run_insight_pipeline_selected(&mut self, selected: Option<Vec<Uuid>>) {
+        self.run_insight_pipeline_budgeted(selected, None);
+    }
+
+    /// A live sweep can yield only between complete insight turns. The returned
+    /// cursor identifies the last consumed ID, including removed/inactive rows.
+    fn run_insight_pipeline_budgeted(
+        &mut self,
+        selected: Option<Vec<Uuid>>,
+        budget: Option<std::time::Duration>,
+    ) -> (Option<Uuid>, usize) {
+        let started = std::time::Instant::now();
+        let mut last_processed = None;
+        let mut processed = 0;
+        let mut snapshot_membership_changed = false;
+        // Move only the row being updated. Other insights and the identity index
+        // remain available to DCA/risk pipes through StrategyContext.
         let mut pipeline = std::mem::take(&mut self.insight_pipeline);
-        let mut insights = std::mem::take(&mut self.insights);
         let mut touched_insight_ids = FxHashSet::default();
 
-        let insight_ids = insights.active_insight_ids_unsorted();
+        let full_pass = selected.is_none();
+        let insight_ids = selected.unwrap_or_else(|| self.insights.active_insight_ids_unsorted());
+        if full_pass && !pipeline.deferred.is_empty() {
+            let active_ids = insight_ids.iter().copied().collect::<FxHashSet<_>>();
+            let stale = pipeline
+                .deferred
+                .iter()
+                .filter(|(id, resume)| {
+                    !self.insights.get(id).is_some_and(|insight| {
+                        active_ids.contains(id) && insight.state == resume.state
+                    })
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for id in stale {
+                pipeline.forget_continuation(&id);
+                self.insights.mark_execution_dirty(id);
+            }
+            for pipes in pipeline.pipeline.values_mut() {
+                for pipe in pipes {
+                    pipe.retain_active_insights(&active_ids);
+                }
+            }
+        }
 
         for id in insight_ids {
-            let mut insight = match insights.get_mut(&id) {
+            if budget.is_some_and(|budget| processed > 0 && started.elapsed() >= budget)
+                || (budget.is_some()
+                    && (*self.shutdown_tx.borrow() || self.runtime_telemetry.shutdown_requested()))
+            {
+                break;
+            }
+            last_processed = Some(id);
+            processed += 1;
+            if !self
+                .insights
+                .get(&id)
+                .is_some_and(|row| !row.state.is_inactive())
+            {
+                if pipeline.forget_continuation(&id) {
+                    self.insights.mark_execution_dirty(id);
+                }
+                continue;
+            }
+            if pipeline.deferred.get(&id).is_some_and(|resume| {
+                self.insights
+                    .get(&id)
+                    .is_some_and(|row| row.state != resume.state)
+            }) {
+                if pipeline.forget_continuation(&id) {
+                    self.insights.mark_execution_dirty(id);
+                }
+            }
+            let before_continuation = pipeline.execution_checkpoint(&id);
+            let mut insight = match self.insights.take_for_update(&id) {
                 Some(ins) => ins,
                 None => continue,
             };
 
-            let state = insight.state.clone();
-            let expiration_managed_by_pipe = pipeline.pipeline.get(&state).is_some_and(|pipes| {
-                pipes.iter().any(|pipe| {
-                    pipe.controls_expiration() && pipe.matches_asset_and_alpha(&insight)
-                })
-            });
-            let can_expire = insight.can_expire();
-            let should_clear_first_on_fill =
-                state == InsightState::Filled && insight.first_on_fill();
-            let mut before_fingerprint = if can_expire || should_clear_first_on_fill {
-                Some(insight.snapshot_fingerprint_hash())
-            } else {
-                None
-            };
+            'insight_turn: {
+                let state = insight.state.clone();
+                let expiration_managed_by_pipe =
+                    pipeline.pipeline.get(&state).is_some_and(|pipes| {
+                        pipes.iter().any(|pipe| {
+                            pipe.controls_expiration() && pipe.matches_asset_and_alpha(&insight)
+                        })
+                    });
+                let can_expire = insight.can_expire();
+                let should_clear_first_on_fill =
+                    state == InsightState::Filled && insight.first_on_fill();
+                let mut before_fingerprint = if can_expire || should_clear_first_on_fill {
+                    Some(insight.snapshot_fingerprint_hash())
+                } else {
+                    None
+                };
 
-            if can_expire && !expiration_managed_by_pipe && insight.has_expired(self) {
-                debug!(
-                    "Skipping expired insight {} in state {:?}",
-                    insight.insight_id(),
-                    insight.state()
-                );
-                if before_fingerprint
-                    .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
-                {
-                    touched_insight_ids.insert(id);
-                }
-                continue;
-            }
-
-            if let Some(pipes) = pipeline.get_pipes_for_state(&state) {
-                let should_run_any_pipe = pipes.iter().any(|pipe| pipe.should_run(&insight));
-                if should_run_any_pipe && before_fingerprint.is_none() {
-                    before_fingerprint = Some(insight.snapshot_fingerprint_hash());
-                }
-                let mut failed = false;
-                let mut rejection_reason: Option<String> = None;
-                for pipe in pipes.iter_mut() {
-                    if !pipe.should_run(&insight) {
-                        continue;
-                    }
+                if can_expire && !expiration_managed_by_pipe && insight.has_expired(self) {
                     debug!(
-                        "Running insight pipe {} for insight {} in state {:?}",
-                        pipe.name(),
+                        "Skipping expired insight {} in state {:?}",
                         insight.insight_id(),
-                        state
+                        insight.state()
                     );
-                    let result = pipe.run(self, &mut insight);
-                    debug!(
-                        "Insight pipe {} result for insight {}: success={} passed={} message={:?}",
-                        pipe.name(),
-                        insight.insight_id(),
-                        result.success,
-                        result.passed,
-                        result.message
-                    );
-                    if !result.success {
-                        failed = true;
-                        rejection_reason = Some(result.message.unwrap_or_else(|| {
-                            format!("Insight pipe {} failed", result.pipe_name)
-                        }));
-                        break;
-                    }
-                    if !result.passed {
-                        if insight.closing || insight.cancelling || insight.state.is_inactive() {
-                            break;
-                        }
-                        failed = true;
-                        rejection_reason = Some(result.message.unwrap_or_else(|| {
-                            format!("Insight pipe {} did not pass", result.pipe_name)
-                        }));
-                        break;
-                    }
-                }
-                if failed {
-                    let reason = rejection_reason
-                        .as_deref()
-                        .unwrap_or("Insight pipeline failed");
-                    if insight.state == InsightState::Filled {
-                        insight.state_log(Some(format!(
-                            "Filled insight pipeline failed; position remains active: {reason}"
-                        )));
-                    } else if !insight.state.is_inactive() {
-                        insight.order_rejected(reason);
-                    }
                     if before_fingerprint
                         .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
                     {
                         touched_insight_ids.insert(id);
                     }
-                    continue;
+                    break 'insight_turn;
+                }
+
+                let previous_resume = pipeline.deferred.remove(&id);
+                let resume_index = previous_resume.as_ref().map_or(0, |resume| resume.index);
+                let mut deferred = None;
+                if let Some(pipes) = pipeline.get_pipes_for_state(&state) {
+                    let should_run_any_pipe = pipes.iter().any(|pipe| pipe.should_run(&insight));
+                    if should_run_any_pipe && before_fingerprint.is_none() {
+                        before_fingerprint = Some(insight.snapshot_fingerprint_hash());
+                    }
+                    let mut failed = false;
+                    let mut rejection_reason: Option<String> = None;
+                    for (pipe_index, pipe) in pipes.iter_mut().enumerate().skip(resume_index) {
+                        if !pipe.should_run(&insight) {
+                            continue;
+                        }
+                        debug!(
+                            "Running insight pipe {} for insight {} in state {:?}",
+                            pipe.name(),
+                            insight.insight_id(),
+                            state
+                        );
+                        let result = pipe.run(self, &mut insight);
+                        debug!(
+                            "Insight pipe {} result for insight {}: success={} passed={} message={:?}",
+                            pipe.name(),
+                            insight.insight_id(),
+                            result.success,
+                            result.passed,
+                            result.message
+                        );
+                        if let Some(dependency) = result.deferred {
+                            let snapshot_attempted = previous_resume
+                                .as_ref()
+                                .filter(|resume| resume.dependency == dependency)
+                                .and_then(|resume| resume.snapshot_attempted);
+                            deferred = Some(types::DeferredPipeResume {
+                                state: state.clone(),
+                                index: pipe_index,
+                                dependency,
+                                snapshot_attempted,
+                            });
+                            break;
+                        }
+                        if !result.success {
+                            failed = true;
+                            rejection_reason = Some(result.message.unwrap_or_else(|| {
+                                format!("Insight pipe {} failed", result.pipe_name)
+                            }));
+                            break;
+                        }
+                        if !result.passed {
+                            if insight.closing || insight.cancelling || insight.state.is_inactive()
+                            {
+                                break;
+                            }
+                            failed = true;
+                            rejection_reason = Some(result.message.unwrap_or_else(|| {
+                                format!("Insight pipe {} did not pass", result.pipe_name)
+                            }));
+                            break;
+                        }
+                    }
+                    if failed {
+                        let reason = rejection_reason
+                            .as_deref()
+                            .unwrap_or("Insight pipeline failed");
+                        if insight.state == InsightState::Filled {
+                            insight.state_log(Some(format!(
+                                "Filled insight pipeline failed; position remains active: {reason}"
+                            )));
+                        } else if insight.has_pending_submit()
+                            || insight.state == InsightState::Executed
+                        {
+                            insight.state_log(Some(format!(
+                                "Insight pipeline failed; broker cleanup requested: {reason}"
+                            )));
+                            self.schedule_insight_cleanup(id);
+                        } else if !insight.state.is_inactive() {
+                            insight.order_rejected(reason);
+                        }
+                        if before_fingerprint
+                            .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
+                        {
+                            touched_insight_ids.insert(id);
+                        }
+                        break 'insight_turn;
+                    }
+                }
+
+                if let Some(resume) = deferred {
+                    pipeline.deferred.insert(id, resume);
+                    if before_fingerprint
+                        .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
+                    {
+                        touched_insight_ids.insert(id);
+                    }
+                    // Initial configuration and completed side effects are not replayed.
+                    // first_on_fill remains true until this continuation completes.
+                    break 'insight_turn;
+                }
+
+                if should_clear_first_on_fill {
+                    debug!(
+                        "Filled-state insight pipeline completed for insight {}; clearing first_on_fill",
+                        insight.insight_id()
+                    );
+                    insight.set_first_on_fill(false);
+                }
+                if before_fingerprint
+                    .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
+                {
+                    touched_insight_ids.insert(id);
                 }
             }
-
-            if should_clear_first_on_fill {
-                debug!(
-                    "Filled-state insight pipeline completed for insight {}; clearing first_on_fill",
-                    insight.insight_id()
-                );
-                insight.set_first_on_fill(false);
+            self.insights
+                .restore_after_update(insight, touched_insight_ids.contains(&id));
+            if before_continuation != pipeline.execution_checkpoint(&id) {
+                self.insights.mark_execution_dirty(id);
+                // A later stage (including inside And/Or) may wait on the same
+                // snapshot kind. It has not attempted this observation yet.
+                if let Some(resume) = pipeline.deferred.get_mut(&id) {
+                    resume.snapshot_attempted = None;
+                }
+                pipeline.snapshot_dependencies.remove(&id);
             }
-            if before_fingerprint
-                .is_some_and(|before| before != insight.snapshot_fingerprint_hash())
-            {
-                touched_insight_ids.insert(id);
-            }
+            snapshot_membership_changed |= pipeline.snapshot_dependencies.update(
+                id,
+                pipeline.deferred.get(&id).map(|resume| &resume.dependency),
+            );
+            self.schedule_insight_children(id);
         }
 
-        // Split-order submission can register eager child insights through the strategy context
-        // while the main collection is temporarily moved out for pipeline execution. Merge those
-        // newly registered insights before restoring the collection so their broker events remain
-        // trackable.
-        let eager_insight_ids = self.insights.ids();
-        for insight_id in eager_insight_ids {
-            if let Some(insight) = self.insights.remove_insight(&insight_id) {
-                insights.add_insight(insight);
-            }
-        }
-
-        // Put them back
         self.insight_pipeline = pipeline;
-        self.insights = insights;
-        for insight_id in touched_insight_ids {
-            self.insights.refresh_runtime_tracking(&insight_id);
+        if snapshot_membership_changed {
+            if let Some(ready) = self.broker.snapshot_notifier() {
+                ready.notify_one();
+            }
         }
-
-        // Pipes can synchronously submit, cancel, modify, or close orders. Brokers such as
-        // MT5 also enqueue a local acknowledgement for those RPC results. Drain those events
-        // only after the insight collection has been restored so the acknowledgement cannot
-        // be lost between the command and the asynchronous trade-stream notification.
-        self.on_trade_update();
+        // Completions reduce only after every borrowed row has been restored.
+        // Budgeted live sweeps leave ready reducer work to the next owner turn,
+        // so another five-millisecond drain cannot hide inside this budget.
+        if budget.is_none() {
+            self.on_trade_update();
+        }
+        (last_processed, processed)
     }
 
     fn sync_backtest_insight_snapshots(&mut self) {
@@ -1675,314 +1847,201 @@ where
     /// Handles all event types: New, PendingNew, Filled, PartialFilled,
     /// Cancelled, Rejected, Closed, Replaced.
     /// Works with any broker implementing `OrderManagementProvider`.
-    fn on_trade_update(&mut self) {
-        let events = self.broker.drain_trade_events();
-        let mut children_to_submit = Vec::new();
-        let mut parents_to_reconcile = Vec::new();
-        let mut touched_insight_ids = FxHashSet::default();
+    fn has_pending_broker_events(&self) -> bool {
+        !self.pending_broker_events.is_empty()
+            || self.broker.has_pending_trade_events()
+            || self.command_driver.as_ref().is_some_and(|driver| {
+                driver.has_ready_events_with_admission(
+                    self.status.is_running() && !*self.shutdown_tx.borrow(),
+                )
+            })
+            || self
+                .insight_work
+                .is_ready_for_execution(self.insight_execution_enabled())
+            || ((self.execution_persistence.is_ready() || self.insights.has_execution_dirty())
+                && self
+                    .command_driver
+                    .as_ref()
+                    .is_some_and(|driver| !driver.checkpoint_in_flight()))
+    }
 
-        for (order, event) in events {
-            debug!(
-                "Trade event: event={:?} {}",
-                event,
-                Self::order_log_summary(&order)
-            );
-            if !self.universe.contains_key(&order.asset.symbol) {
+    /// Bound reducer work between strategy scheduling points. Individual legacy
+    /// mutation calls in child cleanup are migrated separately; this budget
+    /// never interrupts one state transition half way through.
+    fn on_trade_update(&mut self) {
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(5);
+        let commands = match self.reduce_ready_commands(256, budget) {
+            Ok(count) => count,
+            Err(error) => {
+                error!("Broker command completion driver failed; stopping new dispatch: {error}");
+                self.execution_error.get_or_insert(error);
+                self.shutdown();
+                return;
+            }
+        };
+        let trades = if let Some(remaining) = budget.checked_sub(started.elapsed()) {
+            self.on_trade_update_with_budget(256 - commands, remaining)
+        } else {
+            0
+        };
+        let work = if let Some(remaining) = budget.checked_sub(started.elapsed()) {
+            self.process_insight_work(256 - commands - trades, remaining)
+        } else {
+            0
+        };
+        if let Some(remaining) = budget.checked_sub(started.elapsed()) {
+            if let Err(error) = self.advance_execution_persistence_with_budget(
+                256 - commands - trades - work,
+                remaining,
+            ) {
+                error!("Execution checkpoint failed; stopping new dispatch: {error}");
+                self.execution_error.get_or_insert(error);
+                self.shutdown();
+            }
+        }
+    }
+
+    async fn drain_ready_broker_events(&mut self) {
+        // Backtests must apply every ready event before simulated time advances.
+        // Yield between bounded turns so stop/timers and transport tasks run.
+        while self.has_pending_broker_events() {
+            self.on_trade_update();
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn on_trade_update_with_budget(
+        &mut self,
+        max_events: usize,
+        budget: std::time::Duration,
+    ) -> usize {
+        let started = std::time::Instant::now();
+        let mut processed = 0;
+        while processed < max_events {
+            if processed != 0 && started.elapsed() >= budget {
+                break;
+            }
+            if self.pending_broker_events.is_empty() {
+                self.pending_broker_events.extend(
+                    self.broker
+                        .drain_trade_events_bounded((max_events - processed).min(256)),
+                );
+            }
+            let Some((order, event)) = self.pending_broker_events.pop_front() else {
+                break;
+            };
+            self.process_trade_update(order, event);
+            processed += 1;
+        }
+        processed
+    }
+
+    fn process_trade_update(&mut self, order: Order, event: TradeUpdateEvent) {
+        self.process_order_evidence(order, event, OrderEvidenceSource::TradeStream, None);
+    }
+
+    fn process_order_evidence(
+        &mut self,
+        order: Order,
+        event: TradeUpdateEvent,
+        source: OrderEvidenceSource,
+        response_insight_id: Option<Uuid>,
+    ) -> bool {
+        debug!(
+            "Trade event: event={:?} {}",
+            event,
+            Self::order_log_summary(&order)
+        );
+        let mut parent_to_reconcile = None;
+        let mut changed_id = None;
+        if !self.universe.contains_key(&order.asset.symbol) {
+            return false;
+        }
+        // A submit response may omit the client ID. Its receipt is the only
+        // authoritative route; never guess among other New insights by symbol.
+        let mut insight_ids = if source == OrderEvidenceSource::SubmitResponse {
+            let Some(id) = response_insight_id else {
+                return false;
+            };
+            vec![id]
+        } else {
+            self.insights.candidate_insight_ids_for_trade_event(&order)
+        };
+        if insight_ids.is_empty() && source == OrderEvidenceSource::TradeStream {
+            insight_ids = self.insights.ids();
+        }
+        for id in insight_ids {
+            let Some(insight) = self.insights.get_mut(&id) else {
+                continue;
+            };
+            let reduction = Self::reduce_broker_order(insight, &order, &event, source);
+            if reduction == OrderReduction::Ignored {
+                if source == OrderEvidenceSource::SubmitResponse
+                    && insight.symbol == order.asset.symbol
+                    && insight.side == order.side
+                    && (insight.order_id.as_deref() == Some(order.order_id.as_str())
+                        || matches!(insight.state, InsightState::Filled | InsightState::Closed))
+                    && !order.order_id.is_empty()
+                    && order
+                        .insight_id
+                        .as_deref()
+                        .is_none_or(|value| value == id.to_string())
+                {
+                    // The stream already applied this entry; the late response
+                    // is consumed without resetting first-fill or appending history.
+                    return true;
+                }
                 continue;
             }
-            let mut insight_ids = self.insights.candidate_insight_ids_for_trade_event(&order);
-            if insight_ids.is_empty() {
-                insight_ids = self.insights.ids();
+            if reduction == OrderReduction::AccountingUpdated {
+                // Persist only the corrected evidence. Do not reopen/reclose a
+                // trade, wake pipes, retire children or dispatch broker work.
+                self.insights.refresh_runtime_tracking(&id);
+                return true;
             }
-            for id in insight_ids {
-                let mut insight = match self.insights.get_mut(&id) {
-                    Some(i) => i,
-                    None => continue,
-                };
-                if insight.symbol != order.asset.symbol {
-                    continue;
+            changed_id = Some(id);
+            match reduction {
+                OrderReduction::EntryFilled => {
+                    parent_to_reconcile = insight.parent_id;
                 }
-                let matched = Self::trade_event_matches_insight(&insight, &order);
-
-                match (&insight.state, &event) {
-                    // NEW → EXECUTED on accept
-                    (
-                        InsightState::New,
-                        TradeUpdateEvent::Accepted
-                        | TradeUpdateEvent::PendingNew
-                        | TradeUpdateEvent::New,
-                    ) => {
-                        if matched {
-                            insight.order_accepted(&order.order_id);
-                            touched_insight_ids.insert(id);
-                            break;
-                        }
-                    }
-                    // NEW can jump straight to fill in live brokers
-                    (InsightState::New, TradeUpdateEvent::Filled) => {
-                        if matched {
-                            insight.order_accepted(&order.order_id);
-                            let price = Self::round_order_value(
-                                &order,
-                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                            );
-                            insight.position_filled(
-                                price,
-                                order.filled_qty,
-                                &order.order_id,
-                                Self::round_order_option_value(&order, order.commission),
-                            );
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            touched_insight_ids.insert(id);
-                            if let Some(parent_id) = insight.parent_id {
-                                parents_to_reconcile.push(parent_id);
-                            }
-                            children_to_submit.extend(
-                                insight
-                                    .children
-                                    .iter()
-                                    .filter(|child| !child.is_split_insight())
-                                    .cloned(),
-                            );
-                            break;
-                        }
-                    }
-                    // NEW can jump straight to partial fill in live brokers
-                    (InsightState::New, TradeUpdateEvent::PartialFilled) => {
-                        if matched {
-                            insight.order_accepted(&order.order_id);
-                            let price = Self::round_order_value(
-                                &order,
-                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                            );
-                            insight.partial_filled(
-                                order.filled_qty,
-                                price,
-                                &order.order_id,
-                                Self::round_order_option_value(&order, order.commission),
-                            );
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            touched_insight_ids.insert(id);
-                            break;
-                        }
-                    }
-                    // EXECUTED → FILLED
-                    (InsightState::Executed, TradeUpdateEvent::Filled) => {
-                        if matched {
-                            let price = Self::round_order_value(
-                                &order,
-                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                            );
-                            insight.position_filled(
-                                price,
-                                order.filled_qty,
-                                &order.order_id,
-                                Self::round_order_option_value(&order, order.commission),
-                            );
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            touched_insight_ids.insert(id);
-                            if let Some(parent_id) = insight.parent_id {
-                                parents_to_reconcile.push(parent_id);
-                            }
-
-                            // If this insight has children, queue them for submission
-                            children_to_submit.extend(
-                                insight
-                                    .children
-                                    .iter()
-                                    .filter(|child| !child.is_split_insight())
-                                    .cloned(),
-                            );
-                            break;
-                        }
-                    }
-                    // EXECUTED partial fill
-                    (InsightState::Executed, TradeUpdateEvent::PartialFilled) => {
-                        if matched {
-                            let price = Self::round_order_value(
-                                &order,
-                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                            );
-                            insight.partial_filled(
-                                order.filled_qty,
-                                price,
-                                &order.order_id,
-                                Self::round_order_option_value(&order, order.commission),
-                            );
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            touched_insight_ids.insert(id);
-                            break;
-                        }
-                    }
-                    // FILLED partial close / scale-out
-                    (InsightState::Filled, TradeUpdateEvent::PartialFilled) => {
-                        if matched {
-                            let price = Self::round_order_value(
-                                &order,
-                                Self::close_price_from_order(&order),
-                            );
-                            insight.partial_closed(
-                                order.filled_qty,
-                                price,
-                                &order.order_id,
-                                Self::round_order_option_value(&order, order.commission),
-                            );
-                            touched_insight_ids.insert(id);
-                            // We dont need to reset this when closing the insight - its kind of a
-                            // design choice
-                            // Self::sync_broker_managed_levels(insight, &order);
-                            break;
-                        }
-                    }
-                    // EXECUTED → CANCELED
-                    (InsightState::Executed | InsightState::New, TradeUpdateEvent::Cancelled) => {
-                        if matched {
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            insight.order_cancelled("Order cancelled");
-                            touched_insight_ids.insert(id);
-                            // Cancel any open children
-                            parents_to_reconcile.push(insight.insight_id);
-                            break;
-                        }
-                    }
-                    // EXECUTED → REJECTED
-                    (InsightState::Executed | InsightState::New, TradeUpdateEvent::Rejected) => {
-                        if matched {
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            insight.order_rejected(
-                                order
-                                    .rejection_reason
-                                    .as_deref()
-                                    .unwrap_or("Order rejected"),
-                            );
-                            touched_insight_ids.insert(id);
-                            // Cancel any open children
-                            parents_to_reconcile.push(insight.insight_id);
-                            break;
-                        }
-                    }
-                    // EXECUTED → REPLACED (order modified)
-                    (InsightState::Executed, TradeUpdateEvent::Replaced) => {
-                        if matched {
-                            if order.limit_price != insight.limit_price {
-                                insight.limit_price =
-                                    Self::round_order_option_value(&order, order.limit_price);
-                            }
-                            if insight.quantity != Some(order.qty) {
-                                insight.quantity = Some(order.qty);
-                            }
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            touched_insight_ids.insert(id);
-                            break;
-                        }
-                    }
-                    // FILLED → CLOSED (SL/TP/manual close)
-                    (InsightState::Filled, TradeUpdateEvent::Filled | TradeUpdateEvent::Closed) => {
-                        if matched {
-                            if event == TradeUpdateEvent::Filled && order.side == insight.side {
-                                continue;
-                            }
-                            let price = Self::round_order_value(
-                                &order,
-                                Self::close_price_from_order(&order),
-                            );
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            insight.position_closed(
-                                price,
-                                &order.order_id,
-                                order.filled_qty,
-                                Self::round_order_option_value(&order, order.realized_pnl),
-                                Self::round_order_option_value(&order, order.commission),
-                                Self::round_order_option_value(&order, order.swap),
-                            );
-                            touched_insight_ids.insert(id);
-
-                            // Close/Cancel any open children
-                            parents_to_reconcile.push(insight.insight_id);
-                            break;
-                        }
-                    }
-                    // MT5 can deliver terminal messages out of order. If a real fill arrives
-                    // after a stale cancel/reject, the broker fill is authoritative.
-                    (
-                        InsightState::Cancelled | InsightState::Rejected,
-                        TradeUpdateEvent::Filled,
-                    ) => {
-                        if matched {
-                            let price = Self::round_order_value(
-                                &order,
-                                order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                            );
-                            insight.position_filled(
-                                price,
-                                order.filled_qty,
-                                &order.order_id,
-                                Self::round_order_option_value(&order, order.commission),
-                            );
-                            Self::sync_broker_managed_levels(&mut insight, &order);
-                            touched_insight_ids.insert(id);
-                            if let Some(parent_id) = insight.parent_id {
-                                parents_to_reconcile.push(parent_id);
-                            }
-                            break;
-                        }
-                    }
-                    _ => {}
+                OrderReduction::Terminal => parent_to_reconcile = Some(insight.insight_id),
+                OrderReduction::LateEntryFilled => {
+                    // A cancelled/rejected entry filling late is exposure to
+                    // reconcile, not permission to launch its dormant DCA stack.
+                    parent_to_reconcile = insight.parent_id;
                 }
+                _ => {}
             }
+            break;
+        }
+        let Some(changed_id) = changed_id else {
+            return false;
+        };
+        self.insights.refresh_runtime_tracking(&changed_id);
+        if self
+            .insights
+            .get(&changed_id)
+            .is_some_and(|insight| insight.state.is_inactive())
+        {
+            self.reduce_terminal_command_receipts(changed_id);
+            self.insight_work.retire_children(changed_id);
         }
 
-        // Process deferred child events
-        for mut child in children_to_submit {
-            child.submit(self);
-            self.add_insight(child);
+        self.insight_work.wake(changed_id);
+        if self.status == StrategyStatus::Stopping {
+            self.schedule_insight_cleanup(changed_id);
+        } else {
+            self.schedule_insight_children(changed_id);
         }
-
-        if !parents_to_reconcile.is_empty() {
-            let parents_to_reconcile = parents_to_reconcile
-                .into_iter()
-                .filter(|parent_id| {
-                    self.insights
-                        .get(parent_id)
-                        .is_some_and(|parent| parent.state.is_inactive())
-                })
-                .collect::<FxHashSet<_>>();
-            let children_to_process = self
-                .insights
-                .descendant_ids_for_parents(&parents_to_reconcile);
-
-            // Second pass: apply closures (requires mutable self)
-            for id in children_to_process {
-                if let Some(mut child) = self.insights.remove_insight(&id) {
-                    match child.state {
-                        InsightState::Filled => {
-                            child.close(self);
-                            touched_insight_ids.insert(id);
-                            self.add_insight_internal(child, true);
-                        }
-                        InsightState::New if child.order_id.is_none() => {
-                            child.order_cancelled(
-                                "Parent insight is terminal before child submission",
-                            );
-                            touched_insight_ids.insert(id);
-                            self.add_insight_internal(child, true);
-                        }
-                        InsightState::New | InsightState::Executed => {
-                            child.cancel(self);
-                            touched_insight_ids.insert(id);
-                            self.add_insight_internal(child, true);
-                        }
-                        _ => {
-                            self.add_insight_internal(child, true);
-                        }
-                    }
-                }
-            }
+        if let Some(parent_id) = parent_to_reconcile.filter(|parent_id| {
+            self.insights
+                .get(parent_id)
+                .is_some_and(|parent| parent.state.is_inactive())
+        }) {
+            self.schedule_descendant_cleanup(parent_id);
         }
-
-        for insight_id in touched_insight_ids {
-            self.insights.refresh_runtime_tracking(&insight_id);
-        }
+        true
     }
 }
 
@@ -1994,6 +2053,64 @@ where
     E: Broker + OrderManagementProvider,
     D: DataFeed + DataProvider,
 {
+    fn enqueue_broker_command(
+        &mut self,
+        insight_id: Uuid,
+        action: crate::core::broker::commands::BrokerCommandAction,
+        group: Option<crate::core::broker::commands::BrokerOperationGroup>,
+    ) -> Result<
+        crate::core::broker::commands::BrokerCommandReceipt,
+        crate::core::broker::commands::BrokerCommandError,
+    > {
+        let constraints = match &action {
+            crate::core::broker::commands::BrokerCommandAction::Submit { request } => {
+                crate::core::broker::commands::BrokerDispatchConstraints {
+                    max_total_symbol_quantity: self
+                        .universe
+                        .get(&request.symbol)
+                        .and_then(|asset| asset.max_total_size),
+                }
+            }
+            _ => Default::default(),
+        };
+        let receipt = self
+            .command_driver
+            .as_mut()
+            .ok_or(crate::core::broker::commands::BrokerCommandError::Closed)?
+            .enqueue_with_constraints(&insight_id.to_string(), action, group, constraints)?;
+        self.insights.execution_pin(insight_id);
+        Ok(receipt)
+    }
+
+    fn broker_command_progress(
+        &self,
+        receipt: &crate::core::broker::commands::BrokerCommandReceipt,
+    ) -> Option<command_driver::BrokerCommandProgress> {
+        self.command_driver.as_ref()?.progress(receipt)
+    }
+
+    fn broker_command_reduced(
+        &mut self,
+        receipt: &crate::core::broker::commands::BrokerCommandReceipt,
+    ) {
+        if let Some(driver) = self.command_driver.as_mut() {
+            if let Err(error) = driver.mark_reduced(receipt) {
+                error!("Cannot release broker command reducer ownership: {error}");
+                self.shutdown();
+            }
+        }
+    }
+
+    fn cancel_pending_entry(
+        &mut self,
+        receipt: &crate::core::broker::commands::BrokerCommandReceipt,
+    ) -> Result<(), crate::core::broker::commands::BrokerCommandError> {
+        self.command_driver
+            .as_ref()
+            .ok_or(crate::core::broker::commands::BrokerCommandError::Closed)?
+            .cancel_pending_entry(receipt)
+    }
+
     fn universe(&self) -> &HashMap<String, Asset> {
         &self.universe
     }
@@ -2010,84 +2127,25 @@ where
         self.add_insight_internal(insight, false);
     }
 
-    fn submit_insight(&mut self, insight: &mut Insight) {
-        info!("Submitting order to broker: {}", insight.log_summary());
-        let result = crate::core::broker::block_on_broker_future(
-            self.broker.execution.submit_order(insight.clone()),
-        );
-        if let Ok(order) = result {
-            debug!(
-                "Broker accepted: insight_id={} {}",
-                insight.insight_id(),
-                Self::order_log_summary(&order)
-            );
-            if order.order_id.is_empty() {
-                error!(
-                    "Broker returned an empty order id after submit: insight_id={} {}",
-                    insight.insight_id(),
-                    Self::order_log_summary(&order)
-                );
-            } else {
-                match order.status {
-                    TradeUpdateEvent::Accepted
-                    | TradeUpdateEvent::PendingNew
-                    | TradeUpdateEvent::New
-                    | TradeUpdateEvent::Pending => {
-                        insight.order_accepted(&order.order_id);
-                        Self::sync_broker_managed_levels(insight, &order);
-                    }
-                    TradeUpdateEvent::Filled => {
-                        insight.order_accepted(&order.order_id);
-                        let price = Self::round_order_value(
-                            &order,
-                            order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                        );
-                        insight.position_filled(
-                            price,
-                            order.filled_qty,
-                            &order.order_id,
-                            Self::round_order_option_value(&order, order.commission),
-                        );
-                        Self::sync_broker_managed_levels(insight, &order);
-                    }
-                    TradeUpdateEvent::PartialFilled => {
-                        insight.order_accepted(&order.order_id);
-                        let price = Self::round_order_value(
-                            &order,
-                            order.filled_price.or(order.limit_price).unwrap_or(0.0),
-                        );
-                        insight.partial_filled(
-                            order.filled_qty,
-                            price,
-                            &order.order_id,
-                            Self::round_order_option_value(&order, order.commission),
-                        );
-                        Self::sync_broker_managed_levels(insight, &order);
-                    }
-                    TradeUpdateEvent::Rejected => {
-                        insight.order_rejected(
-                            order
-                                .rejection_reason
-                                .as_deref()
-                                .unwrap_or("Order rejected"),
-                        );
-                    }
-                    TradeUpdateEvent::Cancelled | TradeUpdateEvent::Expired => {
-                        insight.order_cancelled("Order cancelled before acknowledgement");
-                    }
-                    TradeUpdateEvent::Closed | TradeUpdateEvent::Replaced => {
-                        insight.order_id = Some(order.order_id.clone());
-                    }
-                }
-            }
-        } else if let Err(error) = result {
-            error!(
-                "Broker submit_order failed for insight_id={} {}: {:?}",
-                insight.insight_id(),
-                insight.log_summary(),
-                error
-            );
+    fn request_insight_cancellation(
+        &mut self,
+        id: Uuid,
+    ) -> Result<bool, crate::core::broker::commands::BrokerCommandError> {
+        let Some(row) = self.insights.get(&id) else {
+            return Ok(false);
+        };
+        if !matches!(row.state, InsightState::New | InsightState::Executed) {
+            return Ok(false);
         }
+        // Persist the entry gate before queuing cleanup so neither root nor child
+        // submission can race the next pipeline turn or restart recovery.
+        if let Some(mut row) = self.insights.take_for_update(&id) {
+            row.suppress_child_entries = true;
+            self.insights.restore_after_update(row, true);
+        }
+        self.schedule_insight_cleanup(id);
+        self.schedule_descendant_cleanup(id);
+        Ok(true)
     }
 
     fn register_indicator(&mut self, indicator: Box<dyn crate::core::indicators::Indicator>) {
@@ -2160,15 +2218,15 @@ where
     }
 
     fn datafeed_features(&self) -> &'static [DataFeedFeature] {
-        self.broker.data.get_features()
+        // Backtests expose replay capabilities supplied by UnifiedBroker, not
+        // just the underlying provider (e.g. a historical-only CSV file).
+        DataFeed::get_features(&self.broker)
     }
 
     fn tools(&self) -> Box<dyn TradingTools + '_> {
-        Box::new(StrategyTools::new(
-            &self.universe,
-            &self.insights,
-            &self.broker,
-        ))
+        Box::new(
+            StrategyTools::new(&self.universe, &self.insights, &self.broker).with_context(self),
+        )
     }
 
     fn mode(&self) -> StrategyMode {
@@ -2188,7 +2246,16 @@ where
     }
 
     fn account(&self) -> Result<crate::core::broker::types::Account, BrokerError> {
-        crate::core::broker::block_on_broker_future(self.broker.get_account())
+        self.broker
+            .account_snapshot()
+            .map(|account| (*account).clone())
+    }
+
+    fn cached_account(&self) -> Option<crate::core::broker::types::Account> {
+        self.broker
+            .account_snapshot()
+            .ok()
+            .map(|account| (*account).clone())
     }
 
     fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
@@ -2214,24 +2281,12 @@ where
     }
 
     fn latest_quote(&self, symbol: &str) -> Result<crate::core::broker::types::Quote, BrokerError> {
-        if matches!(self.mode, StrategyMode::Backtest) {
-            if let Some(state) = &self.broker.backtest_state {
-                let state = state.read();
-                if let Some(bar) = state.get_current_bar(symbol) {
-                    return Ok(crate::core::broker::types::Quote {
-                        symbol: symbol.to_string(),
-                        bid: bar.close,
-                        ask: bar.close,
-                        bid_size: bar.volume,
-                        ask_size: bar.volume,
-                        last: Some(bar.close),
-                        last_size: Some(bar.volume),
-                        timestamp: bar.timestamp,
-                    });
-                }
-            }
+        if let Some(result) = self.execution_quotes.read(symbol, &self.broker) {
+            return result;
         }
-        crate::core::broker::block_on_broker_future(self.broker.get_latest_quote(symbol))
+        self.broker
+            .quote_snapshot(symbol)
+            .map(|quote| (*quote).clone())
     }
 
     fn preseed_warmup_history(
@@ -2246,34 +2301,8 @@ where
         self.cleanup_active_insights_for_teardown_internal()
     }
 
-    fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError> {
-        self.broker.cancel_order_sync(order_id)
-    }
-
-    fn update_order(&self, order_id: &str, price: f64, qty: f64) -> Result<bool, BrokerError> {
-        self.broker.update_order_sync(order_id, price, qty)
-    }
-
-    fn update_stop_loss_order(
-        &self,
-        order_id: &str,
-        price: f64,
-        qty: f64,
-    ) -> Result<bool, BrokerError> {
-        self.broker.update_stop_loss_sync(order_id, price, qty)
-    }
-
-    fn close_position(
-        &self,
-        order_id: &str,
-        qty: f64,
-        price: Option<f64>,
-    ) -> Result<bool, BrokerError> {
-        self.broker.close_position_sync(order_id, qty, price)
-    }
-
     fn shutdown(&mut self) {
-        self.shutdown_tx.send(true).ok();
+        StrategyState::shutdown(self);
     }
 }
 
@@ -2391,176 +2420,260 @@ where
             .start_tui(TuiConfig::from_process_args());
         self.publish_runtime_snapshot("not configured", None);
 
-        // ── 0. Connect broker (execution + data feed) ──
-        info!(
-            "Starting backtest strategy={} timeframe={:?} start={} end={}",
-            self.name, time_frame, start, end
-        );
-        self.timeframe = time_frame.clone();
-        self.history_seed_anchor = Some(start);
-        if let Err(error) = self.broker.connect().await {
-            error!("Backtest failed while connecting broker: {}", error);
-            self.runtime_telemetry.stop_tui();
-            return Err(error);
-        }
-        self.status = StrategyStatus::Running;
-        self.publish_runtime_snapshot("not configured", None);
-
-        // ── 1. Strategy lifecycle: on_start ──
-        debug!("Invoking strategy on_start");
-        self.run_on_start_logic(LifecycleTiming::BeforeGenerated);
-        strategy.on_start(self);
-        self.run_on_start_logic(LifecycleTiming::AfterGenerated);
-        self.publish_runtime_snapshot("not configured", None);
-
-        // ── 2. Load universe assets ──
-        self.load_universe(&mut strategy).await;
-
-        if self.universe.is_empty() {
-            error!(
-                "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
+        let mut lifecycle_started = false;
+        let execution_result: Result<(), BrokerError> = async {
+            // ── 0. Connect broker (execution + data feed) ──
+            info!(
+                "Starting backtest strategy={} timeframe={:?} start={} end={}",
+                self.name, time_frame, start, end
             );
-            self.runtime_telemetry.stop_tui();
-            return Err(BrokerError::DataFeedError(
-                "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
-                    .to_string(),
-            ));
-        }
-
-        // ── 3. Start alpha models so indicators and warm-up are configured ──
-        self.start_alpha_models();
-
-        // ── 4. Run OnInit lifecycle logic and strategy init per asset ──
-        self.load_init(&mut strategy);
-
-        // ── 5. Init alpha models per asset ──
-        self.init_alpha_models();
-
-        // ── 6. Load historical event streams into BacktestState ──
-        let event_streams = self.resolve_event_streams();
-        use std::fmt::Write as _;
-        let mut event_stream_summary = String::new();
-        for stream in &event_streams {
-            if !event_stream_summary.is_empty() {
-                event_stream_summary.push_str(", ");
+            self.timeframe = time_frame.clone();
+            self.history_seed_anchor = Some(start);
+            if let Some(state) = &self.broker.backtest_state {
+                state.write().set_backtest_window(start, end);
             }
-            let _ = write!(
-                event_stream_summary,
-                "{} {} feature={} trading={}",
-                stream.history_key, stream.key.timeframe, stream.is_feature, stream.allow_trading
-            );
-        }
-        info!("Loading backtest event streams: [{}]", event_stream_summary);
-        if let Err(error) = self
-            .broker
-            .load_backtest_event_streams(&event_streams, start, end)
-            .await
-        {
-            error!("Backtest failed while loading event streams: {}", error);
-            self.runtime_telemetry.stop_tui();
-            return Err(error);
-        }
-        info!("Backtest event streams loaded successfully");
-        self.publish_runtime_event("info", "Backtest started", "not configured");
+            if let Err(error) = self.broker.connect().await {
+                error!("Backtest failed while connecting broker: {}", error);
+                self.runtime_telemetry.stop_tui();
+                return Err(error);
+            }
+            self.status = StrategyStatus::Running;
+            self.publish_runtime_snapshot("not configured", None);
 
-        // ── 7. Main backtest loop ──
-        let mut last_runtime_publish = std::time::Instant::now();
-        loop {
-            if self.runtime_telemetry.shutdown_requested() {
-                warn!("Backtest stop requested from AQE TUI");
-                self.publish_runtime_event(
-                    "warn",
-                    "Backtest stop requested from TUI",
-                    "not configured",
+            // ── 1. Strategy lifecycle: on_start ──
+            lifecycle_started = true;
+            debug!("Invoking strategy on_start");
+            self.run_on_start_logic(LifecycleTiming::BeforeGenerated);
+            strategy.on_start(self);
+            self.run_on_start_logic(LifecycleTiming::AfterGenerated);
+            self.publish_runtime_snapshot("not configured", None);
+
+            // ── 2. Load universe assets ──
+            self.load_universe(&mut strategy).await;
+
+            if self.universe.is_empty() {
+                error!(
+                    "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
                 );
-                break;
+                self.runtime_telemetry.stop_tui();
+                return Err(BrokerError::DataFeedError(
+                    "No tradable universe assets were loaded; check data-feed connectivity, symbol mapping, and asset metadata responses"
+                        .to_string(),
+                ));
             }
-            // Advance one market step: process orders → get current stream events
-            let step_result = match self.broker.step_market_streams() {
-                Ok(step) => step,
-                Err(error) => {
+
+            // ── 3. Start alpha models so indicators and warm-up are configured ──
+            self.start_alpha_models();
+
+            // ── 4. Run OnInit lifecycle logic and strategy init per asset ──
+            self.load_init(&mut strategy);
+
+            // ── 5. Init alpha models per asset ──
+            self.init_alpha_models();
+
+            // ── 6. Load historical event streams into BacktestState ──
+            let event_streams = self.resolve_event_streams();
+            use std::fmt::Write as _;
+            let mut event_stream_summary = String::new();
+            for stream in &event_streams {
+                if !event_stream_summary.is_empty() {
+                    event_stream_summary.push_str(", ");
+                }
+                let _ = write!(
+                    event_stream_summary,
+                    "{} {} feature={} trading={}",
+                    stream.history_key, stream.key.timeframe, stream.is_feature, stream.allow_trading
+                );
+            }
+            info!("Loading backtest event streams: [{}]", event_stream_summary);
+            if let Err(error) = self
+                .broker
+                .load_backtest_event_streams(&event_streams, start, end)
+                .await
+            {
+                error!("Backtest failed while loading event streams: {}", error);
+                self.runtime_telemetry.stop_tui();
+                return Err(error);
+            }
+            info!("Backtest event streams loaded successfully");
+            // Attaching history requires exclusive access to PaperBroker's Arc.
+            // Only share it with the command worker after the simulated clock is
+            // installed. Every backtest gets a private journal, never a live run's.
+            let account = self.broker.get_account().await?;
+            let journal_path = self.artifact_root().join(".aqs/execution/backtests")
+                .join(Uuid::new_v4().to_string()).join("commands.db");
+            self.start_command_driver(
+                &journal_path, &self.strategy_id.to_string(), &account.account_id, Default::default(),
+            ).await.map_err(|error| BrokerError::OrderError(format!("backtest execution startup failed: {error}")))?;
+            self.drain_backtest_execution().await?;
+            self.publish_runtime_event("info", "Backtest started", "not configured");
+
+            // ── 7. Main backtest loop ──
+            let mut last_runtime_publish = std::time::Instant::now();
+            loop {
+                if self.runtime_telemetry.shutdown_requested() || *self.shutdown_tx.borrow() {
+                    warn!("Backtest stop requested from AQE TUI");
                     self.publish_runtime_event(
-                        "error",
-                        format!("Backtest failed: {}", error),
+                        "warn",
+                        "Backtest stop requested from TUI",
                         "not configured",
                     );
-                    self.runtime_telemetry.stop_tui();
-                    return Err(error);
+                    break;
                 }
-            };
-
-            match step_result {
-                None => break, // Backtest complete
-                Some(step) => {
-                    debug!(
-                        "Backtest step events received timestamp={} events={} execution_bars={}",
-                        step.timestamp,
-                        step.events.len(),
-                        step.execution_bars.len()
-                    );
-                    // Process trade events from the broker (fills, closes, cancels, etc.)
-                    debug!("Backtest loop calling on_trade_update");
-                    self.on_trade_update();
-                    debug!("Backtest loop on_trade_update returned");
-                    self.sync_backtest_insight_snapshots();
-
-                    // Call _on_bar for each market data event
-                    for event in step.events {
-                        self._on_market_data_event(&mut strategy, event);
+                // Advance one market step: process orders → get current stream events
+                let step_result = match self.broker.step_market_streams() {
+                    Ok(step) => step,
+                    Err(error) => {
+                        self.publish_runtime_event(
+                            "error",
+                            format!("Backtest failed: {}", error),
+                            "not configured",
+                        );
+                        self.runtime_telemetry.stop_tui();
+                        return Err(error);
                     }
-                    // Run insight pipeline after processing tradable events for this step
-                    if step.has_tradable_events {
-                        debug!("Backtest loop calling run_insight_pipeline");
-                        self.run_insight_pipeline();
-                        debug!("Backtest loop run_insight_pipeline returned");
+                };
+
+                match step_result {
+                    None => break, // Backtest complete
+                    Some(step) => {
+                        debug!(
+                            "Backtest step events received timestamp={} events={} execution_bars={}",
+                            step.timestamp,
+                            step.events.len(),
+                            step.execution_bars.len()
+                        );
+                        // Process trade events from the broker (fills, closes, cancels, etc.)
+                        debug!("Backtest loop calling on_trade_update");
+                        self.drain_backtest_execution().await?;
+                        debug!("Backtest loop on_trade_update returned");
                         self.sync_backtest_insight_snapshots();
-                    }
-                    if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
-                        self.publish_runtime_snapshot("not configured", None);
-                        last_runtime_publish = std::time::Instant::now();
+
+                        // Call _on_bar for each market data event
+                        for event in step.events {
+                            self._on_market_data_event(&mut strategy, event);
+                        }
+                        // Run insight pipeline after processing tradable events for this step
+                        if step.has_tradable_events {
+                            debug!("Backtest loop calling run_insight_pipeline");
+                            self.run_insight_pipeline();
+                            debug!("Backtest loop run_insight_pipeline returned");
+                            self.sync_backtest_insight_snapshots();
+                        }
+                        self.drain_backtest_execution().await?;
+                        self.sync_backtest_insight_snapshots();
+                        if last_runtime_publish.elapsed() >= std::time::Duration::from_millis(500) {
+                            self.publish_runtime_snapshot("not configured", None);
+                            last_runtime_publish = std::time::Instant::now();
+                        }
                     }
                 }
             }
+            Ok(())
         }
+        .await;
 
         // ── 8. Teardown ──
-        debug!("Invoking strategy on_teardown");
-        self.begin_teardown();
-        self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
-        strategy.on_teardown(self);
-        self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
-        loop {
-            let final_close_requests = match self.broker.flush_backtest_close_queue_at_last_bars() {
-                Ok(requests) => requests,
-                Err(error) => {
-                    self.publish_runtime_event(
-                        "error",
-                        format!("Backtest teardown failed: {}", error),
-                        "not configured",
-                    );
-                    self.runtime_telemetry.stop_tui();
-                    return Err(error);
-                }
-            };
-            if final_close_requests == 0 {
-                break;
+        // Keep one cleanup exit for success, stop and all fallible startup/loop
+        // paths. Never leave the strategy taken or a journal worker detached.
+        let mut teardown_result: Result<(), BrokerError> = async {
+            if !lifecycle_started {
+                return Ok(());
             }
+            debug!("Invoking strategy on_teardown");
+            self.begin_teardown();
+            self.run_on_teardown_logic(LifecycleTiming::BeforeGenerated);
+            strategy.on_teardown(self);
+            self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
+            self.drain_backtest_execution().await?;
+            loop {
+                let final_close_requests =
+                    match self.broker.flush_backtest_close_queue_at_last_bars() {
+                        Ok(requests) => requests,
+                        Err(error) => {
+                            self.publish_runtime_event(
+                                "error",
+                                format!("Backtest teardown failed: {}", error),
+                                "not configured",
+                            );
+                            self.runtime_telemetry.stop_tui();
+                            return Err(error);
+                        }
+                    };
+                if final_close_requests == 0 {
+                    break;
+                }
 
-            debug!(
-                "Backtest teardown flushed {} final close request(s); draining trade events",
-                final_close_requests
-            );
-            self.on_trade_update();
+                debug!(
+                    "Backtest teardown flushed {} final close request(s); draining trade events",
+                    final_close_requests
+                );
+                self.drain_backtest_execution().await?;
+                self.sync_backtest_insight_snapshots();
+            }
             self.sync_backtest_insight_snapshots();
+            Ok(())
         }
-        self.sync_backtest_insight_snapshots();
+        .await;
 
-        // Disconnect data feed
-        let _ = self.broker.disconnect().await;
+        if lifecycle_started && teardown_result.is_ok() {
+            if let Some(driver) = &self.command_driver {
+                match driver.complete_execution_stop().await {
+                    Ok(false) if self.teardown_cleanup_requested => {
+                        teardown_result = Err(BrokerError::OrderError(
+                            "backtest teardown still owns unresolved execution work".into(),
+                        ));
+                    }
+                    Err(error) => {
+                        teardown_result = Err(BrokerError::OrderError(format!(
+                            "backtest execution stop completion was not durable: {error}"
+                        )));
+                    }
+                    // Backtests may intentionally retain open exposure when
+                    // their strategy does not request liquidation. Keep that
+                    // journal Stopping instead of claiming broker settlement.
+                    _ => {}
+                }
+            }
+        }
+
+        // The worker can still own an in-flight mutation. Release it before
+        // disconnecting the transports it uses, including after a failed drain.
+        let worker_result = match self.command_driver.take() {
+            Some(driver) => driver.stop().await.map(drop).map_err(|error| {
+                BrokerError::OrderError(format!("backtest execution shutdown failed: {error}"))
+            }),
+            None => Ok(()),
+        };
+        let disconnect_result = self.broker.disconnect().await.map(|_| ());
 
         // Put strategy back
         self.strategy = Some(strategy);
         self.history_seed_anchor = None;
+        for result in [
+            &execution_result,
+            &teardown_result,
+            &worker_result,
+            &disconnect_result,
+        ] {
+            if let Err(error) = result {
+                error!("Backtest did not finish cleanly: {error}");
+            }
+        }
+        if let Err(error) = execution_result
+            .and(teardown_result)
+            .and(worker_result)
+            .and(disconnect_result)
+        {
+            self.status = StrategyStatus::Stopped;
+            self.publish_runtime_event(
+                "error",
+                format!("Backtest failed: {error}"),
+                "not configured",
+            );
+            self.runtime_telemetry.stop_tui();
+            return Err(error);
+        }
 
         // ── 9. Results ──
         let results = self.broker.get_results();

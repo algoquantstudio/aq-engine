@@ -14,12 +14,31 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Check default features
         run: cargo check
 
+      - name: Check source-available license and required notices
+        run: |
+          test -f LICENSE && test -f NOTICE
+          cmp LICENSE live-sync-protocol/LICENSE
+          cmp NOTICE live-sync-protocol/NOTICE
+          test ! -e LICENSE-MIT && test ! -e LICENSE-APACHE
+
       - name: Check runtime features
         run: cargo check --features runtime
 
+      - name: Check standalone node types on WASM
+        run: cargo check --features node --target wasm32-unknown-unknown
+
+      - name: Test public live protocol
+        run: cargo test --manifest-path live-sync-protocol/Cargo.toml
+
       - name: Test runtime features
+        env:
+          # Large debug-only synthetic lifecycle futures exceed libtest's 2 MiB default.
+          # This does not alter production Tokio worker stack settings.
+          RUST_MIN_STACK: 16777216
         run: cargo test --features runtime

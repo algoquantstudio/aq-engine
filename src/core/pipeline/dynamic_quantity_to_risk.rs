@@ -1,10 +1,10 @@
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
-use crate::core::pipeline::quantity_sizing::{
-    AssetQuantityLimits, apply_max_order_size_with_child_legs, entry_price,
-    round_whole_or_fractional_quantity, split_summary,
-};
 use crate::core::strategy::StrategyContext;
+use crate::core::utils::quantity_sizing::{
+    AssetQuantityLimits, apply_max_order_size_with_child_legs, contract_multiplier, entry_price,
+    round_whole_or_fractional_quantity, split_summary, validate_stop_for_side,
+};
 
 use super::InsightPipe;
 
@@ -45,7 +45,7 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
         let entry = match entry_price(ctx, insight) {
-            Ok(value) if value > 0.0 => value,
+            Ok(value) if value.is_finite() && value > 0.0 => value,
             Ok(_) => {
                 return InsightPipeResult::new(
                     false,
@@ -54,14 +54,7 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
                     self.name().to_string(),
                 );
             }
-            Err(_) => {
-                return InsightPipeResult::new(
-                    false,
-                    false,
-                    Some("Insight does not have an entry price set.".to_string()),
-                    self.name().to_string(),
-                );
-            }
+            Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
         };
         let Some(stop_loss) = insight.stop_loss() else {
             return InsightPipeResult::new(
@@ -80,6 +73,26 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
             );
         }
 
+        if let Err(message) = validate_stop_for_side(insight, entry, stop_loss) {
+            return InsightPipeResult::new(false, false, Some(message), self.name().into());
+        }
+        if !self.maximum_cost_basis.is_finite()
+            || self.maximum_cost_basis <= 0.0
+            || !self.minimum_cost_basis.is_finite()
+            || self.minimum_cost_basis < 0.0
+            || self.minimum_cost_basis > self.maximum_cost_basis
+            || !ctx.execution_risk().is_finite()
+            || !(0.0..=1.0).contains(&ctx.execution_risk())
+            || ctx.execution_risk() == 0.0
+        {
+            return InsightPipeResult::new(
+                false,
+                false,
+                Some("Invalid cost-basis limits or execution risk".into()),
+                self.name().into(),
+            );
+        }
+
         let Some(asset) = self.get_asset(ctx, &insight.symbol) else {
             return InsightPipeResult::new(
                 false,
@@ -90,17 +103,22 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
         };
         let limits = AssetQuantityLimits::from_asset(asset);
         let fractional = asset.fractional;
-        let Ok(account) = ctx.account() else {
+        let account = match ctx.account() {
+            Ok(account) => account,
+            Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
+        };
+
+        let mut working_capital = ctx.effective_buying_power(&account, asset)
+            * (insight.confidence.min(100) as f64 / 100.0);
+
+        if !working_capital.is_finite() || working_capital <= 0.0 {
             return InsightPipeResult::new(
                 false,
                 false,
-                Some("Failed to load account".to_string()),
-                self.name().to_string(),
+                Some("Available capital must be finite and positive".into()),
+                self.name().into(),
             );
-        };
-
-        let mut working_capital =
-            ctx.effective_buying_power(&account, asset) * (insight.confidence as f64 / 100.0);
+        }
 
         if working_capital < self.minimum_cost_basis {
             insight.order_rejected(&format!(
@@ -119,7 +137,8 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
             working_capital = self.maximum_cost_basis;
         }
 
-        let risk_per_share = (entry - stop_loss).abs();
+        let multiplier = contract_multiplier(asset);
+        let risk_per_share = (entry - stop_loss).abs() * multiplier;
         if risk_per_share <= 0.0 {
             return InsightPipeResult::new(
                 false,
@@ -130,7 +149,7 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
         }
 
         let account_size_at_risk = working_capital * ctx.execution_risk();
-        let maximum_can_buy = working_capital / entry;
+        let maximum_can_buy = working_capital / (entry * multiplier);
         let mut size_should_buy = (account_size_at_risk / risk_per_share).min(maximum_can_buy);
 
         size_should_buy = match round_whole_or_fractional_quantity(
@@ -145,12 +164,6 @@ impl InsightPipe for DynamicQuantityToRiskPipe {
                 return InsightPipeResult::new(false, true, Some(message), self.name().to_string());
             }
         };
-
-        if let Some(contract_size) = asset.contract_size {
-            if contract_size > 0 {
-                size_should_buy = (size_should_buy / contract_size as f64).round();
-            }
-        }
 
         let split =
             match apply_max_order_size_with_child_legs(ctx, insight, size_should_buy, limits) {

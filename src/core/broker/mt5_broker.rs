@@ -1,23 +1,71 @@
 use super::BrokerFeature;
+use super::commands::{BrokerOrderRequest, SubmissionCorrelation, SubmissionResolution};
 use super::mt5_bridge::{Mt5Bridge, Mt5RpcAction};
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
     Account, AccountType, BrokerError, Order, OrderClass, OrderLeg, OrderLegs,
     OrderLifecycleSnapshot, OrderSide, OrderType, Position, TimeInForce, TradeUpdateEvent,
 };
-use crate::core::insight::Insight;
 use crate::core::utils::tools::dynamic_round_for_asset;
 use chrono::{DateTime, Utc};
 use log::debug;
 use std::sync::Arc;
-use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct Mt5Broker {
     name: String,
     bridge: Arc<Mt5Bridge>,
 }
 
 impl Mt5Broker {
+    fn is_reconcilable_close_error(error: &BrokerError) -> bool {
+        // FROZEN can race a broker-managed TP/SL just like POSITION_CLOSED.
+        // Neither code alone proves the position closed; reconcile the ticket.
+        matches!(error, BrokerError::TradeError(message) if matches!(message.trim(), "10029" | "10036"))
+    }
+
+    fn has_confirmed_cached_close(&self, order_id: &str) -> bool {
+        self.bridge.order(order_id).is_ok_and(|order| {
+            order.status == TradeUpdateEvent::Closed
+                && order.filled_price.is_some_and(|price| price.is_finite() && price > 0.0)
+                && order.realized_pnl.is_some_and(f64::is_finite)
+                && order.commission.is_some_and(f64::is_finite)
+                && order.swap.is_some_and(f64::is_finite)
+        })
+    }
+
+    // Do not infer a close from absence in the active-position list. Require
+    // ticket-scoped terminal history with actual execution values.
+    fn reconciled_close_order(order: &Order, snapshot: &OrderLifecycleSnapshot) -> Option<Order> {
+        if snapshot.order_id != order.order_id
+            || snapshot.status != super::types::OrderLifecycleStatus::Closed
+            || snapshot.symbol.as_deref().is_some_and(|symbol| symbol != order.asset.symbol)
+        {
+            return None;
+        }
+        let close = snapshot.close_details.as_ref()?;
+        if !close.close_price.is_finite()
+            || close.close_price <= 0.0
+            || !close.realized_pnl.is_finite()
+            || !close.commission.is_finite()
+            || !close.swap.is_finite()
+            || close.closed_at > Utc::now()
+            || close.closed_at.timestamp() < order.filled_at.unwrap_or(order.created_at) as i64
+        {
+            return None;
+        }
+        let mut closed = order.clone();
+        closed.status = TradeUpdateEvent::Closed;
+        closed.filled_price = Some(close.close_price);
+        closed.updated_at = close.closed_at.timestamp().max(0) as u64;
+        closed.filled_at = Some(closed.updated_at);
+        closed.realized_pnl = Some(close.realized_pnl);
+        closed.position_accounting = close.validated_position_accounting(&order.order_id);
+        closed.commission = Some(close.commission);
+        closed.swap = Some(close.swap);
+        Some(closed)
+    }
+
     pub fn from_env() -> Result<Self, BrokerError> {
         Ok(Self::new(Mt5Bridge::shared_from_env()?))
     }
@@ -92,7 +140,7 @@ impl Mt5Broker {
         payload
     }
 
-    fn order_from_insight(&self, insight: Insight) -> Result<Order, BrokerError> {
+    fn order_from_request(&self, insight: BrokerOrderRequest) -> Result<Order, BrokerError> {
         let qty = insight.quantity.ok_or_else(|| {
             BrokerError::OrderError(format!(
                 "Cannot submit MT5 order for {} without a quantity",
@@ -149,7 +197,7 @@ impl Mt5Broker {
                         filled_at: None,
                     })
                 }),
-                trailing_stop: insight.trailing_stop_price().map(|gap| OrderLeg {
+                trailing_stop: insight.trailing_stop_price.map(|gap| OrderLeg {
                     order_id: None,
                     limit_price: None,
                     trail_price: Some(gap),
@@ -169,7 +217,7 @@ impl Mt5Broker {
         };
 
         Ok(Order {
-            order_id: Uuid::new_v4().to_string(),
+            order_id: insight.client_order_id.clone(),
             insight_id: Some(insight.insight_id.to_string()),
             strategy_type: Some(insight.strategy_type.to_string()),
             asset,
@@ -188,11 +236,81 @@ impl Mt5Broker {
             submitted_at: now_ts,
             filled_at: None,
             realized_pnl: None,
+            position_accounting: None,
             commission: None,
             swap: None,
             rejection_reason: None,
             legs,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl super::fill_history::ExecutionFillHistoryReader for Mt5Broker {
+    async fn read(&self, account_id: &str, entry_order_id: &str, symbol: &str)
+        -> Result<Option<super::fill_history::ExecutionFillHistory>, BrokerError> {
+        let native_symbol = self.bridge.config().mt5_symbol(symbol).to_owned();
+        let payload = self.bridge.request_rpc_with_timeout(
+            Mt5RpcAction::GetExecutionFillHistory,
+            serde_json::json!({"accountId":account_id,"entryOrderId":entry_order_id,"symbol":native_symbol,"invalidationVersion":1,"positionSnapshotVersion":1}),
+            std::time::Duration::from_secs(5),
+        ).await?;
+        if payload.is_null() { return Ok(None); }
+        let mut history: super::fill_history::ExecutionFillHistory = serde_json::from_value(payload)
+            .map_err(|error| BrokerError::TradeError(format!("invalid fill history: {error}")))?;
+        history.validate(account_id, entry_order_id, &native_symbol)?;
+        history.symbol = symbol.to_owned();
+        for fill in &mut history.fills { fill.symbol = symbol.to_owned(); }
+        for invalidation in &mut history.invalidations { invalidation.symbol = symbol.to_owned(); }
+        if let Some(position) = &mut history.position_snapshot { position.symbol = symbol.to_owned(); }
+        Ok(Some(history))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::traits::OrderLifecycleReconciler for Mt5Broker {
+    async fn reconcile(
+        &self,
+        order_ids: &[String],
+    ) -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+        <Self as OrderManagementProvider>::reconcile_order_lifecycle(self, order_ids).await
+    }
+}
+
+#[async_trait::async_trait]
+impl super::position_valuation::PositionValuationReader for Mt5Broker {
+    async fn read_positions(
+        &self,
+        account_id: &str,
+        symbol: &str,
+        position_ids: &[String],
+    ) -> Result<Option<super::position_valuation::PositionValuations>, BrokerError> {
+        use super::position_valuation::{PositionValuations, validate_position_valuation_request};
+        validate_position_valuation_request(account_id, symbol, position_ids)
+            .map_err(|e| BrokerError::TradeError(e.into()))?;
+        // MT5 identifiers are canonical positive decimal IDs, not order tickets.
+        if position_ids.iter().any(|id| id.parse::<i64>().ok().filter(|n| *n > 0)
+            .is_none_or(|n| n.to_string() != *id)) {
+            return Err(BrokerError::TradeError("invalid MT5 position identifier".into()));
+        }
+        let native_symbol = self.bridge.config().mt5_symbol(symbol).to_owned();
+        validate_position_valuation_request(account_id, &native_symbol, position_ids)
+            .map_err(|e| BrokerError::TradeError(e.into()))?;
+        let payload = self.bridge.request_rpc_with_timeout(
+            Mt5RpcAction::GetPositionValuations,
+            serde_json::json!({"accountId":account_id,"symbol":native_symbol,"positionIds":position_ids,"valuationVersion":1}),
+            std::time::Duration::from_secs(5),
+        ).await?;
+        if payload.is_null() { return Ok(None); }
+        let mut values: PositionValuations = serde_json::from_value(payload)
+            .map_err(|e| BrokerError::TradeError(format!("invalid position valuation: {e}")))?;
+        values.validate(account_id, &native_symbol, position_ids)
+            .map_err(|e| BrokerError::TradeError(e.into()))?;
+        if values.provider != "mt5-position-v1" {
+            return Err(BrokerError::TradeError("unexpected MT5 valuation provider".into()));
+        }
+        values.symbol = symbol.to_owned();
+        Ok(Some(values))
     }
 }
 
@@ -229,10 +347,19 @@ impl Broker for Mt5Broker {
         &[
             BrokerFeature::MarketOrder,
             BrokerFeature::LimitOrder,
+            BrokerFeature::AmendLimitPrice,
+            BrokerFeature::AmendStopPrice,
             BrokerFeature::StopOrder,
             BrokerFeature::StopLimitOrder,
             BrokerFeature::OcoOrder,
             BrokerFeature::TrailingOrder,
+            BrokerFeature::TradeEventStream,
+            BrokerFeature::AccountStream,
+            BrokerFeature::OrderLifecycleSnapshot,
+            BrokerFeature::BrokerManagedOco,
+            BrokerFeature::MaxTotalOrders,
+            BrokerFeature::MaxTotalSize,
+            BrokerFeature::AuthoritativeMarginEstimate,
         ]
     }
 
@@ -240,11 +367,113 @@ impl Broker for Mt5Broker {
         self.bridge.set_session_id(session_id);
         Ok(())
     }
+
+    fn get_cached_lifecycle_snapshot(
+        &self,
+    ) -> Option<crate::core::broker::types::BrokerLifecycleSnapshot> {
+        Some(crate::core::broker::types::BrokerLifecycleSnapshot {
+            orders: self.bridge.orders(),
+            positions: self.bridge.positions(),
+            terminal_history: Vec::new(),
+            snapshot_complete: self.bridge.has_complete_runtime_snapshot(),
+            captured_at: Utc::now(),
+        })
+    }
 }
 
 impl OrderManagementProvider for Mt5Broker {
-    async fn submit_order(&self, insight: Insight) -> Result<Order, BrokerError> {
-        let order = self.order_from_insight(insight)?;
+    async fn estimate_order_margin(
+        &self,
+        request: &BrokerOrderRequest,
+    ) -> Result<Option<f64>, BrokerError> {
+        let quantity = request
+            .quantity
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| {
+                BrokerError::OrderError("margin estimate requires a positive quantity".into())
+            })?;
+        let symbol = self.bridge.config().mt5_symbol(&request.symbol);
+        let response = self.bridge.request_rpc(Mt5RpcAction::EstimateMargin, serde_json::json!({
+            "symbol": symbol,
+            "qty": quantity,
+            "side": match request.side { OrderSide::Buy => "Buy", OrderSide::Sell => "Sell" },
+            "orderType": match request.order_type {
+                OrderType::Market => "Market",
+                OrderType::Limit => "Limit",
+                OrderType::Stop => "Stop",
+                OrderType::StopLimit => "StopLimit",
+                OrderType::TrailingStop => "TrailingStop",
+            },
+            "price": request.limit_price.or(request.stop_price),
+        })).await?;
+        let margin = response
+            .get("margin")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| {
+                BrokerError::TradeError("MT5 returned an invalid margin estimate".into())
+            })?;
+        Ok(Some(margin))
+    }
+
+    async fn reconcile_submission(
+        &self,
+        account_id: &str,
+        request: &BrokerOrderRequest,
+    ) -> Result<SubmissionResolution, BrokerError> {
+        let correlation = SubmissionCorrelation::new(account_id, request)?;
+        if self.bridge.account()?.account_id.trim() != correlation.account_id {
+            return Err(BrokerError::TradeError(
+                "submission lookup account mismatch".into(),
+            ));
+        }
+        let response = self.bridge.request_rpc(Mt5RpcAction::GetSubmission, serde_json::json!({
+            "submissionKey": correlation.key, "submissionFingerprint": correlation.fingerprint,
+            "submissionAccount": correlation.account_id,
+        })).await?;
+        let Some(value) = response.get("order").filter(|value| !value.is_null()) else {
+            return Ok(SubmissionResolution::Unknown);
+        };
+        if response.get("fingerprint").and_then(|v| v.as_str())
+            != Some(correlation.fingerprint.as_str())
+        {
+            return Err(BrokerError::TradeError(
+                "submission lookup fingerprint mismatch".into(),
+            ));
+        }
+        let mut order: Order = serde_json::from_value(value.clone())
+            .map_err(|e| BrokerError::TradeError(format!("invalid submission receipt: {e}")))?;
+        self.bridge.map_order_to_aqe(&mut order);
+        if order.insight_id.as_deref() != Some(request.insight_id.as_str())
+            || order.asset.symbol != request.symbol
+            || order.side != request.side
+            || order.order_id.is_empty()
+        {
+            return Err(BrokerError::TradeError(
+                "submission receipt identity mismatch".into(),
+            ));
+        }
+        Ok(SubmissionResolution::Confirmed(order))
+    }
+    fn lifecycle_reconciler(&self) -> Option<Arc<dyn super::traits::OrderLifecycleReconciler>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn execution_fill_history_reader(
+        &self,
+    ) -> Option<Arc<dyn super::fill_history::ExecutionFillHistoryReader>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn position_valuation_reader(
+        &self,
+    ) -> Option<Arc<dyn super::position_valuation::PositionValuationReader>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    async fn submit_order(&self, insight: BrokerOrderRequest) -> Result<Order, BrokerError> {
+        let correlation = SubmissionCorrelation::new(&self.bridge.account()?.account_id, &insight)?;
+        let order = self.order_from_request(insight)?;
         let take_profit = order
             .legs
             .as_ref()
@@ -269,12 +498,17 @@ impl OrderManagementProvider for Mt5Broker {
             OrderType::TrailingStop => "TrailingStop",
         };
         let mut payload = serde_json::json!({
+            "submissionKey": correlation.key,
+            "submissionFingerprint": correlation.fingerprint,
+            "submissionAccount": correlation.account_id,
             "clientOrderId": order.order_id.clone(),
             "insightId": order.insight_id.clone(),
             "strategyType": order.strategy_type.clone(),
             "symbol": order.asset.symbol.clone(),
             "qty": order.qty,
             "price": order.limit_price.or(order.stop_price),
+            "limitPrice": order.limit_price,
+            "stopPrice": order.stop_price,
             "side": side,
             "orderType": order_type,
         });
@@ -353,7 +587,41 @@ impl OrderManagementProvider for Mt5Broker {
         Ok(true)
     }
 
-    async fn update_order(
+    async fn amend_entry_prices(
+        &self,
+        order_id: &str,
+        limit_price: Option<f64>,
+        stop_price: Option<f64>,
+    ) -> Result<bool, BrokerError> {
+        if (limit_price.is_none() && stop_price.is_none())
+            || limit_price
+                .into_iter()
+                .chain(stop_price)
+                .any(|p| !p.is_finite() || p <= 0.0)
+        {
+            return Err(BrokerError::UnsupportedOperation(
+                "Invalid entry price amendment".into(),
+            ));
+        }
+        // Dedicated RPC: older EAs must not acknowledge this as a TP/SL update.
+        let result = self.bridge.request_rpc(Mt5RpcAction::AmendEntry,
+            serde_json::json!({"orderId": order_id, "limitPrice": limit_price, "stopPrice": stop_price})).await?;
+        if result.get("amended").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(BrokerError::UnsupportedOperation(
+                result
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Entry amendment not acknowledged")
+                    .into(),
+            ));
+        }
+        // Patch under the cache lock; never overwrite a concurrent fill snapshot.
+        self.bridge
+            .acknowledge_entry_prices(order_id, limit_price, stop_price);
+        Ok(true)
+    }
+
+    async fn update_take_profit(
         &self,
         order_id: &str,
         price: f64,
@@ -430,7 +698,52 @@ impl OrderManagementProvider for Mt5Broker {
                     "strategyType": existing_order.as_ref().and_then(|order| order.strategy_type.clone())
                 }),
             )
-            .await?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if Self::is_reconcilable_close_error(&error) => {
+                // The broker can close a position while our close is in flight.
+                // Reconcile read-only; never send a second close or fabricate PnL.
+                if let Some(order) = existing_order.as_ref() {
+                    for attempt in 0..3 {
+                        if attempt > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        // Native terminal events are also broker evidence. Their
+                        // close event is already queued for the insight reducer.
+                        if self.has_confirmed_cached_close(order_id) {
+                            return Ok(true);
+                        }
+                        let snapshots = match tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            self.reconcile_order_lifecycle(&[order_id.to_string()]),
+                        )
+                        .await
+                        {
+                            Ok(Ok(snapshots)) => snapshots,
+                            _ if self.has_confirmed_cached_close(order_id) => return Ok(true),
+                            _ => return Err(error),
+                        };
+                        if let Some(closed) = snapshots
+                            .iter()
+                            .find_map(|snapshot| Self::reconciled_close_order(order, snapshot))
+                        {
+                            log::info!(
+                                "MT5 close response reconciled: order_id={} error={} confirmed closed; continuing execution",
+                                order_id, error
+                            );
+                            self.bridge.emit_order_event(closed, TradeUpdateEvent::Closed);
+                            return Ok(true);
+                        }
+                    }
+                }
+                if self.has_confirmed_cached_close(order_id) {
+                    return Ok(true);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if let Ok(mut close_order) = serde_json::from_value::<Order>(response) {
             close_order.asset.symbol = self.bridge.aqe_symbol(&close_order.asset.symbol);
             let event = close_order.status.clone();
@@ -522,8 +835,20 @@ impl OrderManagementProvider for Mt5Broker {
         self.bridge.request_account().await
     }
 
-    fn drain_trade_events(&self) -> Vec<(Order, TradeUpdateEvent)> {
-        self.bridge.drain_trade_events()
+    fn get_cached_account(&self) -> Option<Account> {
+        self.bridge.account().ok()
+    }
+
+    fn drain_trade_events_bounded(&self, max_events: usize) -> Vec<(Order, TradeUpdateEvent)> {
+        self.bridge.drain_trade_events_bounded(max_events)
+    }
+
+    fn has_pending_trade_events(&self) -> bool {
+        self.bridge.has_pending_trade_events()
+    }
+
+    fn drain_broker_events(&self) -> Vec<crate::core::broker::types::BrokerOrderEvent> {
+        self.bridge.drain_broker_events()
     }
 
     async fn subscribe_to_trade_stream(
@@ -531,6 +856,14 @@ impl OrderManagementProvider for Mt5Broker {
         on_trade: Arc<dyn Fn((Order, TradeUpdateEvent)) + Send + Sync>,
     ) -> Result<(), BrokerError> {
         self.bridge.subscribe_trade_stream(on_trade);
+        Ok(())
+    }
+
+    async fn subscribe_to_broker_event_stream(
+        &self,
+        on_trade: Arc<dyn Fn(crate::core::broker::types::BrokerOrderEvent) + Send + Sync>,
+    ) -> Result<(), BrokerError> {
+        self.bridge.subscribe_broker_event_stream(on_trade);
         Ok(())
     }
 
@@ -579,9 +912,11 @@ mod tests {
             min_order_size: Some(0.01),
             quantity_base: Some(2),
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(0.0001),
             price_base: Some(5),
             contract_size: None,
+            trading_calendar: None,
             fees: Default::default(),
         }
     }
@@ -607,6 +942,7 @@ mod tests {
             submitted_at: 0,
             filled_at: Some(0),
             realized_pnl: None,
+            position_accounting: None,
             commission: None,
             swap: None,
             rejection_reason: None,
@@ -645,6 +981,45 @@ mod tests {
     }
 
     #[test]
+    fn already_closed_error_is_narrowly_classified() {
+        for code in ["10029", "10036"] {
+            assert!(Mt5Broker::is_reconcilable_close_error(&BrokerError::TradeError(code.into())));
+        }
+        for code in ["10039", "10030", "timeout", "110036"] {
+            assert!(!Mt5Broker::is_reconcilable_close_error(&BrokerError::TradeError(code.into())));
+        }
+    }
+
+    #[test]
+    fn already_closed_requires_matching_terminal_history_and_preserves_actual_pnl() {
+        use super::super::types::OrderLifecycleStatus;
+        let order = sample_order();
+        let mut snapshot: OrderLifecycleSnapshot = serde_json::from_value(serde_json::json!({
+            "orderId": "order-1", "status": "Closed",
+            "closeDetails": {"closePrice": 98.5, "closedAt": "2026-10-01T09:29:55Z",
+                "realizedPnl": -1.5, "commission": 0.2, "swap": -0.1}
+        })).unwrap();
+        let closed = Mt5Broker::reconciled_close_order(&order, &snapshot).unwrap();
+        assert_eq!(closed.status, TradeUpdateEvent::Closed);
+        assert_eq!(closed.filled_price, Some(98.5));
+        assert_eq!(closed.realized_pnl, Some(-1.5));
+        assert_eq!(closed.commission, Some(0.2));
+        assert_eq!(closed.swap, Some(-0.1));
+        assert_eq!(closed.insight_id, order.insight_id);
+        snapshot.order_id = "another-position".into();
+        assert!(Mt5Broker::reconciled_close_order(&order, &snapshot).is_none());
+        snapshot.order_id = order.order_id.clone();
+        for state in [OrderLifecycleStatus::Unknown, OrderLifecycleStatus::PositionOpen,
+            OrderLifecycleStatus::Filled, OrderLifecycleStatus::Cancelled] {
+            snapshot.status = state;
+            assert!(Mt5Broker::reconciled_close_order(&order, &snapshot).is_none());
+        }
+        snapshot.status = OrderLifecycleStatus::Closed;
+        snapshot.close_details = None;
+        assert!(Mt5Broker::reconciled_close_order(&order, &snapshot).is_none());
+    }
+
+    #[test]
     fn update_order_payload_sets_take_profit_and_preserves_stop_loss() {
         let order = sample_order();
         let payload = Mt5Broker::update_order_payload("order-1", 121.5, 1.0, Some(&order), false);
@@ -655,6 +1030,16 @@ mod tests {
         assert_eq!(payload["strategyType"], serde_json::json!("Strategy"));
         assert_eq!(payload["takeProfit"], serde_json::json!(121.5));
         assert_eq!(payload["stopLoss"], serde_json::json!(95.0));
+    }
+
+    #[test]
+    fn stop_only_update_without_cached_order_never_invents_a_take_profit() {
+        let payload = Mt5Broker::update_order_payload("position", 110.0, 1.0, None, true);
+        assert_eq!(payload["stopLoss"], 110.0);
+        assert!(payload.get("takeProfit").is_none());
+        let ea = include_str!("../../../integrations/mt5/AqeMt5BridgeEA.mq5");
+        assert!(ea.contains("double take_profit = ExtractNumber(json, \"takeProfit\", -1.0);"));
+        assert!(!ea.contains("double take_profit = ExtractNumber(json, \"takeProfit\", price);"));
     }
 
     #[test]
@@ -685,7 +1070,14 @@ mod tests {
                 "positionId": "1891390354",
                 "positionQty": null,
                 "symbol": "ETHUSD",
-                "detail": "historical_filled_order_without_open_position"
+                "detail": "position_entry_and_exit_volume_confirmed",
+                "closeDetails": {
+                    "closePrice": 2450.5,
+                    "closedAt": "2026-09-05T12:11:28.388Z",
+                    "realizedPnl": -18.5,
+                    "commission": 1.0,
+                    "swap": -0.5
+                }
             }
         ]))
         .expect("MT5 lifecycle snapshots should use the broker-neutral wire format");
@@ -696,6 +1088,14 @@ mod tests {
             super::super::types::OrderLifecycleStatus::PositionOpen
         );
         assert_eq!(snapshots[0].position_qty, Some(0.81));
+        assert!(snapshots[0].close_details.is_none());
+        let details = snapshots[1].close_details.as_ref().unwrap();
+        assert_eq!(details.close_price, 2450.5);
+        assert_eq!(details.realized_pnl, -18.5);
+        assert_eq!(
+            serde_json::to_value(&snapshots[1]).unwrap()["closeDetails"]["commission"],
+            1.0
+        );
         assert_eq!(
             snapshots[1].status,
             super::super::types::OrderLifecycleStatus::Closed
@@ -753,7 +1153,7 @@ mod tests {
             .set_trailing_stop_price(Some(0.0025));
 
         let order = broker
-            .order_from_insight(insight)
+            .order_from_request(insight.into())
             .expect("trailing-stop insight should form an MT5 order");
         let trailing = order
             .legs
@@ -831,7 +1231,7 @@ mod tests {
         let mut managed_insight = insight.clone();
 
         let submitted_order = broker
-            .submit_order(insight)
+            .submit_order(insight.into())
             .await
             .expect("MT5 market order should submit and fill");
         println!(
@@ -856,7 +1256,7 @@ mod tests {
             );
 
             managed_insight.legs = submitted_order.legs.clone().unwrap_or_default();
-            let mut ctx = LiveMt5InsightContext::new(&broker);
+            let mut ctx = LiveMt5InsightContext::new(&broker).await?;
             ctx.bind_insight_context(&mut managed_insight);
             managed_insight.order_accepted(&submitted_order.order_id);
 
@@ -887,12 +1287,19 @@ mod tests {
 
             for (index, take_profit) in tp_prices.into_iter().enumerate() {
                 drain_trade_events(&broker, &format!("before TP update {}", index + 1));
-                if !managed_insight.update_take_profit(&mut ctx, Some(vec![take_profit])) {
-                    return Err(format!(
-                        "insight TP update {} returned false for order {}",
-                        index + 1,
-                        submitted_order.order_id
-                    ));
+                loop {
+                    match managed_insight
+                        .update_take_profit(&mut ctx, Some(vec![take_profit]))
+                        .map_err(|error| error.to_string())?
+                    {
+                        crate::core::insight::InsightMutationState::Applied => {
+                            ctx.persist_insight(&managed_insight).await?;
+                            break;
+                        }
+                        crate::core::insight::InsightMutationState::Pending(receipt) => {
+                            ctx.wait_for_command(&receipt, &managed_insight).await?
+                        }
+                    }
                 }
                 expect_level(
                     "take_profit_levels",
@@ -925,12 +1332,19 @@ mod tests {
 
             for (index, stop_loss) in sl_prices.into_iter().enumerate() {
                 drain_trade_events(&broker, &format!("before SL update {}", index + 1));
-                if !managed_insight.update_stop_loss(&mut ctx, Some(vec![stop_loss])) {
-                    return Err(format!(
-                        "insight SL update {} returned false for order {}",
-                        index + 1,
-                        submitted_order.order_id
-                    ));
+                loop {
+                    match managed_insight
+                        .update_stop_loss(&mut ctx, Some(vec![stop_loss]))
+                        .map_err(|error| error.to_string())?
+                    {
+                        crate::core::insight::InsightMutationState::Applied => {
+                            ctx.persist_insight(&managed_insight).await?;
+                            break;
+                        }
+                        crate::core::insight::InsightMutationState::Pending(receipt) => {
+                            ctx.wait_for_command(&receipt, &managed_insight).await?
+                        }
+                    }
                 }
                 expect_level(
                     "stop_loss_levels",
@@ -1125,6 +1539,180 @@ mod tests {
             .expect("MT5 bridge should disconnect after ticker info test");
     }
 
+    #[tokio::test]
+    async fn live_protection_harness_persists_admission_and_reduction() {
+        use crate::core::broker::{
+            commands::BrokerCommandAction, paper_broker::PaperBroker, types::AccountType,
+        };
+        let directory =
+            std::env::temp_dir().join(format!("aqe-protection-harness-{}", Uuid::new_v4()));
+        let paper = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+        let mut insight = Insight::default();
+        insight.symbol = "ETHUSD".into();
+        insight.set_quantity(Some(1.0)).set_limit_price(Some(100.0));
+        let order = paper.submit_order((&insight).into()).await.unwrap();
+        let driver = crate::core::strategy::command_driver::StrategyCommandDriver::start(
+            paper,
+            directory.join("commands.db"),
+            "test",
+            "account",
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        // No connection is opened. Paper execution exercises the same durable
+        // harness against a simulated order, without opening an MT5 connection.
+        let broker = Mt5Broker::new(Arc::new(Mt5Bridge::new(Mt5BridgeConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            token: "test".into(),
+            request_timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(100),
+            symbol_map: HashMap::new(),
+        })));
+        let mut ctx = LiveMt5InsightContext {
+            broker: &broker,
+            driver,
+            universe: HashMap::new(),
+            history: HashMap::new(),
+            insights: InsightCollection::new(),
+            variables: DashMap::new(),
+            reduced: Vec::new(),
+        };
+        let receipt = ctx
+            .driver
+            .enqueue(
+                &insight.insight_id().to_string(),
+                BrokerCommandAction::Cancel {
+                    order_id: order.order_id,
+                },
+                None,
+            )
+            .unwrap();
+        ctx.wait_for_command(&receipt, &insight).await.unwrap();
+        assert!(ctx.driver.checkpoint_revision(insight.insight_id()) > 0);
+        ctx.broker_command_reduced(&receipt);
+        ctx.persist_insight(&insight).await.unwrap();
+        assert!(ctx.driver.progress(&receipt).is_none());
+        drop(ctx.driver.stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "places demo MT5 pending entries; requires updated EA on port 18071"]
+    async fn live_mt5_pending_entry_limit_and_stop_amendments() {
+        let bridge = Arc::new(Mt5Bridge::new(Mt5BridgeConfig {
+            bind_addr: std::env::var("AQE_MT5_TEST_BIND_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:18071".into())
+                .parse()
+                .unwrap(),
+            token: std::env::var("AQE_MT5_TEST_TOKEN").unwrap_or_else(|_| "test".into()),
+            request_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(100),
+            symbol_map: HashMap::new(),
+        }));
+        bridge.set_session_id(format!("aqe-entry-amend-test-{}", Uuid::new_v4()));
+        let broker = Mt5Broker::new(bridge.clone());
+        broker.connect().await.unwrap();
+        let support = bridge
+            .request_rpc(
+                Mt5RpcAction::AmendEntry,
+                serde_json::json!({"orderId":"0", "limitPrice":1.0}),
+            )
+            .await
+            .expect("Install the updated EA before running entry-amendment tests");
+        assert!(
+            support.get("amended").is_some(),
+            "EA lacks AMEND_ENTRY; no test orders were submitted"
+        );
+        let positions = broker.get_positions().await.unwrap();
+        let orders = broker.get_orders().await.unwrap();
+        let market = select_live_test_market(&bridge, &positions, &orders).await;
+        for stop in [false, true] {
+            let initial = round_to_step(
+                market.mid_price * if stop { 1.10 } else { 0.90 },
+                market.price_step,
+            );
+            let changed = round_to_step(
+                market.mid_price * if stop { 1.11 } else { 0.89 },
+                market.price_step,
+            );
+            let mut insight = Insight::new(
+                OrderSide::Buy,
+                market.symbol.clone(),
+                StrategyType::Testing,
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+                100,
+                None,
+            );
+            insight.set_quantity(Some(market.qty));
+            if stop {
+                insight.set_stop_price(Some(initial));
+            } else {
+                insight.set_limit_price(Some(initial));
+            }
+            let submitted = broker.submit_order((&insight).into()).await.unwrap();
+            println!("test entry ticket={} symbol={} stop={} initial={} target={}", submitted.order_id, market.symbol, stop, initial, changed);
+            // Retain any assertion failure until this exact test ticket is cleaned up.
+            let result = async {
+                insight.order_accepted(&submitted.order_id);
+                let mut ctx = LiveMt5InsightContext::new(&broker).await?;
+                ctx.bind_insight_context(&mut insight);
+                let mutation = if stop {
+                    insight.update_stop_limit(&mut ctx, changed)
+                } else {
+                    insight.update_limit(&mut ctx, changed)
+                }
+                .map_err(|e| e.to_string())?;
+                if let crate::core::insight::InsightMutationState::Pending(receipt) = mutation {
+                    ctx.wait_for_command(&receipt, &insight).await?;
+                }
+                let applied = if stop {
+                    insight.update_stop_limit(&mut ctx, changed)
+                } else {
+                    insight.update_limit(&mut ctx, changed)
+                }
+                .map_err(|e| e.to_string())?;
+                if applied != crate::core::insight::InsightMutationState::Applied {
+                    return Err("Amendment still pending".into());
+                }
+                ctx.persist_insight(&insight).await?;
+                let rows = broker.get_orders().await.map_err(|e| e.to_string())?;
+                let row = rows
+                    .iter()
+                    .find(|o| o.order_id == submitted.order_id)
+                    .ok_or("Test entry unexpectedly filled or disappeared")?;
+                let price = if stop {
+                    row.stop_price
+                } else {
+                    row.limit_price
+                };
+                if price.is_none_or(|p| (p - changed).abs() > market.price_step) {
+                    return Err(format!("Broker entry price mismatch: {price:?}"));
+                }
+                println!("broker verified amendment ticket={} price={price:?}", submitted.order_id);
+                drop(ctx.driver.stop().await.map_err(|e| e.to_string())?);
+                Ok::<(), String>(())
+            }
+            .await;
+            let cleanup = broker.cancel_order(&submitted.order_id).await;
+            if cleanup.is_err() {
+                broker
+                    .close_position(&submitted.order_id, market.qty, None)
+                    .await
+                    .expect("Test ticket cleanup failed; inspect MT5");
+            }
+            let remaining = broker.get_orders().await.expect("Verify test cleanup with MT5");
+            assert!(!remaining.iter().any(|row| row.order_id == submitted.order_id), "Test ticket remains pending after cleanup");
+            println!("test entry cleaned up ticket={}", submitted.order_id);
+            assert!(
+                result.is_ok(),
+                "entry amendment failed after cleanup: {result:?}"
+            );
+        }
+    }
+
     struct LiveTestMarket {
         symbol: String,
         qty: f64,
@@ -1168,21 +1756,92 @@ mod tests {
 
     struct LiveMt5InsightContext<'a> {
         broker: &'a Mt5Broker,
+        driver: crate::core::strategy::command_driver::StrategyCommandDriver,
         universe: HashMap<String, Asset>,
         history: HashMap<String, DataFrame>,
         insights: InsightCollection,
         variables: DashMap<String, Value>,
+        reduced: Vec<crate::core::broker::commands::BrokerCommandReceipt>,
     }
 
     impl<'a> LiveMt5InsightContext<'a> {
-        fn new(broker: &'a Mt5Broker) -> Self {
-            Self {
+        async fn new(broker: &'a Mt5Broker) -> Result<Self, String> {
+            let account = broker
+                .get_account()
+                .await
+                .map_err(|error| error.to_string())?;
+            let path = std::env::temp_dir()
+                .join(format!("aqe-live-protection-{}", uuid::Uuid::new_v4()))
+                .join("commands.db");
+            let driver = crate::core::strategy::command_driver::StrategyCommandDriver::start(
+                Arc::new(broker.clone()),
+                path,
+                "live-protection-test",
+                account.account_id.trim(),
+                Default::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok(Self {
                 broker,
+                driver,
                 universe: HashMap::new(),
                 history: HashMap::new(),
                 insights: InsightCollection::new(),
                 variables: DashMap::new(),
-            }
+                reduced: Vec::new(),
+            })
+        }
+
+        async fn persist_insight(&mut self, insight: &Insight) -> Result<(), String> {
+            let row =
+                crate::core::insight::execution_checkpoint::InsightExecutionCheckpoint::capture(
+                    insight,
+                    self.driver.checkpoint_revision(insight.insight_id()) + 1,
+                    true,
+                    None,
+                );
+            // Admission alone cannot dispatch: commit the pending mutation and
+            // intent together, then durably acknowledge reductions after apply.
+            self.driver
+                .persist_execution_checkpoints(vec![row], self.reduced.clone())
+                .map_err(|error| error.to_string())?;
+            self.reduced.clear();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.driver.checkpoint_in_flight() {
+                    self.driver
+                        .drain_ready(256, Duration::from_millis(5))
+                        .map_err(|error| error.to_string())?;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|_| "live protection checkpoint timed out".to_string())?
+        }
+
+        async fn wait_for_command(
+            &mut self,
+            receipt: &crate::core::broker::commands::BrokerCommandReceipt,
+            insight: &Insight,
+        ) -> Result<(), String> {
+            use crate::core::strategy::command_driver::BrokerCommandProgress;
+            self.persist_insight(insight).await?;
+            tokio::time::timeout(Duration::from_secs(40), async {
+                loop {
+                    self.driver.drain_ready(256, Duration::from_millis(5)).map_err(|error| error.to_string())?;
+                    match self.driver.progress(receipt) {
+                        Some(BrokerCommandProgress::Completed(completion)) => {
+                            if matches!(completion.outcome, crate::core::broker::commands::BrokerCommandOutcome::Ambiguous { .. }) {
+                                return Err("live protection command requires reconciliation".into());
+                            }
+                            return Ok(());
+                        }
+                        Some(BrokerCommandProgress::Failed(error)) => return Err(error.to_string()),
+                        _ => tokio::time::sleep(Duration::from_millis(1)).await,
+                    }
+                }
+            }).await.map_err(|_| "live protection command timed out".to_string())?
         }
 
         fn block_on_broker<F, T>(&self, future: F) -> T
@@ -1194,6 +1853,39 @@ mod tests {
     }
 
     impl StrategyContext for LiveMt5InsightContext<'_> {
+        fn broker_features(&self) -> &'static [BrokerFeature] {
+            self.broker.get_features()
+        }
+        fn enqueue_broker_command(
+            &mut self,
+            insight_id: uuid::Uuid,
+            action: crate::core::broker::commands::BrokerCommandAction,
+            group: Option<crate::core::broker::commands::BrokerOperationGroup>,
+        ) -> Result<
+            crate::core::broker::commands::BrokerCommandReceipt,
+            crate::core::broker::commands::BrokerCommandError,
+        > {
+            self.driver.enqueue(&insight_id.to_string(), action, group)
+        }
+
+        fn broker_command_progress(
+            &self,
+            receipt: &crate::core::broker::commands::BrokerCommandReceipt,
+        ) -> Option<crate::core::strategy::command_driver::BrokerCommandProgress> {
+            self.driver.progress(receipt)
+        }
+
+        fn broker_command_reduced(
+            &mut self,
+            receipt: &crate::core::broker::commands::BrokerCommandReceipt,
+        ) {
+            self.driver
+                .mark_reduced(receipt)
+                .expect("receipt belongs to this test context");
+            if !self.reduced.contains(receipt) {
+                self.reduced.push(receipt.clone());
+            }
+        }
         fn universe(&self) -> &HashMap<String, Asset> {
             &self.universe
         }
@@ -1213,8 +1905,6 @@ mod tests {
         fn add_insight(&mut self, insight: Insight) {
             self.insights.add_insight(insight);
         }
-
-        fn submit_insight(&mut self, _insight: &mut Insight) {}
 
         fn register_indicator(&mut self, _indicator: Box<dyn Indicator>) {}
 
@@ -1288,32 +1978,6 @@ mod tests {
 
         fn cleanup_active_insights_for_teardown(&mut self) -> TeardownCleanupReport {
             TeardownCleanupReport::default()
-        }
-
-        fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError> {
-            self.block_on_broker(self.broker.cancel_order(order_id))
-        }
-
-        fn update_order(&self, order_id: &str, price: f64, qty: f64) -> Result<bool, BrokerError> {
-            self.block_on_broker(self.broker.update_order(order_id, price, qty))
-        }
-
-        fn update_stop_loss_order(
-            &self,
-            order_id: &str,
-            price: f64,
-            qty: f64,
-        ) -> Result<bool, BrokerError> {
-            self.block_on_broker(self.broker.update_stop_loss(order_id, price, qty))
-        }
-
-        fn close_position(
-            &self,
-            order_id: &str,
-            qty: f64,
-            price: Option<f64>,
-        ) -> Result<bool, BrokerError> {
-            self.block_on_broker(self.broker.close_position(order_id, qty, price))
         }
 
         fn shutdown(&mut self) {}

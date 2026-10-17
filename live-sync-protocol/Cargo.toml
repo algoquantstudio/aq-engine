@@ -1,0 +1,15 @@
+[package]
+name = "aqe-live-protocol"
+version = "0.1.14"
+edition = "2024"
+license-file = "LICENSE"
+repository = "https://github.com/algoquantstudio/aq-engine"
+description = "Broker-neutral AQE live event wire contract, without trading or database dependencies"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+url = "2.5.8"
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.24.1", features = ["v4", "v5", "js", "serde"] }
+sha2 = "0.11"

@@ -28,6 +28,9 @@ impl InsightPipe for CloseMarketChangedPipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
+        if insight.has_pending_close() {
+            return InsightPipeResult::from_exit_mutation(insight.close(ctx), self.name());
+        }
         if insight.closing {
             return InsightPipeResult::new(
                 false,
@@ -38,13 +41,7 @@ impl InsightPipe for CloseMarketChangedPipe {
         }
 
         if insight.market_changed {
-            insight.close(ctx);
-            return InsightPipeResult::new(
-                false,
-                true,
-                Some("Insight closed due to market change".to_string()),
-                self.name().to_string(),
-            );
+            return InsightPipeResult::from_exit_mutation(insight.close(ctx), self.name());
         }
 
         InsightPipeResult::new(true, true, None, self.name().to_string())

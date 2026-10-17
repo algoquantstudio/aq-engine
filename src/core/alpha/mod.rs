@@ -9,6 +9,8 @@ use std::collections::HashSet;
 pub mod ema_price_crossover;
 pub mod rsi_divergance_alpha;
 pub mod test_entry;
+mod options;
+pub use options::BuiltinAlphaOptions;
 pub use ema_price_crossover::EmaPriceCrossover;
 pub use rsi_divergance_alpha::RsiDiverganceAlpha;
 pub use test_entry::TestEntry;

@@ -1,157 +1,16 @@
+use super::types::live_metrics::{
+    HistoricalClosedInsightMetric, LIVE_METRICS_CHECKPOINT_VERSION, LiveMetricsCheckpoint,
+    LiveMetricsSnapshot,
+};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use surrealdb::types::SurrealValue;
 
 use crate::core::insight::InsightSnapshot;
-
-pub const LIVE_METRICS_CHECKPOINT_VERSION: u16 = 1;
-
-/// Versioned persistence state for the online live-performance accumulator.
-/// The public metrics snapshot alone is not sufficient to resume Welford
-/// variance, downside deviation, or an in-progress drawdown exactly.
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue, PartialEq)]
-pub struct LiveMetricsCheckpoint {
-    pub version: u16,
-    pub account_id: String,
-    #[serde(default)]
-    pub history_recovery_complete: bool,
-    pub starting_cash: f64,
-    pub current_equity: f64,
-    pub peak_equity: f64,
-    pub max_drawdown: f64,
-    pub total_trades: usize,
-    #[serde(default)]
-    pub recorded_closed_insight_ids: Vec<String>,
-    pub winning_trades: usize,
-    pub losing_trades: usize,
-    pub gross_profit: f64,
-    pub gross_loss_abs: f64,
-    pub sum_winner: f64,
-    pub sum_loser_abs: f64,
-    pub sum_winner_pct: f64,
-    pub sum_loser_pct_abs: f64,
-    pub best_trade: f64,
-    pub worst_trade: f64,
-    pub sum_hold_secs: i64,
-    pub longest_winning_trade_held_secs: i64,
-    pub longest_losing_trade_held_secs: i64,
-    pub open_positions_count: usize,
-    pub open_insights_count: usize,
-    pub open_positions_unrealized_pnl: f64,
-    pub open_positions_profitable_count: usize,
-    pub open_positions_losing_count: usize,
-    pub symbols: Vec<String>,
-    pub return_count: u64,
-    pub return_mean: f64,
-    pub return_m2: f64,
-    pub downside_return_count: u64,
-    pub downside_return_sum_sq: f64,
-    pub previous_equity: Option<f64>,
-    pub underwater_start: Option<DateTime<Utc>>,
-    pub max_drawdown_duration_secs: i64,
-    pub executed_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Deserialize, SurrealValue)]
-pub(crate) struct HistoricalClosedInsightMetric {
-    pub insight_id: String,
-    pub side: String,
-    pub quantity: Option<f64>,
-    pub limit_price: Option<f64>,
-    pub stop_price: Option<f64>,
-    pub filled_price: Option<f64>,
-    pub close_price: Option<f64>,
-    pub broker_realized_pnl: Option<f64>,
-    pub commission: Option<f64>,
-    #[serde(default)]
-    pub swap: Option<f64>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub filled_at: Option<DateTime<Utc>>,
-    pub closed_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct LiveMetricsSnapshot {
-    pub starting_cash: f64,
-    pub final_equity: f64,
-    pub total_return: f64,
-    pub total_return_pct: f64,
-    pub total_trades: usize,
-    pub winning_trades: usize,
-    pub losing_trades: usize,
-    pub win_rate: f64,
-    pub max_drawdown: f64,
-    pub cagr: f64,
-    pub annualized_volatility: f64,
-    pub sharpe_ratio: f64,
-    pub sortino_ratio: f64,
-    pub calmar_ratio: f64,
-    pub max_drawdown_duration_days: f64,
-    pub expectancy: f64,
-    pub profit_factor: f64,
-    pub payoff_ratio: f64,
-    pub avg_winner: f64,
-    pub avg_loser: f64,
-    pub avg_winner_pct: f64,
-    pub avg_loser_pct: f64,
-    pub best_trade: f64,
-    pub worst_trade: f64,
-    pub consistency_score: f64,
-    pub longest_winning_trade_held_secs: i64,
-    pub longest_losing_trade_held_secs: i64,
-    pub average_trade_held_secs: i64,
-    pub open_positions_count: usize,
-    pub open_insights_count: usize,
-    pub open_positions_unrealized_pnl: f64,
-    pub open_positions_profitable_count: usize,
-    pub open_positions_losing_count: usize,
-    pub symbols: Vec<String>,
-    pub executed_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl LiveMetricsSnapshot {
-    /// SurrealDB float fields and JSON cannot represent NaN or infinity. Keep
-    /// the persistence snapshot total even while very young live sessions can
-    /// temporarily produce unbounded annualized ratios.
-    fn sanitize_non_finite(mut self) -> Self {
-        for value in [
-            &mut self.starting_cash,
-            &mut self.final_equity,
-            &mut self.total_return,
-            &mut self.total_return_pct,
-            &mut self.win_rate,
-            &mut self.max_drawdown,
-            &mut self.cagr,
-            &mut self.annualized_volatility,
-            &mut self.sharpe_ratio,
-            &mut self.sortino_ratio,
-            &mut self.calmar_ratio,
-            &mut self.max_drawdown_duration_days,
-            &mut self.expectancy,
-            &mut self.profit_factor,
-            &mut self.payoff_ratio,
-            &mut self.avg_winner,
-            &mut self.avg_loser,
-            &mut self.avg_winner_pct,
-            &mut self.avg_loser_pct,
-            &mut self.best_trade,
-            &mut self.worst_trade,
-            &mut self.consistency_score,
-            &mut self.open_positions_unrealized_pnl,
-        ] {
-            if !value.is_finite() {
-                *value = 0.0;
-            }
-        }
-        self
-    }
-}
-
+mod legacy_baseline;
+mod trade_history;
+pub(crate) use legacy_baseline::{LegacyRiskBaseline, LegacyRiskMerge};
+pub(crate) use trade_history::TradeHistoryRebuild;
+pub(crate) use trade_history::TradeRecoveryToken;
 #[derive(Clone, Debug, Default)]
 pub struct LivePerformanceTracker {
     account_id: Option<String>,
@@ -162,6 +21,7 @@ pub struct LivePerformanceTracker {
     max_drawdown: f64,
     total_trades: usize,
     recorded_closed_insight_ids: HashSet<String>,
+    trade_recovery: Option<trade_history::TradeRecoveryCapture>,
     winning_trades: usize,
     losing_trades: usize,
     gross_profit: f64,
@@ -229,6 +89,7 @@ impl LivePerformanceTracker {
         executed_at: DateTime<Utc>,
         symbols: impl IntoIterator<Item = String>,
     ) {
+        self.trade_recovery = None;
         self.account_id = account_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -291,6 +152,7 @@ impl LivePerformanceTracker {
             return Err("live metrics checkpoint is missing its broker account id".to_string());
         }
 
+        self.trade_recovery = None;
         self.account_id = Some(account_id.to_string());
         self.history_recovery_complete = checkpoint.history_recovery_complete;
         self.starting_cash = checkpoint.starting_cash;
@@ -473,6 +335,7 @@ impl LivePerformanceTracker {
     }
 
     pub fn mark_history_recovery_complete(&mut self) {
+        self.trade_recovery = None;
         self.history_recovery_complete = true;
         self.last_persisted_checkpoint = None;
     }
@@ -497,6 +360,28 @@ impl LivePerformanceTracker {
         }
         if historical.account_id.trim() != current_account {
             return Err("historical checkpoint belongs to a different broker account".to_string());
+        }
+        // A restored local checkpoint may already include the cloud baseline.
+        // Acknowledging that baseline must not add its trades or return samples again.
+        if self.history_recovery_complete
+            && historical.history_recovery_complete
+            && self.executed_at == Some(historical.executed_at)
+            && self.starting_cash == historical.starting_cash
+            && self
+                .updated_at
+                .is_some_and(|at| at >= historical.updated_at)
+            && self.total_trades >= historical.total_trades
+            && historical.recorded_closed_insight_ids.len() == historical.total_trades
+            && historical
+                .recorded_closed_insight_ids
+                .iter()
+                .all(|id| self.recorded_closed_insight_ids.contains(id))
+            && self.return_count >= historical.return_count
+            && self.gross_profit >= historical.gross_profit
+            && self.gross_loss_abs >= historical.gross_loss_abs
+            && self.max_drawdown >= historical.max_drawdown
+        {
+            return Ok(());
         }
         let current_started_at = self
             .executed_at
@@ -597,42 +482,36 @@ impl LivePerformanceTracker {
         self.last_persisted_checkpoint = None;
     }
 
+    /// The strategy's persisted first equity observation wins over an older
+    /// cash-based checkpoint. Do not reset trade/risk accumulators, and never
+    /// apply an origin from another broker account or a future observation.
+    pub(crate) fn apply_account_equity_baseline(
+        &mut self,
+        account_id: &str,
+        equity: f64,
+        captured_at: DateTime<Utc>,
+    ) -> bool {
+        if self.account_id.as_deref() != Some(account_id.trim())
+            || !equity.is_finite()
+            || equity <= 0.0
+            || self.updated_at.is_none_or(|at| captured_at > at)
+        {
+            return false;
+        }
+        if self.starting_cash != equity || self.executed_at != Some(captured_at) {
+            self.set_continuity_origin(equity, captured_at);
+        }
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_trade_history(
         &mut self,
         records: impl IntoIterator<Item = HistoricalClosedInsightMetric>,
     ) {
-        self.total_trades = 0;
-        self.recorded_closed_insight_ids.clear();
-        self.winning_trades = 0;
-        self.losing_trades = 0;
-        self.gross_profit = 0.0;
-        self.gross_loss_abs = 0.0;
-        self.sum_winner = 0.0;
-        self.sum_loser_abs = 0.0;
-        self.sum_winner_pct = 0.0;
-        self.sum_loser_pct_abs = 0.0;
-        self.best_trade = 0.0;
-        self.worst_trade = 0.0;
-        self.sum_hold_secs = 0;
-        self.longest_winning_trade_held_secs = 0;
-        self.longest_losing_trade_held_secs = 0;
-        for record in records {
-            if !self
-                .recorded_closed_insight_ids
-                .insert(record.insight_id.clone())
-            {
-                continue;
-            }
-            self.record_closed_values(
-                historical_trade_pnl(&record),
-                historical_trade_return_pct(&record),
-                historical_trade_hold_secs(&record),
-                record.closed_at.unwrap_or(record.updated_at),
-            );
-        }
-        self.history_recovery_complete = true;
-        self.last_persisted = None;
-        self.last_persisted_checkpoint = None;
+        let mut rebuild = TradeHistoryRebuild::default();
+        rebuild.push_page(records);
+        self.apply_trade_history_rebuild(rebuild);
     }
 
     pub fn update_equity(&mut self, equity: f64, at: DateTime<Utc>) {
@@ -700,7 +579,9 @@ impl LivePerformanceTracker {
         let return_pct = trade_return_pct(snapshot);
         let hold_secs = trade_hold_secs(snapshot);
 
-        self.record_closed_values(pnl, return_pct, hold_secs, Utc::now());
+        let at = Utc::now();
+        self.capture_recovery_trade(&snapshot.insight_id, pnl, return_pct, hold_secs, at);
+        self.record_closed_values(pnl, return_pct, hold_secs, at);
     }
 
     fn record_closed_values(
@@ -1108,286 +989,5 @@ fn consistency_score(win_rate: f64, profit_factor: f64, payoff_ratio: f64) -> f6
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeDelta;
-
-    #[test]
-    fn very_young_live_session_never_serializes_unbounded_metrics_as_null() {
-        let started_at = Utc::now();
-        let mut tracker = LivePerformanceTracker::default();
-        tracker.initialize(100.0, 100.0, started_at, ["SOLUSD".to_string()]);
-        tracker.update_equity(200.0, started_at + TimeDelta::seconds(1));
-        tracker.update_open_position_metrics(
-            1,
-            1,
-            f64::INFINITY,
-            1,
-            0,
-            vec!["SOLUSD".to_string()],
-            started_at + TimeDelta::seconds(1),
-        );
-
-        let snapshot = tracker.snapshot().expect("initialized live metrics");
-        assert!(snapshot.cagr.is_finite());
-        assert!(snapshot.calmar_ratio.is_finite());
-        assert!(snapshot.open_positions_unrealized_pnl.is_finite());
-
-        let json = serde_json::to_value(snapshot).expect("serializable live metrics");
-        assert!(json["cagr"].is_number());
-        assert!(json["calmar_ratio"].is_number());
-        assert!(json["open_positions_unrealized_pnl"].is_number());
-    }
-
-    #[test]
-    fn fast_equity_refresh_does_not_change_return_sampling_frequency() {
-        let started_at = Utc::now();
-        let mut tracker = LivePerformanceTracker::default();
-        tracker.initialize(100.0, 100.0, started_at, ["SOLUSD".to_string()]);
-
-        tracker.refresh_equity(101.0, started_at + TimeDelta::seconds(1));
-        tracker.refresh_equity(102.0, started_at + TimeDelta::seconds(2));
-        assert_eq!(tracker.return_count, 0);
-        assert_eq!(tracker.previous_equity, Some(100.0));
-
-        tracker.update_equity(103.0, started_at + TimeDelta::seconds(5));
-        assert_eq!(tracker.return_count, 1);
-        assert_eq!(tracker.previous_equity, Some(103.0));
-        assert_eq!(tracker.snapshot().unwrap().final_equity, 103.0);
-    }
-
-    #[test]
-    fn unchanged_open_position_metrics_do_not_mark_tracker_dirty() {
-        let started_at = Utc::now();
-        let mut tracker = LivePerformanceTracker::default();
-        tracker.initialize(100.0, 100.0, started_at, ["SOLUSD".to_string()]);
-        tracker.mark_persisted();
-
-        tracker.update_open_position_metrics(
-            0,
-            0,
-            0.0,
-            0,
-            0,
-            vec!["SOLUSD".to_string()],
-            started_at + TimeDelta::seconds(1),
-        );
-
-        assert!(!tracker.should_persist());
-    }
-
-    #[test]
-    fn checkpoint_round_trip_preserves_accumulators_without_restart_sample() {
-        let started_at = Utc::now() - TimeDelta::hours(3);
-        let mut tracker = LivePerformanceTracker::default();
-        tracker.initialize_for_account(
-            Some(" broker-42 ".to_string()),
-            100_000.0,
-            100_000.0,
-            started_at,
-            ["ETHUSD".to_string()],
-        );
-        tracker.update_equity(101_000.0, started_at + TimeDelta::minutes(5));
-        let checkpoint = tracker.checkpoint().expect("checkpoint");
-        let checkpoint: LiveMetricsCheckpoint =
-            serde_json::from_slice(&serde_json::to_vec(&checkpoint).expect("serialize checkpoint"))
-                .expect("deserialize checkpoint");
-
-        let mut restored = LivePerformanceTracker::default();
-        restored
-            .restore(
-                checkpoint.clone(),
-                101_500.0,
-                started_at + TimeDelta::hours(3),
-                ["SOLUSD".to_string()],
-            )
-            .expect("restore checkpoint");
-
-        assert_eq!(restored.account_id.as_deref(), Some("broker-42"));
-        assert_eq!(restored.return_count, checkpoint.return_count);
-        assert_eq!(restored.previous_equity, Some(101_500.0));
-        assert_eq!(restored.snapshot().unwrap().executed_at, started_at);
-        assert_eq!(restored.snapshot().unwrap().finished_at, None);
-        assert_eq!(restored.symbols, vec!["ETHUSD", "SOLUSD"]);
-    }
-
-    #[test]
-    fn newest_checkpoint_is_selected_without_adding_accumulators() {
-        let now = Utc::now();
-        let checkpoint = |account: &str, updated_at| LiveMetricsCheckpoint {
-            version: LIVE_METRICS_CHECKPOINT_VERSION,
-            account_id: account.to_string(),
-            history_recovery_complete: true,
-            starting_cash: 100.0,
-            current_equity: 100.0,
-            peak_equity: 100.0,
-            max_drawdown: 0.0,
-            total_trades: if updated_at == now { 7 } else { 3 },
-            recorded_closed_insight_ids: Vec::new(),
-            winning_trades: 0,
-            losing_trades: 0,
-            gross_profit: 0.0,
-            gross_loss_abs: 0.0,
-            sum_winner: 0.0,
-            sum_loser_abs: 0.0,
-            sum_winner_pct: 0.0,
-            sum_loser_pct_abs: 0.0,
-            best_trade: 0.0,
-            worst_trade: 0.0,
-            sum_hold_secs: 0,
-            longest_winning_trade_held_secs: 0,
-            longest_losing_trade_held_secs: 0,
-            open_positions_count: 0,
-            open_insights_count: 0,
-            open_positions_unrealized_pnl: 0.0,
-            open_positions_profitable_count: 0,
-            open_positions_losing_count: 0,
-            symbols: vec![],
-            return_count: 0,
-            return_mean: 0.0,
-            return_m2: 0.0,
-            downside_return_count: 0,
-            downside_return_sum_sq: 0.0,
-            previous_equity: Some(100.0),
-            underwater_start: None,
-            max_drawdown_duration_secs: 0,
-            executed_at: now - TimeDelta::hours(1),
-            updated_at,
-        };
-        let selected = LivePerformanceTracker::newest_compatible_checkpoint(
-            "account-a",
-            [
-                checkpoint("account-a", now - TimeDelta::minutes(1)),
-                checkpoint("account-a", now),
-                checkpoint("account-b", now + TimeDelta::minutes(1)),
-            ],
-        )
-        .expect("matching checkpoint");
-        assert_eq!(selected.total_trades, 7);
-    }
-
-    #[test]
-    fn legacy_trade_rebuild_is_deterministic_and_idempotent() {
-        let now = Utc::now();
-        let mut records = vec![
-            HistoricalClosedInsightMetric {
-                insight_id: "winner".to_string(),
-                side: "Buy".to_string(),
-                quantity: Some(2.0),
-                limit_price: None,
-                stop_price: None,
-                filled_price: Some(10.0),
-                close_price: Some(12.0),
-                broker_realized_pnl: Some(3.5),
-                commission: Some(0.25),
-                swap: Some(0.1),
-                created_at: now - TimeDelta::minutes(20),
-                updated_at: now - TimeDelta::minutes(10),
-                filled_at: Some(now - TimeDelta::minutes(18)),
-                closed_at: Some(now - TimeDelta::minutes(10)),
-            },
-            HistoricalClosedInsightMetric {
-                insight_id: "loser".to_string(),
-                side: "Sell".to_string(),
-                quantity: Some(1.0),
-                limit_price: None,
-                stop_price: None,
-                filled_price: Some(10.0),
-                close_price: Some(11.0),
-                broker_realized_pnl: None,
-                commission: Some(0.2),
-                swap: Some(-0.1),
-                created_at: now - TimeDelta::minutes(9),
-                updated_at: now,
-                filled_at: Some(now - TimeDelta::minutes(8)),
-                closed_at: Some(now),
-            },
-        ];
-        records.insert(1, records[0].clone());
-        let mut tracker = LivePerformanceTracker::default();
-        tracker.initialize_for_account(
-            Some("account".to_string()),
-            100.0,
-            102.2,
-            now - TimeDelta::hours(1),
-            std::iter::empty(),
-        );
-
-        tracker.replace_trade_history(records.clone());
-        let first = tracker.checkpoint().unwrap();
-        tracker.replace_trade_history(records);
-        let second = tracker.checkpoint().unwrap();
-
-        assert_eq!(first.total_trades, 2);
-        assert_eq!(first.winning_trades, 1);
-        assert_eq!(first.losing_trades, 1);
-        assert_eq!(first.gross_profit, 3.5);
-        assert!((first.gross_loss_abs - 1.3).abs() < 1e-9);
-        assert_eq!(first.total_trades, second.total_trades);
-        assert_eq!(first.gross_profit, second.gross_profit);
-        assert_eq!(first.gross_loss_abs, second.gross_loss_abs);
-        assert!(second.history_recovery_complete);
-    }
-
-    #[test]
-    fn checkpoint_for_a_different_broker_account_is_not_compatible() {
-        let now = Utc::now();
-        let mut tracker = LivePerformanceTracker::default();
-        tracker.initialize_for_account(
-            Some("account-a".to_string()),
-            100.0,
-            100.0,
-            now,
-            std::iter::empty(),
-        );
-        assert!(
-            LivePerformanceTracker::newest_compatible_checkpoint(
-                "account-b",
-                [tracker.checkpoint().unwrap()]
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn non_overlapping_checkpoint_merge_combines_online_statistics_once() {
-        let now = Utc::now();
-        let mut historical_tracker = LivePerformanceTracker::default();
-        historical_tracker.initialize_for_account(
-            Some("account".to_string()),
-            100.0,
-            100.0,
-            now - TimeDelta::hours(2),
-            ["ETHUSD".to_string()],
-        );
-        historical_tracker.update_equity(101.0, now - TimeDelta::hours(1));
-        let historical = historical_tracker.checkpoint().unwrap();
-
-        let mut current = LivePerformanceTracker::default();
-        current.initialize_for_account(
-            Some("account".to_string()),
-            101.0,
-            101.0,
-            now,
-            ["SOLUSD".to_string()],
-        );
-        current.update_equity(102.0, now + TimeDelta::minutes(5));
-        current
-            .merge_historical_checkpoint(historical.clone())
-            .expect("non-overlapping merge");
-
-        assert_eq!(current.return_count, 2);
-        assert_eq!(current.snapshot().unwrap().starting_cash, 100.0);
-        assert_eq!(
-            current.snapshot().unwrap().executed_at,
-            historical.executed_at
-        );
-        assert_eq!(current.symbols, vec!["ETHUSD", "SOLUSD"]);
-        assert!(
-            current
-                .merge_historical_checkpoint(historical)
-                .unwrap_err()
-                .contains("overlaps")
-        );
-    }
-}
+#[path = "live_metrics_tests.rs"]
+mod tests;

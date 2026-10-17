@@ -49,6 +49,25 @@ pub enum TimeFrameError {
 }
 
 impl TimeFrame {
+    /// Parse compact timeframe labels without
+    /// panicking on invalid input. Whitespace and letter case are normalized.
+    /// Examples: `1m`, `15m`, `1h`, `1d`, `1mo` (`m` is minutes, `mo` is months).
+    pub fn parse_timeframe(raw: &str) -> Result<Self, TimeFrameError> {
+        let value = raw.trim().to_ascii_lowercase();
+        let offset = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+        let amount = value[..offset].parse::<u8>()
+            .map_err(|_| TimeFrameError::InvalidTimeFrameAmount)?;
+        let unit = match &value[offset..] {
+            "s" => TimeFrameUnit::Second,
+            "m" => TimeFrameUnit::Minute,
+            "h" => TimeFrameUnit::Hour,
+            "d" => TimeFrameUnit::Day,
+            "mo" => TimeFrameUnit::Month,
+            _ => return Err(TimeFrameError::InvalidTimeFrameUnit),
+        };
+        Self::validate_time_frame(&amount, &unit)
+    }
+
     /// Creates a new `TimeFrame` instance.
     ///
     /// # Arguments
@@ -143,26 +162,28 @@ impl TimeFrame {
         time: DateTime<Utc>,
         periods: i64,
     ) -> Result<DateTime<Utc>, TimeFrameError> {
-        match self.unit {
-            // TODO:  strip the ms from the time so we can get a round time.
-            TimeFrameUnit::Second => {
-                Ok(time + (TimeDelta::seconds((self.amount as i64) * periods)))
-            }
-            TimeFrameUnit::Minute => Ok(time + TimeDelta::minutes((self.amount as i64) * periods)),
-            TimeFrameUnit::Hour => Ok(time + TimeDelta::hours((self.amount as i64) * periods)),
-            TimeFrameUnit::Day => Ok(time + TimeDelta::days((self.amount as i64) * periods)),
-            // TimeFrameUnit::Week => time + chrono::Duration::weeks(self.amount as i64 * periods),
+        let count = i64::from(self.amount)
+            .checked_mul(periods)
+            .ok_or(TimeFrameError::InvalidTimeFramePeriod)?;
+        let duration = match self.unit {
+            TimeFrameUnit::Second => TimeDelta::try_seconds(count),
+            TimeFrameUnit::Minute => TimeDelta::try_minutes(count),
+            TimeFrameUnit::Hour => TimeDelta::try_hours(count),
+            TimeFrameUnit::Day => TimeDelta::try_days(count),
             TimeFrameUnit::Month => {
-                let total_months = (self.amount as i64) * periods;
-                if total_months >= 0 {
-                    time.checked_add_months(Months::new(total_months as u32))
-                        .ok_or(TimeFrameError::InvalidTimeFramePeriod)
+                let months = u32::try_from(count.unsigned_abs())
+                    .map_err(|_| TimeFrameError::InvalidTimeFramePeriod)?;
+                return if count >= 0 {
+                    time.checked_add_months(Months::new(months))
                 } else {
-                    time.checked_sub_months(Months::new((-total_months) as u32))
-                        .ok_or(TimeFrameError::InvalidTimeFramePeriod)
+                    time.checked_sub_months(Months::new(months))
                 }
+                .ok_or(TimeFrameError::InvalidTimeFramePeriod);
             }
         }
+        .ok_or(TimeFrameError::InvalidTimeFramePeriod)?;
+        time.checked_add_signed(duration)
+            .ok_or(TimeFrameError::InvalidTimeFramePeriod)
     }
     pub fn get_current_time_increment(&self, time: DateTime<Utc>) -> DateTime<Utc> {
         match self.unit {
@@ -265,6 +286,22 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     #[test]
+    fn csv_timeframe_parser_uses_canonical_validation() {
+        for (label, amount, unit) in [
+            ("1s", 1, TimeFrameUnit::Second),
+            (" 05M ", 5, TimeFrameUnit::Minute),
+            ("23h", 23, TimeFrameUnit::Hour),
+            ("1d", 1, TimeFrameUnit::Day),
+            ("1mo", 1, TimeFrameUnit::Month),
+        ] {
+            assert_eq!(TimeFrame::parse_timeframe(label).unwrap(), TimeFrame::new(amount, unit));
+        }
+        for label in ["", "0m", "60m", "24h", "2d", "2mo", "256m", "-1m", "1w", "1", "1.5m"] {
+            assert!(TimeFrame::parse_timeframe(label).is_err(), "accepted {label}");
+        }
+    }
+
+    #[test]
     fn test_new_valid_and_invalid() {
         // Valid cases
         let tf = TimeFrame::new(1, TimeFrameUnit::Minute);
@@ -365,6 +402,41 @@ mod tests {
         assert_eq!(
             prev_month,
             Utc.with_ymd_and_hms(2022, 12, 1, 12, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn time_increment_rejects_overflow_without_panicking_or_wrapping_months() {
+        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        for unit in TimeFrameUnit::variants() {
+            let timeframe = TimeFrame::new(1, *unit);
+            assert!(timeframe.add_time_increment(now, i64::MAX).is_err());
+            assert!(timeframe.add_time_increment(now, i64::MIN).is_err());
+            assert!(
+                timeframe
+                    .add_time_increment(DateTime::<Utc>::MAX_UTC, 1)
+                    .is_err()
+            );
+            assert!(
+                timeframe
+                    .add_time_increment(DateTime::<Utc>::MIN_UTC, -1)
+                    .is_err()
+            );
+        }
+        assert!(
+            TimeFrame::new(1, TimeFrameUnit::Month)
+                .add_time_increment(now, i64::from(u32::MAX) + 1)
+                .is_err()
+        );
+        assert!(
+            TimeFrame::new(1, TimeFrameUnit::Day)
+                .add_time_increment(now, i64::from(u32::MAX))
+                .is_err()
+        );
+        assert!(
+            TimeFrame::new(59, TimeFrameUnit::Minute)
+                .add_time_increment(now, i64::MAX)
+                .is_err()
         );
     }
 

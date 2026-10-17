@@ -12,7 +12,7 @@ use super::InsightPipe;
 /// - None.
 ///
 /// Behaviour:
-/// Passes through insights that already have a limit price. Otherwise it reads the latest
+/// Passes through insights that already have a limit/stop entry or have been submitted. Otherwise it reads the latest
 /// `close` value from the symbol history and writes it to `insight.limit_price`. The pipe
 /// fails when history is missing, empty, or the close column cannot be read as a finite value.
 pub struct MarketOrderEntryPipe;
@@ -30,11 +30,16 @@ impl InsightPipe for MarketOrderEntryPipe {
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
         // If insight already has a limit price, pass through
-        if insight.limit_price.is_some() {
+        if insight.limit_price.is_some()
+            || insight.stop_price.is_some()
+            || insight.state != crate::core::insight::types::InsightState::New
+            || insight.submitted
+            || insight.has_pending_submit()
+        {
             return InsightPipeResult::new(
                 true,
                 true,
-                Some("Insight already has limit price set".to_string()),
+                Some("Insight already has an entry or is no longer editable".to_string()),
                 self.name().to_string(),
             );
         }
@@ -46,7 +51,10 @@ impl InsightPipe for MarketOrderEntryPipe {
                 // Get last close price from the history DataFrame
                 if let Ok(close_col) = df.column("close") {
                     if let Ok(close_vals) = close_col.f64() {
-                        if let Some(price) = close_vals.get(df.height() - 1) {
+                        if let Some(price) = close_vals
+                            .get(df.height() - 1)
+                            .filter(|price| price.is_finite() && *price > 0.0)
+                        {
                             insight.set_limit_price(Some(price));
                             return InsightPipeResult::new(
                                 true,

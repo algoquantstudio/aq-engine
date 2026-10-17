@@ -1,9 +1,22 @@
 use crate::core::insight::types::InsightState;
 use crate::core::pipeline::WrappedInsightPipe;
+use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Display,
 };
+
+pub(crate) mod live_metrics;
+
+#[derive(Clone, Debug)]
+pub(super) struct HyperparameterSelection {
+    pub(super) seed: String,
+    pub(super) values: Value,
+    pub(super) sweep_id: String,
+    pub(super) strategy_fingerprint: String,
+    pub(super) source_targets: Value,
+    pub(super) is_sweep_run: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrategyMode {
@@ -74,11 +87,107 @@ impl Display for StrategyStatus {
 /// Mirrors Python's `INSIGHT_EXECUTORS: dict[InsightState, deque[BaseExecutor]]`.
 pub struct InsightPipeline {
     pub pipeline: HashMap<InsightState, VecDeque<WrappedInsightPipe>>,
+    pub(crate) deferred: std::collections::BTreeMap<uuid::Uuid, DeferredPipeResume>,
+    pub(super) snapshot_dependencies: super::snapshot_dependencies::SnapshotDependencies,
+}
+
+pub(crate) struct DeferredPipeResume {
+    pub state: InsightState,
+    pub index: usize,
+    pub dependency: crate::core::pipeline::InsightPipeDeferral,
+    pub snapshot_attempted: Option<crate::core::broker::snapshots::SnapshotReadRevision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InsightPipelineCheckpoint {
+    pub state: InsightState,
+    pub index: usize,
+    pub dependency: crate::core::pipeline::InsightPipeDeferral,
+    pub layout: Vec<String>,
+    pub nested: Option<crate::core::pipeline::PipeContinuationCheckpoint>,
 }
 
 impl InsightPipeline {
+    pub(crate) fn forget_continuation(&mut self, id: &uuid::Uuid) -> bool {
+        self.snapshot_dependencies.remove(id);
+        let Some(resume) = self.deferred.remove(id) else {
+            return false;
+        };
+        if let Some(pipe) = self
+            .pipeline
+            .get_mut(&resume.state)
+            .and_then(|pipes| pipes.get_mut(resume.index))
+        {
+            pipe.inner.forget_insight_continuation(id);
+        }
+        true
+    }
+
+    pub(crate) fn execution_checkpoint(
+        &self,
+        id: &uuid::Uuid,
+    ) -> Option<InsightPipelineCheckpoint> {
+        let resume = self.deferred.get(id)?;
+        let pipes = self.pipeline.get(&resume.state)?;
+        let pipe = pipes.get(resume.index)?;
+        Some(InsightPipelineCheckpoint {
+            state: resume.state.clone(),
+            index: resume.index,
+            dependency: resume.dependency.clone(),
+            layout: pipes
+                .iter()
+                .map(WrappedInsightPipe::recovery_layout)
+                .collect(),
+            nested: pipe.inner.execution_checkpoint(id),
+        })
+    }
+
+    pub(crate) fn restore_execution_checkpoint(
+        &mut self,
+        id: uuid::Uuid,
+        checkpoint: InsightPipelineCheckpoint,
+    ) -> Result<(), String> {
+        let pipes = self
+            .pipeline
+            .get_mut(&checkpoint.state)
+            .ok_or("saved pipeline state no longer exists")?;
+        let layout = pipes
+            .iter()
+            .map(WrappedInsightPipe::recovery_layout)
+            .collect::<Vec<_>>();
+        if layout != checkpoint.layout {
+            return Err("pipeline layout changed since execution checkpoint".into());
+        }
+        let pipe = pipes
+            .get_mut(checkpoint.index)
+            .ok_or("saved pipeline index is out of range")?;
+        pipe.inner
+            .restore_execution_checkpoint(id, checkpoint.nested)?;
+        self.deferred.insert(
+            id,
+            DeferredPipeResume {
+                state: checkpoint.state,
+                index: checkpoint.index,
+                dependency: checkpoint.dependency,
+                snapshot_attempted: None,
+            },
+        );
+        self.snapshot_dependencies
+            .update(id, self.deferred.get(&id).map(|resume| &resume.dependency));
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn pending_deferral(
+        &self,
+        insight_id: &uuid::Uuid,
+    ) -> Option<&crate::core::pipeline::InsightPipeDeferral> {
+        self.deferred
+            .get(insight_id)
+            .map(|resume| &resume.dependency)
     }
 
     /// Register a pipe into the bucket for `pipe.target_state()`.
@@ -115,6 +224,10 @@ impl Default for InsightPipeline {
         pipeline.insert(InsightState::Filled, VecDeque::new());
         pipeline.insert(InsightState::Cancelled, VecDeque::new());
         pipeline.insert(InsightState::Rejected, VecDeque::new());
-        Self { pipeline }
+        Self {
+            pipeline,
+            deferred: Default::default(),
+            snapshot_dependencies: Default::default(),
+        }
     }
 }

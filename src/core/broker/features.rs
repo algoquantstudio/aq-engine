@@ -18,11 +18,33 @@ pub enum BrokerFeature {
     OcoOrder,
     TrailingOrder,
     PartialClose,
+    /// Amend the limit component of an unfilled entry without cancel/re-submit.
+    AmendLimitPrice,
+    /// Amend the trigger component of an unfilled stop/stop-limit entry.
+    AmendStopPrice,
     /// `Account::buying_power` already includes the broker's available leverage.
     ///
     /// Brokers that expose unleveraged free margin should omit this feature so
     /// strategy sizing can explicitly apply `Account::leverage` when appropriate.
     BuyingPowerLeveraged,
+    /// Reports a broker-imposed pending-order ceiling on `Account::max_total_orders`.
+    MaxTotalOrders,
+    /// Reports aggregate symbol volume limits on `Asset::max_total_size`.
+    MaxTotalSize,
+    /// Broker can estimate required margin in account currency for an exact
+    /// immutable order request without placing it.
+    AuthoritativeMarginEstimate,
+    /// Broker emits order lifecycle events without AQE polling for them.
+    TradeEventStream,
+    /// Broker emits account changes without AQE polling `get_account`.
+    AccountStream,
+    /// Broker can produce an authoritative batch lifecycle snapshot for restart reconciliation.
+    OrderLifecycleSnapshot,
+    /// Broker owns attached take-profit/stop-loss lifecycle after entry acceptance.
+    ///
+    /// `OcoOrder` is retained for source compatibility; new runtime decisions should use this
+    /// explicit capability.
+    BrokerManagedOco,
 }
 
 /// Market-data capabilities exposed by an AQE data-feed implementation.
@@ -36,7 +58,12 @@ pub enum DataFeedFeature {
     LatestQuote,
     CandleStream,
     IntraCandleStream,
+    /// Independent, lease-scoped quote callbacks. Does not imply tick-complete delivery.
     QuoteStream,
+    /// Quotes carry the provider's actual bid/ask rather than a bar-close approximation.
+    NativeBidAsk,
+    /// Quotes are bar-close approximations (bid == ask), not executable market quotes.
+    SyntheticQuotes,
 }
 
 /// Resolve the buying power available for sizing from a broker account snapshot.
@@ -87,7 +114,7 @@ impl UnifiedBrokerFeature for DataFeedFeature {
         E: traits::Broker + traits::OrderManagementProvider,
         D: traits::DataFeed + traits::DataProvider,
     {
-        broker.data.get_features().contains(&self)
+        traits::DataFeed::get_features(broker).contains(&self)
     }
 }
 
@@ -99,6 +126,7 @@ mod tests {
     fn account(buying_power: f64, leverage: u8) -> Account {
         Account {
             account_id: "test".to_string(),
+            max_total_orders: None,
             account_type: AccountType::Paper,
             equity: 100_000.0,
             cash: 90_000.0,
@@ -125,9 +153,11 @@ mod tests {
             min_order_size: Some(0.01),
             quantity_base: Some(2),
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(0.01),
             price_base: Some(2),
             contract_size: None,
+            trading_calendar: None,
             fees: Default::default(),
         }
     }

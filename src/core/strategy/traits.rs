@@ -1,4 +1,8 @@
+use super::command_driver::BrokerCommandProgress;
 use crate::core::alpha::WrappedAlphaModel;
+use crate::core::broker::commands::{
+    BrokerCommandAction, BrokerCommandError, BrokerCommandReceipt, BrokerOperationGroup,
+};
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
 use crate::core::broker::types::BrokerError;
 use crate::core::broker::types::{Account, Asset, BarData, Quote};
@@ -21,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default)]
 pub struct TeardownCleanupReport {
+    /// Requested work counts; completion requires terminal broker evidence.
     pub rejected_new: usize,
     pub cancelled_executed: usize,
     pub closed_filled: usize,
@@ -38,7 +43,7 @@ impl TeardownCleanupReport {
 
     pub fn summary(&self) -> String {
         format!(
-            "rejected_new={}, cancelled_executed={}, closed_filled={}",
+            "new_cleanup_requested={}, cancel_requested={}, close_requested={}",
             self.rejected_new, self.cancelled_executed, self.closed_filled
         )
     }
@@ -50,12 +55,89 @@ impl TeardownCleanupReport {
 /// Object-safe — can be used as `&mut dyn StrategyContext`.
 /// For typed broker access, see the `BrokerAccess` extension trait.
 pub trait StrategyContext {
+    /// Non-blocking broker mutation admission. A receipt is not execution proof.
+    /// Retain it across `Deferred` pipe resumes and inspect `broker_command_progress`.
+    fn enqueue_broker_command(
+        &mut self,
+        _insight_id: uuid::Uuid,
+        _action: BrokerCommandAction,
+        _group: Option<BrokerOperationGroup>,
+    ) -> Result<BrokerCommandReceipt, BrokerCommandError> {
+        Err(BrokerCommandError::Closed)
+    }
+
+    fn broker_command_progress(
+        &self,
+        _receipt: &BrokerCommandReceipt,
+    ) -> Option<BrokerCommandProgress> {
+        None
+    }
+
+    /// The operation's owner consumed its completion. This is not a durable
+    /// checkpoint acknowledgement; the runtime persists the resulting state.
+    fn broker_command_reduced(&mut self, _receipt: &BrokerCommandReceipt) {}
+
+    fn cancel_pending_entry(
+        &mut self,
+        _receipt: &BrokerCommandReceipt,
+    ) -> Result<(), BrokerCommandError> {
+        Err(BrokerCommandError::Closed)
+    }
+
+    /// Low-level order helpers still return admission receipts, never `bool`.
+    /// Insight methods are preferred because they retain/poll these receipts.
+    fn cancel_order(&mut self, order_id: &str) -> Result<BrokerCommandReceipt, BrokerCommandError> {
+        let id = self
+            .insights()
+            .insight_id_for_order(order_id)
+            .ok_or_else(|| {
+                BrokerCommandError::Invalid("order is not tracked by this strategy".into())
+            })?;
+        self.enqueue_broker_command(
+            id,
+            BrokerCommandAction::Cancel {
+                order_id: order_id.into(),
+            },
+            None,
+        )
+    }
+
+    fn close_position(
+        &mut self,
+        order_id: &str,
+        quantity: f64,
+        price: Option<f64>,
+    ) -> Result<BrokerCommandReceipt, BrokerCommandError> {
+        let id = self
+            .insights()
+            .insight_id_for_order(order_id)
+            .ok_or_else(|| {
+                BrokerCommandError::Invalid("position is not tracked by this strategy".into())
+            })?;
+        self.enqueue_broker_command(
+            id,
+            BrokerCommandAction::Close {
+                order_id: order_id.into(),
+                quantity,
+                price,
+            },
+            None,
+        )
+    }
+
     fn universe(&self) -> &HashMap<String, Asset>;
     fn history(&self) -> &HashMap<String, DataFrame>;
     fn insights(&self) -> &InsightCollection;
     fn mode(&self) -> StrategyMode;
     fn add_insight(&mut self, insight: Insight);
-    fn submit_insight(&mut self, insight: &mut Insight);
+
+    /// Request cancellation of a canonical pending entry (never an already-filled position).
+    /// The runtime owns retries, broker receipts, and any fill/cancel race cleanup.
+    fn request_insight_cancellation(&mut self, _id: uuid::Uuid) -> Result<bool, BrokerCommandError> {
+        Err(BrokerCommandError::Invalid(
+            "Insight cancellation is not supported by this context".into(),
+        ))
+    }
     fn register_indicator(&mut self, indicator: Box<dyn Indicator>);
 
     fn add_alpha(&mut self, alpha: WrappedAlphaModel);
@@ -127,9 +209,17 @@ pub trait StrategyContext {
     /// Set the warm-up period. Only raises the value — never lowers it.
     fn set_warm_up_bars(&mut self, bars: i32);
     fn timeframe(&self) -> &TimeFrame;
+    /// Transport-free decision snapshot. Missing/stale live data returns a typed
+    /// SnapshotUnavailable error; pipes must defer instead of rejecting the insight.
     fn account(&self) -> Result<Account, BrokerError>;
+    /// Non-blocking broker snapshot for hot-path capacity checks. Never performs I/O.
+    fn cached_account(&self) -> Option<Account> {
+        None
+    }
     fn current_time(&self) -> DateTime<Utc>;
     fn bind_insight_context(&self, insight: &mut Insight);
+    /// Transport-free quote for this context's feed and clock. Never fetches a
+    /// network quote as a fallback when a simulated/live snapshot is missing.
     fn latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError>;
     fn preseed_warmup_history(
         &mut self,
@@ -145,21 +235,6 @@ pub trait StrategyContext {
         TeardownCleanupReport::default()
     }
 
-    // Order operations (delegated to broker internally)
-    fn cancel_order(&self, order_id: &str) -> Result<bool, BrokerError>;
-    fn update_order(&self, order_id: &str, price: f64, qty: f64) -> Result<bool, BrokerError>;
-    fn update_stop_loss_order(
-        &self,
-        order_id: &str,
-        price: f64,
-        qty: f64,
-    ) -> Result<bool, BrokerError>;
-    fn close_position(
-        &self,
-        order_id: &str,
-        qty: f64,
-        price: Option<f64>,
-    ) -> Result<bool, BrokerError>;
     fn shutdown(&mut self);
 }
 

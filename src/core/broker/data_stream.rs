@@ -79,13 +79,13 @@ impl DataStreamManager {
         let handle = tokio::spawn(async move {
             let mut last_bar_timestamp: Option<DateTime<Utc>> = None;
             let mut retry_after_error = false;
-            let mut bootstrap_completed_bar = mode == DataStreamMode::CompletedBar;
+            let mut bootstrap = true;
 
             loop {
                 let sleep_duration = if retry_after_error {
                     ERROR_RETRY_INTERVAL
-                } else if bootstrap_completed_bar {
-                    bootstrap_completed_bar = false;
+                } else if bootstrap {
+                    bootstrap = false;
                     Duration::ZERO
                 } else {
                     next_poll_delay(time_frame, mode, Utc::now())

@@ -2,10 +2,11 @@ use crate::core::broker::types::OrderSide;
 use crate::core::insight::Insight;
 use crate::core::insight::types::StrategyDependentConfirmation;
 use crate::core::pipeline::InsightPipeResult;
-use crate::core::pipeline::quantity_sizing::{
-    AssetQuantityLimits, apply_max_order_size_with_child_legs,
-};
 use crate::core::strategy::StrategyContext;
+use crate::core::utils::quantity_sizing::{
+    AssetQuantityLimits, apply_max_order_size_with_child_legs, cap_asset_total_quantity,
+    cap_quantity_levels, floor_quantity, validate_pending_tree_limits,
+};
 
 use super::InsightPipe;
 
@@ -52,6 +53,29 @@ impl InsightPipe for PercentageDcaLevelsPipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
+        if !self.dca_percentage.is_finite() || self.dca_percentage <= 0.0 || self.dca_levels > 1024
+        {
+            return InsightPipeResult::new(
+                false,
+                false,
+                Some("DCA requires a positive finite spacing and at most 1024 levels".into()),
+                self.name().into(),
+            );
+        }
+        if insight.state != crate::core::insight::types::InsightState::New
+            || insight.submitted
+            || insight.has_pending_submit()
+            || insight.children.iter().any(|child| {
+                child.submitted || child.has_pending_submit() || child.order_id.is_some()
+            })
+        {
+            return InsightPipeResult::new(
+                false,
+                false,
+                Some("DCA must be configured before submission".into()),
+                self.name().into(),
+            );
+        }
         if insight.quantity.is_none() {
             return InsightPipeResult::new(
                 true,
@@ -77,14 +101,7 @@ impl InsightPipe for PercentageDcaLevelsPipe {
                     OrderSide::Buy => quote.ask,
                     OrderSide::Sell => quote.bid,
                 },
-                Err(_) => {
-                    return InsightPipeResult::new(
-                        false,
-                        false,
-                        Some("Insight does not have an entry price".to_string()),
-                        self.name().to_string(),
-                    );
-                }
+                Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
             }
         };
         let Some(stop_loss) = insight.stop_loss() else {
@@ -107,7 +124,7 @@ impl InsightPipe for PercentageDcaLevelsPipe {
                 self.name().to_string(),
             );
         };
-        let limits = AssetQuantityLimits::from_asset(&asset);
+        let mut limits = AssetQuantityLimits::from_asset(&asset);
 
         // A quantity-sizing pipe may already have split the original order before this DCA pipe
         // runs. Restore that logical total and rebuild the execution fragments after distributing
@@ -125,14 +142,21 @@ impl InsightPipe for PercentageDcaLevelsPipe {
                 self.name().to_string(),
             );
         }
-        let existing_split_quantity: f64 = insight
-            .children
-            .iter()
-            .filter(|child| child.is_split_insight())
-            .filter_map(|child| child.quantity())
-            .sum();
-        let desired_quantity = insight.quantity.unwrap_or(0.0) + existing_split_quantity;
-        insight.children.retain(|child| !child.is_split_insight());
+        let desired_quantity = insight.total_insight_quantity_size();
+        let desired_quantity =
+            match cap_asset_total_quantity(ctx, insight, desired_quantity, limits) {
+                Ok(quantity) => quantity,
+                Err(message) => {
+                    return InsightPipeResult::new(
+                        false,
+                        true,
+                        Some(message),
+                        self.name().to_string(),
+                    );
+                }
+            };
+        // Cap the complete budget once; each level must not claim the same free capacity.
+        limits.max_total_size = None;
 
         let mut price_levels = vec![entry];
         for level in 1..=self.dca_levels {
@@ -143,7 +167,21 @@ impl InsightPipe for PercentageDcaLevelsPipe {
             price_levels.push(ctx.tools().dynamic_round(price, &insight.symbol));
         }
 
-        let quantities = self.calculate_dca_quantities(desired_quantity, &price_levels);
+        if price_levels
+            .iter()
+            .any(|price| !price.is_finite() || *price <= 0.0)
+        {
+            return InsightPipeResult::new(
+                false,
+                true,
+                Some("Invalid DCA price levels".into()),
+                self.name().to_string(),
+            );
+        }
+        let mut quantities = self.calculate_dca_quantities(desired_quantity, &price_levels);
+        if let Err(message) = cap_quantity_levels(ctx, insight, &mut quantities, limits) {
+            return InsightPipeResult::new(false, true, Some(message), self.name().to_string());
+        }
 
         let dca_stop_loss = match insight.side {
             OrderSide::Buy => {
@@ -153,11 +191,31 @@ impl InsightPipe for PercentageDcaLevelsPipe {
                 price_levels.last().copied().unwrap_or(entry) + ((stop_loss - entry) / 2.0)
             }
         };
-        insight.set_stop_loss(Some(
-            ctx.tools().dynamic_round(dca_stop_loss, &insight.symbol),
-        ));
+        let dca_stop_loss = ctx.tools().dynamic_round(dca_stop_loss, &insight.symbol);
+        // Validate the entire plan before replacing existing execution fragments.
+        if let Err(message) =
+            crate::core::utils::quantity_sizing::validate_stop_for_side(insight, entry, stop_loss)
+                .and_then(|_| {
+                    crate::core::utils::quantity_sizing::validate_stop_for_side(
+                        insight,
+                        *price_levels.last().unwrap(),
+                        dca_stop_loss,
+                    )
+                })
+        {
+            return InsightPipeResult::new(false, false, Some(message), self.name().into());
+        }
+        for quantity in &quantities {
+            if let Err(message) =
+                crate::core::utils::quantity_sizing::plan_quantity_parts(*quantity, limits, None)
+            {
+                return InsightPipeResult::new(false, false, Some(message), self.name().into());
+            }
+        }
+        insight.children.retain(|child| !child.is_split_insight());
+        insight.set_stop_loss(Some(dca_stop_loss));
 
-        let parent_target_quantity = ctx.tools().quantity_round(quantities[0], &insight.symbol);
+        let parent_target_quantity = floor_quantity(quantities[0], limits);
         let parent_split = match apply_max_order_size_with_child_legs(
             ctx,
             insight,
@@ -175,13 +233,8 @@ impl InsightPipe for PercentageDcaLevelsPipe {
         let mut split_fragment_count = parent_split.child_count;
 
         for (index, level_price) in price_levels.iter().enumerate().skip(1) {
-            let quantity_index = if insight.side == OrderSide::Buy {
-                index
-            } else {
-                quantities.len().saturating_sub(index)
-            };
             let quantity = quantities
-                .get(quantity_index)
+                .get(index)
                 .copied()
                 .unwrap_or(*quantities.last().unwrap_or(&desired_quantity));
             let mut child = Insight::new(
@@ -192,7 +245,7 @@ impl InsightPipe for PercentageDcaLevelsPipe {
                 insight.confidence,
                 Some(*insight.insight_id()),
             );
-            let level_target_quantity = ctx.tools().quantity_round(quantity, &insight.symbol);
+            let level_target_quantity = floor_quantity(quantity, limits);
             child
                 .set_limit_price(Some(*level_price))
                 .set_stop_loss_levels(insight.stop_loss_levels())
@@ -224,6 +277,10 @@ impl InsightPipe for PercentageDcaLevelsPipe {
             insight.add_child_insight(child, None, ctx);
         }
 
+        if let Err(message) = validate_pending_tree_limits(ctx, insight) {
+            insight.state_log(Some(message.clone()));
+            return InsightPipeResult::new(false, true, Some(message), self.name().to_string());
+        }
         InsightPipeResult::new(
             true,
             true,
@@ -239,9 +296,7 @@ impl InsightPipe for PercentageDcaLevelsPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::pipeline::quantity_sizing::tests::{
-        MockContext, sample_asset, sample_insight,
-    };
+    use crate::core::utils::quantity_sizing::tests::{MockContext, sample_asset, sample_insight};
 
     fn execution_quantity(insight: &Insight) -> f64 {
         insight.quantity().unwrap_or_default()
@@ -299,7 +354,7 @@ mod tests {
             );
             total_quantity += execution_quantity(level);
         }
-        assert!((total_quantity - 300.0).abs() < 1e-9);
+        assert!(total_quantity <= 300.0 && total_quantity > 297.0);
     }
 
     #[test]
@@ -333,6 +388,6 @@ mod tests {
                 .filter(|child| !child.is_split_insight())
                 .map(execution_quantity)
                 .sum::<f64>();
-        assert!((total_quantity - 250.0).abs() < 1e-9);
+        assert!(total_quantity <= 250.0 && total_quantity > 247.0);
     }
 }

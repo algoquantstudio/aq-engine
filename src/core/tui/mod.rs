@@ -9,6 +9,10 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
+#[cfg(feature = "tui")]
+mod dashboard;
+#[cfg(all(test, feature = "tui"))]
+mod render_tests;
 
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 const GLOBAL_LOG_CAPACITY: usize = 512;
@@ -18,9 +22,13 @@ const EVENTS_VISIBLE_ROWS: usize = 5;
 const VARIABLE_VALUE_LIMIT: usize = 160;
 const VARIABLE_CHILD_LIMIT: usize = 64;
 const VARIABLE_DEPTH_LIMIT: usize = 5;
+const VARIABLE_NODE_LIMIT: usize = 256;
+const LOG_LINE_LIMIT: usize = 4096;
+pub const INSIGHT_PREVIEW_LIMIT: usize = 128;
 
 static TERMINAL_OUTPUT_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static GLOBAL_TUI_LOG_EVENTS: OnceLock<Mutex<VecDeque<RuntimeEventSnapshot>>> = OnceLock::new();
+static GLOBAL_LOG_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfig {
@@ -86,6 +94,7 @@ pub struct RuntimeInsightStateSnapshot {
     pub at: DateTime<Utc>,
     pub state: String,
     pub message: Option<String>,
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -154,6 +163,19 @@ pub struct RuntimeSnapshot {
     pub dropped_events: u64,
     pub events: Vec<RuntimeEventSnapshot>,
     pub updated_at: DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
+    pub sync: Option<RuntimeSyncSnapshot>,
+    pub provider_capabilities: Vec<String>,
+}
+
+/// Local publisher observations only. Local acceptance is NOT a remote commit or UI receipt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeSyncSnapshot {
+    pub transport: String,
+    pub runtime_id: String,
+    pub run_id: String,
+    pub publisher: crate::core::live_sync::PublisherHealth,
+    pub sampled_at: DateTime<Utc>,
 }
 
 impl Default for RuntimeSnapshot {
@@ -177,6 +199,9 @@ impl Default for RuntimeSnapshot {
             dropped_events: 0,
             events: Vec::new(),
             updated_at: Utc::now(),
+            started_at: Utc::now(),
+            sync: None,
+            provider_capabilities: Vec::new(),
         }
     }
 }
@@ -211,7 +236,8 @@ impl RuntimeTelemetry {
         self.snapshot.clone()
     }
 
-    fn push_event_snapshot(&mut self, event: RuntimeEventSnapshot) {
+    fn push_event_snapshot(&mut self, mut event: RuntimeEventSnapshot) {
+        event.message = bounded_text(&event.message);
         if self.events.len() >= self.event_capacity {
             self.events.pop_front();
             self.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -294,16 +320,24 @@ impl Drop for RuntimeTelemetry {
 }
 
 pub fn summarise_value(value: &Value) -> RuntimeVariableSnapshot {
-    summarise_variable_value(String::new(), value, 0)
+    let mut budget = VARIABLE_NODE_LIMIT;
+    summarise_variable_value(String::new(), value, 0, &mut budget)
 }
 
-fn summarise_variable_value(key: String, value: &Value, depth: usize) -> RuntimeVariableSnapshot {
+fn summarise_variable_value(
+    key: String,
+    value: &Value,
+    depth: usize,
+    budget: &mut usize,
+) -> RuntimeVariableSnapshot {
+    *budget = budget.saturating_sub(1);
     match value {
         Value::Array(items) => summarise_variable_children(
             key,
             format!("[{} items]", items.len()),
             items.len(),
             depth,
+            budget,
             items
                 .iter()
                 .enumerate()
@@ -317,6 +351,7 @@ fn summarise_variable_value(key: String, value: &Value, depth: usize) -> Runtime
                 format!("{{{} fields}}", map.len()),
                 map.len(),
                 depth,
+                budget,
                 entries.into_iter().map(|(key, value)| (key.clone(), value)),
             )
         }
@@ -329,6 +364,7 @@ fn summarise_variable_children<'a, I>(
     value: String,
     total_children: usize,
     depth: usize,
+    budget: &mut usize,
     children: I,
 ) -> RuntimeVariableSnapshot
 where
@@ -339,9 +375,19 @@ where
 
     if depth < VARIABLE_DEPTH_LIMIT {
         for (child_key, child_value) in children.into_iter().take(VARIABLE_CHILD_LIMIT) {
-            child_nodes.push(summarise_variable_value(child_key, child_value, depth + 1));
+            if *budget == 0 {
+                truncated = true;
+                break;
+            }
+            child_nodes.push(summarise_variable_value(
+                child_key,
+                child_value,
+                depth + 1,
+                budget,
+            ));
         }
-        if total_children > VARIABLE_CHILD_LIMIT {
+        if total_children > VARIABLE_CHILD_LIMIT && *budget > 0 {
+            *budget -= 1;
             child_nodes.push(RuntimeVariableSnapshot {
                 key: "...".to_string(),
                 value: format!("{} more entries", total_children - VARIABLE_CHILD_LIMIT),
@@ -365,7 +411,7 @@ where
 
 fn summarise_variable_scalar(key: String, value: &Value) -> RuntimeVariableSnapshot {
     let mut value_text = match value {
-        Value::String(value) => value.clone(),
+        Value::String(value) => value.chars().take(VARIABLE_VALUE_LIMIT + 1).collect(),
         _ => value.to_string(),
     };
     let truncated = value_text.chars().count() > VARIABLE_VALUE_LIMIT;
@@ -404,11 +450,12 @@ fn push_global_tui_event(level: impl Into<String>, message: impl Into<String>) {
     if let Ok(mut events) = global_tui_log_events().lock() {
         if events.len() >= GLOBAL_LOG_CAPACITY {
             events.pop_front();
+            GLOBAL_LOG_EVICTIONS.fetch_add(1, Ordering::Relaxed);
         }
         events.push_back(RuntimeEventSnapshot {
             created_at: Utc::now(),
             level: level.into(),
-            message: message.into(),
+            message: bounded_text(&message.into()),
         });
     }
 }
@@ -431,6 +478,47 @@ fn pending_global_log_events() -> Vec<RuntimeEventSnapshot> {
 #[derive(Default)]
 struct TuiLogWriter {
     line_buffer: Vec<u8>,
+    truncated: bool,
+}
+
+fn bounded_text(text: &str) -> String {
+    let mut end = text.len().min(LOG_LINE_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = String::with_capacity(end);
+    let mut chars = text[..end].chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}'
+                            || (next == '\u{1b}' && chars.next_if_eq(&'\\').is_some())
+                        {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if character.is_control() {
+            result.push(' ');
+        } else {
+            result.push(character);
+        }
+    }
+    if end < text.len() {
+        result.push_str(" … [truncated]");
+    }
+    result
 }
 
 impl TuiLogWriter {
@@ -438,8 +526,12 @@ impl TuiLogWriter {
         if self.line_buffer.is_empty() {
             return;
         }
-        let line = String::from_utf8_lossy(&self.line_buffer).to_string();
+        let mut line = String::from_utf8_lossy(&self.line_buffer).to_string();
+        if self.truncated {
+            line.push_str(" … [truncated]");
+        }
         self.line_buffer.clear();
+        self.truncated = false;
         push_global_log_line(line);
     }
 }
@@ -449,8 +541,10 @@ impl Write for TuiLogWriter {
         for byte in buf {
             if *byte == b'\n' {
                 self.flush_line();
-            } else {
+            } else if self.line_buffer.len() < LOG_LINE_LIMIT {
                 self.line_buffer.push(*byte);
+            } else {
+                self.truncated = true;
             }
         }
         Ok(buf.len())
@@ -501,6 +595,7 @@ fn start_tui_thread(
 enum TuiFocusPane {
     Metrics,
     Insights,
+    Inspector,
     Variables,
     Watch,
     Events,
@@ -511,7 +606,8 @@ impl TuiFocusPane {
     fn next(self) -> Self {
         match self {
             Self::Metrics => Self::Insights,
-            Self::Insights => Self::Variables,
+            Self::Insights => Self::Inspector,
+            Self::Inspector => Self::Variables,
             Self::Variables => Self::Watch,
             Self::Watch => Self::Events,
             Self::Events => Self::Metrics,
@@ -522,7 +618,8 @@ impl TuiFocusPane {
         match self {
             Self::Metrics => Self::Events,
             Self::Insights => Self::Metrics,
-            Self::Variables => Self::Insights,
+            Self::Inspector => Self::Insights,
+            Self::Variables => Self::Inspector,
             Self::Watch => Self::Variables,
             Self::Events => Self::Watch,
         }
@@ -535,6 +632,11 @@ struct TuiUiState {
     metrics_scroll: usize,
     events_scroll: usize,
     insight_index: usize,
+    selected_insight_id: Option<String>,
+    inspector_scroll: usize,
+    zoom: bool,
+    diagnostics: bool,
+    diagnostics_scroll: usize,
     variable_index: usize,
     variable_path: Vec<usize>,
     watch_index: usize,
@@ -549,6 +651,11 @@ impl Default for TuiUiState {
             metrics_scroll: 0,
             events_scroll: 0,
             insight_index: 0,
+            selected_insight_id: None,
+            inspector_scroll: 0,
+            zoom: false,
+            diagnostics: false,
+            diagnostics_scroll: 0,
             variable_index: 0,
             variable_path: Vec::new(),
             watch_index: 0,
@@ -674,7 +781,22 @@ fn watch_items<'a>(
 
 #[cfg(feature = "tui")]
 fn normalise_ui_state(state: &mut TuiUiState, snapshot: &RuntimeSnapshot) {
+    if let Some(index) = snapshot
+        .active_insights
+        .iter()
+        .position(|insight| Some(&insight.insight_id) == state.selected_insight_id.as_ref())
+    {
+        state.insight_index = index;
+    }
     clamp_index(&mut state.insight_index, snapshot.active_insights.len());
+    let selected = snapshot
+        .active_insights
+        .get(state.insight_index)
+        .map(|insight| insight.insight_id.clone());
+    if selected != state.selected_insight_id {
+        state.inspector_scroll = 0;
+    }
+    state.selected_insight_id = selected;
     clamp_index(&mut state.watch_index, state.watch_paths.len());
 
     let mut valid_path = Vec::new();
@@ -700,12 +822,10 @@ fn normalise_ui_state(state: &mut TuiUiState, snapshot: &RuntimeSnapshot) {
         snapshot
             .metrics
             .as_ref()
-            .map(|metrics| metrics.summary_lines.len().saturating_sub(1))
+            .map(|metrics| metrics.summary_lines.len().max(5).saturating_sub(1))
             .unwrap_or(0),
     );
-    state.events_scroll = state
-        .events_scroll
-        .min(snapshot.events.len().saturating_sub(EVENTS_VISIBLE_ROWS));
+    // The renderer clamps against snapshot + pending logs and the actual viewport.
 }
 
 #[cfg(feature = "tui")]
@@ -784,6 +904,7 @@ fn insight_detail_lines(
 
     let mut lines = vec![
         detail_line("ID", insight.insight_id.clone()),
+        detail_line("Parent", option_value(insight.parent_id.as_deref())),
         detail_line("Symbol", insight.symbol.clone()),
         detail_line("State", insight.state.clone()),
         detail_line("Side", insight.side.clone()),
@@ -825,6 +946,8 @@ fn insight_detail_lines(
         ),
         detail_line("Confidence", insight.confidence.to_string()),
         detail_line("Updated", time_value(insight.updated_at)),
+        detail_line("Filled at (UTC)", time_value(insight.filled_at)),
+        detail_line("Closed at (UTC)", time_value(insight.closed_at)),
     ];
 
     if !insight.state_history.is_empty() {
@@ -837,12 +960,385 @@ fn insight_detail_lines(
                 .unwrap_or("-");
             lines.push(detail_line(
                 entry.at.format("%H:%M:%S").to_string(),
-                format!("{} {}", entry.state, message),
+                format!("{} [{}] {}", entry.state, entry.kind, message),
             ));
         }
     }
 
     lines
+}
+
+#[cfg(feature = "tui")]
+fn render_dashboard(
+    frame: &mut ratatui::Frame,
+    current: &RuntimeSnapshot,
+    ui_state: &mut TuiUiState,
+) {
+    use ratatui::{
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    };
+    let area = frame.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(
+                if area.width < 120 || area.height < 30 || ui_state.zoom || ui_state.diagnostics {
+                    0
+                } else {
+                    5
+                },
+            ),
+            Constraint::Min(0),
+            Constraint::Length(
+                if area.width < 120 || area.height < 30 || ui_state.zoom || ui_state.diagnostics {
+                    0
+                } else {
+                    7
+                },
+            ),
+        ])
+        .split(area);
+
+    let title = format!(
+        "AQE {} - {} [{}]",
+        current.mode.as_str(),
+        current.strategy_name,
+        current.status
+    );
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Strategy: ", Style::default().fg(Color::Gray)),
+            Span::raw(current.strategy_id.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Broker: ", Style::default().fg(Color::Gray)),
+            Span::raw(current.broker_status.clone()),
+            Span::raw("  "),
+            Span::styled("Data Feed: ", Style::default().fg(Color::Gray)),
+            Span::raw(current.datafeed_status.clone()),
+            Span::raw("  "),
+            Span::styled("AQS: ", Style::default().fg(Color::Gray)),
+            Span::raw(current.aqs_sync_status.clone()),
+        ]),
+        Line::from("Tab panes | m/i/d/v/e | s sync | z zoom | PgUp/Dn scroll | q stop/close"),
+    ])
+    .block(Block::default().title(title).borders(Borders::ALL));
+    frame.render_widget(header, rows[0]);
+    if ui_state.diagnostics {
+        let diagnostics =
+            Paragraph::new(dashboard::diagnostic_lines(current)).wrap(Wrap { trim: false });
+        ui_state.diagnostics_scroll = ui_state.diagnostics_scroll.min(
+            diagnostics
+                .line_count(rows[2].width.saturating_sub(2))
+                .saturating_sub(rows[2].height.saturating_sub(2) as usize),
+        );
+        frame.render_widget(
+            diagnostics
+                .scroll((ui_state.diagnostics_scroll.min(u16::MAX as usize) as u16, 0))
+                .block(
+                    Block::bordered()
+                        .title("Runtime / sync diagnostics — s return | Up/Down scroll"),
+                ),
+            rows[2],
+        );
+        return;
+    }
+
+    let progress = current
+        .backtest_progress
+        .as_ref()
+        .map(|progress| progress.progress_pct.clamp(0.0, 100.0))
+        .unwrap_or(0.0);
+    let progress_label = current
+        .backtest_progress
+        .as_ref()
+        .map(|progress| {
+            format!(
+                "{:.1}%  {}/{} steps  streams={}",
+                progress.progress_pct,
+                progress.processed_steps,
+                progress.total_steps,
+                progress.stream_count
+            )
+        })
+        .unwrap_or_else(|| "live run".to_string());
+    let gauge = Gauge::default()
+        .block(Block::default().title("Progress").borders(Borders::ALL))
+        .gauge_style(Style::default().fg(Color::Cyan))
+        .percent(progress.round() as u16)
+        .label(progress_label);
+    if current.mode == StrategyMode::Backtest {
+        frame.render_widget(gauge, rows[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new(dashboard::live_summary(current)).block(
+                Block::bordered().title("Live health — local observation, not cloud delivery"),
+            ),
+            rows[1],
+        );
+    }
+
+    let mut columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(rows[2])
+        .to_vec();
+    let focused = area.width < 120 || area.height < 30 || ui_state.zoom;
+    if focused {
+        columns.fill(ratatui::layout::Rect::default());
+    }
+    if focused && ui_state.focus == TuiFocusPane::Metrics {
+        columns[0] = rows[2];
+    }
+
+    let metrics = current
+        .metrics
+        .as_ref()
+        .map(|metrics| {
+            if metrics.summary_lines.is_empty() {
+                vec![
+                    Line::from(format!("Equity: {:.2}", metrics.final_equity)),
+                    Line::from(format!("Return: {:.2}%", metrics.total_return_pct)),
+                    Line::from(format!("Trades: {}", metrics.total_trades)),
+                    Line::from(format!("Open positions: {}", metrics.open_positions_count)),
+                    Line::from(format!("Open insights: {}", metrics.open_insights_count)),
+                ]
+            } else {
+                metrics
+                    .summary_lines
+                    .iter()
+                    .cloned()
+                    .map(Line::from)
+                    .collect()
+            }
+        })
+        .unwrap_or_else(|| vec![Line::from("No metrics yet")]);
+    frame.render_widget(
+        Paragraph::new(metrics)
+            .scroll((ui_state.metrics_scroll as u16, 0))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(pane_title("Metrics", TuiFocusPane::Metrics, ui_state.focus))
+                    .borders(Borders::ALL),
+            ),
+        columns[0],
+    );
+
+    let mut insight_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(columns[1])
+        .to_vec();
+    if focused && ui_state.focus == TuiFocusPane::Insights {
+        insight_rows[0] = rows[2];
+    }
+    if focused && ui_state.focus == TuiFocusPane::Inspector {
+        insight_rows[1] = rows[2];
+    }
+    let insight_items = current
+        .active_insights
+        .iter()
+        .map(|insight| {
+            ListItem::new(format!(
+                "{} {} {} {}",
+                insight.symbol,
+                insight.side,
+                insight.state,
+                short_id(&insight.insight_id)
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut insight_list_state = ListState::default();
+    if !current.active_insights.is_empty() {
+        insight_list_state.select(Some(ui_state.insight_index));
+    }
+    frame.render_stateful_widget(
+        List::new(insight_items)
+            .block(
+                Block::default()
+                    .title(pane_title(
+                        format!(
+                            "Active Insights {}/{} (latest)",
+                            current.active_insights.len(),
+                            dashboard::active_count(current)
+                        ),
+                        TuiFocusPane::Insights,
+                        ui_state.focus,
+                    ))
+                    .borders(Borders::ALL),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> "),
+        insight_rows[0],
+        &mut insight_list_state,
+    );
+    let insight_detail = Paragraph::new(insight_detail_lines(
+        current.active_insights.get(ui_state.insight_index),
+    ))
+    .wrap(Wrap { trim: true });
+    if insight_rows[1].height > 2 {
+        ui_state.inspector_scroll = ui_state.inspector_scroll.min(
+            insight_detail
+                .line_count(insight_rows[1].width.saturating_sub(2))
+                .saturating_sub(insight_rows[1].height.saturating_sub(2) as usize),
+        );
+    }
+    frame.render_widget(
+        insight_detail
+            .scroll((ui_state.inspector_scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(pane_title(
+                        "Inspector / recent history — d, PgUp/Dn",
+                        TuiFocusPane::Inspector,
+                        ui_state.focus,
+                    ))
+                    .borders(Borders::ALL),
+            ),
+        insight_rows[1],
+    );
+
+    let mut variable_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(columns[2])
+        .to_vec();
+    if focused && ui_state.focus == TuiFocusPane::Variables {
+        variable_rows[0] = rows[2];
+    }
+    if focused && ui_state.focus == TuiFocusPane::Watch {
+        variable_rows[1] = rows[2];
+    }
+
+    let (variable_scope, variable_title) =
+        variable_scope(&current.variables, &ui_state.variable_path);
+    let variable_items = variable_scope
+        .iter()
+        .map(|variable| {
+            let marker = if variable.children.is_empty() {
+                "  "
+            } else {
+                "> "
+            };
+            let truncated = if variable.truncated { " *" } else { "" };
+            ListItem::new(format!(
+                "{}{}: {}{}",
+                marker, variable.key, variable.value, truncated
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut variable_list_state = ListState::default();
+    if !variable_scope.is_empty() {
+        variable_list_state.select(Some(ui_state.variable_index));
+    }
+    frame.render_stateful_widget(
+        List::new(variable_items)
+            .block(
+                Block::default()
+                    .title(pane_title(
+                        variable_title,
+                        TuiFocusPane::Variables,
+                        ui_state.focus,
+                    ))
+                    .borders(Borders::ALL),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> "),
+        variable_rows[0],
+        &mut variable_list_state,
+    );
+
+    let mut watch_list_state = ListState::default();
+    if !ui_state.watch_paths.is_empty() {
+        watch_list_state.select(Some(ui_state.watch_index));
+    }
+    frame.render_stateful_widget(
+        List::new(watch_items(&current.variables, &ui_state.watch_paths))
+            .block(
+                Block::default()
+                    .title(pane_title("Watch", TuiFocusPane::Watch, ui_state.focus))
+                    .borders(Borders::ALL),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> "),
+        variable_rows[1],
+        &mut watch_list_state,
+    );
+
+    let mut visible_events = current.events.clone();
+    visible_events.extend(pending_global_log_events());
+    let events_area = if focused && ui_state.focus == TuiFocusPane::Events {
+        rows[2]
+    } else {
+        rows[3]
+    };
+    let visible_rows = events_area.height.saturating_sub(2) as usize;
+    let max_events_scroll = visible_events.len().saturating_sub(visible_rows);
+    ui_state.events_scroll = ui_state.events_scroll.min(max_events_scroll);
+    let log_items = visible_events
+        .iter()
+        .rev()
+        .skip(ui_state.events_scroll)
+        .take(visible_rows)
+        .map(|event| {
+            if event.level == "log" {
+                ListItem::new(Line::from(Span::raw(event.message.clone())))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", event.created_at.format("%H:%M:%S")),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("[{}] ", event.level),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(event.message.clone()),
+                ]))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(log_items).block(
+            Block::default()
+                .title(pane_title(
+                    format!(
+                        "Events (evicted={} + log={})",
+                        current.dropped_events,
+                        GLOBAL_LOG_EVICTIONS.load(Ordering::Relaxed)
+                    ),
+                    TuiFocusPane::Events,
+                    ui_state.focus,
+                ))
+                .borders(Borders::ALL),
+        ),
+        events_area,
+    );
 }
 
 #[cfg(feature = "tui")]
@@ -853,13 +1349,6 @@ fn run_tui(
     render_interval: Duration,
 ) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use ratatui::{
-        layout::{Constraint, Direction, Layout},
-        style::{Color, Modifier, Style},
-        text::{Line, Span},
-        widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
-    };
-
     let mut terminal = ratatui::init();
     let mut ui_state = TuiUiState::default();
     let result = (|| -> std::io::Result<()> {
@@ -870,287 +1359,34 @@ fn run_tui(
                 .unwrap_or_default();
             normalise_ui_state(&mut ui_state, &current);
 
-            terminal.draw(|frame| {
-                let area = frame.area();
-                let rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(5),
-                        Constraint::Length(5),
-                        Constraint::Min(10),
-                        Constraint::Length(7),
-                    ])
-                    .split(area);
-
-                let title = format!(
-                    "AQE {} - {} [{}]",
-                    current.mode.as_str(),
-                    current.strategy_name,
-                    current.status
-                );
-                let header = Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled("Strategy: ", Style::default().fg(Color::Gray)),
-                        Span::raw(current.strategy_id.clone()),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Broker: ", Style::default().fg(Color::Gray)),
-                        Span::raw(current.broker_status.clone()),
-                        Span::raw("  "),
-                        Span::styled("Data Feed: ", Style::default().fg(Color::Gray)),
-                        Span::raw(current.datafeed_status.clone()),
-                        Span::raw("  "),
-                        Span::styled("AQS: ", Style::default().fg(Color::Gray)),
-                        Span::raw(current.aqs_sync_status.clone()),
-                    ]),
-                    Line::from(
-                        "Tab focus | m/i/v/e quick focus | w watch variable | Enter/Right open | Left/Backspace parent | q quit",
-                    ),
-                ])
-                .block(Block::default().title(title).borders(Borders::ALL));
-                frame.render_widget(header, rows[0]);
-
-                let progress = current
-                    .backtest_progress
-                    .as_ref()
-                    .map(|progress| progress.progress_pct.clamp(0.0, 100.0))
-                    .unwrap_or(0.0);
-                let progress_label = current
-                    .backtest_progress
-                    .as_ref()
-                    .map(|progress| {
-                        format!(
-                            "{:.1}%  {}/{} steps  streams={}",
-                            progress.progress_pct,
-                            progress.processed_steps,
-                            progress.total_steps,
-                            progress.stream_count
-                        )
-                    })
-                    .unwrap_or_else(|| "live run".to_string());
-                let gauge = Gauge::default()
-                    .block(Block::default().title("Progress").borders(Borders::ALL))
-                    .gauge_style(Style::default().fg(Color::Cyan))
-                    .percent(progress.round() as u16)
-                    .label(progress_label);
-                frame.render_widget(gauge, rows[1]);
-
-                let columns = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(34),
-                        Constraint::Percentage(33),
-                        Constraint::Percentage(33),
-                    ])
-                    .split(rows[2]);
-
-                let metrics = current
-                    .metrics
-                    .as_ref()
-                    .map(|metrics| {
-                        if metrics.summary_lines.is_empty() {
-                            vec![
-                                Line::from(format!("Equity: {:.2}", metrics.final_equity)),
-                                Line::from(format!("Return: {:.2}%", metrics.total_return_pct)),
-                                Line::from(format!("Trades: {}", metrics.total_trades)),
-                                Line::from(format!(
-                                    "Open positions: {}",
-                                    metrics.open_positions_count
-                                )),
-                                Line::from(format!("Open insights: {}", metrics.open_insights_count)),
-                            ]
-                        } else {
-                            metrics
-                                .summary_lines
-                                .iter()
-                                .cloned()
-                                .map(Line::from)
-                                .collect()
-                        }
-                    })
-                    .unwrap_or_else(|| vec![Line::from("No metrics yet")]);
-                frame.render_widget(
-                    Paragraph::new(metrics)
-                        .scroll((ui_state.metrics_scroll as u16, 0))
-                        .wrap(Wrap { trim: true })
-                        .block(
-                            Block::default()
-                                .title(pane_title("Metrics", TuiFocusPane::Metrics, ui_state.focus))
-                                .borders(Borders::ALL),
-                        ),
-                    columns[0],
-                );
-
-                let insight_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
-                    .split(columns[1]);
-                let insight_items = current
-                    .active_insights
-                    .iter()
-                    .map(|insight| {
-                        ListItem::new(format!(
-                            "{} {} {} {}",
-                            insight.symbol,
-                            insight.side,
-                            insight.state,
-                            short_id(&insight.insight_id)
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                let mut insight_list_state = ListState::default();
-                if !current.active_insights.is_empty() {
-                    insight_list_state.select(Some(ui_state.insight_index));
-                }
-                frame.render_stateful_widget(
-                    List::new(insight_items)
-                        .block(
-                            Block::default()
-                                .title(pane_title(
-                                    "Active Insights",
-                                    TuiFocusPane::Insights,
-                                    ui_state.focus,
-                                ))
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::Cyan)
-                                .fg(Color::Black)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("> "),
-                    insight_rows[0],
-                    &mut insight_list_state,
-                );
-                let insight_detail =
-                    insight_detail_lines(current.active_insights.get(ui_state.insight_index));
-                frame.render_widget(
-                    Paragraph::new(insight_detail)
-                        .wrap(Wrap { trim: true })
-                        .block(Block::default().title("Insight Detail").borders(Borders::ALL)),
-                    insight_rows[1],
-                );
-
-                let variable_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
-                    .split(columns[2]);
-
-                let (variable_scope, variable_title) =
-                    variable_scope(&current.variables, &ui_state.variable_path);
-                let variable_items = variable_scope
-                    .iter()
-                    .map(|variable| {
-                        let marker = if variable.children.is_empty() {
-                            "  "
-                        } else {
-                            "> "
-                        };
-                        let truncated = if variable.truncated { " *" } else { "" };
-                        ListItem::new(format!(
-                            "{}{}: {}{}",
-                            marker, variable.key, variable.value, truncated
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                let mut variable_list_state = ListState::default();
-                if !variable_scope.is_empty() {
-                    variable_list_state.select(Some(ui_state.variable_index));
-                }
-                frame.render_stateful_widget(
-                    List::new(variable_items)
-                        .block(
-                            Block::default()
-                                .title(pane_title(
-                                    variable_title,
-                                    TuiFocusPane::Variables,
-                                    ui_state.focus,
-                                ))
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::Cyan)
-                                .fg(Color::Black)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("> "),
-                    variable_rows[0],
-                    &mut variable_list_state,
-                );
-
-                let mut watch_list_state = ListState::default();
-                if !ui_state.watch_paths.is_empty() {
-                    watch_list_state.select(Some(ui_state.watch_index));
-                }
-                frame.render_stateful_widget(
-                    List::new(watch_items(&current.variables, &ui_state.watch_paths))
-                        .block(
-                            Block::default()
-                                .title(pane_title(
-                                    "Watch",
-                                    TuiFocusPane::Watch,
-                                    ui_state.focus,
-                                ))
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::Cyan)
-                                .fg(Color::Black)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("> "),
-                    variable_rows[1],
-                    &mut watch_list_state,
-                );
-
-                let mut visible_events = current.events.clone();
-                visible_events.extend(pending_global_log_events());
-                let max_events_scroll = visible_events.len().saturating_sub(EVENTS_VISIBLE_ROWS);
-                ui_state.events_scroll = ui_state.events_scroll.min(max_events_scroll);
-                let log_items = visible_events
-                    .iter()
-                    .rev()
-                    .skip(ui_state.events_scroll)
-                    .take(EVENTS_VISIBLE_ROWS)
-                    .map(|event| {
-                        if event.level == "log" {
-                            ListItem::new(Line::from(Span::raw(event.message.clone())))
-                        } else {
-                            ListItem::new(Line::from(vec![
-                                Span::styled(
-                                    format!("{} ", event.created_at.format("%H:%M:%S")),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                                Span::styled(
-                                    format!("[{}] ", event.level),
-                                    Style::default().add_modifier(Modifier::BOLD),
-                                ),
-                                Span::raw(event.message.clone()),
-                            ]))
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                frame.render_widget(
-                    List::new(log_items).block(
-                        Block::default()
-                            .title(pane_title(
-                                format!("Events (dropped={})", current.dropped_events),
-                                TuiFocusPane::Events,
-                                ui_state.focus,
-                            ))
-                            .borders(Borders::ALL),
-                    ),
-                    rows[3],
-                );
-            })?;
+            terminal.draw(|frame| render_dashboard(frame, &current, &mut ui_state))?;
 
             if event::poll(render_interval)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
+                            KeyCode::Char('s') => {
+                                ui_state.diagnostics = !ui_state.diagnostics;
+                            }
+                            KeyCode::Esc if ui_state.diagnostics => {
+                                ui_state.diagnostics = false;
+                            }
+                            KeyCode::Esc if ui_state.zoom => {
+                                ui_state.zoom = false;
+                            }
+                            KeyCode::Char('z') => {
+                                ui_state.zoom = !ui_state.zoom;
+                            }
+                            KeyCode::Up | KeyCode::PageUp if ui_state.diagnostics => {
+                                ui_state.diagnostics_scroll = ui_state
+                                    .diagnostics_scroll
+                                    .saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
+                            }
+                            KeyCode::Down | KeyCode::PageDown if ui_state.diagnostics => {
+                                ui_state.diagnostics_scroll = (ui_state.diagnostics_scroll
+                                    + if key.code == KeyCode::Down { 1 } else { 10 })
+                                .min(4096);
+                            }
                             KeyCode::Char('q') | KeyCode::Esc => {
                                 if is_terminal_status(&current.status) {
                                     tui_close_requested.store(true, Ordering::Relaxed);
@@ -1181,6 +1417,9 @@ fn run_tui(
                             }
                             KeyCode::Char('i') => {
                                 ui_state.focus = TuiFocusPane::Insights;
+                            }
+                            KeyCode::Char('d') => {
+                                ui_state.focus = TuiFocusPane::Inspector;
                             }
                             KeyCode::Char('v') => {
                                 ui_state.focus = TuiFocusPane::Variables;
@@ -1220,6 +1459,10 @@ fn run_tui(
                                     current.active_insights.len(),
                                     -1,
                                 ),
+                                TuiFocusPane::Inspector => {
+                                    ui_state.inspector_scroll =
+                                        ui_state.inspector_scroll.saturating_sub(1);
+                                }
                                 TuiFocusPane::Variables => {
                                     let (scope, _) =
                                         variable_scope(&current.variables, &ui_state.variable_path);
@@ -1241,7 +1484,7 @@ fn run_tui(
                                         .metrics
                                         .as_ref()
                                         .map(|metrics| {
-                                            metrics.summary_lines.len().saturating_sub(1)
+                                            metrics.summary_lines.len().max(5).saturating_sub(1)
                                         })
                                         .unwrap_or(0);
                                     ui_state.metrics_scroll =
@@ -1252,6 +1495,10 @@ fn run_tui(
                                     current.active_insights.len(),
                                     1,
                                 ),
+                                TuiFocusPane::Inspector => {
+                                    ui_state.inspector_scroll =
+                                        ui_state.inspector_scroll.saturating_add(1).min(4096);
+                                }
                                 TuiFocusPane::Variables => {
                                     let (scope, _) =
                                         variable_scope(&current.variables, &ui_state.variable_path);
@@ -1274,6 +1521,29 @@ fn run_tui(
                             KeyCode::PageUp if ui_state.focus == TuiFocusPane::Events => {
                                 ui_state.events_scroll =
                                     ui_state.events_scroll.saturating_sub(EVENTS_VISIBLE_ROWS);
+                            }
+                            KeyCode::PageUp | KeyCode::PageDown
+                                if ui_state.focus == TuiFocusPane::Inspector =>
+                            {
+                                ui_state.inspector_scroll = if key.code == KeyCode::PageUp {
+                                    ui_state.inspector_scroll.saturating_sub(10)
+                                } else {
+                                    ui_state.inspector_scroll.saturating_add(10).min(4096)
+                                };
+                            }
+                            KeyCode::Home if ui_state.focus == TuiFocusPane::Inspector => {
+                                ui_state.inspector_scroll = 0;
+                            }
+                            KeyCode::PageUp | KeyCode::PageDown
+                                if ui_state.focus == TuiFocusPane::Insights =>
+                            {
+                                if key.code == KeyCode::PageUp {
+                                    ui_state.insight_index =
+                                        ui_state.insight_index.saturating_sub(10);
+                                } else {
+                                    ui_state.insight_index = (ui_state.insight_index + 10)
+                                        .min(current.active_insights.len().saturating_sub(1));
+                                }
                             }
                             KeyCode::PageDown if ui_state.focus == TuiFocusPane::Events => {
                                 let event_count =
@@ -1324,6 +1594,14 @@ fn run_tui(
                             }
                             _ => {}
                         }
+                        let selected = current
+                            .active_insights
+                            .get(ui_state.insight_index)
+                            .map(|insight| insight.insight_id.clone());
+                        if selected != ui_state.selected_insight_id {
+                            ui_state.inspector_scroll = 0;
+                        }
+                        ui_state.selected_insight_id = selected;
                     }
                 }
             }

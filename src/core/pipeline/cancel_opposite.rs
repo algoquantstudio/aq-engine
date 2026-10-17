@@ -4,7 +4,7 @@ use crate::core::strategy::StrategyContext;
 
 use super::InsightPipe;
 
-/// Reports active insights on the opposite side for the same symbol.
+/// Cancels pending opposite-side entries for the same symbol.
 ///
 /// Author: @isaac-diaby
 ///
@@ -12,9 +12,9 @@ use super::InsightPipe;
 /// - None.
 ///
 /// Behaviour:
-/// Reads the strategy insight collection for the current symbol, counts insights whose side is
-/// opposite to the incoming insight, and returns that count in the result message. The current
-/// implementation is informational and does not cancel or mutate the matching insights.
+/// Requests runtime-owned cancellation for New/Executed opposite-side entries. Filled positions
+/// and terminal insights are left alone. Broker acknowledgements are handled by the execution
+/// queue; scheduling cancellation is not reported as an already-completed broker operation.
 pub struct CancelOppositePipe;
 
 impl CancelOppositePipe {
@@ -29,19 +29,35 @@ impl InsightPipe for CancelOppositePipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
-        // Count opposite-side insights for the same symbol
-        let insights = ctx.insights();
-        let same_symbol = insights.get_insights_by_symbol(&insight.symbol);
-        let affected = same_symbol
-            .iter()
-            .filter(|other| other.side != insight.side)
-            .count();
+        let ids: Vec<_> = ctx
+            .insights()
+            .iter_active_insights()
+            .filter(|other| {
+                other.symbol == insight.symbol
+                    && other.side != insight.side
+                    && other.insight_id != insight.insight_id
+                    && matches!(
+                        other.state,
+                        crate::core::insight::types::InsightState::New
+                            | crate::core::insight::types::InsightState::Executed
+                    )
+            })
+            .map(|other| other.insight_id)
+            .collect();
+        let mut affected = 0;
+        for id in ids {
+            match ctx.request_insight_cancellation(id) {
+                Ok(true) => affected += 1,
+                Ok(false) => {}
+                Err(error) => return InsightPipeResult::from_mutation(Err(error), self.name()),
+            }
+        }
 
         InsightPipeResult::new(
             true,
             true,
             Some(format!(
-                "Flagged {} opposite-side insights for {}",
+                "Requested cancellation of {} opposite-side entries for {}",
                 affected, insight.symbol
             )),
             self.name().to_string(),

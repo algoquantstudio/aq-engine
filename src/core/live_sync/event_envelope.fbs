@@ -1,0 +1,23 @@
+namespace aqe.live_sync.v1;
+
+// The payload remains an opaque JSON byte vector at the SurrealDB boundary. The local envelope
+// fields are individually addressable, versioned, and verified by FlatBuffers.
+table EventEnvelope {
+  protocol_version:ushort;
+  event_id:string (required);
+  runtime_id:string (required);
+  strategy_id:string (required);
+  live_session_id:string (required);
+  entity_id:string (required);
+  entity_revision:ulong;
+  critical_sequence:ulong;
+  has_critical_sequence:bool;
+  priority:ubyte;
+  kind:string (required);
+  payload_json:[ubyte] (required);
+  latency_json:[ubyte] (required);
+  created_at_us:long;
+}
+
+root_type EventEnvelope;
+file_identifier "AQSL";

@@ -1,3 +1,7 @@
+use super::{
+    BuiltinAlphaOptions,
+    options::{self, EntryGate},
+};
 use crate::core::alpha::{AlphaModel, AlphaResult};
 use crate::core::broker::types::{Asset, OrderSide};
 use crate::core::indicators::atr::AverageTrueRange;
@@ -27,6 +31,8 @@ pub struct TestEntry {
     limit_entries: bool,
     max_spawn: usize,
     base_confidence_modifier_field: Option<String>,
+    options: BuiltinAlphaOptions,
+    gate: EntryGate,
 }
 
 impl TestEntry {
@@ -39,7 +45,7 @@ impl TestEntry {
         let modifier = if base_confidence_modifier_field.trim().is_empty() {
             None
         } else {
-            Some(base_confidence_modifier_field)
+            Some(base_confidence_modifier_field.trim().to_string())
         };
 
         Self {
@@ -48,19 +54,22 @@ impl TestEntry {
             limit_entries,
             max_spawn,
             base_confidence_modifier_field: modifier,
+            options: BuiltinAlphaOptions {
+                take_profit_atr: 2.0,
+                ..Default::default()
+            },
+            gate: EntryGate::default(),
         }
     }
 
-    fn latest_numeric(df: &polars::prelude::DataFrame, col: &str) -> Result<f64, String> {
-        let series = df
-            .column(col)
-            .map_err(|e| format!("Failed to find column '{}': {}", col, e))?
-            .f64()
-            .map_err(|e| format!("Column '{}' is not Float64: {}", col, e))?;
+    pub fn with_options(mut self, options: BuiltinAlphaOptions) -> Self {
+        self.options = options;
+        self
+    }
 
-        series
-            .get(df.height().saturating_sub(1))
-            .ok_or_else(|| format!("Latest value for '{}' is null", col))
+    fn validate(&self) -> Result<(), String> {
+        options::validate_period("ATR period", self.atr_period)?;
+        self.options.validate()
     }
 
     fn symbol_spawn_count_key(&self, symbol: &str) -> String {
@@ -72,15 +81,7 @@ impl TestEntry {
     }
 
     fn active_spawn_count(&self, ctx: &dyn StrategyContext, symbol: &str) -> usize {
-        ctx.insights()
-            .values()
-            .into_iter()
-            .filter(|insight| {
-                insight.symbol() == symbol
-                    && matches!(insight.strategy_type(), StrategyType::Testing)
-                    && insight.state().is_active()
-            })
-            .count()
+        options::active_roots(ctx, symbol, "TestEntry")
     }
 
     fn sync_symbol_spawn_count(&self, ctx: &dyn StrategyContext, symbol: &str) -> usize {
@@ -91,33 +92,20 @@ impl TestEntry {
         );
         spawn_count
     }
-
-    fn confidence_for_symbol(&self, ctx: &dyn StrategyContext, symbol: &str) -> Result<u8, String> {
-        let mut confidence = ctx.base_confidence();
-        if let Some(field) = &self.base_confidence_modifier_field {
-            let history = ctx
-                .history()
-                .get(symbol)
-                .ok_or_else(|| format!("No history found for {}", symbol))?;
-            confidence *= Self::latest_numeric(history, field)?.abs();
-        }
-
-        if confidence <= 0.0 {
-            return Err("Base Confidence is 0.".to_string());
-        }
-
-        Ok((confidence * 100.0).round().clamp(0.0, 100.0) as u8)
-    }
 }
 
 impl AlphaModel for TestEntry {
     fn version(&self) -> &str {
-        "1.0"
+        "1.1"
     }
 
     fn start(&mut self, ctx: &mut dyn StrategyContext) {
+        self.gate.clear();
+        if self.validate().is_err() {
+            return;
+        }
         ctx.register_indicator(Box::new(AverageTrueRange::new(self.atr_period)));
-        ctx.set_warm_up_bars(self.atr_period as i32);
+        ctx.set_warm_up_bars(ctx.warm_up_bars().max(self.atr_period.max(2) as i32));
     }
 
     fn init(&mut self, ctx: &mut dyn StrategyContext, asset: &Asset) {
@@ -128,14 +116,13 @@ impl AlphaModel for TestEntry {
     }
 
     fn generate_insights(&mut self, ctx: &mut dyn StrategyContext, symbol: &str) -> AlphaResult {
+        if let Err(message) = self.validate() {
+            return AlphaResult::new(None, false, Some(message), self.name().into());
+        }
+        if !self.gate.allows(ctx, symbol, "TestEntry", &self.options) {
+            return AlphaResult::new(None, true, None, self.name().into());
+        }
         let spawn_count = self.sync_symbol_spawn_count(ctx, symbol);
-
-        let confidence = match self.confidence_for_symbol(ctx, symbol) {
-            Ok(value) => value,
-            Err(message) => {
-                return AlphaResult::new(None, true, Some(message), self.name().to_string());
-            }
-        };
 
         let spawn_key = self.symbol_spawn_count_key(symbol);
 
@@ -148,37 +135,52 @@ impl AlphaModel for TestEntry {
             );
         }
 
-        let latest_bar = match self.get_latest_bar(ctx, symbol) {
-            Ok(bar) => bar,
-            Err(message) => {
-                return AlphaResult::new(None, true, Some(message), self.name().to_string());
+        let history = match self.get_history(ctx, symbol) {
+            Some(history) if history.height() >= self.atr_period.max(2) => history,
+            _ => {
+                return AlphaResult::new(
+                    None,
+                    true,
+                    Some("Not enough history".into()),
+                    self.name().into(),
+                );
             }
         };
-        let _previous_bar = match self.get_previos_bar(ctx, symbol) {
-            Ok(bar) => bar,
-            Err(message) => {
-                return AlphaResult::new(None, true, Some(message), self.name().to_string());
-            }
-        };
+        let confidence =
+            match options::confidence(ctx, history, self.base_confidence_modifier_field.as_deref())
+            {
+                Ok(value) => value,
+                Err(message) => {
+                    return AlphaResult::new(None, true, Some(message), self.name().into());
+                }
+            };
 
-        let close = match Self::latest_numeric(&latest_bar, "close") {
+        let close = match options::numeric(history, "close", 0) {
             Ok(value) => value,
             Err(message) => {
                 return AlphaResult::new(None, false, Some(message), self.name().to_string());
             }
         };
-        let open = match Self::latest_numeric(&latest_bar, "open") {
+        let open = match options::numeric(history, "open", 0) {
             Ok(value) => value,
             Err(message) => {
                 return AlphaResult::new(None, false, Some(message), self.name().to_string());
             }
         };
-        let atr = match Self::latest_numeric(&latest_bar, &self.atr_column) {
+        let atr = match options::numeric(history, &self.atr_column, 0) {
             Ok(value) => value,
             Err(message) => {
                 return AlphaResult::new(None, false, Some(message), self.name().to_string());
             }
         };
+        if close <= 0.0 || open <= 0.0 || atr <= 0.0 {
+            return AlphaResult::new(
+                None,
+                true,
+                Some("Waiting for positive prices and ATR".into()),
+                self.name().into(),
+            );
+        }
 
         let Some(asset) = self.get_asset(ctx, symbol) else {
             return AlphaResult::new(
@@ -188,6 +190,17 @@ impl AlphaModel for TestEntry {
                 self.name().to_string(),
             );
         };
+        if !asset.tradable || close == open {
+            return AlphaResult::new(None, true, None, self.name().into());
+        }
+        let signal_side = if close > open {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        if !self.options.allows(signal_side, asset.shortable) {
+            return AlphaResult::new(None, true, None, self.name().into());
+        }
 
         let (side, tp, sl, entry) = {
             let tools = ctx.tools();
@@ -200,15 +213,15 @@ impl AlphaModel for TestEntry {
             if close > open {
                 (
                     OrderSide::Buy,
-                    tools.dynamic_round(close + (atr * 2.0), symbol),
-                    tools.dynamic_round(close - (atr * 1.5), symbol),
+                    tools.dynamic_round(close + (atr * self.options.take_profit_atr), symbol),
+                    tools.dynamic_round(close - (atr * self.options.stop_loss_atr), symbol),
                     entry,
                 )
             } else if asset.shortable {
                 (
                     OrderSide::Sell,
-                    tools.dynamic_round(close - (atr * 2.0), symbol),
-                    tools.dynamic_round(close + (atr * 1.5), symbol),
+                    tools.dynamic_round(close - (atr * self.options.take_profit_atr), symbol),
+                    tools.dynamic_round(close + (atr * self.options.stop_loss_atr), symbol),
                     entry,
                 )
             } else {
@@ -221,6 +234,15 @@ impl AlphaModel for TestEntry {
             }
         };
 
+        let priced_entry = entry.unwrap_or(close);
+        if !options::valid_levels(&side, priced_entry, sl, tp) {
+            return AlphaResult::new(
+                None,
+                true,
+                Some("ATR levels are invalid after price rounding".into()),
+                self.name().into(),
+            );
+        }
         let mut insight = Insight::new(
             side,
             symbol.to_string(),
@@ -233,10 +255,11 @@ impl AlphaModel for TestEntry {
             .set_limit_price(entry)
             .set_take_profit_levels(Some(vec![tp]))
             .set_stop_loss(Some(sl))
-            .set_period_unfilled(Some(5))
-            .set_period_till_tp(Some(10));
+            .set_period_unfilled(Some(self.options.unfilled_ttl(5)))
+            .set_period_till_tp(Some(self.options.filled_ttl(10)));
         ctx.variables()
             .insert(spawn_key, serde_json::Value::from((spawn_count + 1) as u64));
+        self.gate.emitted(symbol);
 
         AlphaResult::new(Some(insight), true, None, self.name().to_string())
     }

@@ -41,6 +41,247 @@ mod tests {
 
     static MT5_INTEGRATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    include!("stop_burst_tests.rs");
+    include!("live_memory_regression_tests.rs");
+    include!("lifecycle_reconciliation_tests.rs");
+    include!("exit_level_regression_tests.rs");
+    include!("indicator_runtime_tests.rs");
+
+    struct LiveCommandLifecycleFixture {
+        teardown_calls: Arc<std::sync::atomic::AtomicUsize>,
+        cleanup: bool,
+    }
+    impl Strategy for LiveCommandLifecycleFixture {
+        fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+            ctx.add_pipe(WrappedInsightPipe::builder(Box::new(InsightSubmitPipe::new())).build());
+        }
+        fn init(&mut self, _: &mut dyn StrategyContext, _: &Asset) {}
+        fn universe(&self, _: &mut dyn StrategyContext) -> HashSet<String> {
+            HashSet::from(["AAPL".into()])
+        }
+        fn on_bar(&mut self, _: &mut dyn StrategyContext, _: &str, _: &BarData) {}
+        fn generate_insights(&mut self, _: &mut dyn StrategyContext, _: &str) {}
+        fn insight_pipeline(&mut self, _: &mut dyn StrategyContext, _: &Insight) {}
+        fn on_teardown(&mut self, ctx: &mut dyn StrategyContext) {
+            self.teardown_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.cleanup {
+                ctx.cleanup_active_insights_for_teardown();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_live_execution_installs_journal_and_finishes_teardown_before_release() {
+        use crate::core::broker::command_journal::{
+            BrokerCommandJournal, lifecycle::ExecutionPhase,
+        };
+        use crate::core::strategy::StrategyStatus;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        // The actual run_live path, but only an in-memory paper account and a
+        // fixture feed. No MT5, NATS, SurrealDB, or public market-data endpoint.
+        for recovering_stop in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("aqe-live-owner-test-{}", uuid::Uuid::new_v4()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut state = StrategyState::new(
+                "LiveCommandFixture".into(),
+                "1".into(),
+                LiveCommandLifecycleFixture {
+                    teardown_calls: calls.clone(),
+                    cleanup: true,
+                },
+                UnifiedBroker::new(
+                    PaperBroker::new(AccountType::Paper, 100_000.0, 1),
+                    FixedScaleOutDataFeed::new(),
+                ),
+                StrategyMode::Live,
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+            )
+            .with_artifact_root(&directory);
+            let account = state.broker.get_account().await.unwrap();
+            let strategy_id = state.strategy_id.to_string();
+            let path = state.live_execution_journal_path(&strategy_id, &account.account_id);
+            assert_eq!(
+                path,
+                state.live_execution_journal_path(
+                    &format!(" strategy:{strategy_id} "),
+                    &format!(" {} ", account.account_id)
+                )
+            );
+            assert_ne!(
+                path,
+                state.live_execution_journal_path(&strategy_id, "other-account")
+            );
+            assert!(
+                state
+                    .live_execution_journal_path("../escape", "../../outside")
+                    .starts_with(directory.join(".aqs/execution/live"))
+            );
+            let mut insight = Insight::default();
+            insight.symbol = "AAPL".into();
+            insight.side = OrderSide::Buy;
+            insight.set_quantity(Some(1.0));
+            insight.order_type = OrderType::Limit;
+            insight.set_limit_price(Some(100.0));
+            state.insights.add_insight(insight);
+            if recovering_stop {
+                let mut journal =
+                    BrokerCommandJournal::open(&path, &strategy_id, &account.account_id)
+                        .await
+                        .unwrap();
+                journal.request_execution_stop().await.unwrap();
+            }
+            // An old completed stop is recovered before starting this new run;
+            // it must not act as a stop request for the new execution.
+            let watcher = {
+                let broker = state.broker.execution.clone();
+                let stop = state.shutdown_tx.clone();
+                Some(tokio::spawn(async move {
+                    if recovering_stop {
+                        // Recovery cancels the old pending entry rather than
+                        // submitting it as a new order in this execution.
+                        while !broker.is_connected() {
+                            tokio::task::yield_now().await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        stop.send_replace(true);
+                        return;
+                    }
+                    let accepted = tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if !broker.get_orders().await.unwrap().is_empty() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await;
+                    stop.send_replace(true);
+                    accepted.expect("normal live loop must dispatch the configured pending entry");
+                }))
+            };
+            let result = tokio::time::timeout(Duration::from_secs(10), state.run_live(None)).await;
+            if result.is_err() {
+                state.shutdown();
+                let _ = state.stop_live_execution_worker().await;
+                let _ = state.broker.disconnect().await;
+            }
+            result.expect("live fixture must not hang").unwrap();
+            if let Some(watcher) = watcher {
+                watcher.await.unwrap();
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.status, StrategyStatus::Stopped);
+            assert_eq!(state.insights.active_insight_count(), 0);
+            assert!(state.command_driver.is_none());
+            assert!(state.broker.snapshot_refresh_health().is_none());
+            assert!(state.broker.connection_worker_health().is_none());
+            assert!(state.metrics_checkpoint_writer.is_none());
+            assert!(!state.legacy_metrics_recovery.is_running());
+            let persisted = state
+                .load_local_live_metrics_checkpoint(&strategy_id)
+                .unwrap();
+            assert_eq!(persisted.account_id, account.account_id);
+            assert_eq!(
+                persisted.current_equity,
+                state.live_metrics.checkpoint().unwrap().current_equity
+            );
+            assert!(!state.broker.is_connected());
+            assert_eq!(Arc::strong_count(&state.broker.execution), 1);
+            assert_eq!(Arc::strong_count(&state.broker.data), 1);
+            let journal = BrokerCommandJournal::open(&path, &strategy_id, &account.account_id)
+                .await
+                .unwrap();
+            assert_eq!(journal.execution_lifecycle().phase, ExecutionPhase::Stopped);
+            assert!(journal.recovery_page(0, 256).await.unwrap().is_empty());
+            drop(journal);
+            drop(state);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_live_execution_retains_unsettled_stop_and_releases_workers() {
+        use crate::core::broker::command_journal::{
+            BrokerCommandJournal, lifecycle::ExecutionPhase,
+        };
+        use crate::core::strategy::StrategyStatus;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let directory =
+            std::env::temp_dir().join(format!("aqe-live-unsettled-test-{}", uuid::Uuid::new_v4()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut state = StrategyState::new(
+            "UnsettledLiveFixture".into(),
+            "1".into(),
+            LiveCommandLifecycleFixture {
+                teardown_calls: calls.clone(),
+                cleanup: false,
+            },
+            UnifiedBroker::new(
+                PaperBroker::new(AccountType::Paper, 100_000.0, 1),
+                FixedScaleOutDataFeed::new(),
+            ),
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        )
+        .with_artifact_root(&directory);
+        let account = state.broker.get_account().await.unwrap();
+        let strategy_id = state.strategy_id.to_string();
+        let path = state.live_execution_journal_path(&strategy_id, &account.account_id);
+        // An already-executed row without terminal evidence must not disappear
+        // merely because a teardown hook omitted cleanup. No broker order is
+        // created by this fixture and no close is fabricated to settle it.
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1.0);
+        insight.state = InsightState::Executed;
+        insight.order_id = Some("unconfirmed-order".into());
+        let insight_id = insight.insight_id;
+        state.insights.add_insight(insight);
+        state.shutdown_tx.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(10), state.run_live(None)).await;
+        if result.is_err() {
+            state.shutdown();
+            let _ = state.stop_live_execution_worker().await;
+            let _ = state.broker.disconnect().await;
+        }
+        let error = result
+            .expect("unsettled teardown must release ownership without hanging")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved broker work or exposure"),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.status, StrategyStatus::Stopping);
+        assert_eq!(
+            state.insights.get(&insight_id).unwrap().state,
+            InsightState::Executed
+        );
+        assert!(state.command_driver.is_none());
+        assert!(state.broker.snapshot_refresh_health().is_none());
+        assert!(state.broker.connection_worker_health().is_none());
+        assert!(state.metrics_checkpoint_writer.is_none());
+        assert!(!state.broker.is_connected());
+        assert_eq!(Arc::strong_count(&state.broker.execution), 1);
+        assert_eq!(Arc::strong_count(&state.broker.data), 1);
+        let journal = BrokerCommandJournal::open(&path, &strategy_id, &account.account_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.execution_lifecycle().phase,
+            ExecutionPhase::Stopping
+        );
+        drop(journal);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn installs_a_rustls_provider_when_multiple_backends_are_enabled() {
         crate::core::strategy::ensure_rustls_crypto_provider();
@@ -200,9 +441,11 @@ mod tests {
                 min_order_size: None,
                 quantity_base: None,
                 max_order_size: None,
+                max_total_size: None,
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                trading_calendar: None,
                 fees: Default::default(),
             })
         }
@@ -378,9 +621,11 @@ mod tests {
                 min_order_size: None,
                 quantity_base: None,
                 max_order_size: None,
+                max_total_size: None,
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                trading_calendar: None,
                 fees: Default::default(),
             })
         }
@@ -648,7 +893,7 @@ mod tests {
         fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn multi_timeframe_feature_stream_updates_feature_history_without_trading() {
         init_test_logger("debug");
         let on_bar_events = Arc::new(Mutex::new(Vec::new()));
@@ -774,9 +1019,11 @@ mod tests {
                 min_order_size: None,
                 quantity_base: None,
                 max_order_size: None,
+                max_total_size: None,
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                trading_calendar: None,
                 fees: Default::default(),
             })
         }
@@ -908,7 +1155,7 @@ mod tests {
         fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn backtest_add_event_history_uses_backtest_end_not_wall_clock_now() {
         let feature_timeframe = TimeFrame::new(15, TimeFrameUnit::Minute);
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
@@ -1392,7 +1639,7 @@ mod tests {
         insight.set_trailing_stop_price(Some(222.25));
 
         let order = broker
-            .submit_order(insight.clone())
+            .submit_order((&insight).into())
             .await
             .expect("paper broker should accept trailing-stop insight");
 
@@ -1451,7 +1698,7 @@ mod tests {
     /// - SMA crossover alpha generates insights on crossovers
     /// - Insights are collected in the InsightCollection
     /// - Backtest completes without errors
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_sma_crossover_backtest_with_yahoo() {
         // 1. Create components
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
@@ -1512,7 +1759,7 @@ mod tests {
     /// Creates an insight directly and runs pipes against it to verify
     /// that the PositionSizerPipe sets quantity and RiskManagementPipe
     /// sets stop-loss/take-profit.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_insight_pipes_modify_insight() {
         // 1. Create components
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
@@ -1675,7 +1922,7 @@ mod tests {
     ///
     /// Runs a very short backtest and checks that the alpha model's
     /// lifecycle methods are called in the correct order.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_alpha_model_lifecycle() {
         use std::sync::{Arc, Mutex};
 
@@ -2009,7 +2256,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_strategy_lifecycle_logic_and_universe_models_run() {
         struct VariableOnStartLogic {
             key: &'static str,
@@ -2247,6 +2494,130 @@ mod tests {
             crate::core::strategy::StrategyStatus::Stopping
         );
         assert_eq!(state.insights.len(), 0);
+        assert!(!state.teardown_cleanup_requested);
+        state.cleanup_active_insights_for_teardown_internal();
+        assert!(state.teardown_cleanup_requested);
+    }
+
+    #[tokio::test]
+    async fn teardown_late_fill_does_not_submit_dca_children() {
+        let (mut state, execution) = trade_update_state();
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        let directory =
+            std::env::temp_dir().join(format!("aqe-teardown-late-fill-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let mut parent = Insight::new(
+            OrderSide::Buy,
+            "AAPL".into(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        parent.set_quantity(Some(1.0));
+        let mut child = Insight::new(
+            OrderSide::Buy,
+            "AAPL".into(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        child.set_quantity(Some(1.0));
+        let child_id = *child.insight_id();
+        parent.add_child_insight(child, None, &mut state);
+        assert!(matches!(
+            parent.submit(&mut state).unwrap(),
+            crate::core::insight::InsightMutationState::Pending(_)
+        ));
+        let id = *parent.insight_id();
+        state.add_insight(parent);
+        drive_insight_work(&mut state, |state| {
+            state.insights.get(&id).unwrap().state == InsightState::Executed
+        })
+        .await;
+        let parent = state.insights.get(&id).unwrap().clone();
+        state.begin_teardown();
+        execution.emit(
+            test_order(
+                parent.order_id.as_deref().unwrap(),
+                &parent,
+                TradeUpdateEvent::Filled,
+                OrderSide::Buy,
+                Some(100.0),
+            ),
+            TradeUpdateEvent::Filled,
+        );
+        state.on_trade_update();
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Filled);
+        assert!(state.insights.get(&child_id).is_none());
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn teardown_close_request_remains_pending_until_broker_confirmation() {
+        let (mut state, execution) = trade_update_state();
+        let directory =
+            std::env::temp_dir().join(format!("aqe-teardown-confirm-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let mut insight = Insight::new(
+            OrderSide::Buy,
+            "AAPL".into(),
+            StrategyType::Testing,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+            90,
+            None,
+        );
+        insight.quantity = Some(10.0);
+        insight.partial_filled_quantity = Some(4.0);
+        insight.filled_price = Some(100.0);
+        insight.order_id = Some("teardown-position".into());
+        insight.state = InsightState::Filled;
+        let id = *insight.insight_id();
+        state.insights.add_insight(insight.clone());
+        state.begin_teardown();
+        state.cleanup_active_insights_for_teardown_internal();
+        drive_insight_work(&mut state, |_| {
+            !execution.close_quantities.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(execution.close_quantities.lock().unwrap().as_slice(), [6.0]);
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Filled);
+        assert!(state.insights.get(&id).unwrap().closing);
+        // Retrying cleanup while a close is in flight must not send a duplicate close.
+        state.cleanup_active_insights_for_teardown_internal();
+        assert_eq!(execution.close_quantities.lock().unwrap().len(), 1);
+        execution.emit(
+            test_order(
+                "teardown-position",
+                &insight,
+                TradeUpdateEvent::Closed,
+                OrderSide::Sell,
+                Some(101.0),
+            ),
+            TradeUpdateEvent::Closed,
+        );
+        state.on_trade_update();
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Closed);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -2279,9 +2650,11 @@ mod tests {
                 min_order_size: None,
                 quantity_base: None,
                 max_order_size: None,
+                max_total_size: None,
                 min_price_increment: Some(0.01),
                 price_base: None,
                 contract_size: None,
+                trading_calendar: None,
                 fees: Default::default(),
             },
         );
@@ -2329,7 +2702,7 @@ mod tests {
     /// A strategy generates a BUY insight with quantity on the first bar (after warm-up).
     /// PaperBroker fills the market order on the next step. `on_trade_update()` should
     /// transition the insight from EXECUTED → FILLED.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_trade_event_fill() {
         /// Strategy that generates one BUY insight with quantity already set.
         struct FillTestStrategy {
@@ -2507,32 +2880,63 @@ mod tests {
             min_order_size: None,
             quantity_base: None,
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: None,
             price_base: None,
             contract_size: None,
+            trading_calendar: None,
             fees: Default::default(),
         }
     }
 
     #[derive(Clone)]
     struct TestExecutionBroker {
+        submit_requests: Arc<Mutex<Vec<crate::core::broker::BrokerOrderRequest>>>,
+        lifecycle_reader: Option<Arc<dyn crate::core::broker::traits::OrderLifecycleReconciler>>,
         events: Arc<Mutex<VecDeque<(crate::core::broker::types::Order, TradeUpdateEvent)>>>,
         close_requests: Arc<Mutex<Vec<String>>>,
         close_quantities: Arc<Mutex<Vec<f64>>>,
         cancel_requests: Arc<Mutex<Vec<String>>>,
         cancel_acknowledgements: Arc<Mutex<HashMap<String, crate::core::broker::types::Order>>>,
+        connected: Arc<Mutex<bool>>,
+        disconnect_count: Arc<Mutex<usize>>,
+        fail_connect: bool,
+        submit_gate: Option<Arc<TestSubmitGate>>,
+        fail_submit: bool,
+        fail_close: bool,
         features: &'static [BrokerFeature],
+    }
+
+    #[derive(Default)]
+    struct TestSubmitGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     impl TestExecutionBroker {
         fn with_features(features: &'static [BrokerFeature]) -> Self {
             Self {
+                submit_requests: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_reader: None,
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 close_requests: Arc::new(Mutex::new(Vec::new())),
                 close_quantities: Arc::new(Mutex::new(Vec::new())),
                 cancel_requests: Arc::new(Mutex::new(Vec::new())),
                 cancel_acknowledgements: Arc::new(Mutex::new(HashMap::new())),
+                connected: Arc::new(Mutex::new(false)),
+                disconnect_count: Arc::new(Mutex::new(0)),
+                fail_connect: false,
+                submit_gate: None,
+                fail_submit: false,
+                fail_close: false,
                 features,
+            }
+        }
+
+        fn failing_connect() -> Self {
+            Self {
+                fail_connect: true,
+                ..Self::with_features(&[])
             }
         }
 
@@ -2550,15 +2954,23 @@ mod tests {
 
     impl Broker for TestExecutionBroker {
         async fn connect(&self) -> Result<bool, BrokerError> {
+            if self.fail_connect {
+                return Err(BrokerError::ConnectionError(
+                    "test broker is unavailable".to_string(),
+                ));
+            }
+            *self.connected.lock().unwrap() = true;
             Ok(true)
         }
 
         async fn disconnect(&self) -> Result<bool, BrokerError> {
+            *self.connected.lock().unwrap() = false;
+            *self.disconnect_count.lock().unwrap() += 1;
             Ok(true)
         }
 
         fn is_connected(&self) -> bool {
-            true
+            *self.connected.lock().unwrap()
         }
 
         fn get_current_time(&self) -> chrono::DateTime<Utc> {
@@ -2578,13 +2990,122 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_startup_connection_failure_rolls_back_all_owned_state() {
+        let execution = TestExecutionBroker::failing_connect();
+        let execution_probe = execution.clone();
+        let data = FixedScaleOutDataFeed::new();
+        let data_connected = data.connected.clone();
+        let broker = UnifiedBroker::new(execution, data);
+        let mut state = StrategyState::new(
+            "FailedLiveStartup".to_string(),
+            "1.0".to_string(),
+            NoopStrategy,
+            broker,
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+
+        let result = state.run_live(None).await;
+
+        assert!(matches!(result, Err(BrokerError::ConnectionError(_))));
+        assert_eq!(state.status, crate::core::strategy::StrategyStatus::Stopped);
+        assert!(
+            state.strategy.is_some(),
+            "strategy ownership must be restored"
+        );
+        assert!(!*execution_probe.connected.lock().unwrap());
+        assert!(!*data_connected.lock().unwrap());
+        assert_eq!(*execution_probe.disconnect_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn hosted_live_startup_requires_credentials_and_releases_workers_on_broker_failure() {
+        use crate::core::live_sync::HostedSyncConfig;
+        use crate::core::strategy::AqsAuth;
+        use std::time::Duration;
+        let root =
+            std::env::temp_dir().join(format!("aqe-hosted-startup-{}", uuid::Uuid::new_v4()));
+        let execution = TestExecutionBroker::failing_connect();
+        let probe = execution.clone();
+        let mut state = StrategyState::new(
+            "HostedFailedStartup".into(),
+            "1.0".into(),
+            NoopStrategy,
+            UnifiedBroker::new(execution, FixedScaleOutDataFeed::new()),
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        )
+        .with_hosted_sync(HostedSyncConfig::new("http://127.0.0.1:9", &root).unwrap());
+        let missing = state.run_live(None).await;
+        assert!(
+            matches!(missing, Err(BrokerError::ConnectionError(ref error)) if error.contains("credentials"))
+        );
+        assert!(
+            !root.exists(),
+            "no worker or outbox should start without credentials"
+        );
+        let auth = AqsAuth {
+            access_method: "aqe_live".into(),
+            session_id: "session".into(),
+            session_secret: "isolated-test-secret".into(),
+            strategy_id: "strategy".into(),
+            user_id: "users:test".into(),
+            node_id: None,
+            live_session_id: None,
+            url: Some("http://127.0.0.1:9".into()),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), state.run_live(Some(auth)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(BrokerError::ConnectionError(ref error)) if error.contains("broker"))
+        );
+        assert_eq!(state.status, crate::core::strategy::StrategyStatus::Stopped);
+        assert!(state.strategy.is_some());
+        assert!(!*probe.connected.lock().unwrap());
+        assert_eq!(*probe.disconnect_count.lock().unwrap(), 1);
+        let directory = std::fs::read_dir(&root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(directory.join("runtime.lock"))
+                    .unwrap();
+                if lock.try_lock().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed startup must not leave a standalone worker holding the outbox");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     impl OrderManagementProvider for TestExecutionBroker {
         async fn submit_order(
             &self,
-            insight: Insight,
+            insight: crate::core::broker::BrokerOrderRequest,
         ) -> Result<crate::core::broker::types::Order, BrokerError> {
-            Ok(test_order(
-                "submitted-order",
+            self.submit_requests.lock().unwrap().push(insight.clone());
+            if let Some(gate) = &self.submit_gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            if self.fail_submit {
+                return Err(BrokerError::ConnectionError(
+                    "fixture lost broker response".into(),
+                ));
+            }
+            Ok(test_request_order(
+                &format!("submitted-{}", insight.insight_id),
                 &insight,
                 TradeUpdateEvent::Accepted,
                 insight.side.clone(),
@@ -2609,7 +3130,7 @@ mod tests {
             Ok(true)
         }
 
-        async fn update_order(
+        async fn update_take_profit(
             &self,
             _order_id: &str,
             _price: f64,
@@ -2638,6 +3159,9 @@ mod tests {
                 .unwrap()
                 .push(order_id.to_string());
             self.close_quantities.lock().unwrap().push(qty);
+            if self.fail_close {
+                return Err(BrokerError::OrderError("position ticket not found".into()));
+            }
             Ok(true)
         }
 
@@ -2678,6 +3202,7 @@ mod tests {
         async fn get_account(&self) -> Result<crate::core::broker::types::Account, BrokerError> {
             Ok(crate::core::broker::types::Account {
                 account_id: "test".to_string(),
+                max_total_orders: None,
                 account_type: AccountType::Paper,
                 equity: 100_000.0,
                 cash: 100_000.0,
@@ -2689,8 +3214,23 @@ mod tests {
             })
         }
 
-        fn drain_trade_events(&self) -> Vec<(crate::core::broker::types::Order, TradeUpdateEvent)> {
-            self.events.lock().unwrap().drain(..).collect()
+        fn lifecycle_reconciler(
+            &self,
+        ) -> Option<Arc<dyn crate::core::broker::traits::OrderLifecycleReconciler>> {
+            self.lifecycle_reader.clone()
+        }
+
+        fn drain_trade_events_bounded(
+            &self,
+            max_events: usize,
+        ) -> Vec<(crate::core::broker::types::Order, TradeUpdateEvent)> {
+            let mut events = self.events.lock().unwrap();
+            let count = max_events.min(events.len());
+            events.drain(..count).collect()
+        }
+
+        fn has_pending_trade_events(&self) -> bool {
+            !self.events.lock().unwrap().is_empty()
         }
 
         async fn subscribe_to_trade_stream(
@@ -2743,6 +3283,16 @@ mod tests {
         side: OrderSide,
         filled_price: Option<f64>,
     ) -> crate::core::broker::types::Order {
+        test_request_order(order_id, &insight.into(), event, side, filled_price)
+    }
+
+    fn test_request_order(
+        order_id: &str,
+        insight: &crate::core::broker::BrokerOrderRequest,
+        event: TradeUpdateEvent,
+        side: OrderSide,
+        filled_price: Option<f64>,
+    ) -> crate::core::broker::types::Order {
         crate::core::broker::types::Order {
             order_id: order_id.to_string(),
             insight_id: Some(insight.insight_id.to_string()),
@@ -2763,6 +3313,7 @@ mod tests {
             submitted_at: 0,
             filled_at: Some(0),
             realized_pnl: None,
+            position_accounting: None,
             commission: None,
             swap: None,
             rejection_reason: None,
@@ -2811,6 +3362,1692 @@ mod tests {
     }
 
     #[test]
+    fn order_reducer_submit_and_stream_fills_are_idempotent() {
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>;
+        for sources in [
+            [Source::SubmitResponse, Source::TradeStream],
+            [Source::TradeStream, Source::SubmitResponse],
+        ] {
+            let mut insight = Insight::default();
+            insight.symbol = "AAPL".into();
+            insight.quantity = Some(10.0);
+            let accepted = test_order(
+                "entry",
+                &insight,
+                TradeUpdateEvent::Accepted,
+                OrderSide::Buy,
+                None,
+            );
+            let filled = test_order(
+                "entry",
+                &insight,
+                TradeUpdateEvent::Filled,
+                OrderSide::Buy,
+                Some(100.0),
+            );
+            assert_eq!(
+                State::reduce_broker_order(&mut insight, &accepted, &accepted.status, sources[0]),
+                Reduction::Updated
+            );
+            assert_eq!(
+                State::reduce_broker_order(&mut insight, &filled, &filled.status, sources[0]),
+                Reduction::EntryFilled
+            );
+            insight.set_first_on_fill(false);
+            let history_len = insight.state_history.len();
+            let filled_at = insight.filled_at;
+            assert_eq!(
+                State::reduce_broker_order(&mut insight, &filled, &filled.status, sources[1]),
+                Reduction::Ignored
+            );
+            assert_eq!(
+                State::reduce_broker_order(&mut insight, &accepted, &accepted.status, sources[1]),
+                Reduction::Ignored
+            );
+            assert_eq!(insight.state, InsightState::Filled);
+            assert_eq!(insight.state_history.len(), history_len);
+            assert_eq!(insight.filled_at, filled_at);
+            assert!(!insight.first_on_fill);
+            assert_eq!(insight.entry_filled_quantity, Some(10.0));
+            assert!(insight.partial_closes.is_empty());
+        }
+    }
+
+    #[test]
+    fn order_reducer_position_accounting_updates_do_not_reclose_or_change_trading_values() {
+        use crate::core::strategy::order_reducer::{OrderEvidenceSource as Source,OrderReduction as Reduction};
+        type State=StrategyState<NoopStrategy,TestExecutionBroker,YahooFinanceDataFeed>;
+        let mut insight=Insight::default();
+        insight.symbol="GENERIC-ASSET".into();insight.state=InsightState::Closed;
+        insight.order_id=Some("entry".into());insight.quantity=Some(10.);
+        insight.broker_realized_pnl=Some(12.);insight.closed_at=Some(chrono::Utc::now());
+        let closed_at=insight.closed_at;let history=insight.state_history.clone();
+        let mut order=test_order("entry",&insight,TradeUpdateEvent::Closed,OrderSide::Sell,Some(101.));
+        order.realized_pnl=Some(999.);
+        order.position_accounting=Some(aqe_live_protocol::PositionCloseAccounting {
+            version:1,provider:"test-v1".into(),position_id:"position".into(),entry_order_id:"entry".into(),currency:"USD".into(),
+            opened_at_us:100,closed_at_us:200,as_of_us:300,net_pnl:95.,commission:7.,swap:2.,
+        });
+        assert_eq!(State::reduce_broker_order(&mut insight,&order,&order.status,Source::SubmitResponse),Reduction::Ignored);
+        assert_eq!(State::reduce_broker_order(&mut insight,&order,&order.status,Source::TradeStream),Reduction::AccountingUpdated);
+        assert_eq!(State::reduce_broker_order(&mut insight,&order,&order.status,Source::TerminalHistory),Reduction::Ignored);
+        order.position_accounting.as_mut().unwrap().as_of_us=400;
+        order.position_accounting.as_mut().unwrap().net_pnl=96.;
+        assert_eq!(State::reduce_broker_order(&mut insight,&order,&order.status,Source::TerminalHistory),Reduction::AccountingUpdated);
+        assert_eq!(insight.position_accounting.as_ref().unwrap().net_pnl,96.);
+        assert_eq!(insight.broker_realized_pnl,Some(12.));assert_eq!(insight.quantity,Some(10.));
+        assert_eq!(insight.closed_at,closed_at);assert_eq!(insight.state_history,history);
+    }
+
+    #[test]
+    fn order_reducer_partial_entries_are_not_partial_closes() {
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>;
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(10.0);
+        for (qty, expected) in [
+            (3.0, Reduction::Updated),
+            (3.0, Reduction::Ignored),
+            (2.0, Reduction::Ignored),
+            (5.0, Reduction::Updated),
+        ] {
+            let mut order = test_order(
+                "entry",
+                &insight,
+                TradeUpdateEvent::PartialFilled,
+                OrderSide::Buy,
+                Some(100.0),
+            );
+            order.filled_qty = qty;
+            assert_eq!(
+                State::reduce_broker_order(
+                    &mut insight,
+                    &order,
+                    &order.status,
+                    Source::SubmitResponse
+                ),
+                expected
+            );
+            assert_eq!(
+                State::reduce_broker_order(
+                    &mut insight,
+                    &order,
+                    &order.status,
+                    Source::TradeStream
+                ),
+                Reduction::Ignored
+            );
+            assert_eq!(insight.partial_filled_quantity, None);
+            assert!(insight.partial_closes.is_empty());
+        }
+        assert_eq!(insight.entry_filled_quantity, Some(5.0));
+        let filled = test_order(
+            "entry",
+            &insight,
+            TradeUpdateEvent::Filled,
+            OrderSide::Buy,
+            Some(100.0),
+        );
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &filled, &filled.status, Source::TradeStream),
+            Reduction::EntryFilled
+        );
+        let mut stale_partial = filled.clone();
+        stale_partial.status = TradeUpdateEvent::PartialFilled;
+        stale_partial.filled_qty = 5.0;
+        assert_eq!(
+            State::reduce_broker_order(
+                &mut insight,
+                &stale_partial,
+                &stale_partial.status,
+                Source::TradeStream
+            ),
+            Reduction::Ignored
+        );
+        assert_eq!(insight.remaining_quantity(), 10.0);
+        assert_eq!(insight.get_pl(Some(101.0), true), 10.0);
+        assert!(insight.partial_closes.is_empty());
+        let snapshot =
+            crate::core::insight::InsightSnapshot::from_insight(&insight, "test-strategy");
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["entry_filled_quantity"], 10.0);
+        json.as_object_mut()
+            .unwrap()
+            .remove("entry_filled_quantity");
+        let legacy: crate::core::insight::InsightSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.entry_filled_quantity, None);
+    }
+
+    #[test]
+    fn order_reducer_cancelled_partial_entry_preserves_actual_exposure() {
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>;
+        for event in [
+            TradeUpdateEvent::Cancelled,
+            TradeUpdateEvent::Expired,
+            TradeUpdateEvent::Rejected,
+        ] {
+            let mut insight = Insight::default();
+            insight.symbol = "AAPL".into();
+            insight.quantity = Some(10.0);
+            let mut partial = test_order(
+                "entry",
+                &insight,
+                TradeUpdateEvent::PartialFilled,
+                OrderSide::Buy,
+                Some(100.0),
+            );
+            partial.filled_qty = 4.0;
+            partial.commission = Some(1.0);
+            assert_eq!(
+                State::reduce_broker_order(
+                    &mut insight,
+                    &partial,
+                    &partial.status,
+                    Source::TradeStream
+                ),
+                Reduction::Updated
+            );
+            let cancelled = test_order("entry", &insight, event, OrderSide::Buy, None);
+            assert_eq!(
+                State::reduce_broker_order(
+                    &mut insight,
+                    &cancelled,
+                    &cancelled.status,
+                    Source::TradeStream
+                ),
+                Reduction::LateEntryFilled
+            );
+            assert_eq!(insight.state, InsightState::Filled);
+            assert_eq!(insight.remaining_quantity(), 4.0);
+            assert_eq!(insight.filled_price, Some(100.0));
+            assert_eq!(insight.commission, Some(1.0));
+            assert!(insight.partial_closes.is_empty());
+            assert!(!insight.cancelling);
+        }
+    }
+
+    #[test]
+    fn order_reducer_accepts_correlated_response_without_native_insight_id() {
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>;
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1.0);
+        let mut order = test_order(
+            "entry",
+            &insight,
+            TradeUpdateEvent::Accepted,
+            OrderSide::Buy,
+            None,
+        );
+        order.insight_id = None;
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &order, &order.status, Source::TradeStream),
+            Reduction::Ignored
+        );
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &order, &order.status, Source::SubmitResponse),
+            Reduction::Updated
+        );
+        assert_eq!(insight.order_id.as_deref(), Some("entry"));
+    }
+
+    #[test]
+    fn order_reducer_partial_exits_use_cumulative_identity_without_replaying_fills() {
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>;
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(10.0);
+        insight.state = InsightState::Filled;
+        insight.order_id = Some("entry".into());
+        insight.filled_price = Some(100.0);
+        insight.entry_filled_quantity = Some(10.0);
+        let mut exit = test_order(
+            "exit-1",
+            &insight,
+            TradeUpdateEvent::PartialFilled,
+            OrderSide::Sell,
+            Some(110.0),
+        );
+        exit.filled_qty = 4.0;
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &exit, &exit.status, Source::TradeStream),
+            Reduction::Updated
+        );
+        assert_eq!(insight.remaining_quantity(), 6.0);
+        let history = insight.state_history.len();
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &exit, &exit.status, Source::TradeStream),
+            Reduction::Ignored
+        );
+        assert_eq!(insight.state_history.len(), history);
+        exit.filled_qty = 7.0;
+        exit.filled_price = Some(116.0);
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &exit, &exit.status, Source::TradeStream),
+            Reduction::Updated
+        );
+        assert_eq!(insight.remaining_quantity(), 3.0);
+        assert_eq!(insight.partial_closes.last().unwrap().quantity, 3.0);
+        assert_eq!(
+            insight.partial_closes.last().unwrap().filled_price,
+            Some(124.0)
+        );
+        assert_eq!(insight.get_pl(Some(100.0), true), 112.0);
+        exit.filled_qty = 4.0;
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &exit, &exit.status, Source::TradeStream),
+            Reduction::Ignored
+        );
+        // A delayed entry snapshot is still not an exit, even while closing.
+        exit.order_id = "entry".into();
+        exit.side = OrderSide::Buy;
+        insight.closing = true;
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &exit, &exit.status, Source::TradeStream),
+            Reduction::Ignored
+        );
+        assert_eq!(insight.remaining_quantity(), 3.0);
+    }
+
+    #[tokio::test]
+    async fn backtest_execution_barrier_waits_for_in_flight_command_and_checkpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountPipe(Arc<AtomicUsize>);
+        impl InsightPipe for CountPipe {
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn run(&mut self, _: &mut dyn StrategyContext, _: &mut Insight) -> InsightPipeResult {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                InsightPipeResult::new(true, true, None, self.name().to_string())
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("aqe-execution-barrier-{}", uuid::Uuid::new_v4()));
+        let gate = Arc::new(TestSubmitGate::default());
+        let mut broker = TestExecutionBroker::with_features(&[]);
+        broker.submit_gate = Some(gate.clone());
+        let mut state = StrategyState::new(
+            "barrier".into(),
+            "1".into(),
+            NoopStrategy,
+            UnifiedBroker::new(broker, YahooFinanceDataFeed::new()),
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        state.history_seed_anchor = Some(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
+        state.universe.insert("AAPL".into(), test_asset("AAPL"));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let before = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::new(AtomicUsize::new(0));
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(CountPipe(before.clone())))
+                .target_state(InsightState::New)
+                .build(),
+        );
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(InsightSubmitPipe::new()))
+                .target_state(InsightState::New)
+                .build(),
+        );
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(CountPipe(executed.clone())))
+                .target_state(InsightState::Executed)
+                .build(),
+        );
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1.0);
+        let id = insight.insight_id;
+        state.insights.add_insight(insight);
+        state.run_insight_pipeline();
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::New);
+        let clock = state.current_time();
+        {
+            let drain = state.drain_backtest_execution();
+            tokio::pin!(drain);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    result = &mut drain => panic!("barrier returned before broker release: {result:?}"),
+                    _ = gate.entered.notified() => {},
+                }
+                // The ready event queue is empty, but the worker owns this RPC.
+                // Re-polling must remain pending without relying on a sleep.
+                assert!(matches!(futures::poll!(&mut drain), std::task::Poll::Pending));
+                gate.release.notify_one();
+                drain.await.unwrap();
+            }).await.unwrap();
+        }
+        assert_eq!(state.current_time(), clock);
+        assert_eq!(
+            state.insights.get(&id).unwrap().state,
+            InsightState::Executed
+        );
+        assert_eq!(
+            before.load(Ordering::SeqCst),
+            1,
+            "configuration was replayed"
+        );
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            1,
+            "dependent state must resume once"
+        );
+        assert!(state.insight_pipeline.pending_deferral(&id).is_none());
+        let driver = state.command_driver.as_ref().unwrap();
+        assert!(!driver.has_in_flight_work());
+        assert_eq!(driver.pending_count(), 0);
+        assert!(driver.checkpoint_matches(
+            &id,
+            state.insights.get(&id).unwrap().snapshot_fingerprint_hash()
+        ));
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn backtest_execution_barrier_reports_ambiguous_outcome_without_retry() {
+        let directory =
+            std::env::temp_dir().join(format!("aqe-ambiguous-barrier-{}", uuid::Uuid::new_v4()));
+        let mut broker = TestExecutionBroker::with_features(&[]);
+        broker.fail_submit = true;
+        let mut state = StrategyState::new(
+            "barrier".into(),
+            "1".into(),
+            NoopStrategy,
+            UnifiedBroker::new(broker, YahooFinanceDataFeed::new()),
+            StrategyMode::Backtest,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        state.universe.insert("AAPL".into(), test_asset("AAPL"));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(InsightSubmitPipe::new()))
+                .target_state(InsightState::New)
+                .build(),
+        );
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1.0);
+        let id = insight.insight_id;
+        state.insights.add_insight(insight);
+        state.run_insight_pipeline();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.drain_backtest_execution(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous outcome"), "{error}");
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::New);
+        assert!(state.insights.get(&id).unwrap().has_pending_submit());
+        assert!(*state.shutdown_tx.borrow());
+        let journal = state.command_driver.take().unwrap().stop().await.unwrap();
+        let pending = journal.recovery_page(0, 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "ambiguous intent must stay durable");
+        drop(journal);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn execution_stop_is_retained_before_any_listener_subscribes() {
+        let mut state = StrategyState::new(
+            "early-stop".into(),
+            "1".into(),
+            NoopStrategy,
+            UnifiedBroker::new(
+                TestExecutionBroker::with_features(&[]),
+                YahooFinanceDataFeed::new(),
+            ),
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+        assert_eq!(state.shutdown_tx.receiver_count(), 0);
+        StrategyContext::shutdown(&mut state);
+        assert!(*state.shutdown_tx.subscribe().borrow());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backtest_execution_lifecycle_installs_and_releases_worker_on_success_and_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct LifecycleFixture {
+            generated: bool,
+            invalid_graph: bool,
+            teardown: Arc<AtomicUsize>,
+        }
+        impl Strategy for LifecycleFixture {
+            fn name(&self) -> &str {
+                "ExecutionLifecycleFixture"
+            }
+            fn on_start(&mut self, ctx: &mut dyn StrategyContext) {
+                ctx.add_pipe(
+                    WrappedInsightPipe::builder(Box::new(InsightSubmitPipe::new()))
+                        .target_state(InsightState::New)
+                        .build(),
+                );
+            }
+            fn init(&mut self, _: &mut dyn StrategyContext, _: &Asset) {}
+            fn universe(&self, _: &mut dyn StrategyContext) -> HashSet<String> {
+                HashSet::from(["AAPL".into()])
+            }
+            fn on_bar(&mut self, _: &mut dyn StrategyContext, _: &str, _: &BarData) {}
+            fn generate_insights(&mut self, ctx: &mut dyn StrategyContext, symbol: &str) {
+                if self.generated {
+                    return;
+                }
+                self.generated = true;
+                let mut insight = Insight::default();
+                insight.symbol = symbol.into();
+                insight.quantity = Some(1.0);
+                if self.invalid_graph {
+                    // An invalid custom graph must fail before broker dispatch,
+                    // but still exercise the same teardown/worker cleanup exit.
+                    insight.children.push(insight.clone());
+                }
+                ctx.add_insight(insight);
+            }
+            fn insight_pipeline(&mut self, _: &mut dyn StrategyContext, _: &Insight) {}
+            fn on_teardown(&mut self, ctx: &mut dyn StrategyContext) {
+                self.teardown.fetch_add(1, Ordering::SeqCst);
+                ctx.cleanup_active_insights_for_teardown();
+            }
+        }
+        for invalid_graph in [false, true] {
+            let directory = std::env::temp_dir()
+                .join(format!("aqe-backtest-lifecycle-{}", uuid::Uuid::new_v4()));
+            let teardown = Arc::new(AtomicUsize::new(0));
+            let mut state = StrategyState::new(
+                "lifecycle".into(),
+                "1".into(),
+                LifecycleFixture {
+                    generated: false,
+                    invalid_graph,
+                    teardown: teardown.clone(),
+                },
+                UnifiedBroker::new_backtest(
+                    PaperBroker::new(AccountType::Paper, 100_000.0, 1),
+                    FixedScaleOutDataFeed::new(),
+                ),
+                StrategyMode::Backtest,
+                TimeFrame::new(1, TimeFrameUnit::Day),
+            );
+            state.set_artifact_root(&directory);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                state.run_backtest(
+                    Utc.timestamp_millis_opt(1756771200000).unwrap(),
+                    Utc.timestamp_millis_opt(1757030400000).unwrap(),
+                    state.timeframe,
+                ),
+            )
+            .await
+            .expect("backtest must not leave an in-flight worker hanging");
+            assert_eq!(teardown.load(Ordering::SeqCst), 1);
+            assert!(state.strategy.is_some());
+            assert!(state.command_driver.is_none());
+            assert!(state.history_seed_anchor.is_none());
+            assert!(!state.broker.execution.is_connected());
+            assert_eq!(Arc::strong_count(&state.broker.execution), 1);
+            if invalid_graph {
+                assert!(result.is_err());
+                assert_eq!(state.status, crate::core::strategy::StrategyStatus::Stopped);
+                assert!(state.last_backtest_result_path.is_none());
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.total_trades, 1);
+                assert_eq!(
+                    state.status,
+                    crate::core::strategy::StrategyStatus::Completed
+                );
+                assert!(state.insights.active_insight_ids_unsorted().is_empty());
+                assert!(state.last_backtest_result_path.is_some());
+            }
+            // Reopening proves the finished worker released its exclusive lock.
+            let run = std::fs::read_dir(directory.join(".aqs/execution/backtests"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let account = state.broker.execution.get_account().await.unwrap();
+            let journal = crate::core::broker::command_journal::BrokerCommandJournal::open(
+                run.join("commands.db"),
+                &state.strategy_id.to_string(),
+                &account.account_id,
+            )
+            .await
+            .unwrap();
+            assert!(journal.recovery_page(0, 256).await.unwrap().is_empty());
+            use crate::core::broker::command_journal::lifecycle::ExecutionPhase;
+            assert_eq!(
+                journal.execution_lifecycle().phase,
+                if invalid_graph {
+                    ExecutionPhase::Stopping
+                } else {
+                    ExecutionPhase::Stopped
+                }
+            );
+            drop(journal);
+            drop(state);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn order_reducer_rejects_wrong_symbol_and_closed_reopening() {
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>;
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1.0);
+        let mut order = test_order(
+            "entry",
+            &insight,
+            TradeUpdateEvent::Filled,
+            OrderSide::Buy,
+            Some(100.0),
+        );
+        order.asset.symbol = "WRONG".into();
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &order, &order.status, Source::SubmitResponse),
+            Reduction::Ignored
+        );
+        assert_eq!(insight.state, InsightState::New);
+        order.asset.symbol = "AAPL".into();
+        insight.state = InsightState::Closed;
+        assert_eq!(
+            State::reduce_broker_order(&mut insight, &order, &order.status, Source::TradeStream),
+            Reduction::Ignored
+        );
+        assert_eq!(insight.state, InsightState::Closed);
+    }
+
+    #[tokio::test]
+    async fn command_worker_response_and_paper_stream_share_one_reducer() {
+        use crate::core::broker::command_journal::BrokerCommandJournal;
+        use crate::core::broker::command_worker::{
+            BrokerCommandWorker, BrokerCommandWorkerConfig, BrokerCommandWorkerEvent,
+        };
+        use crate::core::broker::commands::{
+            BrokerCommand, BrokerCommandAction, BrokerCommandOutcome,
+        };
+        use crate::core::strategy::order_reducer::{
+            OrderEvidenceSource as Source, OrderReduction as Reduction,
+        };
+        type State = StrategyState<NoopStrategy, PaperBroker, YahooFinanceDataFeed>;
+        for stream_first in [true, false] {
+            let dir =
+                std::env::temp_dir().join(format!("aqe-reducer-worker-{}", uuid::Uuid::new_v4()));
+            let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+            broker.register_asset_metadata(&test_asset("AAPL"));
+            let account = broker.get_account().await.unwrap();
+            let journal = BrokerCommandJournal::open(
+                dir.join("commands.db"),
+                "test-strategy",
+                &account.account_id,
+            )
+            .await
+            .unwrap();
+            let mut worker = BrokerCommandWorker::start(
+                broker.clone(),
+                journal,
+                BrokerCommandWorkerConfig::default(),
+            )
+            .unwrap();
+            let mut state = State::new(
+                "test".into(),
+                "1".into(),
+                NoopStrategy,
+                UnifiedBroker::new(broker.as_ref().clone(), YahooFinanceDataFeed::new()),
+                StrategyMode::Live,
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+            );
+            state.status = crate::core::strategy::StrategyStatus::Running;
+            state.universe.insert("AAPL".into(), test_asset("AAPL"));
+            let mut insight = Insight::default();
+            insight.symbol = "AAPL".into();
+            insight.quantity = Some(1.0);
+            let id = insight.insight_id;
+            let command = BrokerCommand::new(
+                "test-strategy",
+                &account.account_id,
+                &id.to_string(),
+                BrokerCommandAction::Submit {
+                    request: (&insight).into(),
+                },
+                None,
+            );
+            let receipt = worker.sender.try_enqueue(command).unwrap();
+            state.insights.add_insight(insight);
+            // Receipt is queue admission only, not a broker state transition.
+            assert_eq!(state.insights.get(&id).unwrap().state, InsightState::New);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while broker.get_orders().await.unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let bar = Bar {
+                symbol: "AAPL".into(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 100.0,
+                timestamp: Utc::now(),
+            };
+            if stream_first {
+                broker.process_step(
+                    &HashMap::from([("AAPL".into(), bar.clone())]),
+                    bar.timestamp,
+                );
+                state.drain_ready_broker_events().await;
+                assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Filled);
+                state
+                    .insights
+                    .get_mut(&id)
+                    .unwrap()
+                    .set_first_on_fill(false);
+            }
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), worker.events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let BrokerCommandWorkerEvent::Completion(completion) = event else {
+                panic!("missing durable completion");
+            };
+            assert_eq!(completion.receipt, receipt);
+            let BrokerCommandOutcome::OrderResponse { order } = completion.outcome else {
+                panic!("expected paper order response");
+            };
+            let insight = state.insights.get_mut(&id).unwrap();
+            let before_history = insight.state_history.len();
+            let reduced =
+                State::reduce_broker_order(insight, &order, &order.status, Source::SubmitResponse);
+            if stream_first {
+                assert_eq!(reduced, Reduction::Ignored);
+                assert_eq!(insight.state_history.len(), before_history);
+                assert!(!insight.first_on_fill);
+            } else {
+                assert_eq!(reduced, Reduction::Updated);
+                assert_eq!(insight.state, InsightState::Executed);
+                broker.process_step(
+                    &HashMap::from([("AAPL".into(), bar.clone())]),
+                    bar.timestamp,
+                );
+                state.drain_ready_broker_events().await;
+            }
+            let insight = state.insights.get(&id).unwrap();
+            assert_eq!(insight.state, InsightState::Filled);
+            assert_eq!(insight.entry_filled_quantity, Some(1.0));
+            assert_eq!(broker.get_orders().await.unwrap().len(), 1);
+            drop(worker.sender);
+            drop(worker.events);
+            drop(worker.task.await.unwrap().unwrap());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn strategy_context_command_driver_reduces_receipts_without_blocking_or_regressing_fills()
+    {
+        use crate::core::broker::commands::{BrokerCommandAction, BrokerCommandError};
+        use crate::core::strategy::command_driver::BrokerCommandProgress;
+        for stream_first in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("aqe-context-driver-{}", uuid::Uuid::new_v4()));
+            let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+            execution.register_asset_metadata(&test_asset("AAPL"));
+            let mut state = StrategyState::new(
+                "command-driver".into(),
+                "1".into(),
+                NoopStrategy,
+                UnifiedBroker::new(execution, YahooFinanceDataFeed::new()),
+                StrategyMode::Live,
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+            );
+            state.status = crate::core::strategy::StrategyStatus::Running;
+            state.universe.insert("AAPL".into(), test_asset("AAPL"));
+            state
+                .start_command_driver(
+                    directory.join("commands.db"),
+                    "strategy",
+                    "account",
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .start_command_driver(
+                        directory.join("commands.db"),
+                        "strategy",
+                        "account",
+                        Default::default()
+                    )
+                    .await
+                    .is_err()
+            );
+            let mut insight = Insight::default();
+            insight.symbol = "AAPL".into();
+            insight.quantity = Some(1.0);
+            let id = insight.insight_id;
+            let action = BrokerCommandAction::Submit {
+                request: (&insight).into(),
+            };
+            let receipt = state
+                .enqueue_broker_command(id, action.clone(), None)
+                .unwrap();
+            state.insights.add_insight(insight);
+            assert_eq!(state.insights.get(&id).unwrap().state, InsightState::New);
+            assert!(matches!(
+                state.broker_command_progress(&receipt),
+                Some(BrokerCommandProgress::Queued)
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !state
+                    .command_driver
+                    .as_ref()
+                    .unwrap()
+                    .has_completion_events()
+                {
+                    state.advance_execution_persistence().unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let bar = Bar {
+                symbol: "AAPL".into(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 100.0,
+                timestamp: Utc::now(),
+            };
+            if stream_first {
+                state.broker.execution.process_step(
+                    &HashMap::from([("AAPL".into(), bar.clone())]),
+                    bar.timestamp,
+                );
+                state.on_trade_update_with_budget(256, std::time::Duration::from_millis(5));
+                assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Filled);
+                state
+                    .insights
+                    .get_mut(&id)
+                    .unwrap()
+                    .set_first_on_fill(false);
+            }
+            state.on_trade_update();
+            assert!(matches!(
+                state.broker_command_progress(&receipt),
+                Some(BrokerCommandProgress::Completed(_))
+            ));
+            if stream_first {
+                assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Filled);
+                assert!(!state.insights.get(&id).unwrap().first_on_fill);
+            } else {
+                assert_eq!(
+                    state.insights.get(&id).unwrap().state,
+                    InsightState::Executed
+                );
+                state.broker.execution.process_step(
+                    &HashMap::from([("AAPL".into(), bar.clone())]),
+                    bar.timestamp,
+                );
+                state.drain_ready_broker_events().await;
+            }
+            assert_eq!(
+                state.insights.get(&id).unwrap().entry_filled_quantity,
+                Some(1.0)
+            );
+            assert_eq!(state.broker.execution.get_orders().await.unwrap().len(), 1);
+            StrategyContext::shutdown(&mut state);
+            let mut next = Insight::default();
+            next.symbol = "AAPL".into();
+            next.quantity = Some(1.0);
+            assert_eq!(
+                state
+                    .enqueue_broker_command(
+                        next.insight_id,
+                        BrokerCommandAction::Submit {
+                            request: (&next).into(),
+                        },
+                        None
+                    )
+                    .unwrap_err(),
+                BrokerCommandError::Stopping
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    state.advance_execution_persistence().unwrap();
+                    let driver = state.command_driver.as_ref().unwrap();
+                    if !driver.checkpoint_in_flight()
+                        && driver.pending_count() == 0
+                        && driver.checkpoint_matches(
+                            &id,
+                            state.insights.get(&id).unwrap().snapshot_fingerprint_hash(),
+                        )
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let journal = state.command_driver.take().unwrap().stop().await.unwrap();
+            assert!(journal.recovery_page(0, 256).await.unwrap().is_empty());
+            let saved = journal.execution_checkpoint_page("", 32).await.unwrap();
+            assert_eq!(saved.rows[0].state, InsightState::Filled);
+            drop(journal);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    async fn queued_insight_fixture(
+        entry_capacity: usize,
+    ) -> (
+        StrategyState<NoopStrategy, PaperBroker, YahooFinanceDataFeed>,
+        std::path::PathBuf,
+    ) {
+        let directory =
+            std::env::temp_dir().join(format!("aqe-insight-work-{}", uuid::Uuid::new_v4()));
+        let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
+        execution.register_asset_metadata(&test_asset("AAPL"));
+        let mut state = StrategyState::new(
+            "insight-work".into(),
+            "1".into(),
+            NoopStrategy,
+            UnifiedBroker::new(execution, YahooFinanceDataFeed::new()),
+            StrategyMode::Live,
+            TimeFrame::new(1, TimeFrameUnit::Minute),
+        );
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        state.universe.insert("AAPL".into(), test_asset("AAPL"));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                crate::core::broker::command_worker::BrokerCommandWorkerConfig {
+                    entry_capacity,
+                    completion_capacity: 256,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        (state, directory)
+    }
+
+    fn queued_limit(price: f64) -> Insight {
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1.0);
+        insight.order_type = OrderType::Limit;
+        insight.limit_price = Some(price);
+        insight
+    }
+
+    #[test]
+    fn pipeline_keeps_peer_insights_and_current_order_index_available() {
+        struct InspectPeers {
+            peer: uuid::Uuid,
+            current: uuid::Uuid,
+            calls: Arc<Mutex<usize>>,
+        }
+        impl InsightPipe for InspectPeers {
+            fn name(&self) -> &str {
+                "InspectPeers"
+            }
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn run(
+                &mut self,
+                ctx: &mut dyn StrategyContext,
+                insight: &mut Insight,
+            ) -> InsightPipeResult {
+                if insight.insight_id == self.current {
+                    assert!(
+                        ctx.insights().get(&self.peer).is_some(),
+                        "a pipe must see its DCA/risk peers"
+                    );
+                    assert_eq!(
+                        ctx.insights().insight_id_for_order("current-native-order"),
+                        Some(self.current)
+                    );
+                    *self.calls.lock().unwrap() += 1;
+                }
+                InsightPipeResult::new(true, true, None, self.name().into())
+            }
+        }
+        let (mut state, _) = trade_update_state();
+        let peer = queued_limit(40.0);
+        let peer_id = peer.insight_id;
+        let mut current = queued_limit(50.0);
+        let id = current.insight_id;
+        current.order_accepted("current-native-order");
+        state.insights.add_insight(peer);
+        state.insights.add_insight(current);
+        let calls = Arc::new(Mutex::new(0));
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(InspectPeers {
+                peer: peer_id,
+                current: id,
+                calls: calls.clone(),
+            }))
+            .target_state(InsightState::Executed)
+            .build(),
+        );
+        state.run_insight_pipeline();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(
+            state.insights.insight_id_for_order("current-native-order"),
+            Some(id)
+        );
+        assert_eq!(state.insights.active_insight_ids().len(), 2);
+    }
+
+    async fn drive_insight_work<E: Broker + OrderManagementProvider>(
+        state: &mut StrategyState<NoopStrategy, E, YahooFinanceDataFeed>,
+        done: impl Fn(&StrategyState<NoopStrategy, E, YahooFinanceDataFeed>) -> bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                state.on_trade_update();
+                if done(state) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued insight work should make progress");
+    }
+
+    #[tokio::test]
+    async fn queued_split_children_are_eager_but_nested_dca_waits_for_direct_parent_fill() {
+        let (mut state, directory) = queued_insight_fixture(1).await;
+        let mut parent = queued_limit(50.0);
+        let root = parent.insight_id;
+        let split = queued_limit(50.0);
+        let split_id = split.insight_id;
+        parent.add_child_insight(split, Some(true), &mut state);
+        let mut dca = queued_limit(45.0);
+        let dca_id = dca.insight_id;
+        let fragment = queued_limit(45.0);
+        let fragment_id = fragment.insight_id;
+        dca.add_child_insight(fragment, Some(true), &mut state);
+        parent.add_child_insight(dca, None, &mut state);
+        assert!(matches!(
+            parent.submit(&mut state).unwrap(),
+            crate::core::insight::InsightMutationState::Pending(_)
+        ));
+        state.add_insight(parent);
+        // One work unit can materialize at most one child, with no broker wait.
+        assert_eq!(
+            state.process_insight_work(1, std::time::Duration::from_secs(1)),
+            1
+        );
+        assert!(state.insights.get(&split_id).is_some());
+        assert!(state.insights.get(&dca_id).is_none());
+        drive_insight_work(&mut state, |state| {
+            state
+                .insights
+                .get(&split_id)
+                .is_some_and(|row| row.state == InsightState::Executed)
+        })
+        .await;
+        assert_eq!(
+            state.insights.get(&root).unwrap().state,
+            InsightState::Executed
+        );
+        assert_eq!(state.broker.execution.get_orders().await.unwrap().len(), 2);
+        assert!(!state.insights.get(&root).unwrap().has_pending_submit());
+
+        let bar = Bar {
+            symbol: "AAPL".into(),
+            open: 49.0,
+            high: 51.0,
+            low: 48.0,
+            close: 49.0,
+            volume: 100.0,
+            timestamp: Utc::now(),
+        };
+        state.broker.execution.process_step(
+            &HashMap::from([("AAPL".into(), bar.clone())]),
+            bar.timestamp,
+        );
+        drive_insight_work(&mut state, |state| {
+            state
+                .insights
+                .get(&fragment_id)
+                .is_some_and(|row| row.state == InsightState::Executed)
+        })
+        .await;
+        assert_eq!(state.insights.get(&dca_id).unwrap().parent_id, Some(root));
+        assert_eq!(
+            state.insights.get(&fragment_id).unwrap().parent_id,
+            Some(dca_id)
+        );
+        assert!(!state.insights.get(&dca_id).unwrap().is_split_insight());
+        assert!(state.insights.get(&fragment_id).unwrap().is_split_insight());
+        assert_eq!(
+            state.insights.get(&dca_id).unwrap().state,
+            InsightState::Executed
+        );
+        assert_eq!(state.broker.execution.get_orders().await.unwrap().len(), 4);
+        for _ in 0..10 {
+            state.schedule_insight_children(root);
+            state.schedule_insight_children(dca_id);
+            state.on_trade_update();
+        }
+        assert_eq!(state.broker.execution.get_orders().await.unwrap().len(), 4);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_checkpoint_saves_changed_deferral_without_insight_field_changes() {
+        use crate::core::pipeline::InsightPipeDeferral;
+        struct DeferTwice(usize);
+        impl InsightPipe for DeferTwice {
+            fn name(&self) -> &str {
+                "DeferTwice"
+            }
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn run(&mut self, _: &mut dyn StrategyContext, _: &mut Insight) -> InsightPipeResult {
+                self.0 += 1;
+                InsightPipeResult::deferred(
+                    if self.0 == 1 {
+                        InsightPipeDeferral::AccountSnapshot
+                    } else {
+                        InsightPipeDeferral::PositionSnapshot
+                    },
+                    self.name(),
+                )
+            }
+        }
+        let (mut state, directory) = queued_insight_fixture(8).await;
+        state.add_pipe(
+            WrappedInsightPipe::builder(Box::new(DeferTwice(0)))
+                .target_state(InsightState::New)
+                .build(),
+        );
+        let insight = queued_limit(50.0);
+        let id = insight.insight_id;
+        state.add_insight(insight);
+        state.run_insight_pipeline();
+        drive_insight_work(&mut state, |state| {
+            let driver = state.command_driver.as_ref().unwrap();
+            driver.checkpoint_revision(&id) == 1 && !driver.checkpoint_in_flight()
+        })
+        .await;
+        let fingerprint = state.insights.get(&id).unwrap().snapshot_fingerprint_hash();
+        state.run_insight_pipeline();
+        drive_insight_work(&mut state, |state| {
+            let driver = state.command_driver.as_ref().unwrap();
+            driver.checkpoint_revision(&id) == 2 && !driver.checkpoint_in_flight()
+        })
+        .await;
+        assert_eq!(
+            state.insights.get(&id).unwrap().snapshot_fingerprint_hash(),
+            fingerprint
+        );
+        let page = state
+            .command_driver
+            .as_ref()
+            .unwrap()
+            .execution_checkpoint_page(String::new(), 32)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.rows[0].pipeline.as_ref().unwrap().dependency,
+            InsightPipeDeferral::PositionSnapshot
+        );
+        assert!(
+            state
+                .broker
+                .execution
+                .get_orders()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_checkpoint_budget_zero_does_no_work_and_one_makes_progress() {
+        let (mut state, directory) = queued_insight_fixture(8).await;
+        let mut parent = queued_limit(50.0);
+        parent.add_child_insight(queued_limit(45.0), None, &mut state);
+        parent.submit(&mut state).unwrap();
+        state.add_insight(parent);
+        assert_eq!(
+            state
+                .advance_execution_persistence_with_budget(0, std::time::Duration::from_secs(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .advance_execution_persistence_with_budget(256, std::time::Duration::ZERO)
+                .unwrap(),
+            0
+        );
+        assert!(
+            state
+                .command_driver
+                .as_ref()
+                .unwrap()
+                .recovery_page(0, 32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state
+                .broker
+                .execution
+                .get_orders()
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                assert!(
+                    state
+                        .advance_execution_persistence_with_budget(
+                            1,
+                            std::time::Duration::from_millis(5)
+                        )
+                        .unwrap()
+                        <= 1
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_checkpoint_prepares_thousand_child_templates_before_parent_dispatch() {
+        let (mut state, directory) = queued_insight_fixture(8).await;
+        let mut parent = queued_limit(50.0);
+        let root = parent.insight_id;
+        for _ in 0..1000 {
+            parent.add_child_insight(queued_limit(45.0), None, &mut state);
+        }
+        parent.submit(&mut state).unwrap();
+        state.add_insight(parent);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state
+                .broker
+                .execution
+                .get_orders()
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                state.advance_execution_persistence().unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let driver = state.command_driver.as_ref().unwrap();
+        let mut cursor = String::new();
+        let mut count = 0;
+        let mut materialized = 0;
+        loop {
+            let page = driver.execution_checkpoint_page(cursor, 32).await.unwrap();
+            assert!(page.rows.len() <= 32);
+            for row in page.rows {
+                count += 1;
+                materialized += usize::from(row.materialized);
+                if row.insight_id == root {
+                    assert_eq!(row.child_ids.len(), 1000);
+                    assert_eq!(row.owner_receipts.len(), 1);
+                } else {
+                    assert_eq!(row.parent_id, Some(root));
+                    assert!(!row.materialized);
+                }
+            }
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert_eq!(
+            count, 1001,
+            "dispatch requires the complete dormant recovery tree"
+        );
+        assert_eq!(materialized, 1);
+        assert_eq!(state.broker.execution.get_orders().await.unwrap().len(), 1);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_checkpoint_walk_resumes_exact_row_at_byte_boundary() {
+        let (mut state, directory) = queued_insight_fixture(8).await;
+        let mut parent = queued_limit(50.0);
+        let root = parent.insight_id;
+        for _ in 0..2 {
+            let mut child = queued_limit(45.0);
+            child.state_log(Some("h".repeat(600_000)));
+            parent.add_child_insight(child, None, &mut state);
+        }
+        parent.submit(&mut state).unwrap();
+        state.add_insight(parent);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state
+                .broker
+                .execution
+                .get_orders()
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                state.advance_execution_persistence().unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let driver = state.command_driver.as_ref().unwrap();
+        let mut cursor = String::new();
+        let mut saved = HashMap::new();
+        loop {
+            let page = driver.execution_checkpoint_page(cursor, 32).await.unwrap();
+            for row in page.rows {
+                assert!(saved.insert(row.insight_id, row).is_none());
+            }
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert_eq!(saved.len(), 3);
+        for id in &saved[&root].child_ids {
+            assert!(
+                saved[id].state_history.iter().any(|(_, _, value)| value
+                    .as_ref()
+                    .is_some_and(|value| value.len() == 600_000))
+            );
+        }
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_entry_stop_preserves_new_until_cancelled_before_dispatch_evidence() {
+        let (mut state, directory) = queued_insight_fixture(1).await;
+        let mut parent = queued_limit(50.0);
+        let id = parent.insight_id;
+        parent.add_child_insight(queued_limit(50.0), Some(true), &mut state);
+        parent.submit(&mut state).unwrap();
+        state.add_insight(parent);
+        state.begin_teardown();
+        let report = state.cleanup_active_insights_for_teardown_internal();
+        assert_eq!(report.rejected_new, 1);
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::New);
+        drive_insight_work(&mut state, |state| {
+            state.insights.get(&id).unwrap().state == InsightState::Cancelled
+        })
+        .await;
+        assert!(
+            state
+                .broker
+                .execution
+                .get_orders()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state.insights.ids().len(),
+            1,
+            "stop must not materialize dormant split entries"
+        );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_receipts_release_for_response_before_trade_and_trade_before_response() {
+        for response_first in [false, true] {
+            let (mut state, directory) = queued_insight_fixture(8).await;
+            let mut insight = queued_limit(50.0);
+            let id = insight.insight_id;
+            insight.submit(&mut state).unwrap();
+            state.add_insight(insight);
+            drive_insight_work(&mut state, |state| {
+                state.insights.get(&id).unwrap().state == InsightState::Executed
+                    && state.command_driver.as_ref().unwrap().pending_count() == 0
+            })
+            .await;
+            // Remove already-observed entry events; the next stream event is the
+            // cancel acknowledgement, intentionally delivered in either order.
+            state.broker.drain_trade_events_bounded(256);
+            let mut insight = state.insights.take_for_update(&id).unwrap();
+            insight.cancel(&mut state).unwrap();
+            state.insights.restore_after_update(insight, true);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !state
+                    .command_driver
+                    .as_ref()
+                    .unwrap()
+                    .has_completion_events()
+                {
+                    state.advance_execution_persistence().unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if response_first {
+                state
+                    .reduce_ready_commands(256, std::time::Duration::from_millis(5))
+                    .unwrap();
+                assert_eq!(
+                    state.insights.get(&id).unwrap().state,
+                    InsightState::Executed
+                );
+                assert!(
+                    !state
+                        .insights
+                        .get(&id)
+                        .unwrap()
+                        .pending_mutations
+                        .is_empty()
+                );
+            }
+            state.on_trade_update_with_budget(256, std::time::Duration::from_millis(5));
+            assert_eq!(
+                state.insights.get(&id).unwrap().state,
+                InsightState::Cancelled
+            );
+            if !response_first {
+                assert!(
+                    !state
+                        .insights
+                        .get(&id)
+                        .unwrap()
+                        .pending_mutations
+                        .is_empty()
+                );
+                state
+                    .reduce_ready_commands(256, std::time::Duration::from_millis(5))
+                    .unwrap();
+            }
+            assert!(
+                state
+                    .insights
+                    .get(&id)
+                    .unwrap()
+                    .pending_mutations
+                    .is_empty()
+            );
+            drive_insight_work(&mut state, |state| {
+                state.command_driver.as_ref().unwrap().pending_count() == 0
+                    && !state
+                        .command_driver
+                        .as_ref()
+                        .unwrap()
+                        .checkpoint_in_flight()
+            })
+            .await;
+            // Durable owner state now permits pruning; no live-state pipe ran.
+            state.advance_execution_persistence().unwrap();
+            assert_eq!(
+                state.insights.prune_terminal_insights_without_aqs(),
+                vec![id]
+            );
+            let journal = state.command_driver.take().unwrap().stop().await.unwrap();
+            assert!(journal.recovery_page(0, 256).await.unwrap().is_empty());
+            drop(journal);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_parent_cleanup_waits_for_broker_events_and_cancels_nested_children() {
+        let (mut state, directory) = queued_insight_fixture(8).await;
+        let mut parent = queued_limit(50.0);
+        let root = parent.insight_id;
+        let mut child = queued_limit(50.0);
+        let child_id = child.insight_id;
+        let nested = queued_limit(50.0);
+        let nested_id = nested.insight_id;
+        child.add_child_insight(nested, Some(true), &mut state);
+        parent.add_child_insight(child, Some(true), &mut state);
+        parent.submit(&mut state).unwrap();
+        state.add_insight(parent);
+        drive_insight_work(&mut state, |state| {
+            state
+                .insights
+                .get(&nested_id)
+                .is_some_and(|row| row.state == InsightState::Executed)
+        })
+        .await;
+        let root_order = state.insights.get(&root).unwrap().order_id.clone().unwrap();
+        state
+            .broker
+            .execution
+            .cancel_order(&root_order)
+            .await
+            .unwrap();
+        drive_insight_work(&mut state, |state| {
+            [root, child_id, nested_id]
+                .iter()
+                .all(|id| state.insights.get(id).unwrap().state == InsightState::Cancelled)
+        })
+        .await;
+        // Terminal receipts and rows must commit before pruning may release them.
+        drive_insight_work(&mut state, |state| {
+            let driver = state.command_driver.as_ref().unwrap();
+            driver.pending_count() == 0
+                && !driver.checkpoint_in_flight()
+                && [root, child_id, nested_id].iter().all(|id| {
+                    driver.checkpoint_matches(
+                        id,
+                        state.insights.get(id).unwrap().snapshot_fingerprint_hash(),
+                    )
+                })
+        })
+        .await;
+        // A stale embedded child template must not revive a terminal canonical row.
+        state.insights.prune_terminal_insights_without_aqs();
+        assert!(state.insights.get(&nested_id).is_none());
+        assert!(state.insights.was_materialized(&nested_id));
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn submit_response_without_client_id_routes_only_through_its_receipt() {
+        use crate::core::strategy::order_reducer::OrderEvidenceSource;
+        let (mut state, _) = trade_update_state();
+        let mut first = Insight::default();
+        first.symbol = "AAPL".into();
+        first.quantity = Some(1.0);
+        let first_id = first.insight_id;
+        let mut second = first.clone();
+        second.insight_id = uuid::Uuid::new_v4();
+        let second_id = second.insight_id;
+        let mut order = test_order(
+            "native-order",
+            &second,
+            TradeUpdateEvent::New,
+            OrderSide::Buy,
+            None,
+        );
+        order.insight_id = None;
+        state.insights.add_insight(first);
+        state.insights.add_insight(second);
+        assert!(!state.process_order_evidence(
+            order.clone(),
+            TradeUpdateEvent::New,
+            OrderEvidenceSource::SubmitResponse,
+            None
+        ));
+        assert!(state.process_order_evidence(
+            order,
+            TradeUpdateEvent::New,
+            OrderEvidenceSource::SubmitResponse,
+            Some(second_id)
+        ));
+        assert_eq!(
+            state.insights.get(&first_id).unwrap().state,
+            InsightState::New
+        );
+        assert_eq!(
+            state.insights.get(&second_id).unwrap().state,
+            InsightState::Executed
+        );
+        assert_eq!(
+            state.insights.get(&second_id).unwrap().order_id.as_deref(),
+            Some("native-order")
+        );
+    }
+
+    #[test]
+    fn late_fill_cannot_activate_dormant_children_on_later_pipeline_passes() {
+        let (mut state, execution) = trade_update_state();
+        state.status = crate::core::strategy::StrategyStatus::Running;
+        let mut parent = queued_limit(50.0);
+        let id = parent.insight_id;
+        let child = queued_limit(45.0);
+        let child_id = child.insight_id;
+        parent.add_child_insight(child, None, &mut state);
+        parent.order_id = Some("cancelled-pending-ticket".into());
+        parent.state = InsightState::Cancelled;
+        let fill = test_order(
+            "late-position-ticket",
+            &parent,
+            TradeUpdateEvent::Filled,
+            OrderSide::Buy,
+            Some(49.0),
+        );
+        state.insights.add_insight(parent);
+        execution.emit(fill, TradeUpdateEvent::Filled);
+        state.on_trade_update();
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Filled);
+        for _ in 0..3 {
+            state.run_insight_pipeline();
+        }
+        assert!(state.insights.get(&child_id).is_none());
+        assert!(!state.insight_work.is_ready());
+    }
+
+    #[tokio::test]
+    async fn bounded_trade_reducer_keeps_all_events_and_resumes_without_notifications() {
+        let (mut state, execution) = trade_update_state();
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.quantity = Some(1000.0);
+        let id = insight.insight_id;
+        for qty in 1..=1000 {
+            let event = if qty == 1000 {
+                TradeUpdateEvent::Filled
+            } else {
+                TradeUpdateEvent::PartialFilled
+            };
+            let mut order = test_order(
+                "entry",
+                &insight,
+                event.clone(),
+                OrderSide::Buy,
+                Some(100.0),
+            );
+            order.filled_qty = qty as f64;
+            execution.emit(order, event);
+        }
+        state.insights.add_insight(insight);
+        assert_eq!(
+            state.on_trade_update_with_budget(0, std::time::Duration::ZERO),
+            0
+        );
+        assert_eq!(execution.events.lock().unwrap().len(), 1000);
+        assert_eq!(
+            state.on_trade_update_with_budget(256, std::time::Duration::ZERO),
+            1
+        );
+        assert_eq!(state.pending_broker_events.len(), 255);
+        assert_eq!(execution.events.lock().unwrap().len(), 744);
+        assert_eq!(
+            state.insights.get(&id).unwrap().entry_filled_quantity,
+            Some(1.0)
+        );
+        assert_eq!(
+            state.on_trade_update_with_budget(256, std::time::Duration::from_secs(10)),
+            256
+        );
+        assert_eq!(
+            state.insights.get(&id).unwrap().entry_filled_quantity,
+            Some(257.0)
+        );
+        assert!(state.pending_broker_events.len() <= 256);
+        assert!(state.has_pending_broker_events());
+        // Same method the backtest uses before it advances its simulated clock.
+        state.drain_ready_broker_events().await;
+        assert!(!state.has_pending_broker_events());
+        let insight = state.insights.get(&id).unwrap();
+        assert_eq!(insight.state, InsightState::Filled);
+        assert_eq!(insight.entry_filled_quantity, Some(1000.0));
+        assert!(insight.partial_closes.is_empty());
+    }
+
+    #[test]
     fn pipeline_drains_synchronous_cancel_acknowledgement() {
         let (mut state, execution) = trade_update_state();
         state.add_pipe(
@@ -2853,6 +5090,46 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_and_expired_split_insights_leave_executed_state() {
+        for event in [TradeUpdateEvent::Cancelled, TradeUpdateEvent::Expired] {
+            let (mut state, execution) = trade_update_state();
+            let mut insight = Insight::new(
+                OrderSide::Buy,
+                "AAPL".to_string(),
+                StrategyType::Testing,
+                TimeFrame::new(1, TimeFrameUnit::Minute),
+                90,
+                Some(uuid::Uuid::new_v4()),
+            );
+            insight.set_quantity(Some(10.0));
+            insight.is_split_insight = true;
+            insight.order_id = Some("nested-split".into());
+            insight.state = InsightState::Executed;
+            insight.cancelling = true;
+            let id = *insight.insight_id();
+            let order = test_order(
+                "nested-split",
+                &insight,
+                event.clone(),
+                OrderSide::Buy,
+                None,
+            );
+            state.insights.add_insight(insight);
+            execution.emit(order, event);
+            state.on_trade_update();
+            let updated = state.insights.get(&id).unwrap();
+            assert_eq!(updated.state, InsightState::Cancelled);
+            assert!(!updated.cancelling);
+            assert!(
+                updated
+                    .state_history
+                    .iter()
+                    .any(|(_, state, _)| *state == InsightState::Cancelled)
+            );
+        }
+    }
+
+    #[test]
     fn native_oco_skips_manual_take_profit_and_stop_loss_closes() {
         let (mut state, execution) = trade_update_state_with_features(&[BrokerFeature::OcoOrder]);
         let mut insight = Insight::new(
@@ -2880,13 +5157,24 @@ mod tests {
         assert!(!insight.closing);
     }
 
-    #[test]
-    fn manual_take_profit_uses_half_of_remaining_quantity() {
+    #[tokio::test]
+    async fn manual_take_profit_uses_half_of_remaining_quantity() {
         let (mut state, execution) = trade_update_state_with_features(&[
             BrokerFeature::MarketOrder,
             BrokerFeature::PartialClose,
         ]);
         set_protection_test_history(&mut state, 100.0, 111.0);
+        let directory =
+            std::env::temp_dir().join(format!("aqe-partial-tp-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
         let mut insight = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -2904,19 +5192,59 @@ mod tests {
         insight.state = InsightState::Filled;
 
         let result = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
-
+        assert!(result.deferred.is_some());
+        assert_eq!(insight.take_profit_levels(), Some(vec![110.0, 120.0]));
+        let receipt = insight.pending_broker_command().unwrap().clone();
+        state
+            .command_driver
+            .as_mut()
+            .unwrap()
+            .persist_execution_checkpoints(
+                vec![
+                    crate::core::insight::execution_checkpoint::InsightExecutionCheckpoint::capture(
+                        &insight, 1, true, None,
+                    ),
+                ],
+                vec![],
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while matches!(
+                state.broker_command_progress(&receipt),
+                Some(crate::core::strategy::command_driver::BrokerCommandProgress::Queued)
+            ) {
+                state.on_trade_update();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.history.clear(); // Receipt consumption cannot depend on a new bar.
+        let result = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
         assert!(result.success);
         assert!(!result.passed);
         assert_eq!(execution.close_quantities.lock().unwrap().as_slice(), [3.0]);
         assert_eq!(insight.take_profit_levels(), Some(vec![120.0]));
         assert!(insight.closing);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn broker_without_partial_close_closes_remaining_quantity_at_first_target() {
+    #[tokio::test]
+    async fn broker_without_partial_close_closes_remaining_quantity_at_first_target() {
         let (mut state, execution) =
             trade_update_state_with_features(&[BrokerFeature::MarketOrder]);
         set_protection_test_history(&mut state, 100.0, 111.0);
+        let directory = std::env::temp_dir().join(format!("aqe-full-tp-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
         let mut insight = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -2934,11 +5262,39 @@ mod tests {
         insight.state = InsightState::Filled;
 
         let result = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
-
+        assert!(result.deferred.is_some());
+        let receipt = insight.pending_broker_command().unwrap().clone();
+        state
+            .command_driver
+            .as_mut()
+            .unwrap()
+            .persist_execution_checkpoints(
+                vec![
+                    crate::core::insight::execution_checkpoint::InsightExecutionCheckpoint::capture(
+                        &insight, 1, true, None,
+                    ),
+                ],
+                vec![],
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while matches!(
+                state.broker_command_progress(&receipt),
+                Some(crate::core::strategy::command_driver::BrokerCommandProgress::Queued)
+            ) {
+                state.on_trade_update();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = BasicTakeProfitPipe::new().run(&mut state, &mut insight);
         assert!(result.success);
         assert!(!result.passed);
         assert_eq!(execution.close_quantities.lock().unwrap().as_slice(), [6.0]);
         assert!(insight.closing);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3112,9 +5468,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_child_fill_after_parent_closed_is_queued_to_close() {
+    #[tokio::test]
+    async fn test_child_fill_after_parent_closed_is_queued_to_close() {
         let (mut state, execution) = trade_update_state();
+        let directory =
+            std::env::temp_dir().join(format!("aqe-late-child-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
         let mut parent = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -3135,6 +5502,8 @@ mod tests {
             Some(parent_id),
         );
         child.set_quantity(Some(1.0));
+        // The entry's explicit client insight identity links the broker's
+        // pending ticket to a different position ticket on fill.
         child.order_id = Some("client-child".to_string());
         child.state = InsightState::Executed;
         let child_id = *child.insight_id();
@@ -3152,6 +5521,15 @@ mod tests {
 
         state.on_trade_update();
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while execution.close_requests.lock().unwrap().is_empty() {
+                state.on_trade_update();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
         let child = state.insights.get(&child_id).unwrap();
         assert_eq!(child.state, InsightState::Filled);
         assert!(child.closing, "filled child should be queued to close");
@@ -3160,6 +5538,8 @@ mod tests {
             execution.close_requests.lock().unwrap().as_slice(),
             ["mt5-child-position"]
         );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3408,10 +5788,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_children_submit_with_parent_while_ordinary_children_wait_for_fill() {
+    #[tokio::test]
+    async fn split_children_submit_with_parent_while_ordinary_children_wait_for_fill() {
         let (mut state, execution) = trade_update_state();
         state.status = crate::core::strategy::StrategyStatus::Running;
+        let directory =
+            std::env::temp_dir().join(format!("aqe-split-child-fill-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
         let mut parent = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -3458,8 +5849,22 @@ mod tests {
         ordinary_child.add_child_insight(nested_split_child, Some(true), &mut state);
         parent.add_child_insight(ordinary_child, None, &mut state);
 
-        parent.submit(&mut state);
+        assert!(matches!(
+            parent.submit(&mut state).unwrap(),
+            crate::core::insight::InsightMutationState::Pending(_)
+        ));
         state.add_insight(parent);
+        assert_eq!(
+            state.insights.get(&parent_id).unwrap().state,
+            InsightState::New
+        );
+        drive_insight_work(&mut state, |state| {
+            state
+                .insights
+                .get(&split_child_id)
+                .is_some_and(|row| row.state == InsightState::Executed)
+        })
+        .await;
 
         let parent = state.insights.get(&parent_id).unwrap();
         assert_eq!(parent.state, InsightState::Executed);
@@ -3482,6 +5887,13 @@ mod tests {
             TradeUpdateEvent::Filled,
         );
         state.on_trade_update();
+        drive_insight_work(&mut state, |state| {
+            state
+                .insights
+                .get(&nested_split_child_id)
+                .is_some_and(|row| row.state == InsightState::Executed)
+        })
+        .await;
 
         let ordinary_child = state.insights.get(&ordinary_child_id).unwrap();
         assert!(!ordinary_child.is_split_insight());
@@ -3490,13 +5902,15 @@ mod tests {
         assert_eq!(nested_split_child.parent_id(), Some(&ordinary_child_id));
         assert!(nested_split_child.is_split_insight());
         assert_eq!(nested_split_child.state, InsightState::Executed);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Test 5: Verify trade event: bracket order → SL triggers → insight becomes CLOSED.
     ///
     /// Strategy generates a BUY insight with quantity, SL (very tight), and TP (very wide).
     /// The tight SL should trigger during the backtest, causing FILLED → CLOSED.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_trade_event_bracket_close() {
         /// Strategy that generates a bracket order with a very tight stop-loss.
         struct BracketTestStrategy {
@@ -3608,7 +6022,7 @@ mod tests {
     ///
     /// Strategy generates a LIMIT BUY insight with a very low limit price (won't fill),
     /// then cancels it on the next bar.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_trade_event_cancel() {
         use std::sync::{Arc, Mutex};
 
@@ -3653,11 +6067,12 @@ mod tests {
                 } else if !self.cancelled {
                     // Cancel the insight on the next bar
                     let id = self.insight_id.lock().unwrap().unwrap();
-                    let insights = ctx.insights();
-                    if let Some(insight) = insights.get_insight(&id) {
-                        if let Some(order_id) = &insight.order_id {
-                            let _ = ctx.cancel_order(order_id);
-                        }
+                    let order_id = ctx
+                        .insights()
+                        .get_insight(&id)
+                        .and_then(|insight| insight.order_id.clone());
+                    if let Some(order_id) = order_id {
+                        let _ = ctx.cancel_order(&order_id);
                     }
                     self.cancelled = true;
                 }
@@ -3712,7 +6127,7 @@ mod tests {
     ///
     /// Strategy generates a parent BUY insight. Once the parent fills,
     /// a Child SELL insight should automatically be submitted.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_child_insight_lifecycle() {
         use std::sync::{Arc, Mutex};
 
@@ -4021,9 +6436,14 @@ mod tests {
             backtest_state.current_time = current_bar.timestamp;
         }
 
-        let submitted_order =
-            futures::executor::block_on(state.broker.submit_order(insight.clone()))
-                .expect("scale-out test order should submit");
+        let submitted_order = state
+            .broker
+            .submit_order((&insight).into())
+            .await
+            .expect("scale-out test order should submit");
+        // Production strategies load their universe before running pipes. The
+        // scale-out quantity must use this asset's lot/precision constraints.
+        state.universe.insert("AAPL".into(), submitted_order.asset.clone());
         let mut bars = std::collections::HashMap::new();
         bars.insert("AAPL".to_string(), current_bar.clone());
         state
@@ -4036,7 +6456,46 @@ mod tests {
         insight.filled_price = Some(current_bar.open);
         state.bind_insight_context(&mut insight);
 
+        let directory =
+            std::env::temp_dir().join(format!("aqe-scale-out-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
         let mut pipe = ScaleOutPipe::new(0.5);
+        let result = pipe.run(&mut state, &mut insight);
+        assert!(result.deferred.is_some());
+        assert_eq!(insight.take_profit_levels(), Some(vec![110.0, 120.0]));
+        let receipt = insight.pending_broker_command().unwrap().clone();
+        state
+            .command_driver
+            .as_mut()
+            .unwrap()
+            .persist_execution_checkpoints(
+                vec![
+                    crate::core::insight::execution_checkpoint::InsightExecutionCheckpoint::capture(
+                        &insight, 1, true, None,
+                    ),
+                ],
+                vec![],
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while matches!(
+                state.broker_command_progress(&receipt),
+                Some(crate::core::strategy::command_driver::BrokerCommandProgress::Queued)
+            ) {
+                state.on_trade_update();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let result = pipe.run(&mut state, &mut insight);
 
         assert!(result.success);
@@ -4049,6 +6508,8 @@ mod tests {
         );
 
         println!("  ✓ Scale out pipe partial-close test passed!");
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     async fn run_scale_out_backtest_take_profit_with_paper_broker_and_yahoo() {
@@ -4087,7 +6548,7 @@ mod tests {
         println!("  ✓ Scale out backtest SL integration test passed!");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_scale_out_backtest_with_paper_broker_and_yahoo() {
         println!("[scale-out-test] combined test start");
         run_scale_out_backtest_take_profit_with_paper_broker_and_yahoo().await;
@@ -4097,6 +6558,289 @@ mod tests {
     }
 
     struct PipelineHarnessStrategy;
+
+    struct DeferredHarnessPipe {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl InsightPipe for DeferredHarnessPipe {
+        fn version(&self) -> &str {
+            "1.0"
+        }
+        fn run(
+            &mut self,
+            _ctx: &mut dyn StrategyContext,
+            _insight: &mut Insight,
+        ) -> InsightPipeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                InsightPipeResult::deferred(
+                    crate::core::pipeline::InsightPipeDeferral::AccountSnapshot,
+                    self.name(),
+                )
+            } else {
+                InsightPipeResult::new(true, true, None, self.name().into())
+            }
+        }
+    }
+
+    fn deferred_harness_pipe(
+        state: InsightState,
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        ready: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> WrappedInsightPipe {
+        WrappedInsightPipe::builder(Box::new(DeferredHarnessPipe {
+            calls: calls.clone(),
+            ready: ready.clone(),
+        }))
+        .target_state(state)
+        .build()
+    }
+
+    #[test]
+    fn deferred_pipeline_resumes_without_replaying_previous_stages_or_clearing_first_fill() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut state = pipeline_harness_state();
+        let before = Arc::new(AtomicUsize::new(0));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let always_ready = Arc::new(AtomicBool::new(true));
+        state.add_pipe(deferred_harness_pipe(
+            InsightState::Filled,
+            &before,
+            &always_ready,
+        ));
+        state.add_pipe(deferred_harness_pipe(
+            InsightState::Filled,
+            &waiting,
+            &ready,
+        ));
+        state.add_pipe(deferred_harness_pipe(
+            InsightState::Filled,
+            &after,
+            &always_ready,
+        ));
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        insight.state = InsightState::Filled;
+        insight.set_first_on_fill(true);
+        let id = insight.insight_id;
+        state.add_insight(insight);
+        state.run_insight_pipeline();
+        state.run_insight_pipeline();
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(waiting.load(Ordering::SeqCst), 2);
+        assert_eq!(after.load(Ordering::SeqCst), 0);
+        assert!(state.insights.get(&id).unwrap().first_on_fill());
+        assert!(state.insight_pipeline.pending_deferral(&id).is_some());
+        ready.store(true, Ordering::SeqCst);
+        state.run_insight_pipeline();
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(waiting.load(Ordering::SeqCst), 3);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        assert!(!state.insights.get(&id).unwrap().first_on_fill());
+        assert!(state.insight_pipeline.pending_deferral(&id).is_none());
+    }
+
+    #[test]
+    fn deferred_new_insight_is_not_rejected_and_terminal_cursor_is_released() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let mut state = pipeline_harness_state();
+        state.add_pipe(deferred_harness_pipe(
+            InsightState::New,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicBool::new(false)),
+        ));
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        let id = insight.insight_id;
+        state.add_insight(insight);
+        state.run_insight_pipeline();
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::New);
+        assert!(state.insight_pipeline.pending_deferral(&id).is_some());
+        state
+            .insights
+            .get_mut(&id)
+            .unwrap()
+            .order_cancelled("fixture cancelled");
+        state.run_insight_pipeline();
+        assert!(state.insight_pipeline.pending_deferral(&id).is_none());
+    }
+
+    #[test]
+    fn deferred_targeted_terminal_cleanup_releases_nested_owner_without_touching_other_rows() {
+        use crate::core::pipeline::{and_pipe::AndPipe, or_pipe::OrPipe};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let mut state = pipeline_harness_state();
+        let waiting = deferred_harness_pipe(
+            InsightState::New,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let nested = WrappedInsightPipe::builder(Box::new(OrPipe::new(vec![waiting]))).build();
+        state.add_pipe(WrappedInsightPipe::builder(Box::new(AndPipe::new(vec![nested]))).build());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut insight = Insight::default();
+            insight.symbol = "AAPL".into();
+            ids.push(insight.insight_id);
+            state.add_insight(insight);
+        }
+        state.run_insight_pipeline();
+        let other = state
+            .insight_pipeline
+            .execution_checkpoint(&ids[1])
+            .unwrap();
+        assert!(other.nested.as_ref().unwrap().nested.is_some());
+        state.insights.enable_execution_persistence();
+        state.insights.execution_saved(&ids[0]);
+        state
+            .insights
+            .get_mut(&ids[0])
+            .unwrap()
+            .order_cancelled("fixture");
+        state.run_insight_pipeline_selected(Some(vec![ids[0]]));
+        assert!(state.insight_pipeline.pending_deferral(&ids[0]).is_none());
+        let pipe = state
+            .insight_pipeline
+            .pipeline
+            .get(&InsightState::New)
+            .unwrap()
+            .front()
+            .unwrap();
+        assert!(pipe.inner.execution_checkpoint(&ids[0]).is_none());
+        assert_eq!(
+            state.insight_pipeline.execution_checkpoint(&ids[1]),
+            Some(other)
+        );
+        assert!(state.insights.execution_dirty_ids(32).contains(&ids[0]));
+    }
+
+    #[test]
+    fn deferred_nested_composites_do_not_replay_siblings_or_try_another_alternative() {
+        use crate::core::pipeline::{and_pipe::AndPipe, or_pipe::OrPipe};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut state = pipeline_harness_state();
+        let before = Arc::new(AtomicUsize::new(0));
+        let wait = Arc::new(AtomicUsize::new(0));
+        let alternative = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let yes = Arc::new(AtomicBool::new(true));
+        let either = OrPipe::new(vec![
+            deferred_harness_pipe(InsightState::New, &wait, &ready),
+            deferred_harness_pipe(InsightState::New, &alternative, &yes),
+        ]);
+        let all = AndPipe::new(vec![
+            deferred_harness_pipe(InsightState::New, &before, &yes),
+            WrappedInsightPipe::builder(Box::new(either)).build(),
+            deferred_harness_pipe(InsightState::New, &after, &yes),
+        ]);
+        state.add_pipe(WrappedInsightPipe::builder(Box::new(all)).build());
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        state.add_insight(insight);
+        state.run_insight_pipeline();
+        state.run_insight_pipeline();
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(wait.load(Ordering::SeqCst), 2);
+        assert_eq!(alternative.load(Ordering::SeqCst), 0);
+        assert_eq!(after.load(Ordering::SeqCst), 0);
+        ready.store(true, Ordering::SeqCst);
+        state.run_insight_pipeline();
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        assert_eq!(alternative.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn execution_checkpoint_restores_nested_pipe_cursor_without_replaying_completed_siblings() {
+        use crate::core::pipeline::{and_pipe::AndPipe, or_pipe::OrPipe};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let before = Arc::new(AtomicUsize::new(0));
+        let wait = Arc::new(AtomicUsize::new(0));
+        let alternative = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let yes = Arc::new(AtomicBool::new(true));
+        let build = || {
+            let mut state = pipeline_harness_state();
+            let either = OrPipe::new(vec![
+                deferred_harness_pipe(InsightState::New, &wait, &ready),
+                deferred_harness_pipe(InsightState::New, &alternative, &yes),
+            ]);
+            let all = AndPipe::new(vec![
+                deferred_harness_pipe(InsightState::New, &before, &yes),
+                WrappedInsightPipe::builder(Box::new(either)).build(),
+                deferred_harness_pipe(InsightState::New, &after, &yes),
+            ]);
+            state.add_pipe(WrappedInsightPipe::builder(Box::new(all)).build());
+            state
+        };
+        let mut original = build();
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        let id = insight.insight_id;
+        original.add_insight(insight);
+        original.run_insight_pipeline();
+        let row = crate::core::insight::execution_checkpoint::InsightExecutionCheckpoint::capture(
+            original.insights.get(&id).unwrap(),
+            1,
+            true,
+            original.insight_pipeline.execution_checkpoint(&id),
+        );
+        let encoded = serde_json::to_vec(&row).unwrap();
+        drop(original);
+        let saved: crate::core::insight::execution_checkpoint::InsightExecutionCheckpoint =
+            serde_json::from_slice(&encoded).unwrap();
+        let (insight, _, pipeline, _) = saved.into_parts();
+        let mut restarted = build();
+        restarted.add_insight(insight);
+        restarted
+            .insight_pipeline
+            .restore_execution_checkpoint(id, pipeline.unwrap())
+            .unwrap();
+        ready.store(true, Ordering::SeqCst);
+        restarted.run_insight_pipeline();
+        assert_eq!(
+            before.load(Ordering::SeqCst),
+            1,
+            "pre-dependency stage replayed after restart"
+        );
+        assert_eq!(wait.load(Ordering::SeqCst), 2);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        assert_eq!(alternative.load(Ordering::SeqCst), 0);
+        assert!(restarted.insight_pipeline.pending_deferral(&id).is_none());
+    }
+
+    #[test]
+    fn execution_checkpoint_refuses_changed_pipeline_layout() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let mut state = pipeline_harness_state();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        state.add_pipe(deferred_harness_pipe(InsightState::New, &calls, &ready));
+        let mut insight = Insight::default();
+        insight.symbol = "AAPL".into();
+        let id = insight.insight_id;
+        state.add_insight(insight);
+        state.run_insight_pipeline();
+        let checkpoint = state.insight_pipeline.execution_checkpoint(&id).unwrap();
+        state
+            .insight_pipeline
+            .pipeline
+            .get_mut(&InsightState::New)
+            .unwrap()[0]
+            .insight_scope = crate::core::pipeline::InsightPipeScope::Both;
+        assert!(
+            state
+                .insight_pipeline
+                .restore_execution_checkpoint(id, checkpoint)
+                .is_err()
+        );
+    }
 
     impl Strategy for PipelineHarnessStrategy {
         fn name(&self) -> &str {
@@ -5069,7 +7813,6 @@ mod tests {
         final_take_profit: Option<f64>,
         final_stop_loss: Option<f64>,
         persisted_update_cycles: usize,
-        cleanup_acknowledged: bool,
         failure: Option<String>,
     }
 
@@ -5105,7 +7848,7 @@ mod tests {
         stop_losses: [f64; 3],
         price_step: f64,
         shared: &Arc<Mutex<Mt5ProtectionShared>>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let insight_id = *insight.insight_id();
         let order_id = insight
             .order_id
@@ -5120,7 +7863,8 @@ mod tests {
             .and_then(|levels| levels.first().copied())
             .ok_or_else(|| "submitted insight has no initial stop loss".to_string())?;
 
-        for index in 0..3 {
+        let first_cycle = shared.lock().unwrap().persisted_update_cycles;
+        for index in first_cycle..3 {
             // Read the last values back from the managed insight before issuing the next RPC.
             verify_mt5_test_level(
                 "pre-update local take profit",
@@ -5136,18 +7880,15 @@ mod tests {
             )?;
 
             let take_profit = take_profits[index];
-            if !insight.update_take_profit(ctx, Some(vec![take_profit])) {
-                let detail = insight
-                    .state_history
-                    .last()
-                    .and_then(|(_, _, message)| message.as_deref())
-                    .unwrap_or("no insight error detail");
-                return Err(format!(
-                    "take-profit update {} was not acknowledged for order {}: {}",
-                    index + 1,
-                    order_id,
-                    detail
-                ));
+            match insight
+                .update_take_profit(ctx, Some(vec![take_profit]))
+                .map_err(|error| error.to_string())?
+            {
+                crate::core::insight::InsightMutationState::Pending(_) => {
+                    ctx.add_insight(insight);
+                    return Ok(false);
+                }
+                crate::core::insight::InsightMutationState::Applied => {}
             }
             verify_mt5_test_level(
                 "updated insight take profit",
@@ -5157,18 +7898,15 @@ mod tests {
             )?;
 
             let stop_loss = stop_losses[index];
-            if !insight.update_stop_loss(ctx, Some(vec![stop_loss])) {
-                let detail = insight
-                    .state_history
-                    .last()
-                    .and_then(|(_, _, message)| message.as_deref())
-                    .unwrap_or("no insight error detail");
-                return Err(format!(
-                    "stop-loss update {} was not acknowledged for order {}: {}",
-                    index + 1,
-                    order_id,
-                    detail
-                ));
+            match insight
+                .update_stop_loss(ctx, Some(vec![stop_loss]))
+                .map_err(|error| error.to_string())?
+            {
+                crate::core::insight::InsightMutationState::Pending(_) => {
+                    ctx.add_insight(insight);
+                    return Ok(false);
+                }
+                crate::core::insight::InsightMutationState::Applied => {}
             }
             verify_mt5_test_level(
                 "updated insight stop loss",
@@ -5214,7 +7952,7 @@ mod tests {
             );
         }
 
-        Ok(())
+        Ok(true)
     }
 
     struct Mt5ProtectionUpdateStrategy {
@@ -5240,7 +7978,7 @@ mod tests {
             ctx: &mut dyn StrategyContext,
             insight: Insight,
             reference_price: f64,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             let entry_price = insight
                 .filled_price
                 .or(insight.limit_price())
@@ -5405,9 +8143,13 @@ mod tests {
                 return;
             }
 
-            if let Err(error) = self.update_ready_insight(ctx, insight, reference_price) {
-                self.fail(ctx, error);
-                return;
+            match self.update_ready_insight(ctx, insight, reference_price) {
+                Err(error) => {
+                    self.fail(ctx, error);
+                    return;
+                }
+                Ok(false) => return,
+                Ok(true) => {}
             }
             self.completed = true;
             ctx.shutdown();
@@ -5447,18 +8189,11 @@ mod tests {
                 Mt5ProtectionEntryKind::PendingLimit => ctx.cancel_order(&order_id),
             };
             match cleanup_result {
-                Ok(true) => {
-                    self.shared.lock().unwrap().cleanup_acknowledged = true;
+                Ok(_receipt) => {
                     println!(
-                        "[MT5 Protection] {:?} cleanup acknowledged for order {}",
+                        "[MT5 Protection] {:?} cleanup queued for order {}; awaiting broker evidence",
                         self.entry_kind, order_id
                     );
-                }
-                Ok(false) => {
-                    self.shared.lock().unwrap().failure = Some(format!(
-                        "{:?} cleanup returned false for order {}",
-                        self.entry_kind, order_id
-                    ));
                 }
                 Err(error) => {
                     self.shared.lock().unwrap().failure = Some(format!(
@@ -5563,10 +8298,6 @@ mod tests {
             shared.persisted_update_cycles, 3,
             "the local insight did not persist all three TP/SL update cycles"
         );
-        assert!(
-            shared.cleanup_acknowledged,
-            "MT5 did not acknowledge the strategy teardown cleanup"
-        );
         let insight_id = shared
             .insight_id
             .expect("MT5 protection strategy did not record an insight id");
@@ -5582,6 +8313,10 @@ mod tests {
             .insights
             .get(&insight_id)
             .expect("MT5 protection insight should remain in local strategy state");
+        assert!(
+            persisted.state.is_inactive(),
+            "queued teardown is not broker-confirmed cleanup"
+        );
         verify_mt5_test_level(
             "final local take profit",
             persisted.take_profit_levels(),

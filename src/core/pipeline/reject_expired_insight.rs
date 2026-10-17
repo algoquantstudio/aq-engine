@@ -9,7 +9,7 @@ use super::InsightPipe;
 /// Author: @isaac-diaby
 ///
 /// Behaviour:
-/// Calls `insight.has_expired(ctx)` using the strategy clock/context. A new insight is rejected
+/// Calls `insight.expire_if_due(ctx)` using the strategy clock/context. A new insight is rejected
 /// immediately; an executed order is cancelled and a filled position is closed through the
 /// configured broker, with the terminal state applied by the broker event. Non-expired insights
 /// pass through unchanged.
@@ -31,13 +31,8 @@ impl InsightPipe for RejectExpiredInsightPipe {
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
-        if insight.has_expired(ctx) {
-            return InsightPipeResult::new(
-                false,
-                true,
-                Some("Insight has expired".to_string()),
-                self.name().to_string(),
-            );
+        if let Some(result) = insight.expire_if_due(ctx) {
+            return InsightPipeResult::from_exit_mutation(result, self.name());
         }
 
         InsightPipeResult::new(true, true, None, self.name().to_string())

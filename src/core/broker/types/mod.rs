@@ -1,5 +1,14 @@
 use chrono::{DateTime, Utc};
 use std::fmt;
+use uuid::Uuid;
+
+mod mt5_bridge;
+pub(crate) use mt5_bridge::{MT5_PROTOCOL_VERSION, Mt5BridgeV2Inbound};
+pub use mt5_bridge::{
+    Mt5BridgeEnvelope, Mt5BridgeResponse, Mt5HeartbeatPayload, Mt5MarketDataPayload, Mt5RpcAction,
+    Mt5RpcPollPayload, Mt5RpcPollResponse, Mt5RpcRequest, Mt5RpcResponsePayload,
+    Mt5SnapshotPayload, Mt5StreamBar, Mt5TradeEventPayload, Mt5TradeEventsPayload,
+};
 
 // ─────────────────────── Broker Feature Flags ───────────────────────
 
@@ -39,6 +48,9 @@ pub struct Account {
     pub accrued_commission: f64,
     pub shorting_enabled: bool,
     pub leverage: u8,
+    /// Broker's pending-order ceiling. `None` means no reported limit.
+    #[serde(default)]
+    pub max_total_orders: Option<u32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -64,11 +76,25 @@ pub struct Asset {
     pub min_order_size: Option<f64>,
     pub quantity_base: Option<i64>,
     pub max_order_size: Option<f64>,
+    /// Aggregate symbol volume ceiling (not the per-order maximum), in AQE quantity units.
+    /// MT5 reports this per direction; strategy sizing conservatively combines both sides.
+    #[serde(default)]
+    pub max_total_size: Option<f64>,
     pub min_price_increment: Option<f64>,
     pub price_base: Option<i64>,
     pub contract_size: Option<i64>,
+    /// Producer-recorded trading calendar JSON; absent for unknown schedules.
+    /// Generic instrument metadata, independent of AQS and strategy graphs.
+    #[serde(default)]
+    pub trading_calendar: Option<String>,
     #[serde(default)]
     pub fees: AssetFees,
+}
+
+impl AsRef<str> for Asset {
+    fn as_ref(&self) -> &str {
+        &self.symbol
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -355,6 +381,56 @@ pub struct OrderLifecycleSnapshot {
     pub symbol: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
+    /// Broker-confirmed final execution values; absent on legacy/unsupported adapters.
+    #[serde(default)]
+    pub close_details: Option<OrderLifecycleCloseDetails>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderLifecycleCloseDetails {
+    pub close_price: f64,
+    pub closed_at: DateTime<Utc>,
+    pub realized_pnl: f64,
+    pub commission: f64,
+    pub swap: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_accounting: Option<aqe_live_protocol::PositionCloseAccounting>,
+}
+
+impl OrderLifecycleCloseDetails {
+    /// Optional analytics evidence must agree with its enclosing broker history.
+    /// Invalid/foreign metadata cannot replace otherwise valid execution values.
+    pub(crate) fn validated_position_accounting(
+        &self,
+        order_id: &str,
+    ) -> Option<aqe_live_protocol::PositionCloseAccounting> {
+        self.position_accounting.as_ref().filter(|value| {
+            value.validate().is_ok()
+                && value.owns_order(order_id)
+                && value.closed_at_us == self.closed_at.timestamp_micros()
+                && value.net_pnl == self.realized_pnl
+                && value.commission == self.commission
+                && value.swap == self.swap
+        }).cloned()
+    }
+}
+
+/// Latest broker state already resident in the adapter. Reading this snapshot must never
+/// perform network or broker I/O, which makes it safe to use from the live strategy loop.
+/// `snapshot_complete` is deliberately explicit: an empty snapshot is authoritative only when
+/// the broker confirms that all active orders and positions have been enumerated.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerLifecycleSnapshot {
+    #[serde(default)]
+    pub orders: Vec<Order>,
+    #[serde(default)]
+    pub positions: Vec<Position>,
+    #[serde(default)]
+    pub terminal_history: Vec<OrderLifecycleSnapshot>,
+    pub snapshot_complete: bool,
+    pub captured_at: DateTime<Utc>,
 }
 
 // ─────────────────────── Order ───────────────────────
@@ -381,6 +457,8 @@ pub struct Order {
     pub strategy_type: Option<String>,
     pub asset: Asset,
     pub qty: f64,
+    /// Cumulative executed quantity for an entry order snapshot. For an exit
+    /// trade event, the quantity executed by that exit (never the entry total).
     pub filled_qty: f64,
     pub limit_price: Option<f64>,
     pub filled_price: Option<f64>,
@@ -396,6 +474,8 @@ pub struct Order {
     pub filled_at: Option<u64>,
     #[serde(default)]
     pub realized_pnl: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_accounting: Option<aqe_live_protocol::PositionCloseAccounting>,
     #[serde(default)]
     pub commission: Option<f64>,
     #[serde(default)]
@@ -492,6 +572,76 @@ pub enum TradeUpdateEvent {
     Replaced,
 }
 
+/// Clock domain used by a broker event's source timestamp.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerClockDomain {
+    BrokerServer,
+    AdapterHost,
+    RuntimeHost,
+    Unknown,
+}
+
+/// Broker-neutral timing and optional exact execution evidence captured before
+/// an event enters AQE. Legacy/cumulative order snapshots carry no fill fact.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerEventMetadata {
+    /// Corrections must never enter the order/Insight lifecycle reducer.
+    #[serde(default)]
+    pub analytics_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_fill: Option<Box<aqe_live_protocol::ExecutionFill>>,
+    #[serde(default)]
+    pub source_occurred_at_us: Option<i64>,
+    #[serde(default)]
+    pub adapter_queued_at_us: Option<i64>,
+    #[serde(default)]
+    pub source_clock: BrokerClockDomain,
+}
+
+impl Default for BrokerClockDomain {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Idempotent broker event envelope used by native streaming brokers.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerEventEnvelope<T> {
+    pub event_id: Uuid,
+    #[serde(default)]
+    pub source_sequence: Option<u64>,
+    pub event: T,
+    #[serde(default)]
+    pub metadata: BrokerEventMetadata,
+}
+
+impl<T> BrokerEventEnvelope<T> {
+    pub fn new(event: T) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            source_sequence: None,
+            event,
+            metadata: BrokerEventMetadata::default(),
+        }
+    }
+
+    pub fn with_source_sequence(mut self, sequence: u64) -> Self {
+        self.source_sequence = Some(sequence);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: BrokerEventMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Native order lifecycle event shape shared by every broker implementation.
+pub type BrokerOrderEvent = BrokerEventEnvelope<(Order, TradeUpdateEvent)>;
+
 // ─────────────────────── Trade Records (for logging) ───────────────────────
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -510,6 +660,15 @@ pub struct TradeRecord {
     pub commission: f64,
     #[serde(default)]
     pub swap: f64,
+    /// Cash posted by this execution only, not the position's lifetime result.
+    /// Absent in older artifacts; consumers must not manufacture it from P&L.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cash: Option<aqe_live_protocol::ExecutionFillCash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_notional: Option<f64>,
+    /// Declared execution valuation, e.g. the paper broker's limited price-unit model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valuation_basis: Option<String>,
     pub trade_type: TradeRecordType,
 }
 
@@ -523,6 +682,16 @@ pub enum TradeRecordType {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum BrokerError {
+    /// A recoverable read dependency, never evidence that an insight is invalid.
+    SnapshotUnavailable {
+        kind: super::snapshots::SnapshotKind,
+        reason: super::snapshots::SnapshotUnavailable,
+    },
+    /// Definitively unsupported before any transport mutation is attempted.
+    UnsupportedOperation(String),
+    /// The adapter proved that submission was refused before the broker mutation
+    /// call. Unlike transport errors this is terminal evidence, not ambiguity.
+    SubmissionRejected(String),
     ConnectionError(String),
     DisconnectionError(String),
     OrderError(String),
@@ -540,6 +709,11 @@ pub enum BrokerError {
 impl fmt::Display for BrokerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BrokerError::SnapshotUnavailable { kind, reason } => write!(f, "{kind:?}: {reason}"),
+            BrokerError::UnsupportedOperation(msg) => {
+                write!(f, "Unsupported broker operation: {}", msg)
+            }
+            BrokerError::SubmissionRejected(msg) => write!(f, "Submission rejected: {}", msg),
             BrokerError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
             BrokerError::DisconnectionError(msg) => write!(f, "Disconnection error: {}", msg),
             BrokerError::OrderError(msg) => write!(f, "Order error: {}", msg),
@@ -623,6 +797,40 @@ pub struct Quote {
     pub timestamp: DateTime<Utc>,
 }
 
+impl Quote {
+    pub(crate) fn valid_market_values(&self) -> bool {
+        self.bid.is_finite()
+            && self.ask.is_finite()
+            && self.bid > 0.0
+            && self.ask >= self.bid
+            && self.bid_size.is_finite()
+            && self.ask_size.is_finite()
+            && self.bid_size >= 0.0
+            && self.ask_size >= 0.0
+            && self
+                .last
+                .is_none_or(|value| value.is_finite() && value > 0.0)
+            && self
+                .last_size
+                .is_none_or(|value| value.is_finite() && value >= 0.0)
+    }
+
+    /// Zero-spread approximation for bar-only feeds/replay. No invented order-book sizes
+    /// or last-trade size: cumulative candle volume is not the size of a trade.
+    pub fn from_bar_close(bar: &Bar) -> Self {
+        Self {
+            symbol: bar.symbol.clone(),
+            bid: bar.close,
+            ask: bar.close,
+            bid_size: 0.0,
+            ask_size: 0.0,
+            last: Some(bar.close),
+            last_size: None,
+            timestamp: bar.timestamp,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,9 +851,11 @@ mod tests {
             min_order_size: None,
             quantity_base: None,
             max_order_size: None,
+            max_total_size: None,
             min_price_increment: Some(0.01),
             price_base: None,
             contract_size: Some(10),
+            trading_calendar: None,
             fees: AssetFees::default(),
         }
     }

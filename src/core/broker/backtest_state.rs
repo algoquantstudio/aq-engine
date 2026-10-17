@@ -1723,6 +1723,7 @@ mod tests {
     fn test_account(equity: f64) -> Account {
         Account {
             account_id: "test".to_string(),
+            max_total_orders: None,
             account_type: AccountType::Paper,
             equity,
             cash: equity,
@@ -1914,6 +1915,9 @@ mod tests {
                 strategy_type: Some("RuntimeRegression".to_string()),
                 commission: 0.0,
                 swap: 0.0,
+                execution_cash: None,
+                account_notional: None,
+                valuation_basis: None,
                 trade_type: TradeRecordType::Entry,
             },
             TradeRecord {
@@ -1927,6 +1931,9 @@ mod tests {
                 strategy_type: Some("RuntimeRegression".to_string()),
                 commission: 0.0,
                 swap: 0.0,
+                execution_cash: None,
+                account_notional: None,
+                valuation_basis: None,
                 trade_type: TradeRecordType::Exit,
             },
         ];

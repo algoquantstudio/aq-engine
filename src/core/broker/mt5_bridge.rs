@@ -1,6 +1,12 @@
 use super::types::{
-    Account, Asset, AssetExchange, AssetStatus, AssetType, Bar, BrokerError, Order, Position,
-    Quote, TradeUpdateEvent,
+    Account, Asset, AssetExchange, AssetStatus, AssetType, Bar, BrokerClockDomain, BrokerError,
+    BrokerEventMetadata, BrokerOrderEvent, MT5_PROTOCOL_VERSION, Mt5BridgeV2Inbound, Order,
+    Position, Quote, TradeUpdateEvent,
+};
+pub use super::types::{
+    Mt5BridgeEnvelope, Mt5BridgeResponse, Mt5HeartbeatPayload, Mt5MarketDataPayload, Mt5RpcAction,
+    Mt5RpcPollPayload, Mt5RpcPollResponse, Mt5RpcRequest, Mt5RpcResponsePayload,
+    Mt5SnapshotPayload, Mt5StreamBar, Mt5TradeEventPayload, Mt5TradeEventsPayload,
 };
 use actix_web::http::{StatusCode, header::HeaderMap};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
@@ -19,10 +25,14 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[path = "mt5_recovery_task.rs"]
+mod recovery_task;
+use recovery_task::RecoveryTask;
+
 use crate::core::broker::DataStreamMode;
 use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = MT5_PROTOCOL_VERSION;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:18080";
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_HISTORY_TIMEOUT_MS: u64 = 30_000;
@@ -55,16 +65,17 @@ pub struct Mt5BridgeConfig {
 
 impl Mt5BridgeConfig {
     pub fn from_env() -> Result<Self, BrokerError> {
-        let bind_addr = std::env::var("AQE_MT5_BRIDGE_BIND_ADDR")
-            .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
+        let bind_addr = crate::launch_config::setting("AQE_MT5_BRIDGE_BIND_ADDR")
+            .map_err(BrokerError::ConnectionError)?
+            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
             .parse::<SocketAddr>()
             .map_err(|error| {
                 BrokerError::ConnectionError(format!("invalid AQE_MT5_BRIDGE_BIND_ADDR: {}", error))
             })?;
 
-        let token = std::env::var("AQE_MT5_BRIDGE_TOKEN").map_err(|_| {
-            BrokerError::ConnectionError("AQE_MT5_BRIDGE_TOKEN is required".to_string())
-        })?;
+        let token = crate::launch_config::setting("AQE_MT5_BRIDGE_TOKEN")
+            .map_err(BrokerError::ConnectionError)?
+            .ok_or_else(|| BrokerError::ConnectionError("MT5 bridge token is required (launch config or AQE_MT5_BRIDGE_TOKEN)".to_string()))?;
 
         let request_timeout = Duration::from_millis(read_env_u64(
             "AQE_MT5_REQUEST_TIMEOUT_MS",
@@ -137,7 +148,10 @@ pub struct Mt5Bridge {
     event_queue: Arc<Mutex<VecDeque<QueuedTradeEvent>>>,
     local_trade_event_seq: Arc<AtomicU64>,
     trade_subscribers: Arc<Mutex<Vec<Arc<dyn Fn((Order, TradeUpdateEvent)) + Send + Sync>>>>,
+    broker_event_subscribers: Arc<Mutex<Vec<Arc<dyn Fn(BrokerOrderEvent) + Send + Sync>>>>,
     bar_subscribers: Arc<Mutex<Vec<Mt5BarSubscription>>>,
+    quote_subscribers: Arc<Mutex<HashMap<String, Mt5QuoteSubscription>>>,
+    subscription_sync_lock: Arc<AsyncMutex<()>>,
     trade_ingress_tx: Arc<Mutex<Option<mpsc::Sender<TradeIngress>>>>,
     market_data_ingress_tx: Arc<Mutex<Option<mpsc::Sender<MarketDataIngress>>>>,
     trade_ingress_depth: Arc<AtomicU64>,
@@ -145,10 +159,11 @@ pub struct Mt5Bridge {
     trade_ingress_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     market_data_ingress_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     recovery_lock: Arc<AsyncMutex<()>>,
-    recovery_scheduled: Arc<AtomicBool>,
+    recovery_task: Arc<RecoveryTask>,
     server_started: Arc<AtomicBool>,
     server_control: Arc<Mutex<Option<actix_web::dev::ServerHandle>>>,
     server_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    active_transport_generation: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -161,6 +176,7 @@ struct Mt5BridgeState {
     latest_bars: HashMap<String, Bar>,
     latest_bars_by_stream: HashMap<(String, String), Bar>,
     latest_intrabar_bars: HashMap<(String, String), Bar>,
+    authoritative_intrabar_streams: HashSet<(String, String)>,
     history: HashMap<String, Vec<Bar>>,
     seen_event_ids: HashSet<String>,
     seen_event_order: VecDeque<String>,
@@ -192,8 +208,10 @@ struct Mt5BridgeState {
 #[derive(Clone, Debug)]
 struct QueuedTradeEvent {
     sequence: u64,
+    event_id: Uuid,
     order: Order,
     event: TradeUpdateEvent,
+    metadata: BrokerEventMetadata,
 }
 
 #[derive(Debug)]
@@ -255,6 +273,13 @@ struct Mt5BarSubscription {
     timeframe_code: String,
     mode: DataStreamMode,
     callback: Arc<dyn Fn(Bar) + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct Mt5QuoteSubscription {
+    session_id: String,
+    symbol: String,
+    callback: Arc<dyn Fn(Quote) + Send + Sync>,
 }
 
 struct PendingMt5RpcRequest {
@@ -331,7 +356,10 @@ impl Mt5Bridge {
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
             local_trade_event_seq: Arc::new(AtomicU64::new(0)),
             trade_subscribers: Arc::new(Mutex::new(Vec::new())),
+            broker_event_subscribers: Arc::new(Mutex::new(Vec::new())),
             bar_subscribers: Arc::new(Mutex::new(Vec::new())),
+            quote_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            subscription_sync_lock: Arc::new(AsyncMutex::new(())),
             trade_ingress_tx: Arc::new(Mutex::new(None)),
             market_data_ingress_tx: Arc::new(Mutex::new(None)),
             trade_ingress_depth: Arc::new(AtomicU64::new(0)),
@@ -339,10 +367,11 @@ impl Mt5Bridge {
             trade_ingress_handle: Arc::new(Mutex::new(None)),
             market_data_ingress_handle: Arc::new(Mutex::new(None)),
             recovery_lock: Arc::new(AsyncMutex::new(())),
-            recovery_scheduled: Arc::new(AtomicBool::new(false)),
+            recovery_task: Arc::new(RecoveryTask::default()),
             server_started: Arc::new(AtomicBool::new(false)),
             server_control: Arc::new(Mutex::new(None)),
             server_handle: Arc::new(Mutex::new(None)),
+            active_transport_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -393,7 +422,9 @@ impl Mt5Bridge {
         self.pending_rpc.lock().clear();
         self.event_queue.lock().clear();
         self.trade_subscribers.lock().clear();
+        self.broker_event_subscribers.lock().clear();
         self.bar_subscribers.lock().clear();
+        self.quote_subscribers.lock().clear();
         let mut state = self.state.write();
         state.account = None;
         state.assets.clear();
@@ -403,6 +434,7 @@ impl Mt5Bridge {
         state.latest_bars.clear();
         state.latest_bars_by_stream.clear();
         state.latest_intrabar_bars.clear();
+        state.authoritative_intrabar_streams.clear();
         state.history.clear();
         state.seen_event_ids.clear();
         state.seen_event_order.clear();
@@ -498,6 +530,23 @@ impl Mt5Bridge {
         }
         let queued_remaining = queue.len();
         (requests, queued_remaining)
+    }
+
+    fn requeue_unanswered_requests(&self, requests: Vec<Mt5RpcRequest>) {
+        let pending = self.pending_rpc.lock();
+        let mut queue = self.rpc_queue.lock();
+        for request in requests.into_iter().rev() {
+            // A disconnected socket does not prove the EA never executed a command.
+            // Never blindly replay a possibly executed trade operation.
+            if request.action.can_retry_after_transport_failure()
+                && pending.contains_key(&request.request_id)
+                && !queue
+                    .iter()
+                    .any(|queued| queued.request_id == request.request_id)
+            {
+                queue.push_front(request);
+            }
+        }
     }
 
     fn is_rpc_polling(&self) -> bool {
@@ -716,6 +765,13 @@ impl Mt5Bridge {
             return Ok(true);
         }
 
+        if !self.recovery_task.enable() {
+            self.server_started.store(false, Ordering::SeqCst);
+            return Err(BrokerError::ConnectionError(
+                "MT5 automatic recovery is still shutting down".into(),
+            ));
+        }
+
         self.reset_connection_markers();
         self.start_ingress_workers();
 
@@ -731,14 +787,17 @@ impl Mt5Bridge {
                 .route("/v1/market-data", web::post().to(market_data))
                 .route("/v1/trade-event", web::post().to(trade_event))
                 .route("/v1/trade-events", web::post().to(trade_events))
+                .route("/v1/execution-fill-revisions", web::post().to(fill_revisions))
                 .route("/v1/rpc/poll", web::post().to(poll_rpc))
                 .route("/v1/rpc/response", web::post().to(rpc_response))
+                .route("/v2/bridge", web::get().to(bridge_v2))
         })
         .disable_signals()
         .backlog(1_024)
         .keep_alive(Duration::from_secs(75))
         .bind(bind_addr)
         .map_err(|error| {
+            self.recovery_task.close();
             self.server_started.store(false, Ordering::SeqCst);
             self.stop_ingress_workers();
             BrokerError::ConnectionError(format!(
@@ -761,6 +820,7 @@ impl Mt5Bridge {
     }
 
     pub fn stop(&self) {
+        self.recovery_task.close();
         if let Some(control) = self.server_control.lock().take() {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(control.stop(false));
@@ -775,6 +835,7 @@ impl Mt5Bridge {
     }
 
     pub async fn shutdown(&self) {
+        self.recovery_task.shutdown().await;
         let server_control = { self.server_control.lock().take() };
         if let Some(control) = server_control {
             control.stop(true).await;
@@ -878,7 +939,7 @@ impl Mt5Bridge {
     }
 
     pub fn is_market_data_fresh(&self) -> bool {
-        if self.bar_subscribers.lock().is_empty() {
+        if self.bar_subscribers.lock().is_empty() && self.quote_subscribers.lock().is_empty() {
             return true;
         }
 
@@ -991,16 +1052,26 @@ impl Mt5Bridge {
     }
 
     fn schedule_runtime_recovery(self: &Arc<Self>, reason: &'static str) {
-        if self.recovery_scheduled.swap(true, Ordering::SeqCst) {
-            return;
-        }
         let bridge = Arc::clone(self);
-        tokio::spawn(async move {
+        self.recovery_task.schedule(async move {
             warn!("MT5 bridge transport recovered ({reason}); restoring runtime state");
             if let Err(error) = bridge.restore_runtime_state(true).await {
                 warn!("MT5 bridge automatic recovery failed: {error}");
             }
-            bridge.recovery_scheduled.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn schedule_datafeed_recovery(self: &Arc<Self>) {
+        if self.current_subscription_specs().is_empty() {
+            return;
+        }
+        let bridge = Arc::clone(self);
+        self.recovery_task.schedule(async move {
+            // A restarted EA has forgotten subscriptions, even when the broker and
+            // AQE session are unchanged. Quote-only observers need restoring too.
+            if let Err(error) = bridge.recover_datafeed_state().await {
+                warn!("MT5 quote/bar subscription recovery failed: {error}");
+            }
         });
     }
 
@@ -1016,7 +1087,13 @@ impl Mt5Bridge {
         let payload = self
             .request_rpc(Mt5RpcAction::GetAccount, serde_json::json!({}))
             .await?;
-        let account = deserialize_payload::<Account>(payload, "MT5 account")?;
+        let mut account = deserialize_payload::<Account>(payload, "MT5 account")?;
+        account.max_total_orders = Some(
+            account
+                .max_total_orders
+                .filter(|limit| *limit > 0)
+                .unwrap_or(4096),
+        );
         self.state.write().account = Some(account.clone());
         Ok(account)
     }
@@ -1050,8 +1127,42 @@ impl Mt5Bridge {
             .ok_or_else(|| BrokerError::OrderError(format!("MT5 order {} not found", order_id)))
     }
 
+    pub(crate) fn acknowledge_entry_prices(
+        &self,
+        order_id: &str,
+        limit_price: Option<f64>,
+        stop_price: Option<f64>,
+    ) {
+        let mut state = self.state.write();
+        if let Some(order) = state.orders.get_mut(order_id) {
+            if order.filled_qty == 0.0
+                && matches!(
+                    order.status,
+                    TradeUpdateEvent::New
+                        | TradeUpdateEvent::PendingNew
+                        | TradeUpdateEvent::Pending
+                        | TradeUpdateEvent::Accepted
+                        | TradeUpdateEvent::Replaced
+                )
+            {
+                if let Some(price) = limit_price {
+                    order.limit_price = Some(price);
+                }
+                if let Some(price) = stop_price {
+                    order.stop_price = Some(price);
+                }
+            }
+        }
+    }
+
     pub fn positions(&self) -> Vec<Position> {
         self.state.read().positions.values().cloned().collect()
+    }
+
+    pub fn has_complete_runtime_snapshot(&self) -> bool {
+        let broker_connected = self.is_broker_connected();
+        let state = self.state.read();
+        broker_connected && state.last_recovery.is_some()
     }
 
     pub async fn request_positions(&self) -> Result<Vec<Position>, BrokerError> {
@@ -1312,11 +1423,16 @@ impl Mt5Bridge {
                 }
                 Ok(Ok(response)) => {
                     pending_guard.dismiss();
-                    return Err(BrokerError::TradeError(
-                        response
-                            .message
-                            .unwrap_or_else(|| "MT5 RPC request failed".to_string()),
-                    ));
+                    let message = response
+                        .message
+                        .unwrap_or_else(|| "MT5 RPC request failed".to_string());
+                    return Err(
+                        if Self::is_definitive_pre_submit_rejection(action, &message) {
+                            BrokerError::SubmissionRejected(message)
+                        } else {
+                            BrokerError::TradeError(message)
+                        },
+                    );
                 }
                 Ok(Err(_)) => {
                     pending_guard.cleanup();
@@ -1353,10 +1469,14 @@ impl Mt5Bridge {
                         diagnostics.last_response_request_id
                     );
 
-                    if remaining_attempts > 1 && request_was_queued && request_was_pending {
+                    if remaining_attempts > 1
+                        && request_was_queued
+                        && request_was_pending
+                        && action.can_retry_after_transport_failure()
+                    {
                         remaining_attempts -= 1;
                         warn!(
-                            "MT5 RPC request {:?} id={} timed out before delivery; waiting for the EA poll loop and retrying once",
+                            "MT5 read/subscription RPC {:?} id={} timed out while queued or requeued; waiting for transport recovery and retrying once",
                             action, request_id
                         );
                         self.wait_for_rpc_poll().await?;
@@ -1386,6 +1506,16 @@ impl Mt5Bridge {
             && message.is_some_and(|message| message.trim() == "10025")
     }
 
+    fn is_definitive_pre_submit_rejection(action: Mt5RpcAction, message: &str) -> bool {
+        matches!(action, Mt5RpcAction::SubmitOrder)
+            && matches!(
+                message.trim(),
+                "invalid submission correlation/account"
+                    | "invalid submit order request"
+                    | "submission intent receipt could not be flushed"
+            )
+    }
+
     pub fn enqueue_rpc(&self, request: Mt5RpcRequest) -> Result<(), BrokerError> {
         let mut request = request;
         if request.session_id.is_empty() {
@@ -1405,6 +1535,34 @@ impl Mt5Bridge {
         let mut state = self.state.write();
         let mut order = order;
         if let Some(existing) = state.orders.get(&order.order_id) {
+            // A ticket cannot change instruments. Older EAs used the host chart
+            // symbol on thin order events; never let that corrupt cached routing
+            // or the locally generated cancellation acknowledgement.
+            if order.asset.symbol != existing.asset.symbol {
+                warn!(
+                    "MT5 event symbol mismatch for ticket {}: received {}, preserving {}",
+                    order.order_id, order.asset.symbol, existing.asset.symbol
+                );
+                order.asset = existing.asset.clone();
+            }
+            if matches!(
+                existing.status,
+                TradeUpdateEvent::Filled
+                    | TradeUpdateEvent::Closed
+                    | TradeUpdateEvent::Cancelled
+                    | TradeUpdateEvent::Rejected
+                    | TradeUpdateEvent::Expired
+            ) && matches!(
+                order.status,
+                TradeUpdateEvent::Accepted
+                    | TradeUpdateEvent::New
+                    | TradeUpdateEvent::PendingNew
+                    | TradeUpdateEvent::Pending
+            ) {
+                // Reordered/duplicate acceptance must not resurrect a completed
+                // pending order in the cache. Real fills remain authoritative.
+                return existing.clone();
+            }
             if order.insight_id.is_none() {
                 order.insight_id = existing.insight_id.clone();
             }
@@ -1421,16 +1579,48 @@ impl Mt5Bridge {
 
     pub fn emit_order_event(&self, order: Order, event: TradeUpdateEvent) {
         let sequence = self.local_trade_event_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.enqueue_trade_event(sequence, order, event);
+        self.enqueue_trade_event(
+            sequence,
+            Uuid::new_v4(),
+            order,
+            event,
+            BrokerEventMetadata {
+                analytics_only: false,
+                execution_fill: None,
+                source_occurred_at_us: None,
+                adapter_queued_at_us: Some(crate::core::live_sync::now_epoch_micros()),
+                source_clock: BrokerClockDomain::RuntimeHost,
+            },
+        );
     }
 
     pub fn drain_trade_events(&self) -> Vec<(Order, TradeUpdateEvent)> {
+        self.drain_trade_events_bounded(usize::MAX)
+    }
+
+    pub fn has_pending_trade_events(&self) -> bool {
+        !self.event_queue.lock().is_empty()
+    }
+
+    pub fn drain_trade_events_bounded(&self, max_events: usize) -> Vec<(Order, TradeUpdateEvent)> {
         let mut events = self.event_queue.lock();
-        let mut events = events.drain(..).collect::<Vec<_>>();
-        events.sort_by_key(|event| event.sequence);
+        let count = max_events.min(events.len());
         events
-            .into_iter()
+            .drain(..count)
             .map(|event| (event.order, event.event))
+            .collect()
+    }
+
+    pub fn drain_broker_events(&self) -> Vec<BrokerOrderEvent> {
+        let mut events = self.event_queue.lock();
+        events
+            .drain(..)
+            .map(|event| BrokerOrderEvent {
+                event_id: event.event_id,
+                source_sequence: Some(event.sequence),
+                event: (event.order, event.event),
+                metadata: event.metadata,
+            })
             .collect()
     }
 
@@ -1441,8 +1631,16 @@ impl Mt5Bridge {
         self.trade_subscribers.lock().push(on_trade);
     }
 
+    pub fn subscribe_broker_event_stream(
+        &self,
+        on_trade: Arc<dyn Fn(BrokerOrderEvent) + Send + Sync>,
+    ) {
+        self.broker_event_subscribers.lock().push(on_trade);
+    }
+
     pub fn clear_trade_subscribers(&self) {
         self.trade_subscribers.lock().clear();
+        self.broker_event_subscribers.lock().clear();
     }
 
     fn current_subscription_specs(&self) -> Vec<Mt5SubscriptionSpec> {
@@ -1458,6 +1656,16 @@ impl Mt5Bridge {
                 timeframe_code: subscriber.timeframe_code.clone(),
             });
         }
+        // The existing EA bar subscription protocol also enables quote delivery.
+        // A quote lease is independent of the chart timeframe and bar callbacks.
+        for subscriber in self.quote_subscribers.lock().values() {
+            if subscriber.session_id == session_id {
+                specs.insert(Mt5SubscriptionSpec {
+                    symbol: subscriber.symbol.clone(),
+                    timeframe_code: "PERIOD_M1".to_string(),
+                });
+            }
+        }
         let mut specs: Vec<_> = specs.into_iter().collect();
         specs.sort_by(|left, right| {
             left.symbol
@@ -1468,6 +1676,9 @@ impl Mt5Bridge {
     }
 
     async fn sync_bar_subscriptions(&self) -> Result<(), BrokerError> {
+        // SubscribeBars replaces the complete EA subscription set. Serialize and
+        // take the snapshot AFTER acquiring the lock, never send a stale set.
+        let _guard = self.subscription_sync_lock.lock().await;
         let specs = self.current_subscription_specs();
         if specs.is_empty() {
             info!("MT5 bridge clearing bar subscriptions");
@@ -1501,6 +1712,34 @@ impl Mt5Bridge {
         .await?;
         self.state.write().last_subscription_sync = Some(Utc::now());
         Ok(())
+    }
+
+    pub async fn subscribe_quotes_rpc(
+        &self,
+        id: String,
+        symbol: String,
+        callback: Arc<dyn Fn(Quote) + Send + Sync>,
+    ) -> Result<(), BrokerError> {
+        self.quote_subscribers.lock().insert(
+            id.clone(),
+            Mt5QuoteSubscription {
+                session_id: self.session_id(),
+                symbol,
+                callback,
+            },
+        );
+        if let Err(error) = self.sync_bar_subscriptions().await {
+            self.quote_subscribers.lock().remove(&id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn unsubscribe_quotes_rpc(&self, id: &str) -> Result<(), BrokerError> {
+        if self.quote_subscribers.lock().remove(id).is_none() {
+            return Ok(());
+        }
+        self.sync_bar_subscriptions().await
     }
 
     pub fn subscribe_bars(
@@ -1583,7 +1822,13 @@ impl Mt5Bridge {
 
     fn apply_snapshot(&self, _session_id: &str, payload: Mt5SnapshotPayload) {
         let mut state = self.state.write();
-        if let Some(account) = payload.account {
+        if let Some(mut account) = payload.account {
+            account.max_total_orders = Some(
+                account
+                    .max_total_orders
+                    .filter(|limit| *limit > 0)
+                    .unwrap_or(4096),
+            );
             state.account = Some(account);
         }
         for asset in payload.assets {
@@ -1602,9 +1847,12 @@ impl Mt5Bridge {
     fn apply_market_data(&self, session_id: &str, payload: Mt5MarketDataPayload) {
         let quotes = payload.quotes;
         let stream_bars = payload.bars;
+        let intrabar_bars = payload.intrabar_bars;
         let history = payload.history;
         let mut accepted_quotes = Vec::with_capacity(quotes.len());
         let mut accepted_stream_bars = Vec::with_capacity(stream_bars.len());
+        let mut accepted_intrabar_bars = Vec::with_capacity(intrabar_bars.len());
+        let mut authoritative_streams = HashSet::new();
 
         {
             let mut state = self.state.write();
@@ -1660,11 +1908,60 @@ impl Mt5Bridge {
                     .latest_bars_by_stream
                     .insert(stream_key, stream_bar.bar.clone());
                 if let Some(timeframe) = stream_bar.timeframe.as_ref() {
-                    state
+                    let key = (stream_bar.bar.symbol.clone(), timeframe.clone());
+                    if state
                         .latest_intrabar_bars
-                        .remove(&(stream_bar.bar.symbol.clone(), timeframe.clone()));
+                        .get(&key)
+                        .is_some_and(|current| current.timestamp <= stream_bar.bar.timestamp)
+                    {
+                        state.latest_intrabar_bars.remove(&key);
+                    }
                 }
                 accepted_stream_bars.push(stream_bar);
+            }
+            for mut update in intrabar_bars {
+                update.bar.symbol = self.aqe_symbol(&update.bar.symbol);
+                let timeframe = update
+                    .timeframe
+                    .clone()
+                    .unwrap_or_else(|| "PERIOD_M1".into());
+                let key = (update.bar.symbol.clone(), timeframe);
+                // Even an unchanged snapshot suppresses quote-derived OHLC: midpoint
+                // quotes must not overwrite the broker's bid/trade candle or its volume.
+                authoritative_streams.insert(key.clone());
+                let bar = &update.bar;
+                if ![bar.open, bar.high, bar.low, bar.close, bar.volume]
+                    .iter()
+                    .all(|v| v.is_finite())
+                    || bar.low <= 0.0
+                    || bar.high < bar.low
+                    || bar.volume < 0.0
+                {
+                    continue;
+                }
+                state.authoritative_intrabar_streams.insert(key.clone());
+                if let Some(previous) = state.latest_intrabar_bars.get(&key) {
+                    if bar.timestamp < previous.timestamp {
+                        continue;
+                    }
+                    if bar.timestamp == previous.timestamp {
+                        // MT5 tick_volume is cumulative, not an increment per message.
+                        // Reject stale snapshots rather than regressing both price and volume.
+                        if bar.volume < previous.volume {
+                            continue;
+                        }
+                        if bar.open == previous.open
+                            && bar.high == previous.high
+                            && bar.low == previous.low
+                            && bar.close == previous.close
+                            && bar.volume == previous.volume
+                        {
+                            continue;
+                        }
+                    }
+                }
+                state.latest_intrabar_bars.insert(key, update.bar.clone());
+                accepted_intrabar_bars.push(update);
             }
         }
 
@@ -1676,18 +1973,39 @@ impl Mt5Bridge {
                 if subscriber.session_id == session_id
                     && subscriber.symbol == stream_bar.bar.symbol
                     && subscriber.timeframe_code == timeframe_code
-                    && subscriber.mode == DataStreamMode::CompletedBar
                 {
+                    // Intrabar consumers also need the final, authoritative candle volume.
                     (subscriber.callback)(stream_bar.bar.clone());
                 }
             }
         }
 
+        for update in accepted_intrabar_bars {
+            for subscriber in &subscribers {
+                if subscriber.session_id == session_id
+                    && subscriber.symbol == update.bar.symbol
+                    && subscriber.timeframe_code
+                        == update.timeframe.as_deref().unwrap_or("PERIOD_M1")
+                    && subscriber.mode == DataStreamMode::Intrabar
+                {
+                    (subscriber.callback)(update.bar.clone());
+                }
+            }
+        }
+
+        let quote_subscribers: Vec<_> = self.quote_subscribers.lock().values().cloned().collect();
         for quote in accepted_quotes {
+            for subscriber in &quote_subscribers {
+                if subscriber.session_id == session_id && subscriber.symbol == quote.symbol {
+                    (subscriber.callback)(quote.clone());
+                }
+            }
             for subscriber in &subscribers {
                 if subscriber.session_id != session_id
                     || subscriber.symbol != quote.symbol
                     || subscriber.mode != DataStreamMode::Intrabar
+                    || authoritative_streams
+                        .contains(&(subscriber.symbol.clone(), subscriber.timeframe_code.clone()))
                 {
                     continue;
                 }
@@ -1709,6 +2027,9 @@ impl Mt5Bridge {
             .get_current_time_increment(quote.timestamp);
         let key = (subscriber.symbol.clone(), subscriber.timeframe_code.clone());
         let mut state = self.state.write();
+        if state.authoritative_intrabar_streams.contains(&key) {
+            return None;
+        }
         let entry = state
             .latest_intrabar_bars
             .entry(key)
@@ -1741,9 +2062,38 @@ impl Mt5Bridge {
         Some(entry.clone())
     }
 
-    fn enqueue_trade_event(&self, sequence: u64, order: Order, event: TradeUpdateEvent) {
+    fn enqueue_trade_event(
+        &self,
+        sequence: u64,
+        event_id: Uuid,
+        order: Order,
+        event: TradeUpdateEvent,
+        metadata: BrokerEventMetadata,
+    ) {
+        if metadata.analytics_only {
+            // Revision payloads retain order identity for attribution only.
+            // Do not upsert cached orders, enqueue reducer work, or notify the
+            // legacy order stream: all three can reapply filled quantities.
+            let broker_event = BrokerOrderEvent {
+                event_id,
+                source_sequence: Some(sequence),
+                event: (order, event),
+                metadata,
+            };
+            let subscribers = self.broker_event_subscribers.lock().clone();
+            for subscriber in subscribers {
+                subscriber(broker_event.clone());
+            }
+            return;
+        }
         let order = self.upsert_order(order);
         let subscriber_event = (order.clone(), event.clone());
+        let broker_event = BrokerOrderEvent {
+            event_id,
+            source_sequence: Some(sequence),
+            event: subscriber_event.clone(),
+            metadata: metadata.clone(),
+        };
         let dropped_event = {
             let mut queue = self.event_queue.lock();
             let dropped = if queue.len() >= MAX_TRADE_EVENT_QUEUE_LEN {
@@ -1752,11 +2102,22 @@ impl Mt5Bridge {
             } else {
                 false
             };
-            queue.push_back(QueuedTradeEvent {
+            let queued = QueuedTradeEvent {
                 sequence,
+                event_id,
                 order,
                 event,
-            });
+                metadata,
+            };
+            // Fast append for normal ingress. Concurrent publishers may acquire
+            // this lock out of sequence; insert those rare late events in order
+            // instead of sorting the complete backlog on every bounded drain.
+            if queue.back().is_none_or(|last| last.sequence <= sequence) {
+                queue.push_back(queued);
+            } else {
+                let index = queue.partition_point(|item| item.sequence <= sequence);
+                queue.insert(index, queued);
+            }
             dropped
         };
         let mut state = self.state.write();
@@ -1769,6 +2130,10 @@ impl Mt5Bridge {
         let subscribers = self.trade_subscribers.lock().clone();
         for subscriber in subscribers {
             subscriber(subscriber_event.clone());
+        }
+        let subscribers = self.broker_event_subscribers.lock().clone();
+        for subscriber in subscribers {
+            subscriber(broker_event.clone());
         }
     }
 
@@ -1793,6 +2158,12 @@ impl Mt5Bridge {
         envelope_sequence: Option<u64>,
         payload: Mt5TradeEventPayload,
     ) {
+        if payload.analytics_only
+            && payload.execution_fill.as_ref().is_none_or(|fill| fill.validate().is_err())
+        {
+            log::warn!("MT5 historical fill correction has no valid execution evidence");
+            return;
+        }
         let sequence = payload
             .event_seq
             .or(envelope_sequence)
@@ -1803,13 +2174,34 @@ impl Mt5Bridge {
             .map(|native_id| format!("{}:{}", session_id, native_id))
             .unwrap_or_else(|| format!("{}:seq:{}", session_id, sequence));
 
-        if !self.mark_event_seen(event_key) {
+        if !self.mark_event_seen(event_key.clone()) {
             return;
         }
 
         let mut order = payload.order;
         self.map_order_to_aqe(&mut order);
-        self.enqueue_trade_event(sequence, order, payload.event);
+        let mut execution_fill = payload.execution_fill;
+        if let Some(fill) = execution_fill.as_mut() {
+            fill.symbol = self.aqe_symbol(&fill.symbol);
+        }
+        let event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, event_key.as_bytes());
+        self.enqueue_trade_event(
+            sequence,
+            event_id,
+            order,
+            payload.event,
+            BrokerEventMetadata {
+                analytics_only: payload.analytics_only,
+                execution_fill,
+                source_occurred_at_us: payload.source_occurred_at_us,
+                adapter_queued_at_us: payload.adapter_queued_at_us,
+                source_clock: if payload.source_occurred_at_us.is_some() {
+                    BrokerClockDomain::BrokerServer
+                } else {
+                    BrokerClockDomain::Unknown
+                },
+            },
+        );
     }
 
     fn apply_trade_event_batch(
@@ -1854,169 +2246,257 @@ impl Mt5Bridge {
         asset.id = asset.symbol.clone();
     }
 
-    fn map_order_to_aqe(&self, order: &mut Order) {
+    pub(super) fn map_order_to_aqe(&self, order: &mut Order) {
         self.map_asset_to_aqe(&mut order.asset);
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5RpcRequest {
-    #[serde(default)]
-    pub session_id: String,
-    pub request_id: String,
-    pub action: Mt5RpcAction,
-    pub payload: Value,
-}
+async fn bridge_v2(
+    bridge: web::Data<Mt5Bridge>,
+    request: HttpRequest,
+    body: web::Payload,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (response, mut session, messages) = actix_ws::handle(&request, body)?;
+    // The EA fragments large history/account replies into <=32 KiB frames.
+    // Keep the 64 KiB frame limit; bound reassembly to the HTTP payload limit.
+    let mut messages = messages
+        .aggregate_continuations()
+        .max_continuation_size(16 * 1024 * 1024);
+    let bridge = bridge.into_inner();
+    let nonce = Uuid::new_v4().to_string();
+    let bridge_session_id = bridge.session_id();
+    let transport_generation = bridge
+        .active_transport_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
 
-#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Mt5RpcAction {
-    GetTickerInfo,
-    GetHistory,
-    GetLatestQuote,
-    GetLatestBar,
-    GetOrders,
-    ReconcileOrders,
-    GetPositions,
-    GetAccount,
-    SubmitOrder,
-    CancelOrder,
-    UpdateOrder,
-    ClosePosition,
-    CloseAllPositions,
-    SubscribeBars,
-    UnsubscribeBars,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5RpcPollPayload {
-    pub max_requests: Option<usize>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5RpcPollResponse {
-    pub requests: Vec<Mt5RpcRequest>,
-    pub poll_interval_ms: u64,
-    pub session_id: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5RpcResponsePayload {
-    pub request_id: String,
-    pub ok: bool,
-    pub message: Option<String>,
-    pub payload: Option<Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5BridgeEnvelope<T> {
-    pub protocol_version: u16,
-    pub session_id: String,
-    pub request_id: String,
-    pub event_seq: Option<u64>,
-    pub server_time: Option<DateTime<Utc>>,
-    pub payload: T,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5BridgeResponse<T> {
-    pub ok: bool,
-    pub protocol_version: u16,
-    pub session_id: String,
-    pub request_id: String,
-    pub message: Option<String>,
-    pub payload: Option<T>,
-}
-
-impl<T> Mt5BridgeResponse<T> {
-    fn ok(session_id: &str, request_id: String, payload: Option<T>) -> Self {
-        Self {
-            ok: true,
-            protocol_version: PROTOCOL_VERSION,
-            session_id: session_id.to_string(),
-            request_id,
-            message: None,
-            payload,
+    actix_web::rt::spawn(async move {
+        if session
+            .text(
+                serde_json::json!({
+                    "type": "Hello",
+                    "protocolVersion": 2,
+                    "executionFillRevisionVersion": 1,
+                    "nonce": nonce,
+                    "bridgeSessionId": bridge_session_id,
+                    "transportGeneration": transport_generation,
+                    "capabilities": [
+                        "orderedTradeEvents",
+                        "marketDataBatch",
+                        "accountStream",
+                        "commandCorrelation",
+                        "resume"
+                    ],
+                })
+                .to_string(),
+            )
+            .await
+            .is_err()
+        {
+            return;
         }
-    }
 
-    fn error(session_id: &str, request_id: String, message: String) -> Self {
-        Self {
-            ok: false,
-            protocol_version: PROTOCOL_VERSION,
-            session_id: session_id.to_string(),
-            request_id,
-            message: Some(message),
-            payload: None,
+        let mut authenticated_session: Option<String> = None;
+        let mut sent_requests: Vec<Mt5RpcRequest> = Vec::new();
+        let mut command_interval = tokio::time::interval(Duration::from_millis(10));
+        command_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                message = messages.recv() => {
+                    let Some(message) = message else { break; };
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(error) => {
+                            debug!("MT5 /v2/bridge frame error: {error}");
+                            break;
+                        }
+                    };
+                    match message {
+                        actix_ws::AggregatedMessage::Ping(bytes) => {
+                            if session.pong(&bytes).await.is_err() { break; }
+                        }
+                        actix_ws::AggregatedMessage::Pong(_) => {}
+                        actix_ws::AggregatedMessage::Close(reason) => {
+                            let _ = session.clone().close(reason).await;
+                            break;
+                        }
+                        actix_ws::AggregatedMessage::Text(text) => {
+                            let frame = match serde_json::from_str::<Mt5BridgeV2Inbound>(text.as_ref()) {
+                                Ok(frame) => frame,
+                                Err(error) => {
+                                    let _ = session.text(serde_json::json!({
+                                        "type": "Rejected",
+                                        "reason": format!("invalid frame: {error}"),
+                                    }).to_string()).await;
+                                    continue;
+                                }
+                            };
+
+                            if authenticated_session.is_none() {
+                                match frame {
+                                    Mt5BridgeV2Inbound::Authenticate {
+                                        nonce: supplied_nonce,
+                                        token,
+                                        session_id,
+                                        last_acknowledged_sequence,
+                                    } if supplied_nonce == nonce && token == bridge.config.token => {
+                                        bridge.register_session(&session_id);
+                                        bridge.record_rpc_poll(&session_id);
+                                        authenticated_session = Some(session_id.clone());
+                                        let _ = session.text(serde_json::json!({
+                                            "type": "Authenticated",
+                                            "protocolVersion": 2,
+                                            "sessionId": session_id,
+                                            "transportGeneration": transport_generation,
+                                            "resumeFromSequence": last_acknowledged_sequence,
+                                        }).to_string()).await;
+                                        bridge.schedule_datafeed_recovery();
+                                    }
+                                    _ => {
+                                        let _ = session.text(serde_json::json!({
+                                            "type": "Rejected",
+                                            "reason": "authentication failed",
+                                        }).to_string()).await;
+                                        let _ = session.clone().close(None).await;
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if bridge.active_transport_generation.load(Ordering::SeqCst)
+                                != transport_generation
+                            {
+                                let _ = session.clone().close(None).await;
+                                break;
+                            }
+                            let session_id = authenticated_session.as_deref().unwrap_or_default();
+                            bridge.record_rpc_poll(session_id);
+                            let revisions_only = matches!(&frame, Mt5BridgeV2Inbound::ExecutionFillRevisionBatch { .. });
+                            match frame {
+                                Mt5BridgeV2Inbound::Heartbeat { payload } => {
+                                    let mut state = bridge.state.write();
+                                    let broker_reconnected = state.terminal_connected == Some(false)
+                                        && payload.terminal_connected == Some(true);
+                                    state.last_heartbeat = Some(Utc::now());
+                                    state.terminal_name = payload.terminal_name;
+                                    state.heartbeat_account_id = payload.account_id;
+                                    state.terminal_connected = payload.terminal_connected;
+                                    state.terminal_trade_allowed = payload.terminal_trade_allowed;
+                                    drop(state);
+                                    if broker_reconnected {
+                                        bridge.schedule_runtime_recovery("MT5 terminal reconnected through /v2/bridge");
+                                    }
+                                }
+                                Mt5BridgeV2Inbound::TradeEventBatch { sequence, mut events, dropped_count }
+                                | Mt5BridgeV2Inbound::ExecutionFillRevisionBatch { sequence, mut events, dropped_count } => {
+                                    if revisions_only {
+                                        for event in &mut events { event.analytics_only = true; }
+                                    }
+                                    let last_sequence = events.iter().filter_map(|event| event.event_seq).max().or(sequence);
+                                    match bridge.enqueue_trade_ingress(TradeIngress {
+                                        session_id: session_id.to_string(),
+                                        envelope_sequence: sequence,
+                                        events,
+                                        dropped_count: dropped_count.unwrap_or(0),
+                                    }) {
+                                        Ok(accepted) => {
+                                            let _ = session.text(serde_json::json!({
+                                                "type": "BatchAcknowledgement",
+                                                "accepted": accepted,
+                                                "brokerEventSequence": last_sequence,
+                                                "transportGeneration": transport_generation,
+                                            }).to_string()).await;
+                                        }
+                                        Err(error) => {
+                                            let _ = session.text(serde_json::json!({
+                                                "type": "Backpressure",
+                                                "reason": error,
+                                            }).to_string()).await;
+                                        }
+                                    }
+                                }
+                                Mt5BridgeV2Inbound::MarketDataBatch { sequence, payload } => {
+                                    let accepted = bridge.enqueue_market_data_ingress(MarketDataIngress {
+                                        session_id: session_id.to_string(),
+                                        payload,
+                                    });
+                                    match accepted {
+                                        Ok(()) => {
+                                            let _ = session.text(serde_json::json!({
+                                                "type": "BatchAcknowledgement",
+                                                "correlationId": sequence.map(|value| format!("market:{value}")),
+                                                "transportGeneration": transport_generation,
+                                            }).to_string()).await;
+                                        }
+                                        Err(error) => {
+                                            let _ = session.text(serde_json::json!({
+                                                "type": "Backpressure",
+                                                "reason": error,
+                                            }).to_string()).await;
+                                        }
+                                    }
+                                }
+                                Mt5BridgeV2Inbound::AccountSnapshot { payload } => {
+                                    bridge.apply_snapshot(session_id, payload);
+                                }
+                                Mt5BridgeV2Inbound::BrokerCommandResult { payload } => {
+                                    // Only unanswered commands are requeued when the persistent
+                                    // transport disconnects. Keeping completed requests in this
+                                    // list would replay successful broker operations after every
+                                    // reconnect.
+                                    sent_requests.retain(|request| request.request_id != payload.request_id);
+                                    bridge.apply_rpc_response(payload);
+                                }
+                                Mt5BridgeV2Inbound::Resume { last_acknowledged_sequence } => {
+                                    let _ = session.text(serde_json::json!({
+                                        "type": "Resume",
+                                        "acceptedThrough": last_acknowledged_sequence,
+                                        "transportGeneration": transport_generation,
+                                    }).to_string()).await;
+                                }
+                                Mt5BridgeV2Inbound::BatchAcknowledgement { broker_event_sequence, correlation_id } => {
+                                    debug!(
+                                        "MT5 /v2/bridge acknowledgement sequence={broker_event_sequence:?} correlation={correlation_id:?}"
+                                    );
+                                }
+                                Mt5BridgeV2Inbound::GracefulShutdown => break,
+                                Mt5BridgeV2Inbound::Authenticate { .. } => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = command_interval.tick(), if authenticated_session.is_some() => {
+                    if bridge.active_transport_generation.load(Ordering::SeqCst)
+                        != transport_generation
+                    {
+                        break;
+                    }
+                    let (requests, _) = bridge.drain_rpc_requests(1);
+                    if let Some(request) = requests.into_iter().next() {
+                        let frame = serde_json::json!({
+                            "type": "BrokerCommand",
+                            "transportGeneration": transport_generation,
+                            "correlationId": request.request_id,
+                            "request": request,
+                        });
+                        if session.text(frame.to_string()).await.is_err() {
+                            sent_requests.push(request);
+                            break;
+                        }
+                        bridge.record_rpc_poll_delivery(std::slice::from_ref(&request));
+                        sent_requests.push(request);
+                    }
+                }
+            }
         }
-    }
-}
+        bridge.requeue_unanswered_requests(sent_requests);
+        let _ = session.close(None).await;
+    });
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5HeartbeatPayload {
-    pub terminal_name: Option<String>,
-    pub account_id: Option<String>,
-    pub server_time: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub terminal_connected: Option<bool>,
-    #[serde(default)]
-    pub terminal_trade_allowed: Option<bool>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5SnapshotPayload {
-    pub account: Option<Account>,
-    #[serde(default)]
-    pub assets: Vec<Asset>,
-    #[serde(default)]
-    pub positions: Vec<Position>,
-    #[serde(default)]
-    pub orders: Vec<Order>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5MarketDataPayload {
-    #[serde(default)]
-    pub quotes: Vec<Quote>,
-    #[serde(default)]
-    pub bars: Vec<Mt5StreamBar>,
-    #[serde(default)]
-    pub history: Vec<Bar>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5StreamBar {
-    pub timeframe: Option<String>,
-    #[serde(flatten)]
-    pub bar: Bar,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5TradeEventPayload {
-    pub native_event_id: Option<String>,
-    pub event_seq: Option<u64>,
-    pub event: TradeUpdateEvent,
-    pub order: Order,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Mt5TradeEventsPayload {
-    #[serde(default)]
-    pub events: Vec<Mt5TradeEventPayload>,
-    #[serde(default)]
-    pub dropped_count: Option<u64>,
+    Ok(response)
 }
 
 async fn health(bridge: web::Data<Mt5Bridge>) -> HttpResponse {
@@ -2187,6 +2667,18 @@ async fn trade_event(
     ))
 }
 
+async fn fill_revisions(
+    bridge: web::Data<Mt5Bridge>,
+    request: HttpRequest,
+    envelope: web::Json<Mt5BridgeEnvelope<Mt5TradeEventsPayload>>,
+) -> HttpResponse {
+    let mut envelope = envelope.into_inner();
+    for event in &mut envelope.payload.events {
+        event.analytics_only = true;
+    }
+    trade_events(bridge, request, web::Json(envelope)).await
+}
+
 async fn trade_events(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
@@ -2264,7 +2756,9 @@ async fn poll_rpc(
         );
     }
     bridge.record_rpc_poll(&session_id);
-    if !bridge.bar_subscribers.lock().is_empty() && (had_stale_transport || ea_session_reset) {
+    if (!bridge.bar_subscribers.lock().is_empty() || !bridge.quote_subscribers.lock().is_empty())
+        && (had_stale_transport || ea_session_reset)
+    {
         bridge.schedule_runtime_recovery(if ea_session_reset {
             "EA session reset"
         } else {
@@ -2386,9 +2880,11 @@ pub fn default_mt5_asset(symbol: &str) -> Asset {
         min_order_size: None,
         quantity_base: None,
         max_order_size: None,
+        max_total_size: None,
         min_price_increment: None,
         price_base: None,
         contract_size: None,
+        trading_calendar: None,
         fees: Default::default(),
     }
 }
@@ -2478,701 +2974,5 @@ fn bars_to_frame(bars: &[Bar]) -> Result<DataFrame, BrokerError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::broker::types::{
-        OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, TimeInForce,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-    fn test_bridge(token: &str) -> Mt5Bridge {
-        Mt5Bridge::new(Mt5BridgeConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            token: token.to_string(),
-            request_timeout: Duration::from_millis(5_000),
-            connect_timeout: Duration::from_millis(5_000),
-            poll_interval: Duration::from_millis(250),
-            symbol_map: HashMap::new(),
-        })
-    }
-
-    fn headers(session_id: &str, token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-aqe-mt5-session".parse().unwrap(),
-            session_id.parse().unwrap(),
-        );
-        headers.insert("x-aqe-mt5-token".parse().unwrap(), token.parse().unwrap());
-        headers
-    }
-
-    fn trade_event_order(order_id: &str, insight_id: &str, status: TradeUpdateEvent) -> Order {
-        Order {
-            order_id: order_id.to_string(),
-            insight_id: Some(insight_id.to_string()),
-            strategy_type: Some("Testing".to_string()),
-            asset: default_mt5_asset("AAPL"),
-            qty: 1.0,
-            filled_qty: 1.0,
-            limit_price: None,
-            filled_price: Some(100.0),
-            stop_price: None,
-            side: OrderSide::Buy,
-            order_type: OrderType::Market,
-            time_in_force: TimeInForce::GTC,
-            status,
-            order_class: OrderClass::Simple,
-            created_at: 0,
-            updated_at: 0,
-            submitted_at: 0,
-            filled_at: Some(0),
-            realized_pnl: None,
-            commission: None,
-            swap: None,
-            rejection_reason: None,
-            legs: None,
-        }
-    }
-
-    #[test]
-    fn session_token_auth_accepts_stale_session_with_valid_token() {
-        let bridge = test_bridge("test-token");
-        bridge.set_session_id("current-session");
-        let headers = headers("old-session", "test-token");
-
-        assert!(authorize_session_token(&bridge, &headers, "old-session").is_ok());
-    }
-
-    #[test]
-    fn reconcile_orders_action_uses_the_expected_ea_wire_name() {
-        assert_eq!(
-            serde_json::to_value(Mt5RpcAction::ReconcileOrders).unwrap(),
-            serde_json::json!("RECONCILE_ORDERS")
-        );
-    }
-
-    #[test]
-    fn session_token_auth_rejects_invalid_token() {
-        let bridge = test_bridge("test-token");
-        let headers = headers("old-session", "wrong-token");
-
-        assert_eq!(
-            authorize_session_token(&bridge, &headers, "old-session"),
-            Err("invalid MT5 bridge token".to_string())
-        );
-    }
-
-    #[test]
-    fn session_token_auth_rejects_mismatched_session_header() {
-        let bridge = test_bridge("test-token");
-        let headers = headers("other-session", "test-token");
-
-        assert_eq!(
-            authorize_session_token(&bridge, &headers, "old-session"),
-            Err("invalid MT5 bridge session".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_rpc_guard_cleans_abandoned_request() {
-        let bridge = test_bridge("test-token");
-        let request_id = "request-1".to_string();
-        let (tx, _rx) = oneshot::channel();
-        bridge.pending_rpc.lock().insert(request_id.clone(), tx);
-        bridge.rpc_queue.lock().push_back(Mt5RpcRequest {
-            session_id: String::new(),
-            request_id: request_id.clone(),
-            action: Mt5RpcAction::GetAccount,
-            payload: serde_json::json!({}),
-        });
-
-        {
-            let _guard = PendingMt5RpcRequest::new(
-                request_id.clone(),
-                bridge.rpc_queue.clone(),
-                bridge.pending_rpc.clone(),
-            );
-        }
-
-        assert!(!bridge.pending_rpc.lock().contains_key(&request_id));
-        assert!(
-            !bridge
-                .rpc_queue
-                .lock()
-                .iter()
-                .any(|request| request.request_id == request_id)
-        );
-    }
-
-    #[test]
-    fn trade_events_drain_in_sequence_order() {
-        let bridge = test_bridge("test-token");
-        bridge.apply_trade_event(
-            "session-1",
-            None,
-            Mt5TradeEventPayload {
-                native_event_id: Some("event-2".to_string()),
-                event_seq: Some(2),
-                event: TradeUpdateEvent::Closed,
-                order: trade_event_order("order-2", "insight-1", TradeUpdateEvent::Closed),
-            },
-        );
-        bridge.apply_trade_event(
-            "session-1",
-            None,
-            Mt5TradeEventPayload {
-                native_event_id: Some("event-1".to_string()),
-                event_seq: Some(1),
-                event: TradeUpdateEvent::Filled,
-                order: trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled),
-            },
-        );
-
-        let events = bridge.drain_trade_events();
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0.order_id, "order-1");
-        assert_eq!(events[0].1, TradeUpdateEvent::Filled);
-        assert_eq!(events[1].0.order_id, "order-2");
-        assert_eq!(events[1].1, TradeUpdateEvent::Closed);
-    }
-
-    #[test]
-    fn trade_event_batches_notify_subscribers_in_sequence_order() {
-        let bridge = test_bridge("test-token");
-        let callback_order = Arc::new(Mutex::new(Vec::new()));
-        let callback_order_clone = callback_order.clone();
-        bridge.subscribe_trade_stream(Arc::new(move |(order, _event)| {
-            callback_order_clone.lock().push(order.order_id);
-        }));
-
-        bridge.apply_trade_event_batch(
-            "session-1",
-            None,
-            vec![
-                Mt5TradeEventPayload {
-                    native_event_id: Some("event-2".to_string()),
-                    event_seq: Some(2),
-                    event: TradeUpdateEvent::Closed,
-                    order: trade_event_order("order-2", "insight-1", TradeUpdateEvent::Closed),
-                },
-                Mt5TradeEventPayload {
-                    native_event_id: Some("event-1".to_string()),
-                    event_seq: Some(1),
-                    event: TradeUpdateEvent::Filled,
-                    order: trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled),
-                },
-            ],
-        );
-
-        assert_eq!(
-            callback_order.lock().as_slice(),
-            ["order-1".to_string(), "order-2".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn ordered_trade_ingress_acknowledges_before_dispatch_and_preserves_sequence() {
-        let bridge = Arc::new(test_bridge("test-token"));
-        let callback_order = Arc::new(Mutex::new(Vec::new()));
-        let callback_order_clone = Arc::clone(&callback_order);
-        bridge.subscribe_trade_stream(Arc::new(move |(order, _event)| {
-            callback_order_clone.lock().push(order.order_id);
-        }));
-        bridge.start_ingress_workers();
-
-        let accepted = bridge
-            .enqueue_trade_ingress(TradeIngress {
-                session_id: "session-1".to_string(),
-                envelope_sequence: None,
-                events: vec![
-                    Mt5TradeEventPayload {
-                        native_event_id: Some("event-2".to_string()),
-                        event_seq: Some(2),
-                        event: TradeUpdateEvent::Closed,
-                        order: trade_event_order("order-2", "insight-1", TradeUpdateEvent::Closed),
-                    },
-                    Mt5TradeEventPayload {
-                        native_event_id: Some("event-1".to_string()),
-                        event_seq: Some(1),
-                        event: TradeUpdateEvent::Filled,
-                        order: trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled),
-                    },
-                ],
-                dropped_count: 0,
-            })
-            .unwrap();
-
-        assert_eq!(accepted, 2);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if callback_order.lock().len() == 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("ordered ingress worker should dispatch promptly");
-        assert_eq!(
-            callback_order.lock().as_slice(),
-            ["order-1".to_string(), "order-2".to_string()]
-        );
-        bridge.stop_ingress_workers();
-    }
-
-    #[test]
-    fn market_data_ingress_applies_bounded_backpressure() {
-        let bridge = test_bridge("test-token");
-        let (sender, _receiver) = mpsc::channel::<MarketDataIngress>(2);
-        *bridge.market_data_ingress_tx.lock() = Some(sender);
-
-        for _ in 0..2 {
-            bridge
-                .enqueue_market_data_ingress(MarketDataIngress {
-                    session_id: "session-1".to_string(),
-                    payload: Mt5MarketDataPayload::default(),
-                })
-                .unwrap();
-        }
-        let error = bridge
-            .enqueue_market_data_ingress(MarketDataIngress {
-                session_id: "session-1".to_string(),
-                payload: Mt5MarketDataPayload::default(),
-            })
-            .unwrap_err();
-
-        assert!(error.contains("queue is full"));
-        assert_eq!(bridge.market_data_ingress_depth.load(Ordering::Relaxed), 2);
-    }
-
-    #[actix_web::test]
-    async fn actix_health_endpoint_preserves_bridge_response_shape() {
-        let bridge = Arc::new(test_bridge("test-token"));
-        let bridge_data: web::Data<Mt5Bridge> = web::Data::from(bridge);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(bridge_data)
-                .route("/health", web::get().to(health)),
-        )
-        .await;
-
-        let request = actix_web::test::TestRequest::get()
-            .uri("/health")
-            .to_request();
-        let response: Mt5BridgeResponse<Value> =
-            actix_web::test::call_and_read_body_json(&app, request).await;
-
-        assert!(response.ok);
-        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
-        assert!(response.payload.is_some());
-    }
-
-    #[tokio::test]
-    async fn actix_bridge_server_starts_and_stops_on_tokio_runtime() {
-        let bridge = Arc::new(test_bridge("test-token"));
-
-        assert!(bridge.start().await.unwrap());
-        assert!(bridge.server_started.load(Ordering::SeqCst));
-        assert!(bridge.server_control.lock().is_some());
-
-        bridge.shutdown().await;
-        assert!(!bridge.server_started.load(Ordering::SeqCst));
-        assert!(bridge.server_control.lock().is_none());
-    }
-
-    #[test]
-    fn trade_events_dedupe_by_native_event_id_not_order_status() {
-        let bridge = test_bridge("test-token");
-        for (native_id, sequence) in [("fill-1", 1), ("fill-2", 2), ("fill-1", 3)] {
-            bridge.apply_trade_event(
-                "session-1",
-                None,
-                Mt5TradeEventPayload {
-                    native_event_id: Some(native_id.to_string()),
-                    event_seq: Some(sequence),
-                    event: TradeUpdateEvent::Filled,
-                    order: trade_event_order("same-order", "insight-1", TradeUpdateEvent::Filled),
-                },
-            );
-        }
-
-        let events = bridge.drain_trade_events();
-
-        assert_eq!(events.len(), 2);
-        assert!(
-            events
-                .iter()
-                .all(|(_, event)| *event == TradeUpdateEvent::Filled)
-        );
-    }
-
-    #[test]
-    fn trade_event_dedupe_evicts_oldest_ids_at_capacity() {
-        let bridge = test_bridge("test-token");
-        for index in 0..=MAX_SEEN_EVENT_IDS {
-            assert!(bridge.mark_event_seen(format!("event-{index}")));
-        }
-
-        let state = bridge.state.read();
-        assert_eq!(state.seen_event_ids.len(), MAX_SEEN_EVENT_IDS);
-        assert_eq!(state.seen_event_order.len(), MAX_SEEN_EVENT_IDS);
-        assert!(!state.seen_event_ids.contains("event-0"));
-        assert!(
-            state
-                .seen_event_ids
-                .contains(&format!("event-{MAX_SEEN_EVENT_IDS}"))
-        );
-    }
-
-    #[test]
-    fn reverse_symbol_mapping_uses_precomputed_index() {
-        let mut config = test_bridge("test-token").config().clone();
-        config
-            .symbol_map
-            .insert("XAUUSD".to_string(), "GOLD.cash".to_string());
-        let bridge = Mt5Bridge::new(config);
-
-        assert_eq!(bridge.aqe_symbol("GOLD.cash"), "XAUUSD");
-        assert_eq!(bridge.aqe_symbol("EURUSD"), "EURUSD");
-    }
-
-    #[test]
-    fn terminal_disconnect_is_distinct_from_bridge_transport() {
-        let bridge = test_bridge("test-token");
-        {
-            let mut state = bridge.state.write();
-            state.last_rpc_poll = Some(Utc::now());
-            state.terminal_connected = Some(false);
-        }
-
-        assert!(bridge.is_transport_connected());
-        assert!(!bridge.is_broker_connected());
-        assert!(!bridge.is_datafeed_connected());
-
-        bridge.state.write().terminal_connected = Some(true);
-        assert!(bridge.is_broker_connected());
-    }
-
-    #[test]
-    fn update_order_no_changes_response_is_idempotent_success() {
-        assert!(Mt5Bridge::is_idempotent_update_order_response(
-            Mt5RpcAction::UpdateOrder,
-            Some("10025")
-        ));
-        assert!(!Mt5Bridge::is_idempotent_update_order_response(
-            Mt5RpcAction::SubmitOrder,
-            Some("10025")
-        ));
-        assert!(!Mt5Bridge::is_idempotent_update_order_response(
-            Mt5RpcAction::UpdateOrder,
-            Some("10016")
-        ));
-    }
-
-    #[test]
-    fn datafeed_connection_requires_fresh_market_data_for_active_subscriptions() {
-        let bridge = test_bridge("test-token");
-        bridge
-            .subscribe_bars(
-                vec!["AAPL".to_string()],
-                TimeFrame::new(1, TimeFrameUnit::Minute),
-                DataStreamMode::CompletedBar,
-                Arc::new(|_bar| {}),
-            )
-            .unwrap();
-        {
-            let mut state = bridge.state.write();
-            state.last_rpc_poll = Some(Utc::now());
-            state.terminal_connected = Some(true);
-            state.last_subscription_sync = Some(Utc::now());
-        }
-
-        assert!(bridge.is_datafeed_connected());
-
-        bridge.state.write().last_subscription_sync =
-            Some(Utc::now() - chrono::Duration::seconds(MT5_MARKET_DATA_FRESH_SECS + 1));
-        assert!(!bridge.is_datafeed_connected());
-
-        bridge.state.write().last_market_data = Some(Utc::now());
-        assert!(bridge.is_datafeed_connected());
-    }
-
-    #[tokio::test]
-    async fn datafeed_recovery_replays_active_bar_subscriptions() {
-        let bridge = Arc::new(test_bridge("test-token"));
-        bridge
-            .subscribe_bars(
-                vec!["AAPL".to_string()],
-                TimeFrame::new(1, TimeFrameUnit::Minute),
-                DataStreamMode::CompletedBar,
-                Arc::new(|_bar| {}),
-            )
-            .unwrap();
-        {
-            let mut state = bridge.state.write();
-            state.last_rpc_poll = Some(Utc::now());
-            state.terminal_connected = Some(true);
-        }
-
-        let recovering_bridge = Arc::clone(&bridge);
-        let recovery =
-            tokio::spawn(async move { recovering_bridge.recover_datafeed_state().await });
-        let request = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(request) = bridge.rpc_queue.lock().pop_front() {
-                    return request;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("subscription replay should queue an RPC request");
-
-        assert!(matches!(request.action, Mt5RpcAction::SubscribeBars));
-        bridge.apply_rpc_response(Mt5RpcResponsePayload {
-            request_id: request.request_id,
-            ok: true,
-            message: None,
-            payload: Some(serde_json::json!({})),
-        });
-
-        recovery.await.unwrap().unwrap();
-        assert!(bridge.state.read().last_subscription_sync.is_some());
-        assert!(bridge.is_datafeed_connected());
-    }
-
-    #[test]
-    fn older_ea_heartbeat_payloads_remain_compatible() {
-        let payload: Mt5HeartbeatPayload = serde_json::from_value(serde_json::json!({
-            "terminalName": "MetaTrader 5",
-            "accountId": "12345",
-            "serverTime": "2026-08-27T10:00:00Z"
-        }))
-        .unwrap();
-
-        assert_eq!(payload.terminal_connected, None);
-        assert_eq!(payload.terminal_trade_allowed, None);
-    }
-
-    #[test]
-    fn trade_callbacks_can_clear_subscribers_reentrantly() {
-        let bridge = Arc::new(test_bridge("test-token"));
-        let callback_bridge = bridge.clone();
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let callback_count_clone = callback_count.clone();
-        bridge.subscribe_trade_stream(Arc::new(move |_event| {
-            callback_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
-            callback_bridge.clear_trade_subscribers();
-        }));
-
-        bridge.emit_order_event(
-            trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled),
-            TradeUpdateEvent::Filled,
-        );
-
-        assert_eq!(callback_count.load(AtomicOrdering::Relaxed), 1);
-        assert!(bridge.trade_subscribers.lock().is_empty());
-    }
-
-    #[test]
-    fn bar_callbacks_can_unsubscribe_reentrantly() {
-        let bridge = Arc::new(test_bridge("test-token"));
-        let session_id = bridge.session_id();
-        let timeframe = TimeFrame::new(1, TimeFrameUnit::Minute);
-        let callback_bridge = bridge.clone();
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let callback_count_clone = callback_count.clone();
-        bridge
-            .subscribe_bars(
-                vec!["AAPL".to_string()],
-                timeframe,
-                DataStreamMode::CompletedBar,
-                Arc::new(move |_bar| {
-                    callback_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
-                    callback_bridge
-                        .unsubscribe_bars(
-                            vec!["AAPL".to_string()],
-                            timeframe,
-                            DataStreamMode::CompletedBar,
-                        )
-                        .unwrap();
-                }),
-            )
-            .unwrap();
-
-        bridge.apply_market_data(
-            &session_id,
-            Mt5MarketDataPayload {
-                bars: vec![Mt5StreamBar {
-                    timeframe: Some("PERIOD_M1".to_string()),
-                    bar: Bar {
-                        symbol: "AAPL".to_string(),
-                        open: 100.0,
-                        high: 101.0,
-                        low: 99.0,
-                        close: 100.5,
-                        volume: 10.0,
-                        timestamp: Utc::now(),
-                    },
-                }],
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(callback_count.load(AtomicOrdering::Relaxed), 1);
-        assert!(bridge.bar_subscribers.lock().is_empty());
-    }
-
-    #[test]
-    fn retried_completed_bars_are_emitted_once_per_stream() {
-        let bridge = test_bridge("test-token");
-        let session_id = bridge.session_id();
-        let timeframe = TimeFrame::new(1, TimeFrameUnit::Minute);
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let callback_count_clone = callback_count.clone();
-        bridge
-            .subscribe_bars(
-                vec!["AAPL".to_string()],
-                timeframe,
-                DataStreamMode::CompletedBar,
-                Arc::new(move |_bar| {
-                    callback_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
-                }),
-            )
-            .unwrap();
-
-        let completed_bar = Mt5StreamBar {
-            timeframe: Some("PERIOD_M1".to_string()),
-            bar: Bar {
-                symbol: "AAPL".to_string(),
-                open: 100.0,
-                high: 101.0,
-                low: 99.0,
-                close: 100.5,
-                volume: 10.0,
-                timestamp: Utc::now(),
-            },
-        };
-        for _ in 0..2 {
-            bridge.apply_market_data(
-                &session_id,
-                Mt5MarketDataPayload {
-                    bars: vec![completed_bar.clone()],
-                    ..Default::default()
-                },
-            );
-        }
-
-        assert_eq!(callback_count.load(AtomicOrdering::Relaxed), 1);
-    }
-
-    #[test]
-    fn unchanged_intrabar_ticks_are_not_emitted_twice() {
-        let bridge = test_bridge("test-token");
-        let session_id = bridge.session_id();
-        let timeframe = TimeFrame::new(1, TimeFrameUnit::Minute);
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let callback_count_clone = callback_count.clone();
-        bridge
-            .subscribe_bars(
-                vec!["AAPL".to_string()],
-                timeframe,
-                DataStreamMode::Intrabar,
-                Arc::new(move |_bar| {
-                    callback_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
-                }),
-            )
-            .unwrap();
-
-        let quote = Quote {
-            symbol: "AAPL".to_string(),
-            bid: 100.0,
-            ask: 100.2,
-            bid_size: 0.0,
-            ask_size: 0.0,
-            last: Some(100.1),
-            last_size: None,
-            timestamp: Utc::now(),
-        };
-        for _ in 0..2 {
-            bridge.apply_market_data(
-                &session_id,
-                Mt5MarketDataPayload {
-                    quotes: vec![quote.clone()],
-                    ..Default::default()
-                },
-            );
-        }
-
-        assert_eq!(callback_count.load(AtomicOrdering::Relaxed), 1);
-    }
-
-    #[test]
-    fn trade_events_preserve_existing_order_route_and_legs_for_thin_mt5_events() {
-        let bridge = test_bridge("test-token");
-        let mut existing = trade_event_order("order-1", "insight-1", TradeUpdateEvent::Filled);
-        existing.legs = Some(OrderLegs {
-            take_profit: Some(OrderLeg {
-                order_id: Some("tp-1".to_string()),
-                limit_price: Some(110.0),
-                trail_price: None,
-                side: OrderSide::Sell,
-                filled_price: None,
-                order_type: OrderType::Limit,
-                status: TradeUpdateEvent::Pending,
-                order_class: OrderClass::Bracket,
-                created_at: 0,
-                updated_at: 0,
-                submitted_at: 0,
-                filled_at: None,
-            }),
-            stop_loss: Some(OrderLeg {
-                order_id: Some("sl-1".to_string()),
-                limit_price: Some(95.0),
-                trail_price: None,
-                side: OrderSide::Sell,
-                filled_price: None,
-                order_type: OrderType::Stop,
-                status: TradeUpdateEvent::Pending,
-                order_class: OrderClass::Bracket,
-                created_at: 0,
-                updated_at: 0,
-                submitted_at: 0,
-                filled_at: None,
-            }),
-            trailing_stop: None,
-        });
-        bridge.upsert_order(existing);
-
-        let mut thin_close = trade_event_order("order-1", "", TradeUpdateEvent::Closed);
-        thin_close.insight_id = None;
-        thin_close.strategy_type = None;
-        thin_close.legs = None;
-        bridge.apply_trade_event(
-            "session-1",
-            None,
-            Mt5TradeEventPayload {
-                native_event_id: Some("close-1".to_string()),
-                event_seq: Some(1),
-                event: TradeUpdateEvent::Closed,
-                order: thin_close,
-            },
-        );
-
-        let events = bridge.drain_trade_events();
-
-        assert_eq!(events.len(), 1);
-        let order = &events[0].0;
-        assert_eq!(order.insight_id.as_deref(), Some("insight-1"));
-        assert_eq!(order.strategy_type.as_deref(), Some("Testing"));
-        assert_eq!(
-            order
-                .legs
-                .as_ref()
-                .and_then(|legs| legs.take_profit.as_ref())
-                .and_then(|leg| leg.order_id.as_deref()),
-            Some("tp-1")
-        );
-    }
-}
+#[path = "mt5_bridge_tests.rs"]
+mod tests;

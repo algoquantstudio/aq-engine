@@ -1,11 +1,11 @@
-use crate::core::broker::{BrokerFeature, types::OrderSide};
+use crate::core::broker::BrokerFeature;
 use crate::core::insight::Insight;
 use crate::core::pipeline::InsightPipeResult;
 use crate::core::strategy::StrategyContext;
 
-use super::InsightPipe;
+use super::{InsightPipe, exit_trigger::ExitTrigger};
 
-/// Closes an active insight when the latest candle breaches its stop loss.
+/// Closes an active insight when its executable quote or simulated bar breaches its stop loss.
 ///
 /// Author: @isaac-diaby
 ///
@@ -14,9 +14,9 @@ use super::InsightPipe;
 ///
 /// Behaviour:
 /// Passes through insights without a stop loss and leaves native OCO protection to the broker.
-/// For brokers without OCO, it reads the latest `low` and `high` from strategy history: buy
-/// insights close when low is at or below stop loss, and sell insights close when high is at or
-/// above stop loss. Insights already being closed do not issue another close request.
+/// Without OCO, native live feeds use bid for buy insights and ask for sell insights.
+/// Missing/stale quotes defer execution. Backtests and bar-only feeds retain low/high
+/// history semantics. Insights already being closed do not issue another close request.
 pub struct BasicStopLossPipe;
 
 impl BasicStopLossPipe {
@@ -27,10 +27,15 @@ impl BasicStopLossPipe {
 
 impl InsightPipe for BasicStopLossPipe {
     fn version(&self) -> &str {
+        // The continuation/receipt layout is unchanged; existing pending closes
+        // must remain resumable after this decision-source fix.
         "1.0"
     }
 
     fn run(&mut self, ctx: &mut dyn StrategyContext, insight: &mut Insight) -> InsightPipeResult {
+        if insight.has_pending_close() {
+            return InsightPipeResult::from_exit_mutation(insight.close(ctx), self.name());
+        }
         let Some(stop_loss) = insight.stop_loss() else {
             return InsightPipeResult::new(
                 true,
@@ -56,38 +61,13 @@ impl InsightPipe for BasicStopLossPipe {
             );
         }
 
-        let Some(df) = ctx.history().get(&insight.symbol) else {
-            return InsightPipeResult::new(
-                false,
-                false,
-                Some("No history found".to_string()),
-                self.name().to_string(),
-            );
-        };
-        let row = df.tail(Some(1));
-        let low = row
-            .column("low")
-            .ok()
-            .and_then(|c| c.f64().ok())
-            .and_then(|c| c.get(0));
-        let high = row
-            .column("high")
-            .ok()
-            .and_then(|c| c.f64().ok())
-            .and_then(|c| c.get(0));
-        let should_close = match insight.side {
-            OrderSide::Buy => low.map(|v| v <= stop_loss).unwrap_or(false),
-            OrderSide::Sell => high.map(|v| v >= stop_loss).unwrap_or(false),
+        let should_close = match ExitTrigger::StopLoss.reached(ctx, insight, stop_loss) {
+            Ok(reached) => reached,
+            Err(error) => return InsightPipeResult::from_read_error(error, self.name()),
         };
 
         if should_close {
-            insight.close(ctx);
-            return InsightPipeResult::new(
-                false,
-                true,
-                Some(format!("Price broke stop loss for {}", insight.symbol)),
-                self.name().to_string(),
-            );
+            return InsightPipeResult::from_exit_mutation(insight.close(ctx), self.name());
         }
 
         InsightPipeResult::new(true, true, None, self.name().to_string())

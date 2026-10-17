@@ -49,6 +49,7 @@ pub enum InsightState {
 pub enum DataFeedType {
     YahooFinance,
     Mt5,
+    Csv,
 }
 
 impl Default for DataFeedType {
@@ -62,13 +63,14 @@ impl std::fmt::Display for DataFeedType {
         match self {
             Self::YahooFinance => write!(f, "Yahoo Finance"),
             Self::Mt5 => write!(f, "MT5"),
+            Self::Csv => write!(f, "CSV"),
         }
     }
 }
 
 impl DataFeedType {
     pub fn variants() -> &'static [DataFeedType] {
-        &[DataFeedType::YahooFinance, DataFeedType::Mt5]
+        &[DataFeedType::YahooFinance, DataFeedType::Mt5, DataFeedType::Csv]
     }
 }
 
@@ -156,6 +158,9 @@ pub enum DataFeedStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DataFeedConfig {
+    /// Local historical CSV file. No credentials or live execution are supported.
+    #[serde(default)]
+    pub csv_path: Option<String>,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub environment: Option<DataFeedEnvironment>,

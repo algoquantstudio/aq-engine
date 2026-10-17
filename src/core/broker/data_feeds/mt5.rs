@@ -60,11 +60,36 @@ impl DataFeed for Mt5DataFeed {
             DataFeedFeature::LatestQuote,
             DataFeedFeature::CandleStream,
             DataFeedFeature::IntraCandleStream,
+            DataFeedFeature::QuoteStream,
+            DataFeedFeature::NativeBidAsk,
         ]
     }
 }
 
 impl DataProvider for Mt5DataFeed {
+    async fn subscribe_to_quote_stream(
+        &self,
+        subscription_id: String,
+        symbol: String,
+        on_quote: crate::core::broker::QuoteCallback,
+    ) -> Result<(), BrokerError> {
+        if subscription_id.is_empty() || symbol.trim().is_empty() {
+            return Err(BrokerError::DataFeedError(
+                "Quote subscription requires an ID and symbol".into(),
+            ));
+        }
+        self.bridge
+            .subscribe_quotes_rpc(subscription_id, symbol, on_quote)
+            .await
+    }
+
+    async fn unsubscribe_from_quote_stream(
+        &self,
+        subscription_id: &str,
+    ) -> Result<(), BrokerError> {
+        self.bridge.unsubscribe_quotes_rpc(subscription_id).await
+    }
+
     fn configure_live_session(&self, session_id: &str) -> Result<(), BrokerError> {
         self.bridge.set_session_id(session_id);
         Ok(())
