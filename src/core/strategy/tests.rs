@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_live_execution_retains_unsettled_stop_and_releases_workers() {
+    async fn early_live_stop_persists_unsettled_exposure_and_releases_workers() {
         use crate::core::broker::command_journal::{
             BrokerCommandJournal, lifecycle::ExecutionPhase,
         };
@@ -257,7 +257,11 @@ mod tests {
                 .contains("unresolved broker work or exposure"),
             "{error}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an early stop skips user teardown hooks"
+        );
         assert_eq!(state.status, StrategyStatus::Stopping);
         assert_eq!(
             state.insights.get(&insight_id).unwrap().state,
@@ -277,8 +281,45 @@ mod tests {
             journal.execution_lifecycle().phase,
             ExecutionPhase::Stopping
         );
+        let rows = journal.execution_checkpoint_page("", 32).await.unwrap().rows;
+        assert_eq!(rows.len(), 1, "unsettled exposure must survive a restart");
+        assert_eq!(rows[0].insight_id, insight_id);
+        assert_eq!(rows[0].state, InsightState::Executed);
         drop(journal);
         drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_stop_does_not_certify_uncheckpointed_owner_exposure() {
+        use crate::core::broker::command_journal::{
+            BrokerCommandJournal, lifecycle::ExecutionPhase,
+        };
+        let (mut state, execution, directory) = trade_update_state_with_command_driver().await;
+        let mut insight = queued_limit(100.0);
+        insight.state = InsightState::Executed;
+        insight.order_id = Some("uncheckpointed-order".into());
+        let id = insight.insight_id;
+        state.insights.add_insight(insight);
+        state.begin_teardown();
+
+        // Deliberately call the final fence before the owner drains its dirty
+        // row. An empty journal alone must not certify that execution stopped.
+        let error = state.finish_live_execution(None).await.unwrap_err();
+        assert!(
+            error.to_string().contains("unresolved broker work or exposure")
+        );
+        assert!(state.command_driver.is_none());
+        assert_eq!(state.insights.get(&id).unwrap().state, InsightState::Executed);
+        assert!(execution.submit_requests.lock().unwrap().is_empty());
+        assert!(execution.close_requests.lock().unwrap().is_empty());
+        assert!(execution.cancel_requests.lock().unwrap().is_empty());
+        let journal =
+            BrokerCommandJournal::open(directory.join("commands.db"), "strategy", "account")
+                .await
+                .unwrap();
+        assert_eq!(journal.execution_lifecycle().phase, ExecutionPhase::Stopping);
+        drop(journal);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1691,15 +1732,15 @@ mod tests {
         assert_eq!(state.max_history_rows(), 3000);
     }
 
-    /// Test 1: Full backtest with SMA crossover alpha using Yahoo Finance data.
+    /// Full SMA crossover backtest using fixed historical bars, without network I/O.
     ///
     /// Verifies:
-    /// - Yahoo Finance data feed fetches real data
+    /// - The fixture supplies the same complete date range on every run
     /// - SMA crossover alpha generates insights on crossovers
     /// - Insights are collected in the InsightCollection
     /// - Backtest completes without errors
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_sma_crossover_backtest_with_yahoo() {
+    async fn test_sma_crossover_backtest_with_fixed_history() {
         // 1. Create components
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
         let data = FixedScaleOutDataFeed::new();
@@ -1730,17 +1771,20 @@ mod tests {
         // 5. Set warm-up period to slow SMA length
         state.set_warm_up_bars(20);
 
-        // 6. Run backtest: 6 months of daily data
-        let end = chrono::Utc::now();
-        let start = end - chrono::Duration::days(365);
+        // Use the fixture's endpoints; a window relative to today eventually
+        // expires and tests neither the alpha nor the execution pipeline.
+        let history = fixed_scale_out_fixture_df();
+        let timestamps = history.column("timestamp").unwrap().i64().unwrap();
+        let start = Utc.timestamp_millis_opt(timestamps.get(0).unwrap()).unwrap();
+        let end = Utc
+            .timestamp_millis_opt(timestamps.get(history.height() - 1).unwrap())
+            .unwrap();
 
         println!("Running SMA crossover backtest: {} to {}", start, end);
 
         let result = state.run_backtest(start, end, state.timeframe()).await;
 
-        let Some(results) = assert_backtest_or_skip(result, "SMA crossover backtest failed") else {
-            return;
-        };
+        let results = result.expect("fixed-history SMA crossover backtest must succeed");
         results.print_metrics();
 
         assert!(
@@ -1749,6 +1793,10 @@ mod tests {
         );
 
         let insight_count = state.insights.len();
+        assert!(
+            insight_count > 0,
+            "fixture must exercise crossover insight generation"
+        );
         println!("  Insights generated: {}", insight_count);
         println!("  Strategy completed successfully ✓");
         println!("  Insights: {:#?}", state.insights.get_state_count());
@@ -2669,18 +2717,46 @@ mod tests {
         );
         insight.set_quantity(Some(1.0));
 
-        insight.submit(&mut state);
-        let first_order_id = insight.order_id.clone();
-        assert!(insight.submitted);
-        assert_eq!(insight.state, InsightState::Executed);
+        let directory = std::env::temp_dir()
+            .join(format!("aqe-submit-idempotence-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let id = insight.insight_id;
+        let pending = insight.submit(&mut state).unwrap();
+        assert!(matches!(
+            pending,
+            crate::core::insight::InsightMutationState::Pending(_)
+        ));
+        state.insights.add_insight(insight);
+        drive_insight_work(&mut state, |state| {
+            state.insights.get(&id).unwrap().state == InsightState::Executed
+                && state.command_driver.as_ref().unwrap().pending_count() == 0
+        })
+        .await;
+        let acknowledged = state.insights.get(&id).unwrap();
+        let first_order_id = acknowledged.order_id.clone();
+        assert!(acknowledged.submitted);
         assert!(
             first_order_id.is_some(),
-            "broker acknowledgement should attach an order id immediately"
+            "the asynchronous broker acknowledgement must attach its order id"
         );
 
-        insight.submit(&mut state);
+        let mut insight = state.insights.take_for_update(&id).unwrap();
+        assert!(matches!(
+            insight.submit(&mut state).unwrap(),
+            crate::core::insight::InsightMutationState::Applied
+        ));
 
         assert_eq!(insight.order_id, first_order_id);
+        state.insights.restore_after_update(insight, true);
+        drive_insight_work(&mut state, |state| !state.live_execution_pending()).await;
         let orders = state
             .broker
             .get_orders()
@@ -2691,6 +2767,8 @@ mod tests {
             1,
             "a second submit call for the same acknowledged insight must not create another order"
         );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -3276,6 +3354,26 @@ mod tests {
         (state, execution)
     }
 
+    async fn trade_update_state_with_command_driver() -> (
+        StrategyState<NoopStrategy, TestExecutionBroker, YahooFinanceDataFeed>,
+        TestExecutionBroker,
+        std::path::PathBuf,
+    ) {
+        let (mut state, execution) = trade_update_state();
+        let directory =
+            std::env::temp_dir().join(format!("aqe-trade-update-{}", uuid::Uuid::new_v4()));
+        state
+            .start_command_driver(
+                directory.join("commands.db"),
+                "strategy",
+                "account",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        (state, execution, directory)
+    }
+
     fn test_order(
         order_id: &str,
         insight: &Insight,
@@ -3333,7 +3431,7 @@ mod tests {
             ctx: &mut dyn StrategyContext,
             insight: &mut Insight,
         ) -> InsightPipeResult {
-            insight.cancel(ctx);
+            insight.cancel(ctx).expect("cancel fixture must admit broker work");
             InsightPipeResult::new(
                 false,
                 true,
@@ -4390,9 +4488,13 @@ mod tests {
         assert_eq!(state.insights.active_insight_ids().len(), 2);
     }
 
-    async fn drive_insight_work<E: Broker + OrderManagementProvider>(
-        state: &mut StrategyState<NoopStrategy, E, YahooFinanceDataFeed>,
-        done: impl Fn(&StrategyState<NoopStrategy, E, YahooFinanceDataFeed>) -> bool,
+    async fn drive_insight_work<
+        S: Strategy,
+        E: Broker + OrderManagementProvider,
+        D: DataFeed + DataProvider,
+    >(
+        state: &mut StrategyState<S, E, D>,
+        done: impl Fn(&StrategyState<S, E, D>) -> bool,
     ) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -5047,9 +5149,9 @@ mod tests {
         assert!(insight.partial_closes.is_empty());
     }
 
-    #[test]
-    fn pipeline_drains_synchronous_cancel_acknowledgement() {
-        let (mut state, execution) = trade_update_state();
+    #[tokio::test]
+    async fn pipeline_drains_broker_worker_cancel_acknowledgement() {
+        let (mut state, execution, directory) = trade_update_state_with_command_driver().await;
         state.add_pipe(
             WrappedInsightPipe::builder(Box::new(CancelPendingPipe))
                 .target_state(InsightState::Executed)
@@ -5079,6 +5181,11 @@ mod tests {
         state.insights.add_insight(insight);
 
         state.run_insight_pipeline();
+        drive_insight_work(&mut state, |state| {
+            state.insights.get(&insight_id).unwrap().state == InsightState::Cancelled
+                && !state.live_execution_pending()
+        })
+        .await;
 
         let updated = state.insights.get(&insight_id).unwrap();
         assert_eq!(updated.state, InsightState::Cancelled);
@@ -5087,6 +5194,8 @@ mod tests {
             execution.cancel_requests.lock().unwrap().as_slice(),
             ["pending-order"]
         );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -5542,9 +5651,9 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn test_parent_close_event_cancels_unfilled_child() {
-        let (mut state, execution) = trade_update_state();
+    #[tokio::test]
+    async fn test_parent_close_event_cancels_unfilled_child() {
+        let (mut state, execution, directory) = trade_update_state_with_command_driver().await;
         let mut parent = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -5583,6 +5692,10 @@ mod tests {
         execution.emit(close, TradeUpdateEvent::Closed);
 
         state.on_trade_update();
+        drive_insight_work(&mut state, |_| {
+            !execution.cancel_requests.lock().unwrap().is_empty()
+        })
+        .await;
 
         let parent = state.insights.get(&parent_id).unwrap();
         assert_eq!(parent.state, InsightState::Closed);
@@ -5596,11 +5709,13 @@ mod tests {
             execution.cancel_requests.lock().unwrap().as_slice(),
             ["child-pending"]
         );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn test_parent_close_event_closes_filled_child_and_cancels_pending_child() {
-        let (mut state, execution) = trade_update_state();
+    #[tokio::test]
+    async fn test_parent_close_event_closes_filled_child_and_cancels_pending_child() {
+        let (mut state, execution, directory) = trade_update_state_with_command_driver().await;
         let mut parent = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -5656,6 +5771,11 @@ mod tests {
         );
         execution.emit(parent_close, TradeUpdateEvent::Closed);
         state.on_trade_update();
+        drive_insight_work(&mut state, |_| {
+            !execution.close_requests.lock().unwrap().is_empty()
+                && !execution.cancel_requests.lock().unwrap().is_empty()
+        })
+        .await;
 
         let parent = state.insights.get(&parent_id).unwrap();
         assert_eq!(parent.state, InsightState::Closed);
@@ -5713,11 +5833,16 @@ mod tests {
             InsightState::Cancelled,
             "pending limit child should become Cancelled after broker cancel event"
         );
+        drive_insight_work(&mut state, |state| !state.live_execution_pending()).await;
+        assert_eq!(execution.close_requests.lock().unwrap().len(), 1);
+        assert_eq!(execution.cancel_requests.lock().unwrap().len(), 1);
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn test_parent_close_event_recursively_reconciles_nested_descendants() {
-        let (mut state, execution) = trade_update_state();
+    #[tokio::test]
+    async fn test_parent_close_event_recursively_reconciles_nested_descendants() {
+        let (mut state, execution, directory) = trade_update_state_with_command_driver().await;
         let mut parent = Insight::new(
             OrderSide::Buy,
             "AAPL".to_string(),
@@ -5776,6 +5901,11 @@ mod tests {
 
         state.on_trade_update();
 
+        drive_insight_work(&mut state, |_| {
+            !execution.close_requests.lock().unwrap().is_empty()
+                && !execution.cancel_requests.lock().unwrap().is_empty()
+        })
+        .await;
         assert!(state.insights.get(&child_id).unwrap().closing);
         assert!(state.insights.get(&split_grandchild_id).unwrap().cancelling);
         assert_eq!(
@@ -5786,6 +5916,8 @@ mod tests {
             execution.cancel_requests.lock().unwrap().as_slice(),
             ["recursive-split-pending"]
         );
+        drop(state.command_driver.take().unwrap().stop().await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

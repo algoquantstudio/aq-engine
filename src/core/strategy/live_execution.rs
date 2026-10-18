@@ -73,6 +73,13 @@ impl<S: Strategy, E: Broker + OrderManagementProvider, D: DataFeed + DataProvide
     ) -> Result<(), BrokerError> {
         let settled = match self.live_execution_failure() {
             Some(error) => Err(BrokerError::OrderError(error.to_string())),
+            None if self.live_execution_pending() || self.insights.active_insight_count() != 0 => {
+                // The journal cannot prove settlement for owner-side work that
+                // has not reached a durable checkpoint yet.
+                Err(BrokerError::OrderError(
+                    "Live teardown still has unresolved broker work or exposure; durable stop remains incomplete".into(),
+                ))
+            }
             None => match &self.command_driver {
                 Some(driver) => match driver.complete_execution_stop().await {
                     Ok(true) => Ok(()),

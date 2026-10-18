@@ -1990,9 +1990,9 @@ where
             if let Some(sync) = local_batch_sync.as_ref() {
                 sync.flush_pending_publications();
             }
-            if !entered_live_execution {
-                break;
-            }
+            // An early stop skips user hooks, not owner reconciliation. Even
+            // before the live loop starts, recovered/preloaded rows must reach
+            // the journal before it can prove that the epoch is settled.
             let mut execution_fills = Vec::new();
             for _ in 0..LIVE_TRADE_NOTIFICATION_BATCH_SIZE {
                 let Ok(envelope) = trade_rx.try_recv() else {
