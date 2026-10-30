@@ -18,6 +18,46 @@ pub struct Mt5Broker {
 }
 
 impl Mt5Broker {
+    async fn cancellation_status(&self, account: &str, order: &str)
+        -> Result<Option<OrderLifecycleSnapshot>, BrokerError> {
+        if account.trim().is_empty() || order.trim().is_empty()
+            || self.bridge.account()?.account_id.trim() != account {
+            return Err(BrokerError::AccountError("MT5 cancellation recovery account mismatch".into()));
+        }
+        let mut rows = self.reconcile_order_lifecycle(&[order.to_owned()]).await?;
+        if self.bridge.account()?.account_id.trim() != account {
+            return Err(BrokerError::AccountError("MT5 account changed during cancellation recovery".into()));
+        }
+        if rows.len() != 1 || rows[0].order_id != order {
+            return Ok(None);
+        }
+        let row = rows.remove(0);
+        if self.bridge.order(order).is_ok_and(|saved|
+            row.symbol.as_deref().is_some_and(|symbol| symbol != saved.asset.symbol)) {
+            return Ok(None);
+        }
+        Ok(Some(row))
+    }
+
+    pub(super) async fn read_account_cash_flows(
+        &self,
+        account: &str,
+        source: Option<&str>,
+        after: u64,
+    ) -> Result<Option<aqe_live_protocol::AccountCashFlowPage>, BrokerError> {
+        let payload = self.bridge.request_rpc_with_timeout(
+            Mt5RpcAction::GetAccountCashFlows,
+            serde_json::json!({"accountId":account,"sourceId":source,"afterSequence":after}),
+            std::time::Duration::from_secs(3),
+        ).await?;
+        if payload.is_null() {
+            return Ok(None);
+        }
+        let page: aqe_live_protocol::AccountCashFlowPage = serde_json::from_value(payload)
+            .map_err(|_| BrokerError::AccountError("invalid MT5 account cash-flow response".into()))?;
+        page.validate(account).map_err(|e| BrokerError::AccountError(e.into()))?;
+        Ok(Some(page))
+    }
     fn is_reconcilable_close_error(error: &BrokerError) -> bool {
         // FROZEN can race a broker-managed TP/SL just like POSITION_CLOSED.
         // Neither code alone proves the position closed; reconcile the ticket.
@@ -382,6 +422,9 @@ impl Broker for Mt5Broker {
 }
 
 impl OrderManagementProvider for Mt5Broker {
+    fn account_cash_flow_reader(&self) -> Option<Arc<dyn super::account_cash_flow::AccountCashFlowReader>> {
+        Some(Arc::new(self.clone()))
+    }
     async fn estimate_order_margin(
         &self,
         request: &BrokerOrderRequest,
@@ -457,6 +500,62 @@ impl OrderManagementProvider for Mt5Broker {
     }
     fn lifecycle_reconciler(&self) -> Option<Arc<dyn super::traits::OrderLifecycleReconciler>> {
         Some(Arc::new(self.clone()))
+    }
+
+    async fn pending_cancellation_recovery(&self, account: &str, order: &str)
+        -> Result<Option<OrderLifecycleSnapshot>, BrokerError> {
+        if self.bridge.order(order).is_ok_and(|saved| matches!(saved.status,
+            TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled | TradeUpdateEvent::Closed
+            | TradeUpdateEvent::Cancelled | TradeUpdateEvent::Expired | TradeUpdateEvent::Rejected)) {
+            return Ok(None);
+        }
+        Ok(self.cancellation_status(account, order).await?.filter(|row|
+            row.status == super::types::OrderLifecycleStatus::Pending
+                && row.position_id.is_none() && row.position_qty.is_none()
+                && row.symbol.as_ref().is_some_and(|symbol| !symbol.trim().is_empty())))
+    }
+
+    async fn retry_cancellation(&self, account: &str, order: &str) -> Result<bool, BrokerError> {
+        use super::types::OrderLifecycleStatus;
+        // Re-read under the account mutation lane: the earlier read can race a
+        // fill. OrderDelete targets this exact ticket only; never place an entry
+        // or close a position as a substitute for a failed cancellation.
+        if self.pending_cancellation_recovery(account, order).await?.is_none() {
+            return Ok(false);
+        }
+        let existing = match self.bridge.order(order) {
+            Ok(saved) => Some(saved),
+            Err(_) => self.bridge.request_orders().await?.into_iter().find(|saved| saved.order_id == order),
+        };
+        let Some(mut existing) = existing else { return Ok(false); };
+        if matches!(existing.status, TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled
+            | TradeUpdateEvent::Closed | TradeUpdateEvent::Cancelled | TradeUpdateEvent::Expired | TradeUpdateEvent::Rejected)
+            || self.bridge.account()?.account_id.trim() != account {
+            return Ok(false);
+        }
+        let result = self.bridge.request_rpc(Mt5RpcAction::CancelOrder,
+            serde_json::json!({"orderId":order,"insightId":existing.insight_id,"strategyType":existing.strategy_type})).await;
+        // An ACK (or a timeout) alone cannot establish cancellation. Older EAs
+        // also return ACK before terminal history is visible. Keep the original
+        // ambiguous receipt unless the exact ticket is now terminal.
+        let after = self.cancellation_status(account, order).await?;
+        if after.is_some_and(|row| matches!(row.status,
+            OrderLifecycleStatus::Cancelled | OrderLifecycleStatus::Expired)) {
+            // Confirmation must reach the canonical Insight reducer, not just
+            // consume its receipt: a Cancel ACK alone never changes its state.
+            if self.bridge.order(order).is_ok_and(|saved| matches!(saved.status,
+                TradeUpdateEvent::Filled | TradeUpdateEvent::PartialFilled | TradeUpdateEvent::Closed | TradeUpdateEvent::Rejected)) {
+                return Ok(false);
+            }
+            if !self.bridge.order(order).is_ok_and(|saved| matches!(saved.status,
+                TradeUpdateEvent::Cancelled | TradeUpdateEvent::Expired)) {
+                existing.status = TradeUpdateEvent::Cancelled;
+                existing.updated_at = Self::now_ts();
+                self.bridge.emit_order_event(existing, TradeUpdateEvent::Cancelled);
+            }
+            return Ok(true);
+        }
+        result.map(|_| false)
     }
 
     fn execution_fill_history_reader(
@@ -823,12 +922,8 @@ impl OrderManagementProvider for Mt5Broker {
     }
 
     async fn get_position(&self, symbol: &str) -> Result<Position, BrokerError> {
-        self.bridge
-            .request_positions()
-            .await?
-            .into_iter()
-            .find(|position| position.asset.symbol == symbol)
-            .ok_or_else(|| BrokerError::PositionError(format!("MT5 position {} not found", symbol)))
+        self.bridge.request_positions().await?;
+        self.bridge.position(symbol)
     }
 
     async fn get_account(&self) -> Result<Account, BrokerError> {

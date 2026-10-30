@@ -785,3 +785,43 @@ async fn history_owner_pages_include_terminal_rows_and_are_bounded() {
     }
     assert_eq!(ids.len(), 65);
 }
+
+#[tokio::test]
+async fn active_fill_history_bypasses_archive_without_losing_historical_owners() {
+    use crate::core::insight::types::InsightState;
+    let fixture=Fixture::new();
+    let mut j=fixture.open().await;
+    for n in 1..=65 {
+        let mut row=Insight::default();row.insight_id=uuid::Uuid::from_u128(n);
+        row.symbol="ANY".into();row.order_id=Some(format!("archive-{n}"));row.state=InsightState::Closed;
+        j.persist_execution_batch(&ExecutionCheckpointBatch::new(vec![InsightExecutionCheckpoint::capture(&row,1,true,None)],vec![]).unwrap()).await.unwrap();
+    }
+    let mut live=Insight::default();live.insight_id=uuid::Uuid::from_u128(1000);
+    live.symbol="ANY".into();live.order_id=Some("newly-filled".into());live.state=InsightState::Filled;
+    let mut partial=live.clone();partial.insight_id=uuid::Uuid::from_u128(1001);
+    partial.order_id=Some("partial".into());partial.state=InsightState::Executed;partial.entry_filled_quantity=Some(1.);
+    let mut pending=live.clone();pending.insight_id=uuid::Uuid::from_u128(1002);
+    pending.order_id=Some("unfilled".into());pending.state=InsightState::Executed;
+    pending.entry_filled_quantity=None;
+    for row in [&live,&partial,&pending] {
+        j.persist_execution_batch(&ExecutionCheckpointBatch::new(vec![InsightExecutionCheckpoint::capture(row,1,true,None)],vec![]).unwrap()).await.unwrap();
+    }
+    let archive=j.fill_history_owner_page("").await.unwrap();
+    assert_eq!(archive.owners.len(),32);
+    assert!(archive.owners.iter().all(|o|o.entry_order_id.starts_with("archive-")),"reproduce why a new fill was stuck behind old UUIDs");
+    let active=j.active_fill_history_owner_page("").await.unwrap();
+    assert_eq!(active.owners.iter().map(|o|o.entry_order_id.as_str()).collect::<Vec<_>>(),["newly-filled","partial"]);
+    assert!(j.active_fill_history_owner_page(active.next_cursor.as_deref().unwrap()).await.unwrap().owners.is_empty());
+    partial.state=InsightState::Closed;
+    j.persist_execution_batch(&ExecutionCheckpointBatch::new(vec![InsightExecutionCheckpoint::capture(&partial,2,true,None)],vec![]).unwrap()).await.unwrap();
+    assert_eq!(j.active_fill_history_owner_page("").await.unwrap().owners.len(),1,"closed and unfilled orders must not consume the active lane");
+    drop(j);
+    let j=fixture.open().await;
+    assert_eq!(j.active_fill_history_owner_page("").await.unwrap().owners[0].entry_order_id,"newly-filled");
+    let mut cursor=String::new();let mut total=0;
+    loop {
+        let page=j.fill_history_owner_page(&cursor).await.unwrap();total+=page.owners.len();
+        match page.next_cursor {Some(next)=>cursor=next,None=>break}
+    }
+    assert_eq!(total,68,"historical recovery is retained independently");
+}

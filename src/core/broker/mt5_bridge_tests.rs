@@ -15,6 +15,126 @@ fn test_bridge(token: &str) -> Mt5Bridge {
     })
 }
 
+#[actix_web::test]
+async fn unauthenticated_v2_connections_cannot_fence_the_active_ea() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let bridge = Arc::new(test_bridge("transport-secret"));
+    let data: web::Data<Mt5Bridge> = web::Data::from(bridge.clone());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = HttpServer::new(move || App::new().app_data(data.clone())
+        .route("/v2/bridge", web::get().to(bridge_v2)))
+        .workers(1).listen(listener).unwrap().run();
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+    let url = format!("ws://{address}/v2/bridge");
+    let (mut ea, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let hello: Value = serde_json::from_str(ea.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(bridge.active_transport_generation.load(Ordering::SeqCst), 0);
+    ea.send(Message::Text(serde_json::json!({"type":"Authenticate", "nonce":hello["nonce"],
+        "token":"transport-secret", "sessionId":"authenticated-ea"}).to_string().into())).await.unwrap();
+    let authenticated: Value = serde_json::from_str(ea.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let generation = authenticated["transportGeneration"].as_u64().unwrap();
+    assert_eq!(generation, 1);
+
+    let (mut unauthenticated, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let hello: Value = serde_json::from_str(unauthenticated.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(bridge.active_transport_generation.load(Ordering::SeqCst), generation);
+    unauthenticated.send(Message::Text(serde_json::json!({"type":"Authenticate", "nonce":hello["nonce"],
+        "token":"wrong-secret", "sessionId":"attacker"}).to_string().into())).await.unwrap();
+    let rejected: Value = serde_json::from_str(unauthenticated.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(rejected["type"], "Rejected");
+    assert_eq!(bridge.active_transport_generation.load(Ordering::SeqCst), generation);
+    assert!(!bridge.state.read().active_sessions.contains_key("attacker"));
+
+    // Exercise actual command delivery, not just the generation counter.
+    let requester = bridge.clone();
+    let request = tokio::spawn(async move { requester.request_rpc_with_timeout(
+        Mt5RpcAction::GetHistory, serde_json::json!({}), Duration::from_secs(2)).await });
+    let command = tokio::time::timeout(Duration::from_secs(2), ea.next()).await.unwrap().unwrap().unwrap();
+    let command: Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
+    assert_eq!(command["type"], "BrokerCommand");
+    ea.send(Message::Text(serde_json::json!({"type":"BrokerCommandResult", "payload":{
+        "requestId":command["request"]["requestId"], "ok":true, "payload":[]}}).to_string().into())).await.unwrap();
+    assert_eq!(request.await.unwrap().unwrap(), serde_json::json!([]));
+
+    // A genuine authenticated reconnect still claims a new generation.
+    let (mut replacement, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let hello: Value = serde_json::from_str(replacement.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    replacement.send(Message::Text(serde_json::json!({"type":"Authenticate", "nonce":hello["nonce"],
+        "token":"transport-secret", "sessionId":"authenticated-replacement"}).to_string().into())).await.unwrap();
+    let response: Value = serde_json::from_str(replacement.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(response["transportGeneration"], generation + 1);
+    let _ = ea.close(None).await;
+    let _ = replacement.close(None).await;
+    handle.stop(false).await;
+    bridge.shutdown().await;
+}
+
+#[actix_web::test]
+async fn unauthenticated_v2_sockets_are_bounded_and_expire() {
+    use futures::StreamExt;
+    let bridge = Arc::new(test_bridge("handshake-secret"));
+    let data: web::Data<Mt5Bridge> = web::Data::from(bridge.clone());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = HttpServer::new(move || App::new().app_data(data.clone())
+        .route("/v2/bridge", web::get().to(bridge_v2)))
+        .workers(1).listen(listener).unwrap().run();
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+    let url = format!("ws://{address}/v2/bridge");
+    let mut sockets = Vec::new();
+    for _ in 0..MT5_V2_MAX_AUTH_CONNECTIONS {
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        sockets.push(socket);
+    }
+    let rejected = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+    match rejected {
+        tokio_tungstenite::tungstenite::Error::Http(response) => assert_eq!(response.status(), 429),
+        other => panic!("Expected bounded handshake rejection: {other}"),
+    }
+    tokio::time::timeout(MT5_V2_AUTH_TIMEOUT + Duration::from_secs(2), async {
+        while bridge.v2_auth_slots.available_permits() != MT5_V2_MAX_AUTH_CONNECTIONS {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(bridge.active_transport_generation.load(Ordering::SeqCst), 0);
+    drop(sockets);
+    handle.stop(false).await;
+    bridge.shutdown().await;
+}
+
+#[test]
+fn position_payload_keeps_order_ids_and_all_same_symbol_tickets() {
+    let bridge=test_bridge("position-identities");
+    let position=|id:&str,pnl| Position {
+        account_id:"account".into(),order_id:Some(id.into()),asset:default_mt5_asset("BTCUSD"),
+        avg_entry_price:100.,qty:1.,side:OrderSide::Sell,market_value:99.,cost_basis:100.,current_price:99.,
+        unrealized_pnl:pnl,realized_pnl:0.,entry_commission:0.,margin_required:None,
+    };
+    let payload=|positions| Mt5SnapshotPayload {account:None,assets:vec![],orders:vec![],positions};
+    bridge.apply_snapshot("session",payload(vec![position("a",5.),position("b",12.)]));
+    assert_eq!(bridge.positions().len(),2);
+    assert_eq!(bridge.positions().iter().map(|p|p.unrealized_pnl).sum::<f64>(),17.);
+    assert!(bridge.position("BTCUSD").is_err()); // Ambiguous symbol, never choose an arbitrary split.
+    bridge.apply_snapshot("session",payload(vec![position("b",14.)]));
+    assert_eq!(bridge.positions().len(),1);
+    assert_eq!(bridge.position("BTCUSD").unwrap().order_id.as_deref(),Some("b"));
+    let mut legacy=serde_json::to_value(position("b",14.)).unwrap();
+    assert!(legacy.get("symbol").is_none());
+    assert_eq!(legacy["asset"]["symbol"],"BTCUSD");
+    // Old EAs may still send the redundant field. The asset is authoritative.
+    legacy["symbol"]=serde_json::json!("obsolete-duplicate");
+    let decoded:Position=serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(decoded.asset.symbol,"BTCUSD");
+    assert_eq!(decoded.order_id.as_deref(),Some("b"));
+    legacy.as_object_mut().unwrap().remove("order_id");
+    assert!(serde_json::from_value::<Position>(legacy).unwrap().order_id.is_none());
+}
+
 #[tokio::test]
 async fn automatic_recovery_shutdown_cancels_pending_reads_and_fences_rescheduling() {
     let bridge = Arc::new(test_bridge("owned-recovery-test"));
@@ -256,6 +376,7 @@ fn quote_leases_survive_bar_unsubscribe_and_deliver_only_matching_fresh_quotes()
         .unwrap();
     assert_eq!(bridge.current_subscription_specs().len(), 2);
     let quote = Quote {
+        profit_model: None,
         symbol: "AAPL".into(),
         bid: 100.0,
         ask: 100.2,
@@ -275,6 +396,19 @@ fn quote_leases_survive_bar_unsubscribe_and_deliver_only_matching_fresh_quotes()
         );
     }
     assert_eq!(count.load(AtomicOrdering::Relaxed), 1);
+    let mut fx_quote=quote.clone();
+    fx_quote.profit_model=Some(aqe_live_protocol::BrokerQuoteProfit {
+        version:1,account_id:"account".into(),currency:"GBP".into(),symbol:"AAPL".into(),as_of_us:1,
+        buy_gain:0.75,buy_loss:0.76,sell_gain:0.75,sell_loss:0.76,
+    });
+    bridge.apply_market_data(&session,Mt5MarketDataPayload{quotes:vec![fx_quote.clone()],..Default::default()});
+    assert_eq!(bridge.latest_quote("AAPL").unwrap().profit_model,fx_quote.profit_model);
+    assert_eq!(count.load(AtomicOrdering::Relaxed),1,"FX metadata alone must not replay execution quotes");
+    fx_quote.set_mapped_symbol("Alias".into());
+    assert_eq!(fx_quote.profit_model.as_ref().unwrap().symbol,"Alias");
+    fx_quote.profit_model.as_mut().unwrap().symbol="wrong-instrument".into();
+    fx_quote.set_mapped_symbol("AnotherAlias".into());
+    assert!(fx_quote.profit_model.is_none());
     bridge.quote_subscribers.lock().remove("selected");
     let specs = bridge.current_subscription_specs();
     assert_eq!(specs.len(), 1);
@@ -457,6 +591,74 @@ async fn already_closed_close_rpc_reconciles_without_repeating_close() {
     assert_eq!(order.commission, Some(0.2));
     assert_eq!(order.swap, Some(-0.1));
     assert!(bridge.drain_rpc_requests(1).0.is_empty());
+    }
+}
+
+fn cancellation_recovery_bridge() -> Arc<Mt5Bridge> {
+    let bridge=Arc::new(test_bridge("cancel-recovery"));
+    let account:Account=serde_json::from_value(serde_json::json!({
+        "account_id":"account","account_type":"Live","equity":100000.,
+        "cash":100000.,"currency":"USD","buying_power":90000.,
+        "shorting_enabled":true,"leverage":100
+    })).unwrap();
+    bridge.apply_snapshot("cancel-recovery",Mt5SnapshotPayload { account:Some(account),..Default::default() });
+    bridge.upsert_order(trade_event_order("2025202590","saved-owner",TradeUpdateEvent::New));
+    bridge
+}
+
+fn reply_cancel_history(bridge:&Mt5Bridge,request:Mt5RpcRequest,status:&str) {
+    assert!(matches!(request.action,Mt5RpcAction::ReconcileOrders));
+    assert_eq!(request.payload["orderIds"],serde_json::json!(["2025202590"]));
+    bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id:request.request_id,ok:true,message:None,
+        payload:Some(serde_json::json!([{"orderId":"2025202590","status":status,"symbol":"AAPL"}])) });
+}
+
+#[tokio::test]
+async fn cancellation_recovery_requires_pending_proof_then_terminal_confirmation_not_ack() {
+    use crate::core::broker::{mt5_broker::Mt5Broker,traits::OrderManagementProvider};
+    for (rpc_ok,after,confirmed) in [(true,"Cancelled",true),(false,"Cancelled",true),
+        (true,"Pending",false),(true,"Unknown",false),(true,"PositionOpen",false)] {
+        let bridge=cancellation_recovery_bridge();
+        let broker=Mt5Broker::new(bridge.clone());
+        let task=tokio::spawn(async move {broker.retry_cancellation("account","2025202590").await});
+        reply_cancel_history(&bridge,next_test_rpc(&bridge).await,"Pending");
+        let cancel=next_test_rpc(&bridge).await;
+        assert!(matches!(cancel.action,Mt5RpcAction::CancelOrder));
+        assert_eq!(cancel.payload["orderId"],"2025202590");
+        bridge.apply_rpc_response(Mt5RpcResponsePayload {request_id:cancel.request_id,ok:rpc_ok,
+            message:(!rpc_ok).then(||"old request may already have cancelled".into()),payload:Some(serde_json::json!({"cancelled":true}))});
+        reply_cancel_history(&bridge,next_test_rpc(&bridge).await,after);
+        assert_eq!(task.await.unwrap().unwrap(),confirmed,"{rpc_ok}/{after}");
+        let events=bridge.drain_trade_events();
+        assert_eq!(events.len(),usize::from(confirmed),"no Cancelled event on an ACK alone");
+        if confirmed {assert_eq!(events[0].1,TradeUpdateEvent::Cancelled);assert_eq!(events[0].0.order_id,"2025202590");}
+        assert!(bridge.drain_rpc_requests(10).0.is_empty(),"never submit, close, or retry blindly");
+    }
+}
+
+#[tokio::test]
+async fn cancellation_recovery_never_mutates_unknown_filled_or_foreign_tickets() {
+    use crate::core::broker::{mt5_broker::Mt5Broker,traits::OrderManagementProvider};
+    for status in ["Unknown","Filled","PositionOpen","Closed","Cancelled"] {
+        let bridge=cancellation_recovery_bridge();
+        let broker=Mt5Broker::new(bridge.clone());
+        assert!(broker.pending_cancellation_recovery("foreign-account","2025202590").await.is_err());
+        assert!(bridge.drain_rpc_requests(1).0.is_empty());
+        let task=tokio::spawn(async move {broker.retry_cancellation("account","2025202590").await});
+        reply_cancel_history(&bridge,next_test_rpc(&bridge).await,status);
+        assert!(!task.await.unwrap().unwrap());
+        assert!(bridge.drain_rpc_requests(1).0.is_empty(),"{status}: must not cancel/close/submit");
+    }
+    for payload in [serde_json::json!([]),serde_json::json!([{"orderId":"other","status":"Pending","symbol":"AAPL"}]),
+        serde_json::json!([{"orderId":"2025202590","status":"Pending","symbol":"WRONG"}]),
+        serde_json::json!([{"orderId":"2025202590","status":"Pending","symbol":"AAPL","positionId":"partially-filled"}])] {
+        let bridge=cancellation_recovery_bridge();
+        let broker=Mt5Broker::new(bridge.clone());
+        let task=tokio::spawn(async move {broker.pending_cancellation_recovery("account","2025202590").await});
+        let request=next_test_rpc(&bridge).await;
+        bridge.apply_rpc_response(Mt5RpcResponsePayload {request_id:request.request_id,ok:true,message:None,payload:Some(payload)});
+        assert!(task.await.unwrap().unwrap().is_none());
+        assert!(bridge.drain_rpc_requests(1).0.is_empty());
     }
 }
 
@@ -772,6 +974,16 @@ fn v2_post_authentication_frames_decode_camel_case_fields() {
             assert_eq!(correlation_id.as_deref(), Some("market:42"));
         }
         _ => panic!("expected BatchAcknowledgement frame"),
+    }
+}
+
+#[test]
+fn token_auth_rejects_empty_configured_secrets() {
+    for token in ["", "   "] {
+        let bridge = test_bridge(token);
+        let headers = headers("session", token);
+        assert!(authorize_session_token(&bridge, &headers, "session").is_err());
+        assert!(authorize_token(&bridge, &headers).is_err());
     }
 }
 
@@ -1301,6 +1513,14 @@ async fn actix_health_endpoint_preserves_bridge_response_shape() {
     assert_eq!(response.protocol_version, PROTOCOL_VERSION);
     assert_eq!(response.execution_fill_revision_version, 1);
     assert!(response.payload.is_some());
+    assert!(response.payload.as_ref().unwrap().get("diagnostics").is_none());
+    let authenticated = actix_web::test::TestRequest::get().uri("/health")
+        .insert_header(("x-aqe-mt5-token", "test-token")).to_request();
+    let full: Mt5BridgeResponse<Value> = actix_web::test::call_and_read_body_json(&app, authenticated).await;
+    assert!(full.payload.unwrap().get("diagnostics").is_some());
+    let invalid = actix_web::test::TestRequest::get().uri("/health")
+        .insert_header(("x-aqe-mt5-token", "wrong-token")).to_request();
+    assert_eq!(actix_web::test::call_service(&app, invalid).await.status(), StatusCode::UNAUTHORIZED);
     let mut legacy = serde_json::to_value(&response).unwrap();
     legacy.as_object_mut().unwrap().remove("executionFillRevisionVersion");
     let legacy: Mt5BridgeResponse<Value> = serde_json::from_value(legacy).unwrap();
@@ -1394,6 +1614,45 @@ fn terminal_disconnect_is_distinct_from_bridge_transport() {
 
     bridge.state.write().terminal_connected = Some(true);
     assert!(bridge.is_broker_connected());
+}
+
+#[test]
+fn account_observations_distinguish_missing_values_from_confirmed_zero_equity() {
+    let mut account: Account = serde_json::from_value(serde_json::json!({
+        "account_id":"123", "account_type":"Live", "currency":"GBP", "equity":0., "cash":0.,
+        "buying_power":0., "shorting_enabled":true, "leverage":100
+    })).unwrap();
+    assert!(Mt5Bridge::validate_account_observation(&account, None).is_err());
+    assert!(Mt5Bridge::validate_account_observation(&account, Some(false)).is_err());
+    assert!(Mt5Bridge::validate_account_observation(&account, Some(true)).is_ok());
+    account.equity = -10.;
+    assert!(Mt5Bridge::validate_account_observation(&account, Some(true)).is_ok());
+    account.equity = 100.; account.cash = 100.;
+    assert!(Mt5Bridge::validate_account_observation(&account, None).is_ok());
+    for invalid in [f64::NAN, f64::INFINITY] {
+        account.equity = invalid;
+        assert!(Mt5Bridge::validate_account_observation(&account, Some(true)).is_err());
+    }
+    account.equity = 100.; account.account_id = "0".into();
+    assert!(Mt5Bridge::validate_account_observation(&account, Some(true)).is_err());
+}
+
+#[tokio::test]
+async fn disconnected_terminal_cannot_refresh_or_publish_account_placeholders() {
+    let bridge = test_bridge("account-proof");
+    let account: Account = serde_json::from_value(serde_json::json!({
+        "account_id":"123", "account_type":"Live", "currency":"GBP", "equity":100., "cash":100.,
+        "buying_power":90., "shorting_enabled":true, "leverage":100
+    })).unwrap();
+    bridge.apply_snapshot("account-proof", Mt5SnapshotPayload { account:Some(account.clone()), ..Default::default() });
+    assert_eq!(bridge.account().unwrap().equity,100.);
+    bridge.state.write().terminal_connected=Some(false);
+    let mut placeholder=account; placeholder.equity=0.;placeholder.cash=0.;placeholder.buying_power=0.;
+    bridge.apply_snapshot("account-proof", Mt5SnapshotPayload { account:Some(placeholder), ..Default::default() });
+    assert!(bridge.account().is_err());
+    assert!(bridge.request_account().await.is_err());
+    assert!(bridge.rpc_queue.lock().is_empty(),"No disconnected RPC is dispatched");
+    assert_eq!(bridge.state.read().account.as_ref().unwrap().equity,100.);
 }
 
 #[test]
@@ -1649,6 +1908,7 @@ fn unchanged_intrabar_ticks_are_not_emitted_twice() {
         .unwrap();
 
     let quote = Quote {
+        profit_model: None,
         symbol: "AAPL".to_string(),
         bid: 100.0,
         ask: 100.2,
@@ -1700,6 +1960,7 @@ fn quote_and_authoritative_intrabar_volume_remain_independent() {
         },
     };
     let quote = Quote {
+        profit_model: None,
         symbol: "AAPL".into(),
         bid: 101.0,
         ask: 102.0,

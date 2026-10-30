@@ -165,6 +165,7 @@ impl DataProvider for SyntheticFeed {
     }
     async fn get_latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
         Ok(Quote {
+            profit_model: None,
             symbol: symbol.into(),
             bid: 100.5,
             ask: 100.5,

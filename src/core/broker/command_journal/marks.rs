@@ -79,43 +79,55 @@ impl BrokerCommandJournal {
             return Err(journal_error("invalid sampling minute"));
         }
         let (provider, position) = after.unwrap_or_default();
-        let mut rows=self.connection.query("SELECT p.provider,p.position_id,p.insight_id,p.execution_epoch,p.ledger_sequence,p.check_json
-            FROM broker_execution_position_checks p JOIN broker_insight_checkpoints c ON c.insight_id=p.insight_id AND c.execution_epoch=p.execution_epoch AND c.materialized=1
+        let mut rows=self.analytics_connection().query("SELECT p.provider,p.position_id,p.insight_id,p.execution_epoch,p.ledger_sequence,p.check_json
+            FROM broker_execution_position_checks p
             LEFT JOIN broker_position_mark_heads h ON h.fill_provider=p.provider AND h.position_id=p.position_id
             WHERE json_extract(p.check_json,'$.matched')=1 AND (json_extract(p.check_json,'$.snapshot.quantity')>0 OR h.is_open=1)
             AND NOT EXISTS(SELECT 1 FROM broker_execution_position_checks other WHERE other.position_id=p.position_id AND other.provider<>p.provider)
             AND COALESCE(h.sample_minute_us,0)<?1 AND (p.provider>?2 OR (p.provider=?2 AND p.position_id>?3)) ORDER BY p.provider,p.position_id LIMIT 33",params![minute,provider,position]).await.map_err(journal_error)?;
         let mut owners = Vec::new();
+        let mut examined = 0;
+        let mut last_examined = None;
+        let mut more = false;
         while let Some(r) = rows.next().await.map_err(journal_error)? {
+            if examined == MAX_POSITION_MARK_ROWS { more = true; break; }
+            examined += 1;
+            let provider: String = r.get(0).map_err(journal_error)?;
+            let position: String = r.get(1).map_err(journal_error)?;
+            let insight: String = r.get(2).map_err(journal_error)?;
+            let epoch: i64 = r.get(3).map_err(journal_error)?;
+            last_examined = Some((provider.clone(), position.clone()));
+            // Canonical ownership remains in the uncapped recovery store.
+            if !self.mark_checkpoint_matches(&insight, epoch, None).await? { continue; }
             let check: PositionQuantityCheck =
                 serde_json::from_str(&r.get::<String>(5).map_err(journal_error)?)
                     .map_err(journal_error)?;
             owners.push(PositionMarkOwner {
-                fill_provider: r.get(0).map_err(journal_error)?,
-                position_id: r.get(1).map_err(journal_error)?,
-                insight_id: r.get(2).map_err(journal_error)?,
-                execution_epoch: r.get::<i64>(3).map_err(journal_error)? as u64,
+                fill_provider: provider,
+                position_id: position,
+                insight_id: insight,
+                execution_epoch: epoch as u64,
                 ledger_sequence: r.get::<i64>(4).map_err(journal_error)? as u64,
                 symbol: check.snapshot.symbol,
                 quantity: check.snapshot.quantity,
                 side: check.snapshot.side,
             });
         }
-        let more = owners.len() > MAX_POSITION_MARK_ROWS;
-        owners.truncate(MAX_POSITION_MARK_ROWS);
-        let next_after = more
-            .then(|| {
-                owners
-                    .last()
-                    .map(|o| (o.fill_provider.clone(), o.position_id.clone()))
-            })
-            .flatten();
+        let next_after = more.then_some(last_examined).flatten();
         Ok(PositionMarkOwners { owners, next_after })
+    }
+
+    async fn mark_checkpoint_matches(&self, insight: &str, epoch: i64, symbol: Option<&str>) -> Result<bool, BrokerCommandError> {
+        let mut rows = self.connection.query("SELECT symbol FROM broker_insight_checkpoints WHERE insight_id=?1 AND execution_epoch=?2 AND materialized=1",
+            params![insight.to_owned(),epoch]).await.map_err(journal_error)?;
+        let Some(row) = rows.next().await.map_err(journal_error)? else { return Ok(false); };
+        Ok(symbol.is_none_or(|symbol| row.get::<String>(0).ok().as_deref() == Some(symbol)))
     }
     pub(crate) async fn record_position_marks(
         &mut self,
         batch: PositionMarkBatch,
     ) -> Result<usize, BrokerCommandError> {
+        self.check_analytics_admission().await?;
         // Revalidate at the journal boundary even if a caller bypassed `new`.
         let batch = PositionMarkBatch::new(batch.owners, batch.values, batch.sample_minute_us)?;
         if batch.values.account_id != self.account_id {
@@ -134,9 +146,8 @@ impl BrokerCommandJournal {
             )
             .map_err(journal_error)?;
         let recorded_at_us = chrono::Utc::now().timestamp_micros();
-        let tx = self
-            .connection
-            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+        let tx = turso::transaction::Transaction::new_unchecked(
+            self.analytics_connection(),turso::transaction::TransactionBehavior::Immediate)
             .await
             .map_err(journal_error)?;
         let mut next = tx
@@ -164,7 +175,7 @@ impl BrokerCommandJournal {
                 .ok_or_else(|| journal_error("missing position mark identity"))?;
             // Recheck the lease on the serialized worker after the broker read.
             // A later fill/correction revokes the comparison before admission.
-            let mut rows=tx.query("SELECT p.insight_id,p.execution_epoch,p.ledger_sequence,p.check_json,c.symbol FROM broker_execution_position_checks p JOIN broker_insight_checkpoints c ON c.insight_id=p.insight_id AND c.materialized=1 AND c.execution_epoch=p.execution_epoch WHERE p.provider=?1 AND p.position_id=?2 AND NOT EXISTS(SELECT 1 FROM broker_execution_position_checks other WHERE other.position_id=p.position_id AND other.provider<>p.provider)",params![owner.fill_provider.clone(),owner.position_id.clone()]).await.map_err(journal_error)?;
+            let mut rows=tx.query("SELECT p.insight_id,p.execution_epoch,p.ledger_sequence,p.check_json FROM broker_execution_position_checks p WHERE p.provider=?1 AND p.position_id=?2 AND NOT EXISTS(SELECT 1 FROM broker_execution_position_checks other WHERE other.position_id=p.position_id AND other.provider<>p.provider)",params![owner.fill_provider.clone(),owner.position_id.clone()]).await.map_err(journal_error)?;
             let Some(r) = rows.next().await.map_err(journal_error)? else {
                 continue;
             };
@@ -174,7 +185,7 @@ impl BrokerCommandJournal {
             if r.get::<String>(0).map_err(journal_error)? != owner.insight_id
                 || r.get::<i64>(1).map_err(journal_error)? as u64 != owner.execution_epoch
                 || r.get::<i64>(2).map_err(journal_error)? as u64 != owner.ledger_sequence
-                || r.get::<String>(4).map_err(journal_error)? != owner.symbol
+                || !self.mark_checkpoint_matches(&owner.insight_id, owner.execution_epoch as i64, Some(&owner.symbol)).await?
                 || !check.matched
                 || check.snapshot.quantity != owner.quantity
                 || check.snapshot.side != owner.side
@@ -227,7 +238,7 @@ impl BrokerCommandJournal {
             admitted += 1;
             sequence += 1;
         }
-        tx.commit().await.map_err(journal_error)?;
+        super::analytics_capture::commit_observations(tx,self.analytics_connection(),self.analytics_path(),self.analytics_capture_budget,self.lifecycle.epoch).await?;
         Ok(admitted)
     }
     pub(crate) async fn position_mark_page(
@@ -237,8 +248,7 @@ impl BrokerCommandJournal {
         if after > i64::MAX as u64 {
             return Err(journal_error("invalid position mark cursor"));
         }
-        let mut rows = self
-            .connection
+        let mut rows = self.analytics_connection()
             .query(
                 "SELECT COALESCE(MAX(sequence),0) FROM broker_position_marks",
                 (),
@@ -256,7 +266,7 @@ impl BrokerCommandJournal {
         if after > through {
             return Err(journal_error("position mark cursor exceeds retained head"));
         }
-        let mut rows=self.connection.query("SELECT body FROM broker_position_marks WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 32",params![after as i64,through as i64]).await.map_err(journal_error)?;
+        let mut rows=self.analytics_connection().query("SELECT body FROM broker_position_marks WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 32",params![after as i64,through as i64]).await.map_err(journal_error)?;
         let mut page = PositionMarkPage {
             version: POSITION_MARK_VERSION,
             source_id: self.evidence_source_id.clone(),

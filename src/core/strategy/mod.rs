@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod snapshot_context_tests;
 #[cfg(test)]
+mod position_read_tests;
+#[cfg(test)]
 mod tests;
 use crate::core::alpha::WrappedAlphaModel;
 use crate::core::broker::backtest_state::BacktestResults;
@@ -43,6 +45,7 @@ pub mod hyperparameters;
 mod insight_work;
 mod legacy_metrics_recovery;
 mod lifecycle_reconciliation;
+mod live_capture_recovery;
 mod live_event_projection;
 mod live_evidence_export;
 mod live_execution;
@@ -53,6 +56,7 @@ mod live_projection;
 mod live_quotes;
 mod local_live_artifacts;
 mod metrics_checkpoint_writer;
+mod metrics_risk_fence;
 mod metrics_continuity;
 mod metrics_continuity_lookup;
 mod order_reducer;
@@ -760,6 +764,22 @@ where
         // Counts describe requested work, not broker-confirmed closures.
         self.process_insight_work(256, std::time::Duration::from_millis(5));
         report
+    }
+
+    fn cancel_unsubmitted_insights_for_early_stop(&mut self) {
+        for id in self.insights.active_insight_ids() {
+            if self.insights.get(&id).is_some_and(|insight| {
+                insight.state == InsightState::New
+                    && !insight.submitted
+                    && insight.order_id.is_none()
+                    && insight.pending_mutations.is_empty()
+                    && insight.entry_filled_quantity.unwrap_or(0.0) == 0.0
+            }) {
+                self.schedule_insight_cleanup(id);
+            }
+        }
+        // Requests are IDs only; the ordinary bounded owner turns settle them.
+        self.process_insight_work(256, std::time::Duration::from_millis(5));
     }
 
     fn begin_teardown(&mut self) {
@@ -2251,6 +2271,10 @@ where
             .map(|account| (*account).clone())
     }
 
+    fn get_positions(&self) -> Result<Vec<crate::core::broker::types::Position>, BrokerError> {
+        self.broker.get_positions_sync()
+    }
+
     fn cached_account(&self) -> Option<crate::core::broker::types::Account> {
         self.broker
             .account_snapshot()
@@ -2271,13 +2295,7 @@ where
     }
 
     fn bind_insight_context(&self, insight: &mut Insight) {
-        if let Some(state) = self.broker.backtest_state.clone() {
-            insight.bind_context(InsightStrategyContext::new(move || {
-                state.read().current_time
-            }));
-        } else {
-            insight.bind_context(InsightStrategyContext::new(chrono::Utc::now));
-        }
+        insight.bind_context(self.broker.insight_context());
     }
 
     fn latest_quote(&self, symbol: &str) -> Result<crate::core::broker::types::Quote, BrokerError> {

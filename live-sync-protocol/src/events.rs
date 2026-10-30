@@ -214,6 +214,26 @@ pub struct ReconciliationSnapshot {
 pub const RECONCILIATION_TARGET_BYTES: usize = 64 * 1024;
 pub const LOCAL_EVENT_HARD_LIMIT_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationPurpose {
+    #[default]
+    Startup,
+    CaptureRecovery,
+}
+
+impl ReconciliationPurpose {
+    pub fn is_startup(&self) -> bool {
+        *self == Self::Startup
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::CaptureRecovery => "capture_recovery",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconciliationStart {
@@ -223,6 +243,14 @@ pub struct ReconciliationStart {
     pub live_session_id: String,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Omitted for legacy/startup compatibility. Mid-run capture recovery must
+    /// explicitly include the current run and a critical-stream cut-off.
+    #[serde(default, skip_serializing_if = "ReconciliationPurpose::is_startup")]
+    pub purpose: ReconciliationPurpose,
+    /// Mid-run replay must be committed through this critical sequence before
+    /// the service may inspect stale state. Omitted by legacy startup writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_replay_through: Option<u64>,
     pub snapshot_complete: bool,
     /// Broker-neutral lifecycle capabilities captured with this authoritative snapshot.
     /// Strings keep protocol compatibility with external broker implementations.
@@ -231,6 +259,21 @@ pub struct ReconciliationStart {
     pub critical_cutoff: Option<u64>,
     pub total_chunks: u32,
     pub total_records: u64,
+}
+
+impl ReconciliationStart {
+    pub fn valid_purpose(&self) -> bool {
+        (self.purpose.is_startup() && self.critical_replay_through.is_none())
+            || (self.purpose == ReconciliationPurpose::CaptureRecovery && self
+                .run_id
+                .as_ref()
+                .is_some_and(|run| !run.is_empty() && run.len() <= 128)
+                && self
+                    .critical_cutoff
+                    .is_some_and(|cutoff| cutoff <= i64::MAX as u64
+                        && self.critical_replay_through.is_some_and(|barrier|
+                            barrier >= cutoff && barrier <= i64::MAX as u64)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -430,6 +473,25 @@ impl EventSubject {
         ))
     }
 
+    /// Versioned compact stop-fact handoff; never a trading-event admission lane.
+    pub fn operational_safety(runtime_id: &str, strategy_id: &str) -> Self {
+        Self(format!(
+            "aqs.local.v1.{}.{}.operational-safety-v1",
+            sanitize_subject_token(runtime_id),
+            sanitize_subject_token(strategy_id)
+        ))
+    }
+
+    /// Bounded history-quality metadata. Independent of both stop controls and
+    /// ordinary audit/trading-event admission; its receipt advances no cursor.
+    pub fn capture_gap_handoff(runtime_id: &str, strategy_id: &str) -> Self {
+        Self(format!(
+            "aqs.local.v1.{}.{}.capture-gap-v1",
+            sanitize_subject_token(runtime_id),
+            sanitize_subject_token(strategy_id)
+        ))
+    }
+
     pub fn sync_status(runtime_id: &str, strategy_id: &str) -> Self {
         Self(format!(
             "aqs.local.v1.{}.{}.sync-status",
@@ -498,6 +560,39 @@ pub fn deterministic_event_id(key: &str) -> EventId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_recovery_is_explicit_cutoff_fenced_and_legacy_wire_is_unchanged() {
+        let legacy = serde_json::json!({"generation":"gen","runtimeId":"runtime","strategyId":"strategy",
+            "liveSessionId":"session","runId":"run","snapshotComplete":true,"brokerFeatures":[],
+            "criticalCutoff":0,"totalChunks":0,"totalRecords":0});
+        let mut start: ReconciliationStart = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(start.purpose.is_startup());
+        assert_eq!(serde_json::to_value(&start).unwrap(), legacy);
+        start.purpose = ReconciliationPurpose::CaptureRecovery;
+        start.critical_replay_through = Some(10);
+        assert!(start.valid_purpose());
+        assert_eq!(
+            serde_json::to_value(&start).unwrap()["purpose"],
+            "capture_recovery"
+        );
+        start.critical_replay_through = None;
+        assert!(!start.valid_purpose());
+        start.critical_replay_through = Some(9);
+        start.critical_cutoff = Some(10);
+        assert!(!start.valid_purpose());
+        start.critical_replay_through = Some(10);
+        start.critical_cutoff = None;
+        assert!(!start.valid_purpose());
+        start.critical_cutoff = Some(u64::MAX);
+        assert!(!start.valid_purpose());
+        start.critical_cutoff = Some(0);
+        start.run_id = None;
+        assert!(!start.valid_purpose());
+        let mut unknown = legacy;
+        unknown["purpose"] = serde_json::json!("arbitrary_scope");
+        assert!(serde_json::from_value::<ReconciliationStart>(unknown).is_err());
+    }
 
     #[test]
     fn subjects_do_not_allow_user_values_to_create_wildcards() {

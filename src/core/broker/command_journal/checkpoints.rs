@@ -10,6 +10,13 @@ use std::{collections::HashSet, io::Write};
 pub(crate) const MAX_CHECKPOINT_ROWS: usize = 32;
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
 
+// Shared verbatim by the partial index and its read-only owner query. Keep
+// historical orders out of the active-fill path without decoding every saved
+// checkpoint on each refresh. Partly filled executed orders also own positions.
+pub(super) const ACTIVE_FILL_OWNER_PREDICATE: &str = "materialized=1 AND execution_epoch>0 AND order_id IS NOT NULL AND
+    (json_extract(checkpoint_json,'$.state')='Filled' OR
+    (json_extract(checkpoint_json,'$.state')='Executed' AND COALESCE(json_extract(checkpoint_json,'$.entry_filled_quantity'),0)>0))";
+
 /// Private journal metadata preserves original execution ownership across
 /// restarts. Existing Insight fields remain the source of order and symbol.
 pub(super) async fn install_owner_epochs(
@@ -103,6 +110,8 @@ pub(super) async fn install_owner_epochs(
             .await
             .map_err(journal_error)?;
     }
+    connection.execute_batch(&format!("CREATE INDEX IF NOT EXISTS idx_fill_history_active_owner ON broker_insight_checkpoints(insight_id) WHERE {ACTIVE_FILL_OWNER_PREDICATE};"))
+        .await.map_err(journal_error)?;
     Ok(())
 }
 

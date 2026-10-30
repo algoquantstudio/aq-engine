@@ -96,7 +96,7 @@ async fn acknowledge_teardown_stop_delivery(
     );
     let accepted = match delivery {
         Some(delivery) => sync.publish_control_ack(event, delivery),
-        None => sync.publish_critical_durable(event).await,
+        None => sync.publish_stop_operational_durable(event).await,
     };
     if !accepted {
         return None;
@@ -446,6 +446,7 @@ where
             Some(crate::launch_config::DeliveryConfig::EmbeddedGateway { url, outbox_directory, .. }) =>
                 Some(crate::core::live_sync::HostedSyncConfig::new(url, outbox_directory)
                     .and_then(|config| config.with_launch_run(&launch.expect("delivery came from a launch file").run_id))
+                    .and_then(|config|match launch.and_then(|value|value.capture){Some(policy)=>config.with_protected_capture(policy),None=>Ok(config)})
                     .map_err(BrokerError::ConnectionError)?),
             _ => None,
         };
@@ -511,6 +512,10 @@ where
             None
         };
         let event_gateway_primary = local_batch_sync.is_some();
+        // This lightweight view does not own publisher queues. Optional source
+        // analytics follows the same generic capture pause; broker execution,
+        // checkpoints, accepted-page receipts and stop controls do not.
+        let analytics_capture = local_batch_sync.as_ref().map(|sync| sync.publisher.cloud_capture_gate());
         let runtime_transport = if embedded_sync.is_some() {
             "Embedded hosted gateway"
         } else if crate::launch_config::setting("AQE_EVENT_BUS")
@@ -876,7 +881,9 @@ where
 
         // Callbacks are installed before restored work can be dispatched. Pipeline
         // configuration is also complete, so saved continuation layouts can be checked.
-        if let Err(error) = self.start_live_execution(auth.as_ref()).await {
+        let source_capture_limit=local_batch_sync.as_ref().and_then(|sync|sync.publisher.source_journal_limit());
+        let source_observer=local_batch_sync.as_ref().filter(|sync|sync.publisher.source_journal_limit().is_some()).map(|sync|sync.publisher.clone());
+        if let Err(error) = self.start_live_execution_with_source_observation(auth.as_ref(),source_capture_limit,source_observer.as_ref()).await {
             live_background_reads.shutdown().await;
             self.rollback_failed_live_startup(strategy, "durable execution recovery")
                 .await;
@@ -905,6 +912,14 @@ where
             } else {
                 Vec::new()
             });
+        if let (Some(sync),Some(driver))=(local_batch_sync.as_mut(),self.command_driver.as_ref()) {
+            if let Err(error)=sync.start_source_observation(driver.sender(),driver.source_observation_preparation()).await {
+                sync.quiesce_source_observation().await;
+                live_background_reads.shutdown().await;
+                self.rollback_failed_live_startup(strategy,"source journal observation").await;
+                return Err(BrokerError::ConnectionError(error));
+            }
+        }
         let mut quote_sweep = super::live_quotes::QuoteSweep::default();
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -961,7 +976,11 @@ where
                 }),
                 None,
             );
-            sync.publish_critical_durable(event).await;
+            if entered_live_execution {
+                sync.publish_start_lifecycle_durable(event).await;
+            } else {
+                sync.publish_critical_durable(event).await;
+            }
             if let Some(reset_event) = live_metrics_reset_event {
                 let event = sync.event(
                     "live-metrics-reset",
@@ -973,19 +992,18 @@ where
                 sync.publish_critical_durable(event).await;
             }
             self.publish_account_and_metrics_to_local_bus(sync, account.as_ref(), true);
-            if !self
-                .publish_startup_reconciliation_to_local_bus(sync, a)
-                .await
-            {
-                let error = BrokerError::ConnectionError(
-                    "Startup reconciliation could not be committed to the local event journal"
-                        .into(),
-                );
-                error!("Live execution failed during startup reconciliation: {error}");
-                live_background_reads.shutdown().await;
-                self.rollback_failed_live_startup(strategy, "startup reconciliation")
-                    .await;
-                return Err(error);
+            match self.establish_startup_cloud_boundary(sync, a).await {
+                Ok(super::live_projection::StartupCloudBoundary::LocallyAccepted) => {}
+                Ok(super::live_projection::StartupCloudBoundary::DeferredCaptureGap) => {
+                    aqs_sync_status = "cloud_capture_paused".into();
+                }
+                Err(error) => {
+                    error!("Live execution failed during startup reconciliation: {error}");
+                    sync.quiesce_source_observation().await;
+                    live_background_reads.shutdown().await;
+                    self.rollback_failed_live_startup(strategy, "startup reconciliation").await;
+                    return Err(error);
+                }
             }
         }
         self.publish_runtime_event(
@@ -1049,6 +1067,8 @@ where
         });
         let mut lifecycle_tick = tokio::time::interval(Duration::from_secs(5));
         lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut capture_recovery_tick = tokio::time::interval(Duration::from_millis(100));
+        capture_recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         macro_rules! mark_live_sync_offline {
             ($auth:expr, $reason:expr) => {{
@@ -1067,7 +1087,20 @@ where
         }
 
         loop {
-            if let Some(sync) = local_batch_sync.as_ref() {
+            if let (Some(sync), Some(auth)) = (local_batch_sync.as_mut(), auth.as_ref()) {
+                if sync.capture_recovery.needs_poll(&sync.publisher) {
+                let mut recovery = std::mem::take(&mut sync.capture_recovery);
+                let source_journal=if sync.publisher.source_journal_limit().is_some(){self.command_driver.as_ref().map(|driver|driver.sender())}else{None};
+                recovery.poll(sync, &self.insights, auth, || {
+                    Broker::get_features(&self.broker).iter().filter_map(|feature|
+                        serde_json::to_value(feature).ok().and_then(|value|value.as_str().map(str::to_owned)))
+                        .collect()
+                },source_journal);
+                sync.capture_recovery = recovery;
+                }
+            }
+            if let Some(sync) = local_batch_sync.as_mut() {
+                sync.flush_start_lifecycle(self.status == StrategyStatus::Running);
                 sync.flush_pending_publications();
             }
             if local_batch_sync
@@ -1084,7 +1117,15 @@ where
                 self.cleanup_active_insights_for_teardown_internal();
                 self.on_trade_update();
                 if self.insights.active_insight_count() == 0 && !self.live_execution_pending() {
-                    match self.resume_after_recovered_stop(auth.as_ref()).await {
+                    let resumed=async {
+                        if let Some(sync)=local_batch_sync.as_mut(){sync.quiesce_source_observation().await;}
+                        self.resume_after_recovered_stop(auth.as_ref(),source_capture_limit,source_observer.as_ref()).await?;
+                        if let (Some(sync),Some(driver))=(local_batch_sync.as_mut(),self.command_driver.as_ref()){
+                            sync.start_source_observation(driver.sender(),driver.source_observation_preparation()).await.map_err(BrokerError::ConnectionError)?;
+                        }
+                        Ok::<(),BrokerError>(())
+                    }.await;
+                    match resumed {
                         Ok(()) => {
                             recovering_previous_stop = false;
                             entered_live_execution = true;
@@ -1108,7 +1149,7 @@ where
                                     serde_json::json!({"state": "running"}),
                                     None,
                                 );
-                                sync.publish_critical_durable(event).await;
+                                sync.publish_start_lifecycle_durable(event).await;
                             }
                         }
                         Err(error) => {
@@ -1142,7 +1183,9 @@ where
                     self.command_driver.as_ref(),
                 ) {
                     live_background_reads
-                        .spawn(super::live_fill_history::recover(reader, driver.sender()));
+                        .spawn(super::live_fill_history::recover_active(reader.clone(), driver.sender(), analytics_capture.clone()));
+                    live_background_reads
+                        .spawn(super::live_fill_history::recover(reader, driver.sender(), analytics_capture.clone()));
                 }
                 if super::live_position_marks::enabled() {
                     if let (Some(reader), Some(driver)) = (
@@ -1150,7 +1193,7 @@ where
                         self.command_driver.as_ref(),
                     ) {
                         live_background_reads
-                            .spawn(super::live_position_marks::sample(reader, driver.sender()));
+                            .spawn(super::live_position_marks::sample(reader, driver.sender(), analytics_capture.clone()));
                     }
                 }
             }
@@ -1223,7 +1266,7 @@ where
                                             }),
                                             None,
                                         );
-                                        sync.publish_critical_durable(acknowledgement).await
+                                        sync.publish_stop_operational_durable(acknowledgement).await
                                     } else {
                                         true
                                     };
@@ -1515,10 +1558,12 @@ where
 
                     }
 
-                    if let Err(error) = self.persist_live_fill_evidence(execution_fills).await {
+                    if let Err(error) = self.persist_live_fill_evidence(execution_fills, analytics_capture.as_ref()).await {
                         // Analytics is observational. Never initiate teardown
                         // or change an order because its analytics write failed.
-                        error!("Broker fill analytics incomplete; evidence not recorded: {error}");
+                        if !matches!(error, crate::core::broker::commands::BrokerCommandError::CapturePaused) {
+                            error!("Broker fill analytics incomplete; evidence not recorded: {error}");
+                        }
                     }
 
                     if let Some(sync) = local_batch_sync.as_ref() {
@@ -1527,11 +1572,14 @@ where
                                 .publish_critical_batch_durable(broker_projection_events)
                                 .await
                         {
-                            // Execution state must still consume the broker page,
-                            // but no new entries may start after its audit boundary
-                            // failed. Final shutdown will report incomplete sync.
-                            error!("Broker lifecycle page was not durably admitted; stopping new entries");
-                            self.shutdown();
+                            // Execution state still consumes the broker page.
+                            // Real evidence-write failures stop new entries;
+                            // intentional capture pause has a durable gap and
+                            // must not stop broker execution.
+                            if !sync.publisher.cloud_capture_paused() {
+                                error!("Broker lifecycle page was not durably admitted; stopping new entries");
+                                self.shutdown();
+                            }
                         }
                     }
 
@@ -1692,6 +1740,9 @@ where
                     self.publish_runtime_snapshot(aqs_sync_status.clone(), None);
                 }
 
+                    _ = capture_recovery_tick.tick(), if local_batch_sync.as_ref()
+                        .is_some_and(|sync|sync.publisher.cloud_capture_paused()) => {}
+
                     _ = heartbeat_interval.tick(), if auth.is_some() => {
                         if let Some(sync) = local_batch_sync.as_mut() {
                             // Cached counters only: the TUI never queries SQLite, the gateway,
@@ -1713,6 +1764,7 @@ where
                                     "status": format!("{:?}", self.status),
                                     "insights_count": self.insights_state_counts_json(),
                                     "publisher_health": sync.publisher.health(),
+                                    "cloud_capture_recovery": sync.capture_recovery.health,
                                     "execution_evidence_export": sync.evidence_export.health,
                                     "execution_fill_export": sync.fill_export.health,
                                     "position_mark_export": sync.mark_export.health,
@@ -1979,6 +2031,10 @@ where
             self.run_on_teardown_logic(LifecycleTiming::AfterGenerated);
         } else {
             info!("Startup recovery ended before live execution; skipping user teardown hooks");
+            // Cancel only entries proven never submitted. Do not infer user
+            // liquidation intent or fabricate settlement for existing broker
+            // exposure when no teardown hook ran.
+            self.cancel_unsubmitted_insights_for_early_stop();
         }
 
         // A close request is not a close confirmation. Keep the bridge and broker event
@@ -2005,8 +2061,10 @@ where
                     });
                 }
             }
-            if let Err(error) = self.persist_live_fill_evidence(execution_fills).await {
-                error!("Teardown fill analytics incomplete; evidence not recorded: {error}");
+            if let Err(error) = self.persist_live_fill_evidence(execution_fills, analytics_capture.as_ref()).await {
+                if !matches!(error, crate::core::broker::commands::BrokerCommandError::CapturePaused) {
+                    error!("Teardown fill analytics incomplete; evidence not recorded: {error}");
+                }
             }
             self.on_trade_update();
             if self.resume_live_command_pipes(&mut command_attempted) {
@@ -2041,6 +2099,7 @@ where
             let remaining = self.insights.active_insight_count();
             if (remaining == 0 || !self.teardown_cleanup_requested)
                 && !self.live_execution_pending()
+                && !self.insight_work.is_ready()
             {
                 break;
             }
@@ -2135,7 +2194,15 @@ where
             }
         }
         lifecycle_reads.shutdown().await;
-        let execution_stop = self.finish_live_execution(local_batch_sync.as_mut()).await;
+        if let Some(sync)=local_batch_sync.as_mut(){sync.quiesce_source_observation().await;}
+        let (execution_stop,final_journal)=self.finish_live_execution_retaining_journal(local_batch_sync.as_mut()).await;
+        if let (Some(sync),Some(journal))=(local_batch_sync.as_mut(),final_journal){
+            if let Err(error)=sync.retain_final_source_journal(journal).await {
+                // Broker settlement remains independent. Final data must use
+                // the existing durable-gap deferral, never a fresh zero/ACK.
+                warn!("Final source journal observation deferred: {error}");
+            }
+        }
 
         // Capture every broker-backed value while the MT5 EA can still poll the bridge. The
         // shutdown persistence below must only consume this in-memory snapshot; issuing account
@@ -2178,8 +2245,13 @@ where
         let final_sync = if execution_stop.is_ok() && disconnected.is_ok() {
             match (local_batch_sync.as_mut(), auth.as_ref()) {
                 (Some(sync), Some(auth)) => {
-                    self.drain_final_insights_to_local_bus(sync, auth, Duration::from_secs(30))
-                        .await
+                    match sync.defer_final_cloud_capture_for_stop().await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => self
+                            .drain_final_insights_to_local_bus(sync, auth, Duration::from_secs(30))
+                            .await,
+                        Err(error) => Err(error),
+                    }
                 }
                 _ => Ok(()),
             }
@@ -2212,7 +2284,7 @@ where
                         )
                     })
                     .collect();
-                sync.publish_critical_batch_durable(actions).await;
+                sync.publish_stop_facts_durable(actions).await;
                 sync.shutdown(LocalEventPublisherConfig::default().graceful_shutdown_timeout)
                     .await;
             }
@@ -2289,7 +2361,11 @@ where
                     )
                 })
                 .collect();
-            sync.publish_stop_completion_durable(stopped, actions).await;
+            if !sync.publish_stop_completion_durable(stopped, actions).await {
+                // Broker settlement is independent, but process completion
+                // must not claim its operational stop fact was persisted.
+                sync.publisher.mark_admission_failed();
+            }
             sync.shutdown(LocalEventPublisherConfig::default().graceful_shutdown_timeout)
                 .await;
         }

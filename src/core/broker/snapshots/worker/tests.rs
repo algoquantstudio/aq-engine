@@ -14,6 +14,11 @@ struct Probe {
     active_accounts: AtomicUsize,
     hold_account: bool,
     hold_quotes: bool,
+    hold_flows: bool,
+    flow_calls: AtomicUsize,
+    active_flows: AtomicUsize,
+    flow_pages:
+        parking_lot::Mutex<std::collections::VecDeque<aqe_live_protocol::AccountCashFlowPage>>,
     accounts: tokio::sync::Semaphore,
     quotes: tokio::sync::Semaphore,
 }
@@ -31,6 +36,10 @@ impl Probe {
             active_accounts: AtomicUsize::new(0),
             hold_account,
             hold_quotes,
+            hold_flows: false,
+            flow_calls: AtomicUsize::new(0),
+            active_flows: AtomicUsize::new(0),
+            flow_pages: Default::default(),
             accounts: tokio::sync::Semaphore::new(0),
             quotes: tokio::sync::Semaphore::new(0),
         }
@@ -43,6 +52,20 @@ impl Drop for Active<'_> {
     }
 }
 impl SnapshotSource for Probe {
+    async fn cash_flows(
+        &self,
+        _account: &str,
+        _source: Option<&str>,
+        _after: u64,
+    ) -> Result<Option<aqe_live_protocol::AccountCashFlowPage>, BrokerError> {
+        self.flow_calls.fetch_add(1, Ordering::SeqCst);
+        self.active_flows.fetch_add(1, Ordering::SeqCst);
+        let _active = Active(&self.active_flows);
+        if self.hold_flows {
+            return std::future::pending().await;
+        }
+        Ok(self.flow_pages.lock().pop_front())
+    }
     async fn orders(&self) -> Result<Vec<Order>, BrokerError> {
         self.order_calls.fetch_add(1, Ordering::SeqCst);
         Ok(vec![])
@@ -90,6 +113,124 @@ fn config() -> SnapshotRefreshConfig {
         interval: Duration::from_secs(10),
         request_timeout: Duration::from_secs(5),
         quote_concurrency: 2,
+    }
+}
+
+#[tokio::test]
+async fn account_cash_flow_reader_is_independent_of_trading_account_refresh_and_cancellable() {
+    let mut probe = Probe::new(false, false);
+    probe.hold_flows = true;
+    let source = Arc::new(probe);
+    let cache = cache(&[]);
+    let worker = SnapshotRefreshWorker::start_source(
+        source.clone(),
+        cache.clone(),
+        SnapshotRefreshConfig {
+            interval: Duration::from_millis(10),
+            ..config()
+        },
+    )
+    .unwrap();
+    until(|| source.active_flows.load(Ordering::SeqCst) == 1).await;
+    let before = source.account_calls.load(Ordering::SeqCst);
+    until(|| source.account_calls.load(Ordering::SeqCst) > before + 2).await;
+    assert!(cache.account().is_ok());
+    worker.stop().await;
+    assert_eq!(source.active_flows.load(Ordering::SeqCst), 0);
+    assert!(cache.account_cash_flows().is_err());
+}
+
+#[tokio::test]
+async fn account_cash_flow_background_capture_keeps_source_gaps_explicit() {
+    let probe = Probe::new(false, false);
+    probe
+        .flow_pages
+        .lock()
+        .push_back(aqe_live_protocol::AccountCashFlowPage {
+            version: 1,
+            provider: "broker".into(),
+            source_id: "source".into(),
+            account_id: "account".into(),
+            currency: "USD".into(),
+            from_us: 10,
+            through_us: 100,
+            coverage: aqe_live_protocol::AccountCashFlowCoverage::ObservedOnly,
+            first_after_sequence: 10,
+            after_sequence: 10,
+            next_sequence: 11,
+            through_sequence: 11,
+            records: vec![aqe_live_protocol::AccountCashFlowRecord {
+                sequence: 11,
+                event_id: "balance-11".into(),
+                kind: aqe_live_protocol::AccountCashFlowKind::Balance,
+                amount: 50.,
+                occurred_at_us: None,
+                observed_at_us: 90,
+                broker_time_ms: Some(50),
+                deleted: false,
+            }],
+        });
+    let source = Arc::new(probe);
+    let cache = cache(&[]);
+    let worker = SnapshotRefreshWorker::start_source(
+        source.clone(),
+        cache.clone(),
+        SnapshotRefreshConfig {
+            interval: Duration::from_millis(10),
+            ..config()
+        },
+    )
+    .unwrap();
+    until(|| cache.account_cash_flows().is_ok()).await;
+    let captured = cache.account_cash_flows().unwrap();
+    assert!(captured.missing_prefix);
+    assert_eq!(captured.cursor, 11);
+    assert_eq!(captured.records["balance-11"].amount, 50.);
+    assert_eq!(
+        captured.coverage,
+        aqe_live_protocol::AccountCashFlowCoverage::ObservedOnly
+    );
+    worker.stop().await;
+    assert!(cache.account_cash_flows().is_err());
+}
+
+#[tokio::test]
+async fn account_cash_flow_background_capture_rejects_foreign_account_or_currency() {
+    for (account_id, currency) in [("foreign", "USD"), ("account", "EUR")] {
+        let probe = Probe::new(false, false);
+        probe
+            .flow_pages
+            .lock()
+            .push_back(aqe_live_protocol::AccountCashFlowPage {
+                version: 1,
+                provider: "broker".into(),
+                source_id: "source".into(),
+                account_id: account_id.into(),
+                currency: currency.into(),
+                from_us: 10,
+                through_us: 100,
+                coverage: aqe_live_protocol::AccountCashFlowCoverage::ObservedOnly,
+                first_after_sequence: 0,
+                after_sequence: 0,
+                next_sequence: 0,
+                through_sequence: 0,
+                records: vec![],
+            });
+        let source = Arc::new(probe);
+        let cache = cache(&[]);
+        let worker = SnapshotRefreshWorker::start_source(
+            source.clone(),
+            cache.clone(),
+            SnapshotRefreshConfig {
+                interval: Duration::from_millis(10),
+                ..config()
+            },
+        )
+        .unwrap();
+        until(|| source.flow_calls.load(Ordering::SeqCst) == 1).await;
+        assert!(cache.account_cash_flows().is_err());
+        assert!(cache.account().is_ok());
+        worker.stop().await;
     }
 }
 
@@ -273,7 +414,7 @@ async fn snapshot_refresh_timeout_is_not_a_zero_account_or_an_unbounded_retry_qu
     assert!(cache.quote("ETHUSD").is_ok());
     assert_eq!(source.account_calls.load(Ordering::SeqCst), 1);
     assert_eq!(source.active_accounts.load(Ordering::SeqCst), 0);
-    assert_eq!(worker.tasks.len(), 4);
+    assert_eq!(worker.tasks.len(), 5);
     worker.stop().await;
 }
 
@@ -309,8 +450,8 @@ async fn snapshot_refresh_account_mismatch_stops_refresh_and_health_keeps_exit_c
     config.interval = Duration::from_millis(5);
     let mut worker =
         SnapshotRefreshWorker::start_source(source.clone(), cache.clone(), config).unwrap();
-    until(|| worker.health().exited_tasks == 4).await;
-    assert_eq!(worker.health().exited_tasks, 4);
+    until(|| worker.health().exited_tasks == 5).await;
+    assert_eq!(worker.health().exited_tasks, 5);
     assert_eq!(
         cache.account().unwrap_err(),
         SnapshotUnavailable::AccountChanged

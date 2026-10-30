@@ -19,7 +19,7 @@ pub use crate::core::broker::{
     paper_broker::PaperBroker,
     types::{
         AccountType, Asset, AssetCommissionFees, AssetFee, AssetFees, AssetSideFees, AssetSwapFees,
-        BarData,
+        BarData, BrokerError, Position,
     },
 };
 pub use crate::core::insight::{Insight, InsightCollection, types::InsightState};

@@ -105,7 +105,7 @@ impl PositionMarkPage {
                 return Err("Incomplete position mark page".into());
             }
         }
-        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > POSITION_MARK_TRANSFER_BYTES
+        if crate::json_encoded_len(self).map_err(|e| e.to_string())? > POSITION_MARK_TRANSFER_BYTES
         {
             return Err("Position mark page byte limit".into());
         }

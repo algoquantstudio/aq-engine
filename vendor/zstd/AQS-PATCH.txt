@@ -1,0 +1,50 @@
+Security backport for zstd 0.13.3: RUSTSEC-2026-0391
+
+Upstream crate: https://crates.io/crates/zstd/0.13.3
+Upstream fix: https://github.com/gyscos/zstd-rs/commit/74ace2dcdca62a2ce0f034895d6079458311e003
+License: MIT, retained in LICENSE. This local copy is not publishable.
+
+Polars 0.55.2 still requires zstd 0.13 and uses Decoder::with_context while
+reading Parquet pages. Reusing an abandoned context without resetting its
+session can expose data from the previous job or corrupt the next stream.
+Backport the upstream SessionOnly resets in both borrowed-context constructors.
+Do not alter parameters, dictionary contents or compression formats.
+
+Extended binding qualification (2026-10-27): select upstream zstd-safe 8.2.0
+and its fixed zstd-sys >=2.1.2 while keeping this compatible 0.13 wrapper.
+Both packages originate at upstream commit
+75bc74045a2f6ea0439aeed7e159a266da20aac0. The fixed bindings address the old
+legacy-error output positions, dictionary/context lifetime, experimental-buffer
+and seekable/allocator advisories instead of locally reimplementing unsafe FFI.
+The same six explicit prepared-dictionary owner lifetimes used by upstream
+zstd 0.14.3 are carried through raw, read and write constructors. This deliberately
+rejects code that drops a prepared dictionary before its stream; dictionary
+bytes alone do not keep the C dictionary allocation alive. Safe owned-lifetime
+dictionary use and all existing codecs remain supported.
+
+The reserved-bit legacy frame regression reported 1024 bytes of output from an
+unsuccessful call before the binding update. The added tests verify zero output
+and consumed positions on failure, no stale writer output after flush/drop,
+prepared-dictionary round trips and compile-time owner lifetime rejection.
+
+The added encoder and decoder isolation tests fail on the unmodified crate and
+pass with this patch. Run the complete upstream suite and these regressions with:
+  cargo test --manifest-path aq-engine/vendor/zstd/Cargo.toml --offline
+The test crate has an isolated workspace and tracked qualification lockfile;
+its target directory remains ignored.
+The CLI/legacy binary fixtures omitted by crates.io are restored from original
+source commit 52e9d41a645fb49edcf1ed3df765f380dbcf13b2. The long-source test uses
+the included text repeated to 242 KiB instead of an absent sibling bindings file.
+
+Both the AQS workspace and standalone AQE source manifests select this patch.
+Cargo patches are not inherited by downstream crates.io consumers. Publishing
+AQE or claiming the registry dependency is fixed therefore remains gated on an
+upstream compatible release/dependency update or an explicit reviewed downstream
+patch. Do not remove this patch merely to make an audit count look smaller.
+The root and isolated qualification lockfiles must select fixed zstd-safe and
+zstd-sys versions. Audit that graph separately: local wrapper source paths are
+not registry-advisory evidence. Native/WASM/research and feature qualification
+is recorded in the security review; a source build is not deployment proof.
+
+Remove the local copy once the dependency graph accepts an upstream fixed codec
+and these tests plus Parquet round trips pass on that graph.

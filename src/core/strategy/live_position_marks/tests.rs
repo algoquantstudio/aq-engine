@@ -47,8 +47,7 @@ impl PositionValuationReader for Reader {
     }
 }
 
-#[tokio::test]
-async fn mark_sampling_is_owned_paced_cancelled_and_never_submits_trades() {
+async fn worker_fixture() -> (std::path::PathBuf, BrokerCommandWorker) {
     let dir = std::env::temp_dir().join(format!("aqe-mark-reader-{}", uuid::Uuid::new_v4()));
     let mut journal = BrokerCommandJournal::open_with_state_history(
         dir.join("commands.db"),
@@ -92,12 +91,35 @@ async fn mark_sampling_is_owned_paced_cancelled_and_never_submits_trades() {
         Default::default(),
     )
     .unwrap();
+    (dir, worker)
+}
+
+#[tokio::test]
+async fn mark_sampling_is_owned_paced_cancelled_and_never_submits_trades() {
+    let (dir, worker) = worker_fixture().await;
     let reader = Arc::new(Reader {
         calls: AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
         dropped: Arc::new(AtomicBool::new(false)),
     });
-    let task = tokio::spawn(sample(reader.clone(), worker.sender.clone()));
+    let capture = crate::core::live_sync::capture_test_fixture::CaptureFixture::active().await;
+    capture.pause().await;
+    let paused_task = tokio::spawn(sample(
+        reader.clone(),
+        worker.sender.clone(),
+        Some(capture.publisher.cloud_capture_gate()),
+    ));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        reader.calls.load(Ordering::SeqCst),
+        0,
+        "a durable cloud pause must not start optional mark reads"
+    );
+    paused_task.abort();
+    assert!(paused_task.await.unwrap_err().is_cancelled());
+    capture.shutdown().await;
+    // Standalone sampling retains its existing behavior without cloud policy.
+    let task = tokio::spawn(sample(reader.clone(), worker.sender.clone(), None));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(reader.calls.load(Ordering::SeqCst), 0);
     tokio::time::timeout(Duration::from_secs(5), reader.entered.notified())
@@ -138,5 +160,78 @@ async fn mark_sampling_is_owned_paced_cancelled_and_never_submits_trades() {
             .is_empty()
     );
     drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+struct LateReader {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+#[async_trait::async_trait]
+impl PositionValuationReader for LateReader {
+    async fn read_positions(
+        &self,
+        account: &str,
+        symbol: &str,
+        ids: &[String],
+    ) -> Result<Option<aqe_live_protocol::PositionValuations>, BrokerError> {
+        assert_eq!((account, symbol), ("account", "GENERIC"));
+        assert_eq!(ids, ["physical-position"]);
+        self.entered.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        Ok(Some(serde_json::from_value(serde_json::json!({"version":1,"provider":"values-v1","account_id":"account","account_currency":"GBP","symbol":"GENERIC","as_of_us":chrono::Utc::now().timestamp_micros(),
+          "positions":[{"position_id":"physical-position","status":"open","quantity":2.0,"side":"buy","average_entry_price":100.0,"current_price":110.0,"gross_unrealized_pnl":20.0,"carry":0.0,"quote_time":null,"notional":{"basis":"paper_price_units","account_value":220.0}}]})).unwrap()))
+    }
+}
+
+#[tokio::test]
+async fn source_capture_pause_during_mark_read_cannot_append_a_late_sample() {
+    let (dir, worker) = worker_fixture().await;
+    let capture = crate::core::live_sync::capture_test_fixture::CaptureFixture::active().await;
+    let reader = Arc::new(LateReader {
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let task = tokio::spawn(sample(
+        reader.clone(),
+        worker.sender.clone(),
+        Some(capture.publisher.cloud_capture_gate()),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), reader.entered.notified())
+        .await
+        .unwrap();
+    capture.pause().await;
+    reader.release.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drop(worker.sender);
+    drop(worker.events);
+    drop(worker.ready);
+    let journal = tokio::time::timeout(Duration::from_secs(2), worker.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        journal
+            .position_mark_page(0)
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert_eq!(
+        journal
+            .execution_fill_page(0, None, 32)
+            .await
+            .unwrap()
+            .records
+            .len(),
+        1,
+        "previously accepted fill evidence remains owned"
+    );
+    drop(journal);
+    capture.shutdown().await;
     std::fs::remove_dir_all(dir).unwrap();
 }

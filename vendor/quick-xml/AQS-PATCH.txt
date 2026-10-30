@@ -1,0 +1,40 @@
+quick-xml 0.39.4 XML denial-of-service compatibility fixes
+========================================================
+
+Baseline: published quick-xml 0.39.4, upstream revision
+f72e8b3718f4e13c949934549bbe4290e65085b1. Original MIT license and notices
+are retained. Cargo.toml.orig is the unmodified published manifest.
+Repository: https://github.com/tafia/quick-xml
+
+Current object_store 0.13 (used by Polars/SurrealDB) requires the 0.39 API.
+The selected HTTP/WebDAV listing deserializer uses NsReader. Do not disable
+research HTTP support or suppress these advisories as an unused dependency.
+
+Changes maintained by AlgoQuant Studio:
+* Backport the per-element namespace declaration budget (256 by default),
+  TooManyDeclarations error and resolver configuration from upstream commit
+  7ca25266e94987210daa864889ab15c9332c8a2a (RUSTSEC-2026-0195).
+  Documentation explicitly limits the claim to binding count, not input bytes
+  or the length of an individual namespace name/value. Parsing is not a global
+  body-size limit and the HTTP provider must still be trusted for data access.
+* Apply the indexed duplicate-detection design from upstream commit
+  07f3db8343cf152f5bc3483ef5b3164582489bea (RUSTSEC-2026-0194).
+  Adaptation: store exact names and first positions in a keyed RandomState
+  HashMap after the same 32-attribute threshold, rather than a hash pre-filter
+  followed by full linear rescans. This also avoids quadratic repeated-error
+  recovery, retains exact Duplicated(new, first) offsets, and does not introduce
+  a lifetime change into the 0.39 deserializer. Small tags retain their scan;
+  with_checks(false), const construction, cloning and error recovery remain.
+* Add public sync/async/serde regressions, a bounded before/after scaling probe,
+  private-package protection and a standalone test workspace.
+
+The real object_store HTTP boundary is additionally exercised by
+aqs-research/tests/http_xml_security.rs, including an ordinary positive listing.
+Both AQS and standalone AQE source manifests select this compatibility copy.
+Cargo patches are NOT inherited by crates.io consumers. Publishing AQE remains
+gated on a compatible upstream dependency release or an explicitly reviewed
+downstream patch. Remove this copy once the required data libraries accept a
+maintained quick-xml version with these fixes, after compatibility testing.
+
+The path dependency is omitted from cargo-audit's registry matching. Track both
+advisories independently; a lower registry advisory count is not the proof.

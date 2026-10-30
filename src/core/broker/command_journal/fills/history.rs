@@ -204,13 +204,35 @@ impl BrokerCommandJournal {
         &self,
         after: &str,
     ) -> Result<FillHistoryOwnerPage, BrokerCommandError> {
+        self.fill_history_owner_page_for(after, false).await
+    }
+
+    pub(crate) async fn active_fill_history_owner_page(
+        &self,
+        after: &str,
+    ) -> Result<FillHistoryOwnerPage, BrokerCommandError> {
+        self.fill_history_owner_page_for(after, true).await
+    }
+
+    async fn fill_history_owner_page_for(
+        &self,
+        after: &str,
+        active_only: bool,
+    ) -> Result<FillHistoryOwnerPage, BrokerCommandError> {
+        let sql = if active_only {
+            format!("SELECT insight_id,execution_epoch,order_id,symbol FROM broker_insight_checkpoints
+                INDEXED BY idx_fill_history_active_owner WHERE insight_id>?1 AND {}
+                ORDER BY insight_id LIMIT 32",super::super::checkpoints::ACTIVE_FILL_OWNER_PREDICATE)
+        } else {
+            "SELECT insight_id,execution_epoch,order_id,symbol
+             FROM broker_insight_checkpoints WHERE insight_id>?1
+                AND execution_epoch>0 AND materialized=1
+             ORDER BY insight_id LIMIT 32".to_owned()
+        };
         let mut rows = self
             .connection
             .query(
-                "SELECT insight_id,execution_epoch,order_id,symbol
-             FROM broker_insight_checkpoints WHERE insight_id>?1
-                AND execution_epoch>0 AND materialized=1
-             ORDER BY insight_id LIMIT 32",
+                &sql,
                 params![after.to_owned()],
             )
             .await
@@ -252,7 +274,7 @@ impl BrokerCommandJournal {
 }
 
 pub(super) async fn validate_owner(
-    tx: &turso::transaction::Transaction<'_>,
+    tx: &Connection,
     owner: &FillHistoryOwner,
 ) -> Result<(), BrokerCommandError> {
     let mut rows = tx

@@ -103,6 +103,31 @@ fn values(position: &str, at: i64) -> PositionValuations {
 }
 
 #[tokio::test]
+async fn split_cloud_history_keeps_canonical_mark_ownership_and_frozen_transfer() {
+    use crate::core::live_sync::{PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES};
+    let fixture=Fixture::new();
+    let mut journal=fixture.open().await;
+    seed(&mut journal,"order","position").await;
+    let mut journal=journal.with_separate_analytics_capture_budget(PhysicalCaptureLimit {
+        physical_limit_bytes:64*1024*1024,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES,
+    }).await.unwrap();
+    let minute=minute();
+    let owners=journal.position_mark_owners(minute,None).await.unwrap().owners;
+    assert_eq!(owners.len(),1);
+    assert_eq!(journal.record_position_marks(PositionMarkBatch::new(owners.clone(),values("position",minute+100),minute).unwrap()).await.unwrap(),1);
+    let frozen=journal.prepare_position_mark_export().await.unwrap().unwrap();
+    drop(journal);
+    let mut journal=fixture.open().await;
+    assert_eq!(journal.prepare_position_mark_export().await.unwrap().unwrap(),frozen);
+    // A canonical checkpoint change revokes a stale mark even though the
+    // optional store still has its prior position comparison.
+    journal.connection.execute("UPDATE broker_insight_checkpoints SET materialized=0",()).await.unwrap();
+    assert!(journal.position_mark_owners(minute+POSITION_MARK_MINUTE_US,None).await.unwrap().owners.is_empty());
+    assert_eq!(journal.record_position_marks(PositionMarkBatch::new(owners,values("position",minute+POSITION_MARK_MINUTE_US+100),minute+POSITION_MARK_MINUTE_US).unwrap()).await.unwrap(),0);
+    assert_eq!(journal.position_mark_page(0).await.unwrap().records.len(),1);
+}
+
+#[tokio::test]
 async fn scheduled_marks_are_owned_minute_bounded_and_survive_without_state_archive() {
     let f = Fixture::new();
     let mut j = f.open().await;
@@ -173,6 +198,35 @@ async fn scheduled_marks_are_owned_minute_bounded_and_survive_without_state_arch
             .is_err()
     );
     assert_eq!(j.position_mark_page(0).await.unwrap().records.len(), 2);
+}
+
+#[tokio::test]
+async fn physical_mark_refusal_keeps_the_source_lease_and_export_head_unchanged() {
+    use crate::core::live_sync::{PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES};
+    let fixture=Fixture::new();let mut journal=fixture.open().await;
+    seed(&mut journal,"order","position").await;
+    journal=journal.with_analytics_capture_budget(PhysicalCaptureLimit {
+        physical_limit_bytes:64*1024*1024,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES,
+    }).await.unwrap();
+    let mut rows=journal.connection.query("PRAGMA wal_checkpoint(TRUNCATE)",()).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}drop(rows);
+    let usage=journal.analytics_capture_usage().await.unwrap().unwrap();
+    journal.analytics_capture_budget=Some(PhysicalCaptureLimit {
+        physical_limit_bytes:MIN_OPERATIONAL_HEADROOM_BYTES+usage.projected_commit_bytes-1,
+        operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES,
+    });
+    let slot=minute();let owner=journal.position_mark_owners(slot,None).await.unwrap().owners.remove(0);
+    assert!(matches!(journal.record_position_marks(PositionMarkBatch::new(vec![owner.clone()],values("position",slot+100),slot).unwrap()).await,Err(BrokerCommandError::CapturePaused)));
+    assert!(journal.position_mark_page(0).await.unwrap().records.is_empty());
+    assert_eq!(journal.position_mark_owners(slot,None).await.unwrap().owners.len(),1,"a refused mark did not consume its source sampling lease");
+    assert!(journal.prepare_position_mark_export().await.unwrap().is_none());
+    let pause=journal.analytics_capture_pause().await.unwrap().unwrap();
+    assert_eq!(pause.execution_epoch,1);
+    // Mandatory canonical checkpoint persistence remains available while new
+    // marks/fills are paused. It is not charged to a cloud analytics partition.
+    let mut checkpoint=Insight::default();checkpoint.symbol="ANY".into();
+    journal.persist_execution_batch(&ExecutionCheckpointBatch::new(vec![InsightExecutionCheckpoint::capture(&checkpoint,1,true,None)],vec![]).unwrap()).await.unwrap();
+    assert_eq!(journal.analytics_capture_pause().await.unwrap(),Some(pause));
 }
 
 #[tokio::test]

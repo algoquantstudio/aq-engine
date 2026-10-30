@@ -117,6 +117,7 @@ fn entry_capacity_combines_fresh_positions_and_active_orders() {
     cache.seed_orders_for_test(vec![order]);
     cache.seed_positions_for_test(vec![Position {
         account_id: "account".into(),
+        order_id: Some("sol".into()),
         asset,
         avg_entry_price: 100.0,
         qty: 20.0,
@@ -134,6 +135,40 @@ fn entry_capacity_combines_fresh_positions_and_active_orders() {
         .unwrap()
         .unwrap();
     assert_eq!(observed.0, 100.0);
+}
+
+#[test]
+fn exact_order_lookup_preserves_split_positions_and_rejects_stale_or_wrong_identity() {
+    let cache=Arc::new(cache());
+    let now=Instant::now();
+    cache.seed_account_for_test(account("account"),now);
+    let make=|id:&str,pnl| Position {
+        account_id:"account".into(),order_id:Some(id.into()),asset:capacity_order("a","SOLUSD",1.,1.,TradeUpdateEvent::Filled).asset,
+        avg_entry_price:100.,qty:1.,side:crate::core::broker::types::OrderSide::Sell,
+        market_value:99.,cost_basis:100.,current_price:99.,unrealized_pnl:pnl,realized_pnl:0.,entry_commission:0.,margin_required:None,
+    };
+    cache.seed_positions_for_test(vec![make("first",7.5),make("second",11.2)]);
+    assert_eq!(cache.position_by_order_id("first","SOLUSD").unwrap().unwrap().unrealized_pnl,7.5);
+    assert_eq!(cache.position_by_order_id("second","SOLUSD").unwrap().unwrap().unrealized_pnl,11.2);
+    assert!(cache.position_by_order_id("absent","SOLUSD").unwrap().is_none());
+    assert!(matches!(cache.position_by_order_id("first","BTCUSD"),Err(SnapshotUnavailable::Invalid)));
+    // A malformed duplicate cannot replace the last good observation.
+    cache.seed_positions_for_test(vec![make("first",99.),make("first",100.)]);
+    assert_eq!(cache.position_by_order_id("first","SOLUSD").unwrap().unwrap().unrealized_pnl,7.5);
+    let mut insight=crate::core::insight::Insight::default();
+    insight.state=crate::core::insight::types::InsightState::Filled;
+    insight.symbol="SOLUSD".into();insight.order_id=Some("first".into());
+    let reader=cache.clone();
+    insight.bind_context(crate::core::insight::InsightStrategyContext::new(chrono::Utc::now).with_position_reader(Some(Arc::new(move |order,symbol|
+        reader.position_by_order_id(order,symbol).map_err(|reason|super::super::types::BrokerError::SnapshotUnavailable {kind:SnapshotKind::Positions,reason})))));
+    let fingerprint=insight.snapshot_fingerprint_hash();
+    assert_eq!(insight.get_position().unwrap().unwrap().unrealized_pnl,7.5);
+    cache.seed_positions_for_test(vec![make("first",9.5),make("second",11.2)]);
+    assert_eq!(insight.get_position().unwrap().unwrap().unrealized_pnl,9.5);
+    assert_eq!(insight.snapshot_fingerprint_hash(),fingerprint); // Snapshot changes, Insight does not.
+    let stale=now-Duration::from_secs(60);
+    cache.state.write().positions.as_mut().unwrap().observed=stale;
+    assert!(matches!(cache.position_by_order_id("first","SOLUSD"),Err(SnapshotUnavailable::Stale)));
 }
 
 #[test]
@@ -189,6 +224,7 @@ pub(super) fn account(id: &str) -> Account {
 }
 pub(super) fn quote(symbol: &str) -> Quote {
     Quote {
+        profit_model: None,
         symbol: symbol.into(),
         bid: 100.0,
         ask: 101.0,

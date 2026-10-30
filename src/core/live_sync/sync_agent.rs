@@ -16,6 +16,9 @@ use surrealdb::method::QueryStream;
 use surrealdb::{Notification, Surreal, engine::any};
 use tokio::sync::{mpsc, watch};
 mod periodic;
+mod telemetry_ingest;
+pub(crate) mod safety;
+pub(crate) mod gaps;
 
 pub type RemoteActionStream = QueryStream<Notification<surrealdb::types::Value>>;
 
@@ -31,6 +34,8 @@ pub use aqe_live_protocol::{LiveSyncBatch, LiveSyncBatchResult};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteSyncErrorKind {
     Transient,
+    /// Generic cloud capability pause; never an instruction to stop trading.
+    CloudPaused,
     Authentication,
     InvalidBatch,
     SequenceConflict,
@@ -53,6 +58,24 @@ impl std::error::Error for RemoteSyncError {}
 
 #[async_trait]
 pub trait RemoteBatchSink: Send + Sync {
+    async fn persist_capture_gap(&self,_notice:&aqe_live_protocol::CaptureGapNotice)
+        -> Result<Option<aqe_live_protocol::CaptureGapReceipt>,RemoteSyncError> {Ok(None)}
+    /// Optional generic operational channel. No billing/subscription concepts.
+    fn safety_run_id(&self) -> Option<&str> {
+        None
+    }
+    async fn persist_safety(
+        &self,
+        _observation: &aqe_live_protocol::SafetyObservation,
+    ) -> Result<bool, RemoteSyncError> {
+        Ok(false)
+    }
+    /// Optional additive connectivity lease. Standalone/local sinks need no
+    /// billing concepts and may retain this no-op implementation.
+    async fn heartbeat(&self) -> Result<(), RemoteSyncError> {
+        Ok(())
+    }
+
     async fn persist_batch(
         &self,
         batch: &LiveSyncBatch,
@@ -128,7 +151,21 @@ pub struct RemoteSyncHealth {
     pub database_bytes: u64,
     #[serde(default)]
     pub reconciliation: Option<ReconciliationJobProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<ReceiverCaptureHealth>,
     pub updated_at_us: i64,
+}
+
+/// Compact operational status, not another copy of the strategy/account data.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiverCaptureHealth {
+    pub state: super::CloudCaptureState,
+    pub generation: Option<u64>,
+    pub retained_bytes: u64,
+    pub limit_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<super::PhysicalCaptureUsage>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -155,7 +192,7 @@ pub struct ReconciliationProcessResult {
     pub superseded: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpBatchSinkConfig {
     /// Legacy-shaped URL used only to derive operational health/cursor/action
     /// endpoints. No execution batch is posted here; the gateway is mandatory.
@@ -351,6 +388,9 @@ impl HttpBatchSink {
     pub async fn fetch_pending_actions(
         &self,
     ) -> Result<Vec<RemoteStrategyAction>, RemoteSyncError> {
+        if let Some(actions) = self.gateway.pending_stop_actions().await? {
+            return Ok(actions);
+        }
         self.refresh_if_expiring().await?;
         let Some(actions_url) = self.config.actions_url.as_ref() else {
             return Ok(Vec::new());
@@ -385,6 +425,10 @@ impl HttpBatchSink {
             },
             message: format!("AQS action endpoint returned {status}: {body}"),
         })
+    }
+
+    pub async fn hosted_safety_registered(&self) -> bool {
+        self.gateway.safety_registered().await
     }
 
     pub async fn subscribe_pending_actions(
@@ -590,6 +634,23 @@ fn database_websocket_url(batch_url: &str) -> Result<String, RemoteSyncError> {
 
 #[async_trait]
 impl RemoteBatchSink for HttpBatchSink {
+    async fn persist_capture_gap(&self,notice:&aqe_live_protocol::CaptureGapNotice)
+        -> Result<Option<aqe_live_protocol::CaptureGapReceipt>,RemoteSyncError> {
+        self.gateway.publish_capture_gap(notice).await.map(Some)
+    }
+    fn safety_run_id(&self) -> Option<&str> {
+        Some(&self.config.run_id)
+    }
+    async fn persist_safety(
+        &self,
+        observation: &aqe_live_protocol::SafetyObservation,
+    ) -> Result<bool, RemoteSyncError> {
+        self.gateway.publish_safety(observation).await
+    }
+    async fn heartbeat(&self) -> Result<(), RemoteSyncError> {
+        self.gateway.heartbeat().await
+    }
+
     async fn persist_batch(
         &self,
         batch: &LiveSyncBatch,
@@ -699,7 +760,13 @@ impl RemoteBatchSink for HttpBatchSink {
     }
 
     async fn reconcile_start(&self, start: &ReconciliationStart) -> Result<(), RemoteSyncError> {
-        self.gateway.reconcile("start", start).await.map(|_| ())
+        let reply = self.gateway.reconcile("start", start).await?;
+        if !start.purpose.is_startup() && (reply["purpose"] != start.purpose.as_str()
+            || reply["criticalReplayThrough"].as_u64() != start.critical_replay_through) {
+            return Err(RemoteSyncError {kind:RemoteSyncErrorKind::CloudPaused,
+                message:"The service does not confirm mid-run capture recovery; accepted local evidence is retained.".into()});
+        }
+        Ok(())
     }
 
     async fn reconcile_chunk(&self, chunk: &ReconciliationChunk) -> Result<(), RemoteSyncError> {
@@ -796,6 +863,9 @@ pub struct SyncAgentConfig {
     pub retention_grace: Duration,
     pub health_interval: Duration,
     pub outbox_soft_limit_bytes: u64,
+    /// Disabled until producer pause/reconciliation and safety headroom are
+    /// installed. A refused handoff is never acknowledged to its durable owner.
+    pub capture_limit_bytes: Option<u64>,
 }
 
 impl SyncAgentConfig {
@@ -822,6 +892,7 @@ impl SyncAgentConfig {
             retention_grace: Duration::from_secs(5 * 60),
             health_interval: Duration::from_secs(1),
             outbox_soft_limit_bytes: DEFAULT_OUTBOX_SOFT_LIMIT_BYTES,
+            capture_limit_bytes: None,
         }
     }
 }
@@ -830,6 +901,7 @@ impl SyncAgentConfig {
 struct AgentHealthState {
     sync_state: String,
     reason: Option<String>,
+    cloud_pause_until: Option<std::time::Instant>,
 }
 
 impl Default for AgentHealthState {
@@ -837,6 +909,7 @@ impl Default for AgentHealthState {
         Self {
             sync_state: "healthy".to_string(),
             reason: None,
+            cloud_pause_until: None,
         }
     }
 }
@@ -852,11 +925,14 @@ pub struct SyncAgent {
 
 impl SyncAgent {
     pub fn new(
-        config: SyncAgentConfig,
+        mut config: SyncAgentConfig,
         bus: Arc<dyn LocalEventBus>,
         outbox: OutboxStore,
         sink: Arc<dyn RemoteBatchSink>,
     ) -> Self {
+        if let Some(budget)=outbox.physical_capture_budget() {
+            config.capture_limit_bytes=Some(config.capture_limit_bytes.unwrap_or(budget.payload_limit_bytes).min(budget.payload_limit_bytes));
+        }
         Self {
             config,
             bus,
@@ -905,9 +981,16 @@ impl SyncAgent {
             let outbox = self.outbox.clone();
             let shutdown = shutdown.clone();
             let errors = ingestion_error_tx.clone();
+            let capture_limit = self.config.capture_limit_bytes;
             workers.spawn(async move {
-                if let Err(error) =
-                    Self::ingest_critical_stream(bus, outbox, &mut subscription, shutdown).await
+                if let Err(error) = Self::ingest_critical_stream(
+                    bus,
+                    outbox,
+                    &mut subscription,
+                    shutdown,
+                    capture_limit,
+                )
+                .await
                 {
                     let _ = errors.send(error).await;
                 }
@@ -917,9 +1000,11 @@ impl SyncAgent {
             let outbox = self.outbox.clone();
             let shutdown = shutdown.clone();
             let errors = ingestion_error_tx.clone();
+            let capture_limit = self.config.capture_limit_bytes;
             workers.spawn(async move {
                 if let Err(error) =
-                    Self::ingest_latest_stream(outbox, &mut subscription, shutdown).await
+                    Self::ingest_latest_stream(outbox, &mut subscription, shutdown, capture_limit)
+                        .await
                 {
                     let _ = errors.send(error).await;
                 }
@@ -934,6 +1019,12 @@ impl SyncAgent {
             let notifier = critical_agent.outbox.change_notifier();
             loop {
                 if *critical_shutdown.borrow() {
+                    break;
+                }
+                if critical_agent
+                    .wait_for_cloud_resume(&mut critical_shutdown)
+                    .await
+                {
                     break;
                 }
                 // Register before reading/flushing: notify_waiters does not retain a
@@ -1007,6 +1098,61 @@ impl SyncAgent {
                 }
             });
         }
+        if let Some(run) = self.sink.safety_run_id() {
+            let gap_agent = self.clone();
+            let gap_shutdown = shutdown.clone();
+            let gap_run = run.to_owned();
+            workers.spawn(async move {
+                super::capture_transport::run_receiver(
+                    gap_agent.outbox, gap_agent.bus, gap_agent.config.runtime_id,
+                    gap_agent.config.strategy_id, gap_agent.config.live_session_id, gap_run, gap_shutdown,
+                ).await;
+            });
+            let subscription = self
+                .bus
+                .subscribe(EventSubject::operational_safety(
+                    &self.config.runtime_id,
+                    &self.config.strategy_id,
+                ))
+                .await?;
+            let agent = self.clone();
+            let receiver = shutdown.clone();
+            let errors = ingestion_error_tx.clone();
+            let run = run.to_owned();
+            workers.spawn(async move {
+                if let Err(error) = super::safety_transport::run_receiver(
+                    agent.outbox,
+                    agent.bus,
+                    subscription,
+                    agent.config.runtime_id,
+                    agent.config.strategy_id,
+                    agent.config.live_session_id,
+                    run,
+                    receiver,
+                )
+                .await
+                {
+                    let _ = errors.send(error.into()).await;
+                }
+            });
+            let agent = self.clone();
+            let receiver = shutdown.clone();
+            let errors = ingestion_error_tx.clone();
+            workers.spawn(async move {
+                if let Err(error) = safety::run(
+                    agent.outbox,
+                    agent.sink,
+                    agent.config.runtime_id,
+                    agent.config.strategy_id,
+                    agent.config.live_session_id,
+                    receiver,
+                )
+                .await
+                {
+                    let _ = errors.send(error).await;
+                }
+            });
+        }
         drop(ingestion_error_tx);
         let outcome = loop {
             if *shutdown.borrow() {
@@ -1025,6 +1171,21 @@ impl SyncAgent {
         // background publisher races that flush or retains a subscription.
         workers.shutdown().await;
         outcome?;
+        // Independent of the ordinary cloud-pause state and its retry deadline.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            safety::flush(
+                &self.outbox,
+                &self.sink,
+                &self.config.runtime_id,
+                &self.config.strategy_id,
+                &self.config.live_session_id,
+            ),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), gaps::flush(
+            &self.outbox, &self.sink, &self.config.strategy_id, &self.config.live_session_id,
+        )).await;
         match tokio::time::timeout(Duration::from_secs(2), self.flush_due()).await {
             Ok(result) => result?,
             Err(_) => self.set_health_state(
@@ -1042,17 +1203,22 @@ impl SyncAgent {
         outbox: OutboxStore,
         subscription: &mut super::EventSubscription,
         mut shutdown: watch::Receiver<bool>,
+        capture_limit: Option<u64>,
     ) -> Result<(), SyncAgentError> {
         loop {
             tokio::select! {
                 delivery = subscription.recv() => {
                     let Some(delivery) = delivery else { return Ok(()) };
-                    Self::accept_critical_batch(
+                    match Self::accept_critical_batch(
                         bus.as_ref(),
                         &outbox,
                         delivery,
                         subscription,
-                    ).await?;
+                        capture_limit,
+                    ).await {
+                        Ok(()) | Err(SyncAgentError::Outbox(OutboxStoreError::CapturePaused(_))) => {},
+                        Err(error) => return Err(error),
+                    }
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -1066,21 +1232,10 @@ impl SyncAgent {
     async fn ingest_latest_stream(
         outbox: OutboxStore,
         subscription: &mut super::EventSubscription,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
+        capture_limit: Option<u64>,
     ) -> Result<(), SyncAgentError> {
-        loop {
-            tokio::select! {
-                delivery = subscription.recv() => {
-                    let Some(delivery) = delivery else { return Ok(()) };
-                    outbox.insert_telemetry_latest(&delivery.event).await?;
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
+        telemetry_ingest::run(outbox, subscription, shutdown, capture_limit).await
     }
 
     async fn accept_critical_batch(
@@ -1088,6 +1243,7 @@ impl SyncAgent {
         outbox: &OutboxStore,
         first: super::EventDelivery,
         subscription: &mut super::EventSubscription,
+        capture_limit: Option<u64>,
     ) -> Result<(), SyncAgentError> {
         // The publisher sends a micro-batch concurrently. Yield once so those publications can
         // reach the local subscription, then commit up to 100 messages in one WAL transaction.
@@ -1105,6 +1261,7 @@ impl SyncAgent {
             .iter()
             .map(|delivery| delivery.event.clone())
             .collect::<Vec<_>>();
+        let mut starts = HashMap::new();
         for event in &events {
             if event.kind == EventKind::ReconciliationStart {
                 let start = serde_json::from_value::<ReconciliationStart>(event.payload.clone())
@@ -1113,10 +1270,36 @@ impl SyncAgent {
                             "invalid reconciliation start: {error}"
                         ))
                     })?;
-                outbox.begin_reconciliation_job(&start).await?;
+                if !start.valid_purpose()
+                    || start.runtime_id != event.runtime_id
+                    || start.strategy_id != event.strategy_id
+                    || start.live_session_id != event.live_session_id
+                    || (event.run_id.is_some() && event.run_id != start.run_id)
+                {
+                    return Err(SyncAgentError::InvalidEvent(
+                        "reconciliation start scope or purpose is invalid".into(),
+                    ));
+                }
+                starts.insert(
+                    (start.strategy_id.clone(), start.live_session_id.clone()),
+                    start,
+                );
             }
         }
-        outbox.insert_events(&events).await?;
+        match capture_limit {
+            // Durable publishers retain these exact envelopes until our local
+            // receipt. A full destination is deferred ownership transfer, not
+            // missing source history. Never manufacture a gap for each retry.
+            Some(limit) => outbox.handoff_accepted_events_with_capacity(&events, limit).await?,
+            None => outbox.insert_events(&events).await?,
+        };
+        // A refused handoff must not supersede already accepted recovery
+        // work. Only initialize metadata after the exact start is durable, and
+        // select the last generation per scope if a micro-batch contains more
+        // than one start. The source retains ownership if this step fails.
+        for start in starts.values() {
+            outbox.begin_reconciliation_job(start).await?;
+        }
         let event_ids = events
             .iter()
             .map(|event| event.event_id)
@@ -1169,13 +1352,15 @@ impl SyncAgent {
     }
 
     async fn publish_health(&self) -> Result<(), SyncAgentError> {
-        let outbox = self.outbox.cached_health(Duration::from_secs(1)).await?;
+        let outbox = self.outbox.health_for_runtime_scope(
+            &self.config.runtime_id, &self.config.strategy_id, &self.config.live_session_id,
+            self.sink.safety_run_id(),
+        ).await?;
         let state = self.health_state.lock().clone();
-        let sync_state = if outbox.dead_letters > 0 && state.sync_state == "healthy" {
-            "degraded".to_string()
-        } else {
-            state.sync_state
-        };
+        // Connection state comes from this worker's actual delivery attempts.
+        // Retained dead letters remain visible diagnostics, not proof that a
+        // replacement worker's current connection is stale.
+        let sync_state = state.sync_state;
         let reason = state.reason.or_else(|| {
             (outbox.dead_letters > 0).then(|| {
                 format!(
@@ -1184,7 +1369,7 @@ impl SyncAgent {
                 )
             })
         });
-        let health = RemoteSyncHealth {
+        let mut health = RemoteSyncHealth {
             runtime_id: self.config.runtime_id.clone(),
             strategy_id: self.config.strategy_id.clone(),
             live_session_id: self.config.live_session_id.clone(),
@@ -1201,8 +1386,52 @@ impl SyncAgent {
             retry_delay_ms: outbox.current_retry_delay_ms,
             database_bytes: outbox.database_bytes,
             reconciliation: outbox.reconciliation,
+            capture: match self.config.capture_limit_bytes {
+                Some(limit) => {
+                    let retained = self.outbox.capture_retained_bytes().await?;
+                    let physical=self.outbox.physical_capture_usage().await?;
+                    let pause = self
+                        .outbox
+                        .capture_pause_for_scope(
+                            &self.config.runtime_id,
+                            &self.config.strategy_id,
+                            &self.config.live_session_id,
+                        )
+                        .await?
+                        .filter(|pause| pause.resumed_at_us.is_none());
+                    Some(ReceiverCaptureHealth {
+                        state: if (retained > (limit / 5) * 4 && pause.is_some())
+                            || retained >= limit
+                            || physical.is_some_and(|usage|usage.exceeds_data_limit())
+                            || (pause.is_some() && physical.is_some_and(|usage|!usage.below_resume_threshold()))
+                        {
+                            super::CloudCaptureState::Paused
+                        } else if pause.is_some() {
+                            super::CloudCaptureState::ReconciliationRequired
+                        } else {
+                            super::CloudCaptureState::Active
+                        },
+                        generation: pause.map(|pause| pause.generation),
+                        retained_bytes: retained,
+                        limit_bytes: limit,
+                        physical,
+                    })
+                }
+                None => None,
+            },
             updated_at_us: now_epoch_micros(),
         };
+        // Accepted older batches can still drain while new capture is paused.
+        // Publish the combined verdict without changing the worker's actual
+        // delivery state, quotas, pause ownership or recovery behavior.
+        let capture = health.capture.as_ref().map(|capture| match capture.state {
+            super::CloudCaptureState::Disabled => "disabled",
+            super::CloudCaptureState::Starting => "starting",
+            super::CloudCaptureState::Active => "active",
+            super::CloudCaptureState::Paused => "paused",
+            super::CloudCaptureState::ReconciliationRequired => "reconciliation_required",
+        });
+        health.sync_state = aqe_live_protocol::sync_delivery_state(&health.sync_state, capture).to_owned();
         let event = EventEnvelope::new(
             self.config.runtime_id.clone(),
             self.config.strategy_id.clone(),
@@ -1213,10 +1442,12 @@ impl SyncAgent {
             EventKind::SyncHealth,
             serde_json::to_value(&health).unwrap_or_default(),
         );
-        self.bus.publish_telemetry(
+        // This local status is a lossy preview too. A full/stalled telemetry
+        // lane must not terminate critical delivery, controls or safety workers.
+        let _ = self.bus.publish_telemetry(
             EventSubject::sync_status(&self.config.runtime_id, &self.config.strategy_id),
             event,
-        )?;
+        );
         // Remote health is intentionally best-effort. The durable cursor remains the source of
         // truth and a failed health endpoint cannot recursively create more outbox work.
         let _ =
@@ -1226,8 +1457,58 @@ impl SyncAgent {
 
     fn set_health_state(&self, sync_state: &str, reason: Option<String>) {
         let mut state = self.health_state.lock();
+        // An already in-flight lane must not hide another lane's explicit pause.
+        if state
+            .cloud_pause_until
+            .is_some_and(|until| until > std::time::Instant::now())
+        {
+            return;
+        }
         state.sync_state = sync_state.to_string();
         state.reason = reason;
+    }
+
+    fn pause_cloud_delivery(&self, reason: String) {
+        let mut state = self.health_state.lock();
+        state.cloud_pause_until = Some(std::time::Instant::now() + Duration::from_secs(60));
+        state.sync_state = "cloud_paused".into();
+        state.reason = Some(reason);
+    }
+
+    fn cloud_pause_remaining(&self) -> Option<Duration> {
+        self.health_state
+            .lock()
+            .cloud_pause_until
+            .and_then(|until| until.checked_duration_since(std::time::Instant::now()))
+    }
+
+    fn ensure_cloud_delivery_ready(&self) -> Result<(), RemoteSyncError> {
+        if self.cloud_pause_remaining().is_some() {
+            Err(RemoteSyncError {
+                kind: RemoteSyncErrorKind::CloudPaused,
+                message: "Cloud delivery is paused by the service; local execution continues."
+                    .into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// While paused, new local events do not trigger more SQL/HTTP retries.
+    /// Shutdown and safety/control workers remain independent and responsive.
+    async fn wait_for_cloud_resume(&self, shutdown: &mut watch::Receiver<bool>) -> bool {
+        if *shutdown.borrow() {
+            return true;
+        }
+        while let Some(remaining) = self.cloud_pause_remaining() {
+            tokio::select! { biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return true; }
+                }
+                _ = tokio::time::sleep(remaining) => {},
+            }
+        }
+        *shutdown.borrow()
     }
 
     async fn flush_priority(
@@ -1236,6 +1517,9 @@ impl SyncAgent {
         max_events: usize,
         max_bytes: usize,
     ) -> Result<(), SyncAgentError> {
+        if self.cloud_pause_remaining().is_some() {
+            return Ok(());
+        }
         let mut records = self
             .outbox
             .pending_batch_for_runtime_scope(
@@ -1270,6 +1554,9 @@ impl SyncAgent {
         records: Vec<OutboxEventRecord>,
     ) -> Result<(), SyncAgentError> {
         for record in records {
+            if self.cloud_pause_remaining().is_some() {
+                break;
+            }
             let reconciliation_generation = record
                 .event
                 .payload
@@ -1377,6 +1664,7 @@ impl SyncAgent {
     }
 
     async fn send_reconciliation_event(&self, event: &CloudEvent) -> Result<(), RemoteSyncError> {
+        self.ensure_cloud_delivery_ready()?;
         let invalid = |label: &str, error: serde_json::Error| RemoteSyncError {
             kind: RemoteSyncErrorKind::InvalidBatch,
             message: format!("invalid {label}: {error}"),
@@ -1397,6 +1685,7 @@ impl SyncAgent {
                     serde_json::from_value::<ReconciliationComplete>(event.payload.clone())
                         .map_err(|error| invalid("reconciliation completion", error))?;
                 loop {
+                    self.ensure_cloud_delivery_ready()?;
                     let progress = self.sink.reconcile_complete(&payload).await?;
                     self.outbox
                         .update_reconciliation_progress(&ReconciliationJobProgress {
@@ -1433,6 +1722,7 @@ impl SyncAgent {
                                 message: error.to_string(),
                             })?
                         {
+                            self.ensure_cloud_delivery_ready()?;
                             tokio::time::sleep(Duration::from_millis(25)).await;
                         }
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1508,6 +1798,7 @@ impl SyncAgent {
                             message: error.to_string(),
                         })?
                     {
+                        self.ensure_cloud_delivery_ready()?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1553,6 +1844,9 @@ impl SyncAgent {
         let mut pending = VecDeque::from([records]);
         let mut authentication_refreshed = false;
         while let Some(records) = pending.pop_front() {
+            if self.cloud_pause_remaining().is_some() {
+                break;
+            }
             let mut events: Vec<CloudEvent> =
                 records.iter().map(|record| record.event.clone()).collect();
             let sent_at = now_epoch_micros();
@@ -1703,7 +1997,10 @@ impl SyncAgent {
         let reconciliation_only = records
             .iter()
             .all(|record| record.event.priority == EventPriority::Reconciliation);
-        let delay = if reconciliation_only {
+        let delay = if error.kind == RemoteSyncErrorKind::CloudPaused {
+            self.pause_cloud_delivery(error.message.clone());
+            60
+        } else if reconciliation_only {
             reconciliation_retry_delay_seconds(attempt)
         } else {
             retry_delay_seconds(attempt)

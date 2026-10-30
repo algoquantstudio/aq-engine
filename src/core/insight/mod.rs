@@ -7,6 +7,8 @@ mod insight;
 #[cfg(not(target_arch = "wasm32"))]
 mod position_accounting;
 #[cfg(not(target_arch = "wasm32"))]
+mod position;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod operations;
 #[cfg(not(target_arch = "wasm32"))]
 mod recovery_views;
@@ -44,14 +46,14 @@ use uuid::Uuid;
 #[cfg(not(target_arch = "wasm32"))]
 pub struct InsightCollection {
     insights: FxHashMap<Uuid, Insight>,
-    dirty_insight_ids: FxHashSet<Uuid>,
+    dirty_insight_ids: std::collections::BTreeSet<Uuid>,
     active_insight_ids: FxHashSet<Uuid>,
     // Ordered IDs permit bounded live cursor reads without collecting/sorting
     // the entire active set. Keep existing iteration order for backtests.
     ordered_active_insight_ids: std::collections::BTreeSet<Uuid>,
     active_by_symbol: HashMap<String, std::collections::BTreeSet<Uuid>>,
     active_symbol_by_id: FxHashMap<Uuid, String>,
-    terminal_pending_prune: FxHashSet<Uuid>,
+    terminal_pending_prune: std::collections::BTreeSet<Uuid>,
     lifetime_state_counts: HashMap<InsightState, usize>,
     last_known_insight_state: FxHashMap<Uuid, InsightState>,
     order_id_to_insight_id: HashMap<String, Uuid>,
@@ -71,12 +73,12 @@ impl InsightCollection {
     pub fn new() -> Self {
         Self {
             insights: FxHashMap::default(),
-            dirty_insight_ids: FxHashSet::default(),
+            dirty_insight_ids: Default::default(),
             active_insight_ids: FxHashSet::default(),
             ordered_active_insight_ids: Default::default(),
             active_by_symbol: HashMap::new(),
             active_symbol_by_id: FxHashMap::default(),
-            terminal_pending_prune: FxHashSet::default(),
+            terminal_pending_prune: Default::default(),
             lifetime_state_counts: HashMap::new(),
             last_known_insight_state: FxHashMap::default(),
             order_id_to_insight_id: HashMap::new(),
@@ -281,7 +283,7 @@ impl InsightCollection {
     }
 
     pub fn take_dirty_insight_ids(&mut self) -> Vec<Uuid> {
-        self.dirty_insight_ids.drain().collect::<Vec<_>>()
+        std::mem::take(&mut self.dirty_insight_ids).into_iter().collect()
     }
 
     pub fn has_dirty_insights(&self) -> bool {
@@ -329,32 +331,50 @@ impl InsightCollection {
         if limit == Some(0) {
             return Vec::new();
         }
-        let mut ids: Vec<Uuid> = if include_full_reconcile {
-            self.ids()
-        } else {
-            let mut ids = Vec::with_capacity(
-                self.dirty_insight_ids.len() + self.terminal_pending_prune.len(),
-            );
-            ids.extend(self.dirty_insight_ids.iter().copied());
-            ids.extend(
-                self.terminal_pending_prune
-                    .iter()
-                    .filter(|id| {
-                        !self.dirty_insight_ids.contains(id)
-                            && !(self.execution_persistence_enabled
-                                && (self.execution_dirty.contains(id)
-                                    || self.execution_pins.contains(id)))
-                    })
-                    .copied(),
-            );
-            ids
-        };
+        if !include_full_reconcile {
+            // Both indexes are maintained on mutation. The ordered union is
+            // lazy and unique: a 64-row flush never allocates/sorts a million
+            // dirty IDs just to truncate them again.
+            return self.dirty_insight_ids.union(&self.terminal_pending_prune)
+                .filter(|id| self.dirty_insight_ids.contains(id)
+                    || !(self.execution_persistence_enabled
+                        && (self.execution_dirty.contains(id) || self.execution_pins.contains(id))))
+                .take(limit.unwrap_or(usize::MAX)).copied().collect();
+        }
+        let mut ids = self.ids();
         if let Some(limit) = limit.filter(|limit| *limit < ids.len()) {
             ids.select_nth_unstable(limit);
             ids.truncate(limit);
         }
         ids.sort_unstable();
         ids
+    }
+
+    /// Current active state plus unpublished terminal state, not the lifetime
+    /// history. Capture one upper bound for a recovery sweep; later mutations
+    /// remain dirty and are sent by ordinary publishing after the sweep.
+    pub(crate) fn cloud_recovery_upper_bound(&self) -> Option<Uuid> {
+        [self.ordered_active_insight_ids.last(), self.dirty_insight_ids.last(),
+            self.terminal_pending_prune.last()].into_iter().flatten().copied().max()
+    }
+
+    pub(crate) fn cloud_recovery_page(
+        &self, after: Option<Uuid>, upper: Uuid, limit: usize,
+    ) -> Vec<Uuid> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        if limit == 0 || after.is_some_and(|id| id >= upper) { return Vec::new(); }
+        let bounds = (after.map_or(Unbounded, Excluded), Included(upper));
+        let mut active = self.ordered_active_insight_ids.range(bounds).peekable();
+        let mut dirty = self.dirty_insight_ids.range(bounds).peekable();
+        let mut terminal = self.terminal_pending_prune.range(bounds).peekable();
+        std::iter::from_fn(|| {
+            let next = [active.peek().copied(), dirty.peek().copied(), terminal.peek().copied()]
+                .into_iter().flatten().copied().min()?;
+            if active.peek().is_some_and(|id| **id == next) { active.next(); }
+            if dirty.peek().is_some_and(|id| **id == next) { dirty.next(); }
+            if terminal.peek().is_some_and(|id| **id == next) { terminal.next(); }
+            Some(next)
+        }).take(limit.min(128)).collect()
     }
 
     pub fn dirty_insight_ids(&self) -> Vec<Uuid> {
@@ -677,6 +697,32 @@ impl InsightCollection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloud_recovery_cursor_is_bounded_unique_and_includes_dirty_terminal_rows() {
+        let mut collection = super::InsightCollection::new();
+        for value in 1..=5000 {
+            let id=uuid::Uuid::from_u128(value);
+            if value%2==0 { collection.ordered_active_insight_ids.insert(id); }
+            if value%3==0 { collection.dirty_insight_ids.insert(id); }
+            if value%5==0 { collection.terminal_pending_prune.insert(id); }
+        }
+        let upper=collection.cloud_recovery_upper_bound().unwrap();
+        let mut after=None;
+        let mut got=Vec::new();
+        loop {
+            let page=collection.cloud_recovery_page(after,upper,17);
+            if page.is_empty(){break;}
+            assert!(page.len()<=17);
+            after=page.last().copied();got.extend(page);
+        }
+        let expected=(1..=5000).filter(|v|v%2==0||v%3==0||v%5==0)
+            .map(uuid::Uuid::from_u128).collect::<Vec<_>>();
+        assert_eq!(got,expected);
+        assert!(collection.cloud_recovery_page(None,upper,0).is_empty());
+        assert!(collection.cloud_recovery_page(Some(upper),upper,128).is_empty());
+        assert_eq!(collection.cloud_recovery_page(None,upper,usize::MAX).len(),128);
+    }
+
     #[test]
     fn limited_live_sync_matches_full_sort_including_overlapping_dirty_sets() {
         let mut collection = super::InsightCollection::new();

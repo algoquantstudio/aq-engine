@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS broker_execution_position_checks (
     execution_epoch INTEGER NOT NULL,ledger_sequence INTEGER NOT NULL,
     as_of_us INTEGER NOT NULL,check_json TEXT NOT NULL,
     PRIMARY KEY(provider,position_id)
-);";
+);
+CREATE INDEX IF NOT EXISTS idx_execution_position_check_ledger ON broker_execution_position_checks(ledger_sequence);";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -173,16 +174,18 @@ impl BrokerCommandJournal {
         &mut self,
         batch: &ExecutionFillBatch,
     ) -> Result<(), BrokerCommandError> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+        self.check_analytics_admission().await?;
+        let tx = turso::transaction::Transaction::new_unchecked(
+            self.analytics_connection(),turso::transaction::TransactionBehavior::Immediate)
             .await
             .map_err(journal_error)?;
         if let Some((account, owner)) = &batch.history_owner {
             if account != &self.account_id {
                 return Err(journal_error("history account scope changed"));
             }
-            history::validate_owner(&tx, owner).await?;
+            // The one command worker owns both connections. Optional history
+            // may read canonical ownership, but never writes broker recovery.
+            history::validate_owner(&self.connection, owner).await?;
         }
         for (input, encoded) in &batch.rows {
             let mut effective = input.clone();
@@ -294,7 +297,7 @@ impl BrokerCommandJournal {
             }
         }
         history::persist_position_check(&tx, batch).await?;
-        tx.commit().await.map_err(journal_error)
+        super::analytics_capture::commit_observations(tx,self.analytics_connection(),self.analytics_path(),self.analytics_capture_budget,self.lifecycle.epoch).await
     }
 
     /// Indexed, fixed-watermark feed. Corrections are replacement records, not
@@ -305,8 +308,7 @@ impl BrokerCommandJournal {
         through: Option<u64>,
         limit: usize,
     ) -> Result<ExecutionFillPage, BrokerCommandError> {
-        let mut rows = self
-            .connection
+        let mut rows = self.analytics_connection()
             .query(
                 "SELECT COALESCE(MAX(sequence),0) FROM broker_execution_fills",
                 (),
@@ -330,7 +332,7 @@ impl BrokerCommandJournal {
             ));
         }
         let limit = limit.clamp(1, MAX_FILL_PAGE_ROWS);
-        let mut rows=self.connection.query("SELECT sequence,execution_epoch,recorded_at_us,observation_json FROM broker_execution_fills
+        let mut rows=self.analytics_connection().query("SELECT sequence,execution_epoch,recorded_at_us,observation_json FROM broker_execution_fills
             WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT ?3",
             params![after as i64,through as i64,(limit+1) as i64]).await.map_err(journal_error)?;
         let mut records = Vec::new();
@@ -387,8 +389,7 @@ impl BrokerCommandJournal {
             bytes += json.len();
         }
         drop(rows);
-        let mut clocks = self
-            .connection
+        let mut clocks = self.analytics_connection()
             .query(
                 "SELECT clock_json FROM broker_execution_fill_history_clocks
             WHERE first_sequence<=?1 ORDER BY first_sequence LIMIT 2",

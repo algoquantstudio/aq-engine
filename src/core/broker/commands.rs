@@ -490,6 +490,13 @@ pub enum BrokerCommandError {
     Invalid(String),
     TooLarge,
     QueueFull,
+    /// Another optional evidence operation owns the single analytics permit.
+    AnalyticsBusy,
+    /// The serialized journal request channel (not broker order admission) is full.
+    AnalyticsQueueFull,
+    /// Only optional analytics capture was refused. This never rejects a
+    /// broker command, checkpoint, receipt or stop operation.
+    CapturePaused,
     Closed,
     Stopping,
     IdentityConflict,
@@ -505,6 +512,11 @@ impl std::fmt::Display for BrokerCommandError {
             Self::QueueFull => {
                 f.write_str("Broker command queue is full; defer and retry admission")
             }
+            Self::AnalyticsBusy => f.write_str("Analytics reader is busy; defer and retry"),
+            Self::AnalyticsQueueFull => f.write_str("Analytics journal request queue is full; defer and retry"),
+            Self::CapturePaused => f.write_str(
+                "New optional analytics capture is paused; no journal receipt was issued",
+            ),
             Self::Closed => f.write_str("Broker command worker is closed"),
             Self::Stopping => f.write_str("Broker entry admission is stopped"),
             Self::IdentityConflict => {
@@ -516,6 +528,12 @@ impl std::fmt::Display for BrokerCommandError {
 }
 
 impl std::error::Error for BrokerCommandError {}
+
+impl BrokerCommandError {
+    pub(crate) fn is_analytics_backpressure(&self) -> bool {
+        matches!(self, Self::AnalyticsBusy | Self::AnalyticsQueueFull)
+    }
+}
 
 #[cfg(test)]
 mod submission_correlation_tests {

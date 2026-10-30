@@ -24,6 +24,7 @@ impl InsightHistoryKind {
 #[derive(Clone)]
 pub struct InsightStrategyContext {
     current_time_fn: std::sync::Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>,
+    position_reader: Option<crate::core::broker::types::PositionSnapshotReader>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -41,11 +42,25 @@ impl InsightStrategyContext {
     {
         Self {
             current_time_fn: std::sync::Arc::new(current_time_fn),
+            position_reader: None,
         }
     }
 
     pub fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
         (self.current_time_fn)()
+    }
+
+    pub fn with_position_reader(mut self, reader: Option<crate::core::broker::types::PositionSnapshotReader>) -> Self {
+        self.position_reader=reader;
+        self
+    }
+
+    pub(crate) fn position(&self, order: &str, symbol: &str) -> Result<Option<crate::core::broker::types::Position>,crate::core::broker::types::BrokerError> {
+        let reader=self.position_reader.as_ref().ok_or(crate::core::broker::types::BrokerError::SnapshotUnavailable {
+            kind:crate::core::broker::snapshots::SnapshotKind::Positions,
+            reason:crate::core::broker::snapshots::SnapshotUnavailable::Missing,
+        })?;
+        reader(order,symbol)
     }
 }
 

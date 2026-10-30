@@ -295,6 +295,7 @@ mod tests {
     fn unrealized_pnl_matches_side() {
         let mut position = Position {
             account_id: "acct".to_string(),
+            order_id: Some("entry".into()),
             asset: sample_asset(),
             avg_entry_price: 100.0,
             qty: 2.0,

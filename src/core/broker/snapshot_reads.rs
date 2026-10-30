@@ -16,6 +16,18 @@ pub(super) struct LiveSnapshotReads {
 }
 
 impl<E: Broker + OrderManagementProvider, D: DataFeed + DataProvider> UnifiedBroker<E, D> {
+    pub(crate) fn insight_context(&self) -> crate::core::insight::InsightStrategyContext {
+        use crate::core::insight::InsightStrategyContext;
+        let context=if let Some(state)=self.backtest_state.clone() {
+            InsightStrategyContext::new(move ||state.read().current_time)
+        } else { InsightStrategyContext::new(chrono::Utc::now) };
+        let reader=if self.backtest_state.is_some() { self.execution.position_snapshot_reader() }
+        else { self.live_snapshot_cache().map(|cache| {
+            Arc::new(move |order:&str,symbol:&str|cache.position_by_order_id(order,symbol)
+                .map_err(|reason|BrokerError::SnapshotUnavailable {kind:SnapshotKind::Positions,reason})) as super::types::PositionSnapshotReader
+        }) };
+        context.with_position_reader(reader)
+    }
     pub fn start_snapshot_reads(
         &self,
         account: Account,
@@ -166,6 +178,7 @@ impl<E: Broker + OrderManagementProvider, D: DataFeed + DataProvider> UnifiedBro
                 .get_current_bar(symbol)
                 .map(|bar| {
                     Arc::new(Quote {
+                        profit_model: None,
                         symbol: symbol.to_owned(),
                         bid: bar.close,
                         ask: bar.close,

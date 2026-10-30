@@ -10,7 +10,8 @@ impl BrokerCommandJournal {
     pub async fn prepare_execution_fill_export(
         &self,
     ) -> Result<Option<ExecutionFillTransfer>, BrokerCommandError> {
-        let mut rows = self.connection.query(
+        self.try_reclaim_cloud_wal().await?;
+        let mut rows = self.analytics_connection().query(
             "SELECT cursor,pending_json,pending_transfer_id,pending_next FROM broker_execution_fill_export WHERE singleton=1", ()
         ).await.map_err(journal_error)?;
         let row = rows
@@ -74,8 +75,10 @@ impl BrokerCommandJournal {
                 .retain(|r| r.sequence <= page.next_sequence);
             page.has_more = true;
         };
-        self.connection.execute("UPDATE broker_execution_fill_export SET pending_transfer_id=?1,pending_next=?2,pending_json=?3 WHERE singleton=1",
+        let tx=turso::transaction::Transaction::new_unchecked(self.analytics_connection(),turso::transaction::TransactionBehavior::Immediate).await.map_err(journal_error)?;
+        tx.execute("UPDATE broker_execution_fill_export SET pending_transfer_id=?1,pending_next=?2,pending_json=?3 WHERE singleton=1",
             params![transfer.transfer_id.clone(),transfer.next_sequence as i64,transfer.body.clone()]).await.map_err(journal_error)?;
+        self.commit_analytics_maintenance(tx).await?;
         Ok(Some(transfer))
     }
 
@@ -83,13 +86,14 @@ impl BrokerCommandJournal {
         &self,
         receipt: &ExecutionFillExportReceipt,
     ) -> Result<(), BrokerCommandError> {
+        self.try_reclaim_cloud_wal().await?;
         if receipt.source_id != self.evidence_source_id
             || receipt.after_sequence >= receipt.next_sequence
             || receipt.next_sequence > i64::MAX as u64
         {
             return Err(journal_error("invalid fill export receipt"));
         }
-        let mut rows = self.connection.query("SELECT cursor,last_transfer_id,pending_transfer_id,pending_next FROM broker_execution_fill_export WHERE singleton=1", ()).await.map_err(journal_error)?;
+        let mut rows = self.analytics_connection().query("SELECT cursor,last_transfer_id,pending_transfer_id,pending_next FROM broker_execution_fill_export WHERE singleton=1", ()).await.map_err(journal_error)?;
         let row = rows
             .next()
             .await
@@ -101,7 +105,7 @@ impl BrokerCommandJournal {
         let next: Option<i64> = row.get(3).map_err(journal_error)?;
         drop(rows);
         if cursor == receipt.next_sequence as i64 && last.as_deref() == Some(&receipt.transfer_id) {
-            return Ok(());
+            return self.retire_handed_off_cloud_history().await;
         }
         if cursor != receipt.after_sequence as i64
             || pending.as_deref() != Some(&receipt.transfer_id)
@@ -111,8 +115,10 @@ impl BrokerCommandJournal {
                 "fill export receipt does not match pending page",
             ));
         }
-        self.connection.execute("UPDATE broker_execution_fill_export SET cursor=?1,last_transfer_id=pending_transfer_id,pending_transfer_id=NULL,pending_next=NULL,pending_json=NULL WHERE singleton=1",
+        let tx=turso::transaction::Transaction::new_unchecked(self.analytics_connection(),turso::transaction::TransactionBehavior::Immediate).await.map_err(journal_error)?;
+        tx.execute("UPDATE broker_execution_fill_export SET cursor=?1,last_transfer_id=pending_transfer_id,pending_transfer_id=NULL,pending_next=NULL,pending_json=NULL WHERE singleton=1",
             params![receipt.next_sequence as i64]).await.map_err(journal_error)?;
-        Ok(())
+        self.commit_analytics_maintenance(tx).await?;
+        self.retire_handed_off_cloud_history().await
     }
 }

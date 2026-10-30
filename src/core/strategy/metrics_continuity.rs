@@ -82,7 +82,18 @@ where
             }
         };
         match serde_json::from_slice::<LocalLiveMetricsCheckpoint>(&bytes) {
-            Ok(stored) if stored.strategy_key == strategy_key => Some(stored.checkpoint),
+            Ok(stored) if stored.strategy_key == strategy_key => {
+                match super::metrics_risk_fence::accepts(&path, strategy_key, &stored.checkpoint) {
+                    Ok(true) => Some(stored.checkpoint),
+                    result => {
+                        warn!(
+                            "Local metrics risk history requires the audited Cloud checkpoint; original file retained: {:?}",
+                            result.err()
+                        );
+                        None
+                    }
+                }
+            }
             Ok(stored) => {
                 warn!(
                     "Ignoring local live metrics checkpoint {} for unexpected strategy {}",

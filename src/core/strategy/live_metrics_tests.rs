@@ -2,6 +2,78 @@ use super::*;
 use chrono::TimeDelta;
 
 #[test]
+fn audited_risk_repair_does_not_lose_newer_local_trade_state() {
+    let at = Utc::now();
+    let mut tracker = LivePerformanceTracker::default();
+    tracker.initialize_for_account(Some("mt5".into()), 1000.0, 1000.0, at, []);
+    let mut cloud = tracker.checkpoint().unwrap();
+    cloud.max_drawdown = 4.25;
+    cloud.updated_at = at + TimeDelta::seconds(10);
+    cloud.equity_risk_reconciliation = Some(EquityRiskReconciliation {
+        repair_id: "audit".into(),
+        through: cloud.updated_at,
+    });
+    let mut local = cloud.clone();
+    local.equity_risk_reconciliation = None;
+    local.updated_at = at + TimeDelta::seconds(11);
+    local.max_drawdown = 100.0;
+    local.total_trades = 876;
+    local.recorded_closed_insight_ids = vec!["newest-trade".into()];
+    let selected =
+        LivePerformanceTracker::newest_compatible_checkpoint("mt5", [local.clone(), cloud.clone()])
+            .unwrap();
+    assert_eq!(selected.max_drawdown, 4.25);
+    assert_eq!(selected.total_trades, 876);
+    assert_eq!(
+        selected.recorded_closed_insight_ids,
+        local.recorded_closed_insight_ids
+    );
+    // Reconnect acknowledgement repairs risk without merging trades twice.
+    let mut contaminated = cloud.clone();
+    contaminated.equity_risk_reconciliation = None;
+    contaminated.max_drawdown = 100.0;
+    tracker
+        .restore(contaminated, 1000.0, at + TimeDelta::seconds(12), [])
+        .unwrap();
+    tracker.merge_historical_checkpoint(cloud.clone()).unwrap();
+    assert_eq!(tracker.checkpoint().unwrap().max_drawdown, 4.25);
+    tracker
+        .restore(selected.clone(), 1000.0, at + TimeDelta::seconds(12), [])
+        .unwrap();
+    assert_eq!(
+        tracker.checkpoint().unwrap().equity_risk_reconciliation,
+        cloud.equity_risk_reconciliation
+    );
+    // A real subsequent loss from a reconciled runtime must never be hidden.
+    tracker.update_equity(0.0, at + TimeDelta::seconds(13));
+    assert_eq!(
+        LivePerformanceTracker::newest_compatible_checkpoint(
+            "mt5",
+            [cloud.clone(), tracker.checkpoint().unwrap()]
+        )
+        .unwrap()
+        .max_drawdown,
+        100.0
+    );
+    let mut wrong = cloud.clone();
+    wrong.account_id = "other".into();
+    assert_eq!(
+        LivePerformanceTracker::newest_compatible_checkpoint("mt5", [local.clone(), wrong])
+            .unwrap()
+            .max_drawdown,
+        100.0
+    );
+    let mut other_origin = cloud;
+    other_origin.executed_at = at - TimeDelta::days(1);
+    assert_eq!(
+        LivePerformanceTracker::newest_compatible_checkpoint("mt5", [local, other_origin])
+            .unwrap()
+            .max_drawdown,
+        100.0
+    );
+}
+
+#[test]
 fn persisted_account_equity_origin_survives_restart_without_resetting_metrics() {
     let at = Utc::now() - TimeDelta::hours(1);
     let mut tracker = LivePerformanceTracker::default();
@@ -149,6 +221,7 @@ fn newest_checkpoint_is_selected_without_adding_accumulators() {
     let checkpoint = |account: &str, updated_at| LiveMetricsCheckpoint {
         version: LIVE_METRICS_CHECKPOINT_VERSION,
         account_id: account.to_string(),
+        equity_risk_reconciliation: None,
         history_recovery_complete: true,
         starting_cash: 100.0,
         current_equity: 100.0,

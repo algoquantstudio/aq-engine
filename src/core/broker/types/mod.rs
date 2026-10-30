@@ -338,6 +338,10 @@ pub enum AssetExchange {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     pub account_id: String,
+    /// Exact execution/position ticket associated with the entry Insight.
+    /// None for legacy payloads or symbol aggregates with multiple owners.
+    #[serde(default)]
+    pub order_id: Option<String>,
     pub asset: Asset,
     pub avg_entry_price: f64,
     pub qty: f64,
@@ -351,6 +355,10 @@ pub struct Position {
     pub entry_commission: f64,
     pub margin_required: Option<f64>,
 }
+
+/// Transport-free position snapshot lookup. Implementations must distinguish
+/// unavailable data from an observed absence and must never submit orders.
+pub type PositionSnapshotReader = std::sync::Arc<dyn Fn(&str, &str) -> Result<Option<Position>, BrokerError> + Send + Sync>;
 
 /// Broker-neutral lifecycle state used when reconciling persisted orders after a restart.
 ///
@@ -787,6 +795,10 @@ pub enum BarData {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Quote {
+    /// Optional native account-currency valuation model for supported contracts.
+    /// Absent on old adapters, unsupported instruments and synthetic bar quotes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profit_model: Option<aqe_live_protocol::BrokerQuoteProfit>,
     pub symbol: String,
     pub bid: f64,
     pub ask: f64,
@@ -798,6 +810,16 @@ pub struct Quote {
 }
 
 impl Quote {
+    pub(crate) fn set_mapped_symbol(&mut self, symbol: String) {
+        if let Some(model) = self.profit_model.as_mut() {
+            if model.symbol.eq_ignore_ascii_case(&self.symbol) {
+                model.symbol = symbol.clone();
+            } else {
+                self.profit_model = None;
+            }
+        }
+        self.symbol = symbol;
+    }
     pub(crate) fn valid_market_values(&self) -> bool {
         self.bid.is_finite()
             && self.ask.is_finite()
@@ -819,6 +841,7 @@ impl Quote {
     /// or last-trade size: cumulative candle volume is not the size of a trade.
     pub fn from_bar_close(bar: &Bar) -> Self {
         Self {
+            profit_model: None,
             symbol: bar.symbol.clone(),
             bid: bar.close,
             ask: bar.close,

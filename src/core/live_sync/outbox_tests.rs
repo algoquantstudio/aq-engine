@@ -1250,6 +1250,15 @@ async fn ten_thousand_reconciliation_records_encode_below_the_hard_limit() {
 
 #[tokio::test]
 async fn oversized_legacy_snapshot_is_upgraded_to_deterministic_chunks_on_reopen() {
+    legacy_snapshot_upgrade(false).await;
+}
+
+#[tokio::test]
+async fn bounded_legacy_snapshot_upgrade_installs_aggregate_and_reopens_without_duplicates() {
+    legacy_snapshot_upgrade(true).await;
+}
+
+async fn legacy_snapshot_upgrade(bounded: bool) {
     let path = temp_database();
     let store = OutboxStore::open(&path).await.unwrap();
     let records = (0..10_000)
@@ -1288,7 +1297,13 @@ async fn oversized_legacy_snapshot_is_upgraded_to_deterministic_chunks_on_reopen
         .unwrap();
     drop(store);
 
-    let reopened = OutboxStore::open(&path).await.unwrap();
+    let budget=PhysicalCaptureBudget {
+        payload_limit_bytes:64*1024*1024,physical_limit_bytes:256*1024*1024,
+        operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES,
+    };
+    let reopened = if bounded {
+        OutboxStore::open_with_physical_capture_budget(&path,budget).await.unwrap()
+    } else { OutboxStore::open(&path).await.unwrap() };
     let mut rows = reopened
         .connection
         .query(
@@ -1314,7 +1329,12 @@ async fn oversized_legacy_snapshot_is_upgraded_to_deterministic_chunks_on_reopen
     }
     assert!(chunks > 1);
     drop(rows);
+    let pending=reopened.pending_count().await.unwrap();
     drop(reopened);
+    if bounded {
+        let again=OutboxStore::open_with_physical_capture_budget(&path,budget).await.unwrap();
+        assert_eq!(again.pending_count().await.unwrap(),pending,"legacy retry must retain exactly the deterministic replacement set");
+    }
     let _ = std::fs::remove_file(path);
 }
 
@@ -1323,6 +1343,8 @@ async fn new_run_supersedes_old_reconciliation_and_preserves_retry_progress() {
     let path = temp_database();
     let store = OutboxStore::open(&path).await.unwrap();
     let start = |generation: &str, run_id: &str| ReconciliationStart {
+        purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
+        critical_replay_through: None,
         generation: generation.to_string(),
         runtime_id: "runtime".to_string(),
         strategy_id: "strategy".to_string(),
@@ -1404,6 +1426,43 @@ async fn new_run_supersedes_old_reconciliation_and_preserves_retry_progress() {
     assert_eq!(progress.unresolved_count, 2);
     assert_eq!(progress.retry_count, 1);
 
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn reconciliation_generation_cannot_change_purpose_or_accept_an_unfenced_recovery() {
+    let path = temp_database();
+    let store = OutboxStore::open(&path).await.unwrap();
+    let start = ReconciliationStart {
+        purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
+        critical_replay_through: None,
+        generation: "immutable-generation".into(),
+        runtime_id: "runtime".into(),
+        strategy_id: "strategy".into(),
+        live_session_id: "session".into(),
+        run_id: Some("run".into()),
+        snapshot_complete: true,
+        broker_features: vec![],
+        critical_cutoff: Some(10),
+        total_chunks: 0,
+        total_records: 0,
+    };
+    store.begin_reconciliation_job(&start).await.unwrap();
+    let before = store.health().await.unwrap().reconciliation.unwrap();
+    let mut changed = start.clone();
+    changed.purpose = aqe_live_protocol::ReconciliationPurpose::CaptureRecovery;
+    changed.critical_replay_through = Some(10);
+    assert!(matches!(store.begin_reconciliation_job(&changed).await,
+        Err(OutboxStoreError::InvalidRecord(_))));
+    changed.generation = "unfenced".into();
+    changed.critical_cutoff = None;
+    assert!(matches!(store.begin_reconciliation_job(&changed).await,
+        Err(OutboxStoreError::InvalidRecord(_))));
+    let after = store.health().await.unwrap().reconciliation.unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.candidate_count, before.candidate_count);
     drop(store);
     let _ = std::fs::remove_file(path);
 }

@@ -1,5 +1,21 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn private_permission_protection_never_follows_a_link() {
+    use std::os::unix::fs::{symlink,PermissionsExt};
+    let root=std::env::temp_dir().join(format!("aqe-private-permission-{}",uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let outside=root.join("unrelated");
+    std::fs::write(&outside,b"unchanged").unwrap();
+    std::fs::set_permissions(&outside,std::fs::Permissions::from_mode(0o644)).unwrap();
+    let link=root.join("linked");
+    symlink(&outside,&link).unwrap();
+    assert!(protect_private_path(&link,false).is_err());
+    assert_eq!(std::fs::metadata(&outside).unwrap().permissions().mode()&0o777,0o644);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn fixture() -> LaunchConfig {
     LaunchConfig {
         version: VERSION,
@@ -23,6 +39,7 @@ fn fixture() -> LaunchConfig {
             account_coordinator_dir: "/fixture/account-locks".into(),
         }),
         fill_export: true,
+        capture:None,
     }
 }
 
@@ -34,9 +51,66 @@ fn schema_keeps_one_session_and_default_access_and_no_legacy_flags() {
     assert!(!json.contains("live_session_id"));
     assert!(!json.contains("AQE_EXECUTION_EVIDENCE_EXPORT"));
     assert!(!json.contains("AQE_POSITION_MARK"));
+    assert!(!json.contains("\"capture\""),"old/default launch files remain unchanged");
     let restored: LaunchConfig = serde_json::from_str(&json).unwrap();
     restored.validate().unwrap();
     assert_eq!(restored.cloud.unwrap().access_method, "aqe_live");
+}
+
+fn capture_fixture()->CloudCaptureConfig{
+    let physical=CapturePartitionConfig{physical_limit_bytes:64*1024*1024,operational_headroom_bytes:MIN_CAPTURE_OPERATIONAL_HEADROOM_BYTES};
+    let outbox=CaptureOutboxConfig{payload_limit_bytes:4*1024*1024,physical};
+    CloudCaptureConfig{version:1,source_journal:physical,publisher:outbox,embedded_receiver:Some(outbox)}
+}
+
+#[test]
+fn protected_capture_has_explicit_transport_appropriate_partitions(){
+    let mut config=fixture();
+    let policy=capture_fixture();
+    config.capture=Some(policy);
+    config.validate().unwrap();
+    let restored:LaunchConfig=serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.capture,Some(policy));
+    assert_eq!(restored.setting("AQE_CAPTURE_POLICY"),None,"no new launch environment flags");
+    config.capture.as_mut().unwrap().embedded_receiver=None;
+    assert!(config.validate().is_err(),"embedded delivery must budget its owned receiver");
+    config.delivery=Some(DeliveryConfig::ManagedNats{
+        runtime_id:uuid::Uuid::new_v4().to_string(),url:"nats://127.0.0.1:4222".into(),token:"fixture".into(),
+        outbox_path:"/fixture/publisher.db".into(),account_coordinator_dir:"/fixture/locks".into(),split_insight_history:true,
+    });
+    config.validate().unwrap();
+    config.capture.as_mut().unwrap().embedded_receiver=policy.embedded_receiver;
+    assert!(config.validate().is_err(),"a strategy cannot assign a private budget to the shared host receiver");
+}
+
+#[test]
+fn protected_capture_rejects_unknown_unsafe_or_unowned_policies(){
+    let mut config=fixture();config.capture=Some(capture_fixture());
+    config.capture.as_mut().unwrap().version=2;
+    assert!(config.validate().is_err());
+    config.capture=Some(capture_fixture());
+    config.capture.as_mut().unwrap().source_journal.operational_headroom_bytes=1;
+    assert!(config.validate().is_err());
+    config.capture=Some(capture_fixture());
+    config.capture.as_mut().unwrap().publisher.payload_limit_bytes=0;
+    assert!(config.validate().is_err());
+    config.capture=Some(capture_fixture());
+    config.cloud.as_mut().unwrap().strategy_id="x".repeat(129);
+    assert!(config.validate().is_err());
+    config.cloud=None;config.delivery=None;
+    assert!(config.validate().is_err(),"standalone trading cannot inherit cloud capture policy");
+    let mut value=serde_json::to_value(capture_fixture()).unwrap();value["unknown"]=true.into();
+    assert!(serde_json::from_value::<CloudCaptureConfig>(value).is_err());
+}
+
+#[cfg(not(target_arch="wasm32"))]
+#[test]
+fn protected_capture_private_file_roundtrip_preserves_exact_allocation(){
+    let root=std::env::temp_dir().join(format!("capture-launch-{}",uuid::Uuid::new_v4()));
+    let path=root.join("launch.json");let mut config=fixture();config.capture=Some(capture_fixture());
+    write_private(&path,&config).unwrap();
+    let restored=read_private(&path).unwrap();assert_eq!(restored.capture,config.capture);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

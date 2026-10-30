@@ -1,0 +1,46 @@
+syntax = "proto3";
+package aqs.live.v1;
+
+// Live transport envelope; payload_json remains the existing lossless JSON
+// document. This schema does not replace the canonical event identity encoding.
+message Batch {
+  // Application protocol version, independent of the MIME wire version.
+  uint32 version = 1;
+  string runtime = 2;
+  string strategy = 3;
+  string session = 4;
+  optional uint64 first = 5;
+  optional uint64 last = 6;
+  repeated Event critical = 7;
+  repeated Event telemetry = 8;
+}
+message Event {
+  uint32 version = 1;
+  bytes id = 2;
+  string runtime = 3;
+  string strategy = 4;
+  string session = 5;
+  optional string run = 6;
+  string entity = 7;
+  uint64 revision = 8;
+  optional uint64 sequence = 9;
+  uint32 priority = 10;
+  bytes kind_json = 11;
+  bytes payload_json = 12;
+  Trace latency = 13;
+  sint64 seconds = 14;
+  uint32 nanos = 15;
+}
+message Trace {
+  optional sint64 source = 1;
+  optional sint64 adapter = 2;
+  optional sint64 runtime = 3;
+  optional sint64 bus = 4;
+  optional sint64 outbox = 5;
+  optional sint64 request = 6;
+  optional sint64 committed = 7;
+  optional sint64 ack = 8;
+  optional sint64 applied = 9;
+  optional sint64 offset = 10;
+  optional uint64 uncertainty = 11;
+}

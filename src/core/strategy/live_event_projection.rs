@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 const MAX_RETRY_EVENTS: usize = 256;
 const MAX_RETRY_BYTES: usize = 8 * 1024 * 1024;
 const DURABLE_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
+mod source_capture;
+mod capture_notices;
+mod lifecycle_recovery;
 
 #[derive(Default)]
 struct PendingPublications {
@@ -25,9 +28,15 @@ pub(super) fn advance_entity_revision(current: &mut u64, clock_revision: u64) ->
 }
 
 pub(super) struct LocalBatchSyncState {
+    deferred_start: lifecycle_recovery::DeferredStart,
+    capture_notices: parking_lot::Mutex<capture_notices::CaptureNoticeLimiter>,
+    source_monitor:Option<crate::core::live_sync::SourceJournalMonitor>,
+    final_source_journal:Option<crate::core::live_sync::FinalSourceJournal>,
+    pub(super) capture_recovery: super::live_capture_recovery::CaptureRecovery,
     pub(super) evidence_export: super::live_evidence_export::ExecutionEvidenceExporter,
     pub(super) fill_export: super::live_evidence_export::ExecutionEvidenceExporter,
     pub(super) mark_export: super::live_evidence_export::ExecutionEvidenceExporter,
+    export_schedule: super::live_evidence_export::ExecutionExportScheduler,
     control_receipts: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pending_publications: parking_lot::Mutex<PendingPublications>,
     pub(super) publisher: LocalEventPublisher,
@@ -43,6 +52,9 @@ pub(super) struct LocalBatchSyncState {
     pub(super) split_insight_history: bool,
     pub(super) last_account_projection_fingerprint: Option<[u8; 32]>,
     pub(super) last_account_projection_at: Option<Instant>,
+    pub(super) account_flow_source: Option<String>,
+    pub(super) account_flow_cursor: u64,
+    pub(super) account_flow_gap_reported: bool,
     pub(super) last_metrics_projection_at: Option<Instant>,
     pub(super) last_equity_history_at: Option<Instant>,
     pub(super) last_equity_history_value: Option<f64>,
@@ -61,13 +73,21 @@ impl Drop for LocalBatchSyncState {
 impl LocalBatchSyncState {
     pub(super) fn new(publisher: LocalEventPublisher, auth: &AqsAuth) -> Self {
         Self {
+            deferred_start: Default::default(),
+            capture_notices: Default::default(),
+            source_monitor:None,
+            final_source_journal:None,
+            capture_recovery: Default::default(),
             evidence_export: super::live_evidence_export::ExecutionEvidenceExporter::new(),
             fill_export: super::live_evidence_export::ExecutionEvidenceExporter::new_fills(),
             mark_export: super::live_evidence_export::ExecutionEvidenceExporter::new_marks(),
+            export_schedule: Default::default(),
             control_receipts: Default::default(),
             pending_publications: Default::default(),
             publisher,
-            runtime_id: crate::launch_config::setting("AQE_RUNTIME_ID").ok().flatten()
+            runtime_id: crate::launch_config::setting("AQE_RUNTIME_ID")
+                .ok()
+                .flatten()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             strategy_id: auth.strategy_id.clone(),
             live_session_id: auth
@@ -75,7 +95,9 @@ impl LocalBatchSyncState {
                 .as_deref()
                 .map(aqs_types::live_session_key)
                 .unwrap_or_else(|| auth.session_id.clone()),
-            run_id: crate::launch_config::setting("AQE_RUN_ID").ok().flatten()
+            run_id: crate::launch_config::setting("AQE_RUN_ID")
+                .ok()
+                .flatten()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             entity_revisions: HashMap::new(),
             insight_projection_fingerprints: HashMap::new(),
@@ -84,6 +106,9 @@ impl LocalBatchSyncState {
             split_insight_history: environment_flag_with_default("AQE_SPLIT_INSIGHT_HISTORY", true),
             last_account_projection_fingerprint: None,
             last_account_projection_at: None,
+            account_flow_source: None,
+            account_flow_cursor: 0,
+            account_flow_gap_reported: false,
             last_metrics_projection_at: None,
             last_equity_history_at: None,
             last_equity_history_value: None,
@@ -104,19 +129,105 @@ impl LocalBatchSyncState {
         advance_entity_revision(revision, clock_revision)
     }
 
-    pub(super) fn progress_execution_evidence(&mut self, sender: Option<crate::core::broker::command_worker::BrokerCommandSender>) {
-        self.evidence_export.poll(sender.clone(), &self.publisher, super::live_evidence_export::ExportIdentity {
-            runtime_id: self.runtime_id.clone(), strategy_id: self.strategy_id.clone(),
-            session_id: self.live_session_id.clone(), run_id: self.run_id.clone(),
-        });
-        self.fill_export.poll(sender.clone(), &self.publisher, super::live_evidence_export::ExportIdentity {
-            runtime_id: self.runtime_id.clone(), strategy_id: self.strategy_id.clone(),
-            session_id: self.live_session_id.clone(), run_id: self.run_id.clone(),
-        });
-        self.mark_export.poll(sender, &self.publisher, super::live_evidence_export::ExportIdentity {
-            runtime_id: self.runtime_id.clone(), strategy_id: self.strategy_id.clone(),
-            session_id: self.live_session_id.clone(), run_id: self.run_id.clone(),
-        });
+    /// At-least-once account audit evidence on the existing gateway path. The
+    /// broker source/event identity remains in the payload for economic dedup;
+    /// neither event count nor balance deltas are strategy P&L.
+    pub(super) fn publish_account_cash_flows(
+        &mut self,
+        flows: &crate::core::broker::account_cash_flow::AccountCashFlows,
+    ) {
+        if self.account_flow_source.as_deref() != Some(flows.source_id.as_str()) {
+            self.account_flow_source = Some(flows.source_id.clone());
+            self.account_flow_cursor = 0;
+            self.account_flow_gap_reported = false;
+        }
+        if self.publisher.cloud_capture_paused() {
+            return;
+        }
+        if (flows.missing_prefix || flows.capacity_exceeded) && !self.account_flow_gap_reported {
+            let event = self.event_at_revision(
+                format!("account-flow-gap:{}", uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID, flows.source_id.as_bytes(),
+                )),
+                flows.cursor.max(1),
+                EventPriority::Audit,
+                EventKind::StrategyEvent,
+                serde_json::json!({
+                    "event_type": "account_cash_flow_gap", "level": "warn",
+                    "title": "Account money-operation history is partial",
+                    "message": "Retained observations are not complete funding history; missing operations are not zero.",
+                    "payload": {
+                        "schema_version": 1, "source_id": flows.source_id,
+                        "account_id": flows.account_id, "missing_prefix": flows.missing_prefix,
+                        "capacity_exceeded": flows.capacity_exceeded,
+                    },
+                }),
+                None,
+            );
+            let subject = EventSubject::for_priority(
+                &self.runtime_id, &self.strategy_id, EventPriority::Audit,
+            );
+            if self.publisher.try_publish_critical(subject, event).is_err() {
+                return;
+            }
+            self.account_flow_gap_reported = true;
+        }
+        let mut rows = flows.records.values()
+            .filter(|r| r.sequence > self.account_flow_cursor)
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|r| r.sequence);
+        // Bounded work per trading/projection turn. Pending source facts stay
+        // in the cache; failed outbox admission does not advance this cursor.
+        for record in rows.into_iter().take(8) {
+            let identity = serde_json::to_vec(&(
+                &flows.provider, &flows.account_id, &flows.currency,
+                &flows.source_id, &record.event_id,
+            )).expect("primitive flow identity");
+            let entity = format!("account-flow:{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &identity));
+            let event = self.event_at_revision(
+                entity, record.sequence, EventPriority::Audit, EventKind::StrategyEvent,
+                serde_json::json!({
+                    "event_type": "account_cash_flow", "level": "info",
+                    "title": "Account money operation observed",
+                    "message": "Broker account evidence; not an Insight or attributed strategy profit.",
+                    "created_at": chrono::DateTime::from_timestamp_micros(record.observed_at_us),
+                    "payload": {
+                        "schema_version": 1, "provider": flows.provider,
+                        "source_id": flows.source_id, "account_id": flows.account_id,
+                        "currency": flows.currency, "coverage": flows.coverage,
+                        "missing_prefix": flows.missing_prefix,
+                        "capacity_exceeded": flows.capacity_exceeded, "record": record,
+                    },
+                }),
+                None,
+            );
+            let subject = EventSubject::for_priority(
+                &self.runtime_id, &self.strategy_id, EventPriority::Audit,
+            );
+            // Optional analytics pressure cannot fill the mandatory lifecycle
+            // retry queue or turn a full preview queue into trading failure.
+            if self.publisher.try_publish_critical(subject, event).is_err() {
+                break;
+            }
+            self.account_flow_cursor = record.sequence;
+        }
+    }
+
+    pub(super) fn progress_execution_evidence(
+        &mut self,
+        sender: Option<crate::core::broker::command_worker::BrokerCommandSender>,
+    ) {
+        self.export_schedule.poll(
+            [&mut self.evidence_export, &mut self.fill_export, &mut self.mark_export],
+            sender,
+            &self.publisher,
+            super::live_evidence_export::ExportIdentity {
+                runtime_id: self.runtime_id.clone(),
+                strategy_id: self.strategy_id.clone(),
+                session_id: self.live_session_id.clone(),
+                run_id: self.run_id.clone(),
+            },
+        );
     }
 
     pub(super) async fn finish_execution_evidence(
@@ -124,35 +235,32 @@ impl LocalBatchSyncState {
         sender: &crate::core::broker::command_worker::BrokerCommandSender,
     ) -> Result<Option<u64>, String> {
         let started = Instant::now();
-        let evidence = self.evidence_export
-            .finish(
-                sender,
-                &self.publisher,
-                &super::live_evidence_export::ExportIdentity {
-                    runtime_id: self.runtime_id.clone(),
-                    strategy_id: self.strategy_id.clone(),
-                    session_id: self.live_session_id.clone(),
-                    run_id: self.run_id.clone(),
-                },
-                Duration::from_secs(10),
-            )
-            .await;
-        // One shared shutdown budget, and still attempt fills if state delivery
-        // failed. Neither failure changes broker stop/recovery semantics.
-        let fills = self.fill_export.finish(sender, &self.publisher,
-            &super::live_evidence_export::ExportIdentity {
-                runtime_id: self.runtime_id.clone(), strategy_id: self.strategy_id.clone(),
-                session_id: self.live_session_id.clone(), run_id: self.run_id.clone(),
-            }, Duration::from_secs(10).saturating_sub(started.elapsed())).await;
-        let marks = self.mark_export.finish(sender, &self.publisher,
-            &super::live_evidence_export::ExportIdentity {
-                runtime_id:self.runtime_id.clone(),strategy_id:self.strategy_id.clone(),
-                session_id:self.live_session_id.clone(),run_id:self.run_id.clone(),
-            },Duration::from_secs(10).saturating_sub(started.elapsed())).await;
-        let result=evidence.as_ref().ok().copied().flatten();
-        let errors=[("state",evidence.err()),("fills",fills.err()),("marks",marks.err())]
-            .into_iter().filter_map(|(kind,error)|error.map(|e|format!("{kind}: {e}"))).collect::<Vec<_>>();
-        if errors.is_empty() {Ok(result)} else {Err(errors.join("; "))}
+        let identity = super::live_evidence_export::ExportIdentity {
+            runtime_id: self.runtime_id.clone(),
+            strategy_id: self.strategy_id.clone(),
+            session_id: self.live_session_id.clone(),
+            run_id: self.run_id.clone(),
+        };
+        let mut streams = [
+            ("state", &mut self.evidence_export),
+            ("fills", &mut self.fill_export),
+            ("marks", &mut self.mark_export),
+        ];
+        // Settle the scheduler's sole in-flight page before another stream
+        // prepares a page. Preserve the existing shared ten-second stop budget.
+        streams.sort_by_key(|(_, exporter)| !exporter.has_inflight());
+        let mut result = None;
+        let mut errors = Vec::new();
+        for (kind, exporter) in streams {
+            let delivered = exporter.finish(sender, &self.publisher, &identity,
+                Duration::from_secs(10).saturating_sub(started.elapsed())).await;
+            match delivered {
+                Ok(sequence) if kind == "state" => result = sequence,
+                Ok(_) => {},
+                Err(error) => errors.push(format!("{kind}: {error}")),
+            }
+        }
+        if errors.is_empty() { Ok(result) } else { Err(errors.join("; ")) }
     }
 
     /// Advance an entity cursor while preserving a source-provided ordering floor.
@@ -216,7 +324,10 @@ impl LocalBatchSyncState {
             source_revision.max(now_epoch_micros().max(1) as u64),
         );
         payload["revision"] = revision.into();
-        let event = self.event_at_revision(
+        // Fingerprinting already removed object nulls. The only later payload
+        // mutation inserted a non-null revision, so preserve that normalized
+        // value rather than walking every field a second time.
+        let event = self.event_from_normalized_payload(
             entity_id,
             revision,
             EventPriority::Critical,
@@ -240,8 +351,23 @@ impl LocalBatchSyncState {
         payload: serde_json::Value,
         latency: Option<LatencyTrace>,
     ) -> CloudEvent {
+        self.event_from_normalized_payload(
+            entity_id, revision, priority, kind, without_json_nulls(payload), latency,
+        )
+    }
+
+    /// Private envelope construction for a payload normalized by this module.
+    /// Ordinary publication/recovery callers keep the normalizing entry point.
+    fn event_from_normalized_payload(
+        &self,
+        entity_id: impl Into<String>,
+        revision: u64,
+        priority: EventPriority,
+        kind: EventKind,
+        payload: serde_json::Value,
+        latency: Option<LatencyTrace>,
+    ) -> CloudEvent {
         let entity_id = entity_id.into();
-        let payload = without_json_nulls(payload);
         let mut event = EventEnvelope::new(
             self.runtime_id.clone(),
             self.strategy_id.clone(),
@@ -284,19 +410,91 @@ impl LocalBatchSyncState {
         self.publish_critical_batch_durable(vec![event]).await
     }
 
-    /// Do not acknowledge a successful stop when its lifecycle projection could
-    /// not enter durable storage. The failed-admission bit remains set so the
-    /// shutdown caller reports incomplete synchronization.
+    /// Stop facts need durable local acceptance, but must not require another
+    /// trading-data slot at an intentional cloud capture pause. Compact receipt
+    /// is explicitly NOT full lifecycle/history acceptance.
+    pub(super) async fn publish_stop_operational_durable(&self, event: CloudEvent) -> bool {
+        if !self.publisher.cloud_capture_paused() {
+            if self.publish_critical_durable(event.clone()).await {
+                return true;
+            }
+            if !self.publisher.cloud_capture_paused() {
+                return false;
+            }
+        }
+        let Some(observation) = aqe_live_protocol::SafetyObservation::from_event(&event) else {
+            return false;
+        };
+        match self.publisher.persist_stop_facts(&[observation]).await {
+            Ok(()) => true,
+            Err(error) => {
+                error!("Compact stop fact was not durably admitted: {error}");
+                false
+            }
+        }
+    }
+
+    pub(super) async fn publish_stop_facts_durable(&self, events: Vec<CloudEvent>) -> bool {
+        if events.len() > MAX_RETRY_EVENTS {
+            return false;
+        }
+        if !self.publisher.cloud_capture_paused() {
+            // Retain normal micro-batching; many repeated stop requests must
+            // not add one batch-delay/transaction round trip per action.
+            if self.publish_critical_batch_durable(events.clone()).await {
+                return true;
+            }
+            if !self.publisher.cloud_capture_paused() {
+                return false;
+            }
+        }
+        let Some(observations) = events
+            .iter()
+            .map(aqe_live_protocol::SafetyObservation::from_event)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        self.publisher
+            .persist_stop_facts(&observations)
+            .await
+            .is_ok()
+    }
+
+    /// The caller must first prove broker settlement. This only distinguishes
+    /// an explicitly recorded cloud-history gap from a failed evidence write;
+    /// it neither clears dirty source history nor claims a full export receipt.
+    pub(super) async fn defer_final_cloud_capture_for_stop(
+        &self,
+    ) -> Result<bool, crate::core::broker::types::BrokerError> {
+        let deferred = self
+            .publisher
+            .has_recorded_capture_gap(&self.runtime_id, &self.strategy_id, &self.live_session_id, &self.run_id)
+            .await
+            .map_err(|error| {
+                crate::core::broker::types::BrokerError::ConnectionError(error.to_string())
+            })?;
+        if deferred {
+            warn!(
+                "Broker settlement confirmed; final cloud capture deferred by a durable history gap. Accepted evidence remains retained."
+            );
+        }
+        Ok(deferred)
+    }
+
+    /// Never complete a stop before its lifecycle fact is durable. Full-event
+    /// failure still withholds completion; intentional capture pause alone uses
+    /// separate bounded operational headroom and never advances the data cursor.
     pub(super) async fn publish_stop_completion_durable(
         &self,
         stopped: CloudEvent,
         actions: Vec<CloudEvent>,
     ) -> bool {
-        if !self.publish_critical_durable(stopped).await {
+        if !self.publish_stop_operational_durable(stopped).await {
             error!("Stop action completion withheld: stopped lifecycle was not admitted");
             return false;
         }
-        self.publish_critical_batch_durable(actions).await
+        self.publish_stop_facts_durable(actions).await
     }
 
     pub(super) async fn publish_critical_batch_durable(&self, events: Vec<CloudEvent>) -> bool {
@@ -378,6 +576,7 @@ impl LocalBatchSyncState {
                     Err(EventBusError::PublisherCapacity) if Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
+                    Err(EventBusError::CloudCapturePaused) => return false,
                     Err(error) => {
                         self.publisher.mark_admission_failed();
                         error!("Durable local event admission failed: {error}");
@@ -388,13 +587,14 @@ impl LocalBatchSyncState {
         }
         for receipt in receipts {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if !matches!(
-                tokio::time::timeout(remaining, receipt).await,
-                Ok(Ok(Ok(_)))
-            ) {
-                self.publisher.mark_admission_failed();
-                error!("Durable local event publication failed before its boundary completed");
-                return false;
+            match tokio::time::timeout(remaining, receipt).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(EventBusError::CloudCapturePaused))) => return false,
+                _ => {
+                    self.publisher.mark_admission_failed();
+                    error!("Durable local event publication failed before its boundary completed");
+                    return false;
+                }
             }
         }
         true
@@ -402,6 +602,13 @@ impl LocalBatchSyncState {
 
     fn publish_retained(&self, subject: EventSubject, event: CloudEvent) -> bool {
         use crate::core::live_sync::{EventBusError, FlatbufferEventCodec};
+        if self.publisher.cloud_capture_paused() {
+            // Do not turn intentional capture backpressure into an additional
+            // retry queue or a fatal engine admission failure. Local preview is
+            // still allowed; no cloud/durable acceptance is claimed.
+            let _ = self.publisher.try_publish_critical(subject, event);
+            return false;
+        }
         let mut pending = self.pending_publications.lock();
         if pending.events.is_empty() {
             match self
@@ -409,6 +616,7 @@ impl LocalBatchSyncState {
                 .try_publish_critical(subject.clone(), event.clone())
             {
                 Ok(_) => return true,
+                Err(EventBusError::CloudCapturePaused) => return false,
                 Err(EventBusError::PublisherCapacity) => {}
                 Err(error) => {
                     self.publisher.mark_admission_failed();
@@ -447,6 +655,9 @@ impl LocalBatchSyncState {
     /// Bounded work per live-loop turn, preserving original IDs and FIFO order.
     pub(super) fn flush_pending_publications(&self) {
         use crate::core::live_sync::EventBusError;
+        if self.publisher.cloud_capture_paused() {
+            return;
+        }
         let mut pending = self.pending_publications.lock();
         for _ in 0..16 {
             let Some((subject, event, bytes)) = pending.events.front() else {
@@ -461,6 +672,7 @@ impl LocalBatchSyncState {
                     pending.events.pop_front();
                 }
                 Err(EventBusError::PublisherCapacity) => break,
+                Err(EventBusError::CloudCapturePaused) => break,
                 Err(error) => {
                     self.publisher.mark_admission_failed();
                     error!("Retained local publication unavailable: {error}");
@@ -517,15 +729,38 @@ impl LocalBatchSyncState {
             &self.strategy_id,
             EventPriority::Critical,
         );
-        let Ok(receipt) = self.publisher.queue_durable(subject, event) else {
-            return false;
+        let observation = aqe_live_protocol::SafetyObservation::from_event(&event);
+        let receipt = match self.publisher.queue_durable(subject, event) {
+            Ok(receipt) => Some(receipt),
+            Err(crate::core::live_sync::EventBusError::CloudCapturePaused)
+                if observation.is_some() =>
+            {
+                None
+            }
+            Err(_) => return false,
         };
         let publisher = self.publisher.clone();
         tasks.push(tokio::spawn(async move {
-            if matches!(
-                tokio::time::timeout(Duration::from_secs(10), receipt).await,
-                Ok(Ok(Ok(_)))
-            ) {
+            let accepted = match receipt {
+                Some(receipt) => match tokio::time::timeout(Duration::from_secs(10), receipt).await
+                {
+                    Ok(Ok(Ok(_))) => true,
+                    Ok(Ok(Err(crate::core::live_sync::EventBusError::CloudCapturePaused))) => {
+                        match observation {
+                            Some(observation) => {
+                                publisher.persist_stop_facts(&[observation]).await.is_ok()
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                },
+                None => match observation {
+                    Some(observation) => publisher.persist_stop_facts(&[observation]).await.is_ok(),
+                    None => false,
+                },
+            };
+            if accepted {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(250),
                     publisher.acknowledge(
@@ -548,7 +783,17 @@ impl LocalBatchSyncState {
             EventPriority::Telemetry,
         );
         if let Err(error) = self.publisher.publish_telemetry(subject, event) {
-            warn!("Failed to queue AQS telemetry update: {}", error);
+            if matches!(error, crate::core::live_sync::EventBusError::CloudCapturePaused) {
+                let status = self.publisher.cloud_capture_status();
+                if let Some(level) = self.capture_notices.lock().level(&status, Instant::now()) {
+                    log::log!(level,
+                        "AQS cloud telemetry deferred: capture_state={} reason={}; local_buffer_bytes={} limit_bytes={:?}; accepted evidence is retained, local broker execution continues",
+                        status.diagnostic_phase(), status.diagnostic_reason(now_epoch_micros()),
+                        status.retained_bytes, status.limit_bytes);
+                }
+            } else {
+                warn!("Failed to queue AQS telemetry update: {}", error);
+            }
         }
     }
 }
@@ -748,6 +993,322 @@ mod retained_publication_tests {
                 url: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn normalized_insight_envelope_matches_generic_cleanup_without_changing_identity() {
+        let mut sync = fixture(Arc::new(InProcessEventBus::default()));
+        let raw = serde_json::json!({
+            "insight_id":"one", "state":"Filled", "revision":7, "missing":null,
+            "zero":0, "disabled":false, "empty":"", "symbol":"ETHUSD",
+            "nested":{"missing":null,"label":"سعر · 값 · 値"},
+            "array":[null,{"missing":null,"keep":false},[],{}]
+        });
+        let actual = sync.insight_projection_event("one", 7, raw.clone()).unwrap();
+        let mut expected_payload = raw.clone();
+        expected_payload["revision"] = actual.entity_revision.into();
+        expected_payload.sort_all_objects();
+        let mut expected = sync.event_at_revision(actual.entity_id.clone(), actual.entity_revision,
+            EventPriority::Critical, EventKind::InsightProjection, expected_payload, None);
+        // Only constructor observation clocks vary between these two calls.
+        assert!(actual.latency.runtime_received_at_us.is_some());
+        expected.latency = actual.latency.clone();
+        expected.created_at = actual.created_at;
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap(),
+            "payload ordering, envelope fields and immutable retry bytes must agree");
+        assert_eq!(actual.payload.get("missing"), None);
+        assert!(actual.payload["array"][0].is_null());
+        assert!(sync.insight_projection_event("one", 999, raw.clone()).is_none());
+        let mut changed = raw.clone();
+        changed["zero"] = 1.into();
+        let next = sync.insight_projection_event("one", 6, changed).unwrap();
+        assert!(next.entity_revision > actual.entity_revision);
+        assert_ne!(next.event_id, actual.event_id);
+        // Generic event/recovery paths still normalize arbitrary raw payloads.
+        let generic = sync.event_at_revision("generic", 1, EventPriority::Telemetry,
+            EventKind::Heartbeat, raw.clone(), None);
+        assert_eq!(generic.payload, without_json_nulls(raw));
+        sync.publisher.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "in-process optimized envelope microbenchmark; no broker, database or network"]
+    async fn normalized_envelope_component_profile() {
+        let sync = fixture(Arc::new(InProcessEventBus::default()));
+        let mut rows = Vec::new();
+        for (phase, normalized) in [false, true, true, false].into_iter().enumerate() {
+            for width in [32, 1024, 32768] {
+                let payload = without_json_nulls(serde_json::json!({
+                    "insight_id":"one", "state":"Filled", "revision":7, "missing":null,
+                    "symbol":"ETHUSD", "side":"Sell", "quantity":10., "entry_price":2309.99,
+                    "strategy_type":"x".repeat(width), "disabled":false, "zero":0, "empty":"",
+                    "nested":{"missing":null,"label":"سعر · 값 · 値","legs":[null,{"price":1.,"missing":null}]},
+                    "partial_closes":[],"take_profit_levels":[2200.,2100.],"stop_loss_levels":[2400.]
+                }));
+                let mut samples = Vec::new();
+                for i in 0..21_000 {
+                    // The caller owns this already-normalized value in both
+                    // cases. Exclude fixture cloning from the envelope clock.
+                    let value = std::hint::black_box(payload.clone());
+                    let started = Instant::now();
+                    let event = if normalized {
+                        sync.event_from_normalized_payload("insight:one", i, EventPriority::Critical,
+                            EventKind::InsightProjection, value, None)
+                    } else {
+                        sync.event_at_revision("insight:one", i, EventPriority::Critical,
+                            EventKind::InsightProjection, value, None)
+                    };
+                    let ns = started.elapsed().as_nanos();
+                    std::hint::black_box(event);
+                    if i >= 1_000 { samples.push(ns); }
+                }
+                samples.sort_unstable();
+                rows.push(serde_json::json!({"phase":phase,"normalized":normalized,"string_bytes":width,
+                    "samples":samples.len(),"p50_ns":samples[samples.len()/2],
+                    "p95_ns":samples[(samples.len()*95).div_ceil(100)-1]}));
+            }
+        }
+        println!("PUBLISHER_NORMALIZED_REPORT {}", serde_json::json!({"rows":rows,
+            "source_sha256":hex::encode(Sha256::digest(include_bytes!("live_event_projection.rs"))),
+            "scope":"In-process envelope construction only, clone and first normalization/fingerprinting excluded; no full-publisher, bandwidth, RSS or end-to-end latency claim"}));
+        sync.publisher.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn account_cash_flow_audit_is_not_profit_and_does_not_repeat_on_ordinary_refresh() {
+        use crate::core::broker::account_cash_flow::AccountCashFlows;
+        let bus=Arc::new(InProcessEventBus::acknowledged());
+        let mut sync=fixture(bus.clone());
+        let subject=EventSubject::for_priority(&sync.runtime_id,&sync.strategy_id,EventPriority::Audit);
+        let mut events=bus.subscribe(subject).await.unwrap();
+        let page: aqe_live_protocol::AccountCashFlowPage=serde_json::from_value(serde_json::json!({
+            "version":1,"provider":"mt5-account-deals-v1","source_id":"ea-instance","account_id":"account","currency":"GBP",
+            "from_us":10,"through_us":100,"coverage":"observed_only","first_after_sequence":0,"after_sequence":0,"next_sequence":1,"through_sequence":1,
+            "records":[{"sequence":1,"event_id":"balance-ticket","kind":"balance","amount":-50.,"occurred_at_us":null,"observed_at_us":90,"broker_time_ms":20,"deleted":false}]
+        })).unwrap();
+        let mut state=AccountCashFlows::from_page(&page).unwrap();
+        sync.publish_account_cash_flows(&state);
+        let delivery=tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap().unwrap();
+        assert_eq!(delivery.event.kind,EventKind::StrategyEvent);
+        assert_eq!(delivery.event.priority,EventPriority::Audit);
+        assert_eq!(delivery.event.payload["event_type"],"account_cash_flow");
+        assert_eq!(delivery.event.payload["payload"]["record"]["kind"],"balance");
+        assert_eq!(delivery.event.payload["payload"]["record"]["amount"],-50.);
+        assert_eq!(delivery.event.payload["payload"]["coverage"],"observed_only");
+        bus.acknowledge(&delivery, SyncAcknowledgement::LocalAccepted {
+            event_ids: vec![delivery.event.event_id],
+        }).await.unwrap();
+        sync.publish_account_cash_flows(&state);
+        assert_eq!(sync.account_flow_cursor,1);
+        assert!(events.try_recv().is_err());
+        let mut correction=page;correction.after_sequence=1;correction.next_sequence=2;correction.through_sequence=2;
+        correction.records[0].sequence=2;correction.records[0].amount=-45.;
+        state.apply(&correction).unwrap();
+        // Delivery to a subscriber precedes release of the publisher's single
+        // fixture slot. The real projection retries retained facts on its next
+        // turn; exercise that path instead of assuming immediate queue capacity.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sync.account_flow_cursor < 2 {
+                sync.publish_account_cash_flows(&state);
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let revised=tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap().unwrap();
+        assert_eq!(revised.event.payload["payload"]["record"]["event_id"],"balance-ticket");
+        assert_eq!(revised.event.payload["payload"]["record"]["amount"],-45.);
+        bus.acknowledge(&revised, SyncAcknowledgement::LocalAccepted {
+            event_ids: vec![revised.event.event_id],
+        }).await.unwrap();
+        assert_eq!(sync.account_flow_cursor,2);
+        assert!(sync.pending_publications.lock().events.is_empty());
+        assert!(!sync.publisher.admission_failed());
+        sync.publisher.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn capture_pause_keeps_control_receipts_and_stop_completion_durable() {
+        let path = std::env::temp_dir().join(format!(
+            "strategy-stop-headroom-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = OutboxStore::open(&path).await.unwrap();
+        let bus = Arc::new(InProcessEventBus::acknowledged());
+        let publisher = LocalEventPublisher::spawn(
+            bus.clone(),
+            Some(store.clone()),
+            LocalEventPublisherConfig {
+                capture_limit_bytes: Some(1024),
+                ..Default::default()
+            },
+        );
+        assert!(
+            publisher
+                .wait_for_capture_initialization(Duration::from_secs(2))
+                .await
+        );
+        let mut sync = LocalBatchSyncState::new(
+            publisher.clone(),
+            &AqsAuth {
+                access_method: "test".into(),
+                session_id: "session".into(),
+                session_secret: "test".into(),
+                strategy_id: "strategy".into(),
+                user_id: "users:test".into(),
+                node_id: None,
+                live_session_id: None,
+                url: None,
+            },
+        );
+        assert!(!sync.defer_final_cloud_capture_for_stop().await.unwrap());
+        let large = sync.event(
+            "insight:large",
+            EventPriority::Critical,
+            EventKind::InsightProjection,
+            serde_json::json!({"data":"x".repeat(4096)}),
+            None,
+        );
+        assert!(
+            !sync
+                .publish_projection_batch_durable(vec![large], vec![])
+                .await
+        );
+        assert!(publisher.cloud_capture_paused());
+        assert!(sync.defer_final_cloud_capture_for_stop().await.unwrap());
+        let subject = EventSubject::control(&sync.runtime_id, &sync.strategy_id);
+        let mut controls = bus.subscribe(subject.clone()).await.unwrap();
+        let control=sync.event("control:stop",EventPriority::Critical,EventKind::Control,
+            serde_json::json!({"action_id":"strategy_actions:headroom","action":"stop","status":"pending"}),None);
+        let control_id = control.event_id;
+        let receipt = bus.publish_critical(subject, control).await.unwrap();
+        let delivery = controls.recv().await.unwrap();
+        let ack=sync.event("strategy-action:strategy_actions:headroom",EventPriority::Critical,
+            EventKind::StrategyActionAcknowledgement,
+            serde_json::json!({"action_id":"strategy_actions:headroom","action":"stop","status":"acknowledged"}),None);
+        assert!(sync.publish_control_ack(ack, delivery));
+        assert!(
+            matches!(receipt.wait().await.unwrap(),crate::core::live_sync::SyncAcknowledgement::LocalAccepted{event_ids} if event_ids==[control_id])
+        );
+        let stopped = sync.event(
+            "strategy-lifecycle",
+            EventPriority::Critical,
+            EventKind::StrategyLifecycle,
+            serde_json::json!({"state":"stopped"}),
+            None,
+        );
+        let completed=sync.event("strategy-action:strategy_actions:headroom",EventPriority::Critical,
+            EventKind::StrategyActionAcknowledgement,
+            serde_json::json!({"action_id":"strategy_actions:headroom","action":"stop","status":"completed"}),None);
+        assert!(
+            sync.publish_stop_completion_durable(stopped, vec![completed])
+                .await
+        );
+        assert!(!publisher.admission_failed());
+        assert_eq!(publisher.critical_sequence_cursor(), 0);
+        assert_eq!(store.capture_retained_bytes().await.unwrap(), 0);
+        assert_eq!(store.pending_count().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .retirement_uncommitted_for_scope("strategy", "session")
+                .await
+                .unwrap(),
+            2
+        );
+        let database = turso::Builder::new_local(path.to_string_lossy().as_ref())
+            .build()
+            .await
+            .unwrap();
+        let reader = database.connect().unwrap();
+        let mut rows = reader
+            .query("SELECT observation FROM safety_observations", ())
+            .await
+            .unwrap();
+        let mut states = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            let fact: aqe_live_protocol::SafetyObservation =
+                serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+            states.push(fact.state);
+        }
+        states.sort();
+        assert_eq!(states, ["completed", "stopped"]);
+        sync.shutdown(Duration::from_secs(2)).await;
+        assert!(publisher.shutdown_complete());
+    }
+
+    #[tokio::test]
+    async fn intentional_cloud_capture_pause_does_not_poison_strategy_admission() {
+        let outbox = OutboxStore::open(std::env::temp_dir().join(format!(
+            "strategy-capture-pause-{}.db",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .unwrap();
+        let publisher = LocalEventPublisher::spawn(
+            Arc::new(InProcessEventBus::default()),
+            Some(outbox.clone()),
+            LocalEventPublisherConfig {
+                capture_limit_bytes: Some(1024),
+                ..Default::default()
+            },
+        );
+        assert!(
+            publisher
+                .wait_for_capture_initialization(Duration::from_secs(2))
+                .await
+        );
+        let mut sync = LocalBatchSyncState::new(
+            publisher.clone(),
+            &AqsAuth {
+                access_method: "test".into(),
+                session_id: "session".into(),
+                session_secret: "test".into(),
+                strategy_id: "strategy".into(),
+                user_id: "users:test".into(),
+                node_id: None,
+                live_session_id: None,
+                url: None,
+            },
+        );
+        let event = sync.event(
+            "insight:large",
+            EventPriority::Critical,
+            EventKind::InsightProjection,
+            serde_json::json!({"data":"x".repeat(4096)}),
+            None,
+        );
+        assert!(
+            !sync
+                .publish_projection_batch_durable(vec![event], vec![])
+                .await
+        );
+        assert!(publisher.cloud_capture_paused());
+        assert!(
+            !publisher.admission_failed(),
+            "the live-loop fatal-admission guard must remain false"
+        );
+        for revision in 1..100 {
+            let event = sync.event(
+                format!("insight:{revision}"),
+                EventPriority::Critical,
+                EventKind::InsightProjection,
+                serde_json::json!({"state":"Filled"}),
+                None,
+            );
+            assert!(!sync.publish_critical(event));
+            sync.flush_pending_publications();
+        }
+        assert_eq!(sync.pending_publications.lock().events.len(), 0);
+        assert_eq!(publisher.critical_sequence_cursor(), 0);
+        assert_eq!(outbox.capture_retained_bytes().await.unwrap(), 0);
+        assert!(
+            outbox
+                .capture_pause_for_scope(&sync.runtime_id, &sync.strategy_id, &sync.live_session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!publisher.admission_failed());
+        publisher.shutdown(Duration::from_secs(1)).await;
+        assert!(publisher.shutdown_complete());
     }
 
     #[tokio::test]

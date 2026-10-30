@@ -21,19 +21,30 @@ fn minute() -> i64 {
     now.div_euclid(POSITION_MARK_MINUTE_US) * POSITION_MARK_MINUTE_US
 }
 
-pub(super) async fn sample(reader: Arc<dyn PositionValuationReader>, sender: BrokerCommandSender) {
+pub(super) async fn sample(
+    reader: Arc<dyn PositionValuationReader>,
+    sender: BrokerCommandSender,
+    capture: Option<crate::core::live_sync::CloudCaptureGate>,
+) {
     let account = sender.scope().1.to_owned();
     let mut after = None;
     let mut next_minute = 0;
-    loop {
+    'sampling: loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        if capture.as_ref().is_some_and(|gate| gate.is_paused()) {
+            // Resume with current valuations, never synthesize skipped minutes
+            // or retain pages of optional reads behind a cloud pause.
+            after = None;
+            next_minute = 0;
+            continue;
+        }
         let slot = minute();
         if slot < next_minute {
             continue;
         }
         let page = match sender.try_position_mark_owners(slot, after.clone()) {
             Ok(reply) => reply.wait().await,
-            Err(BrokerCommandError::QueueFull) => continue,
+            Err(error) if error.is_analytics_backpressure() => continue,
             Err(_) => return,
         };
         let page = match page {
@@ -57,6 +68,9 @@ pub(super) async fn sample(reader: Arc<dyn PositionValuationReader>, sender: Bro
                 .push(owner);
         }
         for ((_, _, symbol), owners) in groups {
+            if capture.as_ref().is_some_and(|gate| gate.is_paused()) {
+                continue 'sampling;
+            }
             let ids = owners
                 .iter()
                 .map(|o| o.position_id.clone())
@@ -67,6 +81,9 @@ pub(super) async fn sample(reader: Arc<dyn PositionValuationReader>, sender: Bro
             )
             .await;
             if let Ok(Ok(Some(values))) = result {
+                if capture.as_ref().is_some_and(|gate| gate.is_paused()) {
+                    continue 'sampling;
+                }
                 // Validate the whole response before partitioning; extra or
                 // repeated identities must not disappear during chunking.
                 if let Err(e) = values.validate(&account, &symbol, &ids) {
@@ -80,14 +97,21 @@ pub(super) async fn sample(reader: Arc<dyn PositionValuationReader>, sender: Bro
                             .retain(|p| owners.iter().any(|o| o.position_id == p.position_id));
                         let result =
                             match PositionMarkBatch::new(owners.to_vec(), subset, sample_minute) {
-                                Ok(batch) => sender.record_position_marks(batch).await,
+                                Ok(batch) => {
+                                    sender
+                                        .record_position_marks_for_capture(batch, capture.clone())
+                                        .await
+                                }
                                 Err(e) => Err(e),
                             };
                         if let Err(e) = result {
                             if matches!(e, BrokerCommandError::Closed) {
                                 return;
                             }
-                            if !matches!(e, BrokerCommandError::QueueFull) {
+                            if matches!(e, BrokerCommandError::CapturePaused) {
+                                continue 'sampling;
+                            }
+                            if !e.is_analytics_backpressure() {
                                 log::warn!("Position mark admission deferred: {e}");
                             }
                         }

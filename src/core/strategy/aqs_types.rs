@@ -127,6 +127,9 @@ impl std::fmt::Display for StrategyEventLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SurrealValue)]
 #[surreal(untagged)]
 pub enum StrategyEventTitle {
+    #[serde(rename = "Cloud history gap")]
+    #[surreal(rename = "Cloud history gap")]
+    CloudHistoryGap,
     #[serde(rename = "Strategy starting")]
     #[surreal(rename = "Strategy starting")]
     StrategyStarting,
@@ -192,6 +195,7 @@ pub enum StrategyEventTitle {
 impl StrategyEventTitle {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::CloudHistoryGap => "Cloud history gap",
             Self::StrategyStarting => "Strategy starting",
             Self::StrategyStopping => "Strategy stopping",
             Self::StrategyFailed => "Strategy failed",
@@ -234,7 +238,7 @@ impl std::fmt::Display for StrategyEventTitle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AqsAuth {
     pub access_method: String,
     pub session_id: String,
@@ -260,7 +264,7 @@ impl AqsAuth {
         }
     }
     pub const DEFAULT_URL: &'static str =
-        "wss://certain-squirre-06echdjfsdvq70hkk9g8bb2s0k.aws-euw1.surreal.cloud";
+        "wss://db.algoquantstudio.com/database";
 
     pub fn from_args<I, S>(args: I) -> Option<Self>
     where
@@ -535,6 +539,13 @@ mod enum_tests {
     use super::*;
 
     #[test]
+    fn cloud_auth_defaults_to_gateway_but_keeps_explicit_standalone_endpoints() {
+        let auth=AqsAuth::from_args(["strategy","--session-id","session","--strategy-id","strategy","--session-secret","secret"]).unwrap();
+        assert_eq!(auth.url(),"wss://db.algoquantstudio.com/database");
+        assert_eq!(auth.with_url("ws://127.0.0.1:4567/database").url(),"ws://127.0.0.1:4567/database");
+    }
+
+    #[test]
     fn producer_calendar_survives_asset_and_lifecycle_conversion() {
         let calendar=r#"{"kind":"continuous","source":"mt5_weekly_trade_sessions","weekly_seconds":[[[0,86400]]],"observed_utc_offset_seconds":7200,"holiday_exceptions_recorded":false}"#;
         let mut raw=serde_json::json!({"id":"fixture","symbol":"BTCUSD","name":"Fixture","asset_type":"Crypto","status":"Active","exchange":{"UNKNOWN":"MT5"},"tradable":true,"marginable":true,"shortable":true,"fractional":true,"trading_calendar":calendar});
@@ -787,6 +798,7 @@ mod tests {
     fn nonterminal_and_failed_lifecycle_titles_round_trip() {
         use surrealdb::types::SurrealValue;
         for title in [
+            super::StrategyEventTitle::CloudHistoryGap,
             super::StrategyEventTitle::StrategyStarting,
             super::StrategyEventTitle::StrategyStopping,
             super::StrategyEventTitle::StrategyFailed,

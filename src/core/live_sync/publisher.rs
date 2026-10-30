@@ -1,7 +1,7 @@
 use super::{
     CloudEvent, EventBusError, EventDelivery, EventId, EventPriority, EventSubject,
     EventSubscription, FlatbufferEventCodec, InProcessEventBus, LocalEventBus, NatsEventBus,
-    OutboxStore, SyncAcknowledgement,
+    OutboxStore, OutboxStoreError, SyncAcknowledgement,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -10,6 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
+mod capture;
+mod source_monitor;
+mod source_recovery;
+pub use source_monitor::SourceJournalMonitor;
+pub(crate) use source_monitor::FinalSourceJournal;
+use capture::CaptureController;
+pub(crate) use capture::CloudCaptureGate;
+pub use capture::{CloudCaptureState, CloudCaptureStatus};
 
 #[derive(Clone, Debug)]
 pub struct LocalEventPublisherConfig {
@@ -25,6 +33,13 @@ pub struct LocalEventPublisherConfig {
     pub volatile_identity_events: usize,
     pub nats_unavailable_fallback_after: Duration,
     pub graceful_shutdown_timeout: Duration,
+    /// Opt-in rollout boundary. Callers must handle CloudCapturePaused without
+    /// stopping execution, then explicitly reconcile current state on recovery.
+    /// Leave disabled until the producer/host/safety integration is installed.
+    pub capture_limit_bytes: Option<u64>,
+    /// Explicit source-journal partition. Requires an owned durable publisher;
+    /// no new capture is admitted until its owner supplies qualified snapshots.
+    pub source_journal_limit:Option<crate::core::live_sync::PhysicalCaptureLimit>,
 }
 
 impl Default for LocalEventPublisherConfig {
@@ -41,6 +56,8 @@ impl Default for LocalEventPublisherConfig {
             volatile_identity_events: 65_536,
             nats_unavailable_fallback_after: Duration::from_millis(500),
             graceful_shutdown_timeout: Duration::from_secs(3),
+            capture_limit_bytes: None,
+            source_journal_limit:None,
         }
     }
 }
@@ -49,6 +66,8 @@ impl Default for LocalEventPublisherConfig {
 pub struct PublisherHealth {
     #[serde(default)]
     pub admission_failed: bool,
+    #[serde(default, skip_serializing_if = "CloudCaptureStatus::is_disabled")]
+    pub cloud_capture: CloudCaptureStatus,
     #[serde(default)]
     pub queued_encoded_bytes: u64,
     pub pending_critical: u64,
@@ -88,6 +107,7 @@ struct QueuedCritical {
     subject: EventSubject,
     event: CloudEvent,
     _memory: QueuedMemory,
+    recovery: bool,
 }
 
 struct QueuedTelemetry {
@@ -173,6 +193,8 @@ pub struct LocalEventPublisher {
     counters: Arc<PublisherCounters>,
     shutdown_sender: watch::Sender<bool>,
     dead_letter_outbox: Option<OutboxStore>,
+    capture: Arc<CaptureController>,
+    source_operation_gate:Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LocalEventPublisher {
@@ -211,36 +233,35 @@ impl LocalEventPublisher {
             initial_critical_sequence,
             None,
             None,
+            None,
         )
     }
 
-    /// Retains exclusive outbox ownership until the actual publisher task has
-    /// finished draining, even when its outer strategy future is cancelled.
-    pub(crate) fn spawn_owned_with_initial_sequence(
-        bus: Arc<dyn LocalEventBus>,
-        emergency_outbox: OutboxStore,
-        config: LocalEventPublisherConfig,
-        initial_sequence: u64,
-        owner: Arc<dyn Send + Sync>,
+    /// Retains the source lease and outer runtime lock until all source handles
+    /// are released, including cancellation and delayed optional readers.
+    pub(crate) fn spawn_owned_with_capture_lease(
+        bus: Arc<dyn LocalEventBus>, emergency_outbox: OutboxStore,
+        config: LocalEventPublisherConfig, initial_sequence: u64,
+        owner: Arc<dyn Send + Sync>, lease: Arc<super::CaptureOwnerLease>,
     ) -> Self {
-        Self::spawn_scoped(
-            bus,
-            Some(emergency_outbox),
-            config,
-            initial_sequence,
-            None,
-            Some(owner),
-        )
+        Self::spawn_scoped(bus, Some(emergency_outbox), config, initial_sequence, None, Some(owner), Some(lease))
     }
 
     fn spawn_scoped(
         bus: Arc<dyn LocalEventBus>,
         emergency_outbox: Option<OutboxStore>,
-        config: LocalEventPublisherConfig,
+        mut config: LocalEventPublisherConfig,
         initial_critical_sequence: u64,
         emergency_replay_scope: Option<EmergencyReplayScope>,
         owner: Option<Arc<dyn Send + Sync>>,
+        capture_owner: Option<Arc<super::CaptureOwnerLease>>,
     ) -> Self {
+        if let Some(budget)=emergency_outbox.as_ref().and_then(|store|store.physical_capture_budget()) {
+            config.capture_limit_bytes=Some(config.capture_limit_bytes.unwrap_or(budget.payload_limit_bytes).min(budget.payload_limit_bytes));
+        }
+        if config.capture_limit_bytes.is_some() && emergency_outbox.is_some() {
+            config.critical_batch_events = config.critical_batch_events.clamp(1, 256);
+        }
         let (critical_sender, critical_receiver) =
             mpsc::channel(config.critical_queue_events.max(1));
         let critical_queue_bytes = config.critical_queue_bytes.max(1) as u64;
@@ -262,6 +283,15 @@ impl LocalEventPublisher {
         });
 
         let dead_letter_outbox = emergency_outbox.clone();
+        // Volatile standalone publishers already have bounded memory and no
+        // disk capture to account. They do not acquire a hosted/cloud policy.
+        let capture = Arc::new(CaptureController::with_source_owner(
+            config
+                .capture_limit_bytes
+                .filter(|_| emergency_outbox.is_some()),
+            capture_owner,
+            config.source_journal_limit,
+        ));
         tokio::spawn(run_publisher(
             Arc::clone(&bus),
             critical_receiver,
@@ -274,6 +304,7 @@ impl LocalEventPublisher {
             config,
             owner,
             Arc::clone(&critical_sequence),
+            Arc::clone(&capture),
         ));
 
         Self {
@@ -289,6 +320,8 @@ impl LocalEventPublisher {
             counters,
             shutdown_sender,
             dead_letter_outbox,
+            capture,
+            source_operation_gate:Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -327,8 +360,19 @@ impl LocalEventPublisher {
     pub async fn from_environment(
         emergency_path: Option<PathBuf>,
         sequence_scope: Option<(&str, &str)>,
-        config: LocalEventPublisherConfig,
+        mut config: LocalEventPublisherConfig,
     ) -> Result<Self, EventBusError> {
+        let capture=crate::launch_config::from_process().map_err(EventBusError::Connect)?.and_then(|launch|launch.capture);
+        if let Some(policy)=capture {
+            policy.validate().map_err(EventBusError::Connect)?;
+            let source=policy.source_journal.into();
+            if config.source_journal_limit.is_some_and(|limit|limit!=source)
+                ||config.capture_limit_bytes.is_some_and(|limit|limit!=policy.publisher.payload_limit_bytes){
+                return Err(EventBusError::Connect("protected capture policy conflicts with publisher configuration".into()));
+            }
+            config.source_journal_limit=Some(source);
+            config.capture_limit_bytes=Some(policy.publisher.payload_limit_bytes);
+        }
         let setting = |name| crate::launch_config::setting(name).map_err(EventBusError::Connect);
         let bus: Arc<dyn LocalEventBus> = match setting("AQE_EVENT_BUS")?
             .unwrap_or_else(|| "in_process".to_string())
@@ -338,8 +382,9 @@ impl LocalEventPublisher {
             "nats" => {
                 let url = setting("AQE_NATS_URL")?
                     .ok_or_else(|| EventBusError::Connect("AQE_NATS_URL is missing".to_string()))?;
-                let token = setting("AQE_NATS_TOKEN")?
-                    .ok_or_else(|| EventBusError::Connect("AQE_NATS_TOKEN is missing".to_string()))?;
+                let token = setting("AQE_NATS_TOKEN")?.ok_or_else(|| {
+                    EventBusError::Connect("AQE_NATS_TOKEN is missing".to_string())
+                })?;
                 Arc::new(NatsEventBus::connect(&url, &token).await?)
             }
             "in_process" | "in-process" | "local" => Arc::new(InProcessEventBus::default()),
@@ -349,10 +394,28 @@ impl LocalEventPublisher {
                 )));
             }
         };
+        let runtime = setting("AQE_RUNTIME_ID")?;
+        let run = setting("AQE_RUN_ID")?;
+        let capture_owner = match (emergency_path.as_ref(), sequence_scope, runtime.as_deref(), run.as_deref()) {
+            (Some(path), Some((strategy,session)), Some(runtime), Some(run)) => {
+                if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|_| EventBusError::Connect("source directory unavailable".into()))?; }
+                Some(Arc::new(super::CaptureOwnerLease::acquire(path,runtime,strategy,session,run).map_err(|error|EventBusError::Connect(error.to_string()))?))
+            }
+            _ if config.capture_limit_bytes.is_some() => return Err(EventBusError::Connect("bounded source capture requires an exact runtime/run lease".into())),
+            _ => None,
+        };
+        if let (Some(path), Some(lease), Some((strategy, session))) =
+            (emergency_path.as_deref(), capture_owner.as_deref(), sequence_scope)
+        {
+            OutboxStore::validate_publisher_file_scope(path, lease, strategy, session).await
+                .map_err(|error| EventBusError::Connect(error.to_string()))?;
+        }
         let emergency_outbox = match emergency_path {
             Some(path) => Some(
-                OutboxStore::open(path)
-                    .await
+                match capture {
+                    Some(policy)=>OutboxStore::open_with_physical_capture_budget(path,policy.publisher.into()).await,
+                    None=>OutboxStore::open(path).await,
+                }
                     .map_err(|error| EventBusError::Connect(error.to_string()))?,
             ),
             None => None,
@@ -392,6 +455,7 @@ impl LocalEventPublisher {
             initial_sequence,
             emergency_replay_scope,
             None,
+            capture_owner,
         ))
     }
 
@@ -420,7 +484,7 @@ impl LocalEventPublisher {
         subject: EventSubject,
         event: CloudEvent,
     ) -> Result<EventId, EventBusError> {
-        self.enqueue_critical(subject, event, None)
+        self.enqueue_critical(subject, event, None, false)
     }
 
     /// Queue admission is not durability. This receipt resolves only after the
@@ -430,14 +494,160 @@ impl LocalEventPublisher {
         subject: EventSubject,
         event: CloudEvent,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<EventId, EventBusError>>, EventBusError> {
+        self.queue_durable_inner(subject, event, false)
+    }
+
+    /// Only the current-state reconciliation owner should use this lane. It is
+    /// admitted in ReconciliationRequired, not while still full, and uses the
+    /// same transactional byte cap. This is not an unlimited bypass.
+    pub fn queue_recovery_durable(
+        &self,
+        subject: EventSubject,
+        event: CloudEvent,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<EventId, EventBusError>>, EventBusError> {
+        self.queue_durable_inner(subject, event, true)
+    }
+
+    fn queue_durable_inner(
+        &self,
+        subject: EventSubject,
+        event: CloudEvent,
+        recovery: bool,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<EventId, EventBusError>>, EventBusError> {
         if self.dead_letter_outbox.is_none() {
             return Err(EventBusError::Publish(
                 "durable admission requires a local outbox".into(),
             ));
         }
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.enqueue_critical(subject, event, Some(sender))?;
+        self.enqueue_critical(subject, event, Some(sender), recovery)?;
         Ok(receiver)
+    }
+
+    pub fn cloud_capture_status(&self) -> CloudCaptureStatus {
+        self.capture.status()
+    }
+    pub fn source_journal_limit(&self)->Option<crate::core::live_sync::PhysicalCaptureLimit>{self.capture.source_limit()}
+
+    pub(crate) fn source_observation_instance_for(
+        &self, strategy: &str, limit: crate::core::live_sync::PhysicalCaptureLimit,
+    ) -> Option<uuid::Uuid> {
+        fn scope(value: &str) -> &str {
+            value.trim().strip_prefix("strategy:").unwrap_or(value.trim())
+        }
+        let owner = self.capture.owner()?;
+        (self.capture.source_limit() == Some(limit) && !scope(strategy).is_empty()
+            && scope(strategy) == scope(&owner.strategy))
+            .then(|| self.capture.source_observation_instance_id())
+    }
+
+    pub(crate) fn prepared_source_observation_id(
+        &self, source: &str, strategy: &str, account: &str,
+    ) -> Option<uuid::Uuid> {
+        self.capture.prepared_source_observation_id(source, strategy, account)
+    }
+
+    /// Owner-driven quality bridge. The source remains paused until its exact
+    /// handoff receipt is durably acknowledged and reconciliation completes.
+    /// Never call this while holding the journal's analytics permit.
+    pub async fn observe_source_journal(
+        &self,report:crate::core::broker::command_journal::AnalyticsCaptureStatus,
+    )->Result<Option<crate::core::broker::command_journal::AnalyticsCaptureHandoffReceipt>,EventBusError> {
+        let _operation=self.source_operation_gate.lock().await;
+        self.observe_source_journal_inner(report).await
+    }
+
+    async fn observe_source_journal_inner(
+        &self,report:crate::core::broker::command_journal::AnalyticsCaptureStatus,
+    )->Result<Option<crate::core::broker::command_journal::AnalyticsCaptureHandoffReceipt>,EventBusError> {
+        if self.capture.source_is_sealed(){return Err(EventBusError::Publish("source journal observation is sealed for finalization".into()));}
+        let to_event=|error:OutboxStoreError|EventBusError::Publish(error.to_string());
+        report.validate().map_err(|error|EventBusError::Publish(error.into()))?;
+        let limit=self.capture.limit().ok_or_else(||EventBusError::Publish("source journal capture is not enabled".into()))?;
+        if self.capture.source_limit()!=Some(report.physical_limit()){return Err(EventBusError::Publish("source journal capture partition mismatch".into()));}
+        let owner=self.capture.owner().ok_or_else(||EventBusError::Publish("source journal capture owner unavailable".into()))?;
+        let outbox=self.dead_letter_outbox.as_ref().ok_or_else(||EventBusError::Publish("source journal capture storage unavailable".into()))?;
+        self.capture.qualify_source_liveness();
+        self.capture.persist_source_suspension(outbox).await.map_err(to_event)?;
+        let receipt=if let Some(pause)=report.pause.as_ref() {
+            self.capture.note_source_pause(pause.clone()).map_err(to_event)?;
+            let Some(receipt)=outbox.handoff_analytics_capture_pause(&owner,pause,limit).await.map_err(to_event)? else {return Ok(None);};
+            if report.handoff_receipt.as_ref().is_some_and(|saved|saved!=&receipt){return Err(EventBusError::Publish("source journal receipt belongs to a different diagnostic owner".into()));}
+            Some(receipt)
+        }else{None};
+        self.capture.observe_source(outbox,report).await.map_err(to_event)?;
+        self.capture.refresh(outbox).await.map_err(to_event)?;
+        Ok(receipt)
+    }
+    /// Constant-time check; no SQLite call on the trading/producer loop.
+    pub fn cloud_capture_paused(&self) -> bool {
+        self.capture.blocked(false)
+    }
+    pub(crate) fn cloud_capture_gate(&self) -> CloudCaptureGate {
+        CloudCaptureGate::new(Arc::clone(&self.capture))
+    }
+    pub fn cloud_capture_reconciliation_required(&self) -> bool {
+        self.capture.requires_reconciliation()
+    }
+    pub async fn wait_for_capture_initialization(&self, timeout: Duration) -> bool {
+        self.capture.initialized(timeout).await
+    }
+
+    /// Operational stop receipt, never full-event or sequence acceptance.
+    /// The default/standalone path continues using full events.
+    pub(crate) async fn persist_stop_facts(
+        &self,
+        observations: &[aqe_live_protocol::SafetyObservation],
+    ) -> Result<(), EventBusError> {
+        if self.capture.limit().is_none() || self.counters.shutting_down.load(Ordering::Acquire) {
+            return Err(EventBusError::Publish(
+                "independent stop admission is not enabled".into(),
+            ));
+        }
+        let outbox = self
+            .dead_letter_outbox
+            .as_ref()
+            .ok_or_else(|| EventBusError::Publish("durable stop storage unavailable".into()))?;
+        outbox
+            .record_safety_only(observations)
+            .await
+            .map_err(|error| EventBusError::Publish(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) async fn has_recorded_capture_gap(
+        &self,
+        runtime: &str,
+        strategy: &str,
+        session: &str,
+        run: &str,
+    ) -> Result<bool, EventBusError> {
+        if !self.cloud_capture_paused() || self.admission_failed() {
+            return Ok(false);
+        }
+        let Some(store) = self.dead_letter_outbox.as_ref() else {
+            return Ok(false);
+        };
+        store
+            .capture_pause_for_scope(runtime, strategy, session)
+            .await
+            .map(|pause| pause.is_some_and(|pause| pause.resumed_at_us.is_none()
+                && pause.owner_run_id.as_deref().is_none_or(|owner| owner == run)))
+            .map_err(|error| EventBusError::Publish(error.to_string()))
+    }
+    /// Call after the bounded current-state replay and gap notice have durable
+    /// receipts. Merely draining the old outbox never clears the gap by itself.
+    pub async fn complete_capture_reconciliation(
+        &self,
+        generation: u64,
+    ) -> Result<bool, EventBusError> {
+        let Some(outbox) = self.dead_letter_outbox.as_ref() else {
+            return Ok(false);
+        };
+        self.capture
+            .complete(outbox, generation)
+            .await
+            .map_err(|error| EventBusError::Publish(error.to_string()))
     }
 
     fn enqueue_critical(
@@ -445,11 +655,24 @@ impl LocalEventPublisher {
         subject: EventSubject,
         mut event: CloudEvent,
         durable_receipt: Option<tokio::sync::oneshot::Sender<Result<EventId, EventBusError>>>,
+        recovery: bool,
     ) -> Result<EventId, EventBusError> {
+        if !self.capture.permits_new_source(&event) {
+            return Err(EventBusError::Publish("capture event is outside its leased source scope".into()));
+        }
         if self.counters.shutting_down.load(Ordering::Acquire) {
             return Err(EventBusError::Publish(
                 "local publisher is shutting down".into(),
             ));
+        }
+        if self.capture.blocked(recovery) {
+            // Fresh local views remain independent of cloud capture. This
+            // provisional copy is not a durable receipt or a cloud replay.
+            let _ = self.bus.publish_telemetry(
+                EventSubject::provisional(&event.runtime_id, &event.strategy_id),
+                event,
+            );
+            return Err(EventBusError::CloudCapturePaused);
         }
         if event.priority == EventPriority::Critical
             && self
@@ -579,6 +802,7 @@ impl LocalEventPublisher {
             event,
             _memory: memory,
             durable_receipt,
+            recovery,
         });
         Ok(event_id)
     }
@@ -588,10 +812,20 @@ impl LocalEventPublisher {
         subject: EventSubject,
         mut event: CloudEvent,
     ) -> Result<(), EventBusError> {
+        if !self.capture.permits_new_source(&event) {
+            return Err(EventBusError::Publish("capture event is outside its leased source scope".into()));
+        }
         if self.counters.shutting_down.load(Ordering::Relaxed) {
             return Err(EventBusError::Publish(
                 "local publisher is shutting down".to_string(),
             ));
+        }
+        if self.capture.blocked(false) {
+            let _ = self.bus.publish_telemetry(
+                EventSubject::provisional(&event.runtime_id, &event.strategy_id),
+                event,
+            );
+            return Err(EventBusError::CloudCapturePaused);
         }
         event.priority = EventPriority::Telemetry;
         let encoded_bytes = FlatbufferEventCodec::encode(&event)
@@ -653,6 +887,7 @@ impl LocalEventPublisher {
         drop(telemetry);
         PublisherHealth {
             admission_failed: self.admission_failed(),
+            cloud_capture: self.cloud_capture_status(),
             queued_encoded_bytes: self.queued_critical_encoded_bytes(),
             pending_critical: self.counters.pending_critical.load(Ordering::Relaxed),
             pending_telemetry_entities,
@@ -710,8 +945,31 @@ async fn run_publisher(
     config: LocalEventPublisherConfig,
     owner: Option<Arc<dyn Send + Sync>>,
     critical_sequence: Arc<AtomicU64>,
+    capture: Arc<CaptureController>,
 ) {
     let _owner = owner;
+    let mut safety_workers = tokio::task::JoinSet::new();
+    if capture.limit().is_some() {
+        if let Some(outbox) = emergency_outbox.as_ref() {
+            safety_workers.spawn(super::safety_transport::run_publisher(
+                outbox.clone(),
+                bus.clone(),
+                shutdown_receiver.clone(),
+            ));
+            if let Some(owner) = capture.owner() {
+                safety_workers.spawn(super::capture_transport::run_publisher(
+                    outbox.clone(), bus.clone(), owner, shutdown_receiver.clone(),
+                ));
+            }
+        }
+    }
+    if let Some(outbox) = emergency_outbox.as_ref() {
+        if let Err(error) = capture.refresh(outbox).await {
+            capture.unavailable(&error);
+        }
+    }
+    let mut capture_interval = tokio::time::interval(Duration::from_secs(1));
+    capture_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut telemetry_interval = tokio::time::interval_at(
         tokio::time::Instant::now() + config.telemetry_flush_delay,
         config.telemetry_flush_delay,
@@ -730,7 +988,7 @@ async fn run_publisher(
                 let Some(first) = first else { break };
                 let batch = collect_critical_batch(first, &mut critical_receiver, &config).await;
                 let batch = prepare_durable_batch(
-                    bus.as_ref(), emergency_outbox.as_ref(), batch, &counters, &critical_sequence,
+                    bus.as_ref(), emergency_outbox.as_ref(), batch, &counters, &critical_sequence, &capture,
                 ).await;
                 if emergency_pending {
                     persist_queued_batch_to_emergency(
@@ -755,6 +1013,11 @@ async fn run_publisher(
             }
             _ = telemetry_interval.tick() => {
                 flush_telemetry(bus.as_ref(), &telemetry, &counters);
+            }
+            _ = capture_interval.tick(), if capture.blocked(false) || capture.source_limit().is_some() => {
+                if let Some(outbox)=emergency_outbox.as_ref() {
+                    if let Err(error)=capture.refresh(outbox).await { capture.unavailable(&error); }
+                }
             }
             _ = maintenance.tick(), if emergency_outbox.is_some() => {
                 if let Some(outbox) = &emergency_outbox {
@@ -792,7 +1055,7 @@ async fn run_publisher(
                     while let Some(first) = critical_receiver.recv().await {
                         let batch = collect_critical_batch(first, &mut critical_receiver, &config).await;
                         let batch = prepare_durable_batch(
-                            bus.as_ref(), emergency_outbox.as_ref(), batch, &counters, &critical_sequence,
+                            bus.as_ref(), emergency_outbox.as_ref(), batch, &counters, &critical_sequence, &capture,
                         ).await;
                         if emergency_pending {
                             persist_queued_batch_to_emergency(
@@ -816,6 +1079,7 @@ async fn run_publisher(
             }
         }
     }
+    safety_workers.shutdown().await;
     counters.finished.store(true, Ordering::Release);
 }
 
@@ -825,14 +1089,29 @@ async fn prepare_durable_batch(
     batch: Vec<QueuedCritical>,
     counters: &PublisherCounters,
     sequence: &AtomicU64,
+    capture: &CaptureController,
 ) -> Vec<QueuedCritical> {
     let Some(outbox) = outbox else { return batch };
     // Audit/history and reconciliation are just as durable as lifecycle work,
     // but do not consume lifecycle sequence numbers. Commit them before any
     // transport attempt: a failed emergency write must never discard them.
+    let mut paused = HashSet::new();
+    let recovery_ids = batch
+        .iter()
+        .filter(|queued| queued.recovery)
+        .map(|queued| queued.event.event_id)
+        .collect::<HashSet<_>>();
+    for queued in &batch {
+        if capture.limit().is_some() && capture.blocked(queued.recovery) {
+            paused.insert(queued.event.event_id);
+        }
+    }
     let background = batch
         .iter()
-        .filter(|queued| queued.event.priority != EventPriority::Critical)
+        .filter(|queued| {
+            queued.event.priority != EventPriority::Critical
+                && !paused.contains(&queued.event.event_id)
+        })
         .map(|queued| queued.event.clone())
         .collect::<Vec<_>>();
     let mut rejected = HashSet::new();
@@ -843,8 +1122,25 @@ async fn prepare_durable_batch(
     };
     while let Some(mut group) = groups.pop() {
         loop {
-            match outbox.insert_events(&group).await {
+            if capture.limit().is_some()
+                && group
+                    .iter()
+                    .any(|event| capture.blocked(recovery_ids.contains(&event.event_id)))
+            {
+                paused.extend(group.iter().map(|event| event.event_id));
+                break;
+            }
+            let result = match capture.limit() {
+                Some(limit) => outbox.capture_events_with_capacity(&group, limit).await,
+                None => outbox.insert_events(&group).await,
+            };
+            match result {
                 Ok(_) => break,
+                Err(super::OutboxStoreError::CapturePaused(capacity)) => {
+                    capture.refused(capacity);
+                    paused.extend(group.iter().map(|event| event.event_id));
+                    break;
+                }
                 Err(super::OutboxStoreError::InvalidRecord(error)) => {
                     if group.len() > 1 {
                         let right = group.split_off(group.len() / 2);
@@ -855,6 +1151,11 @@ async fn prepare_durable_batch(
                     match outbox.reject_publisher_event(&group[0], &error).await {
                         Ok(()) => {
                             rejected.insert(group[0].event_id);
+                            break;
+                        }
+                        Err(super::OutboxStoreError::CapturePaused(capacity))=>{
+                            capture.refused(capacity);
+                            paused.insert(group[0].event_id);
                             break;
                         }
                         Err(error) => log::warn!(
@@ -874,7 +1175,9 @@ async fn prepare_durable_batch(
     }
     let events = batch
         .iter()
-        .filter(|q| q.event.priority == EventPriority::Critical)
+        .filter(|q| {
+            q.event.priority == EventPriority::Critical && !paused.contains(&q.event.event_id)
+        })
         .map(|q| q.event.clone())
         .collect::<Vec<_>>();
     // A transient local storage failure retains this bounded batch in the worker;
@@ -883,15 +1186,42 @@ async fn prepare_durable_batch(
     let mut fresh = HashMap::new();
     while let Some(mut group) = groups.pop() {
         loop {
-            match outbox
-                .reserve_publisher_events(&group, sequence.load(Ordering::Acquire))
-                .await
+            if capture.limit().is_some()
+                && !group.is_empty()
+                && group
+                    .iter()
+                    .any(|event| capture.blocked(recovery_ids.contains(&event.event_id)))
             {
+                paused.extend(group.iter().map(|event| event.event_id));
+                break;
+            }
+            let result = match capture.limit() {
+                Some(limit) => {
+                    outbox
+                        .reserve_publisher_events_with_capacity(
+                            &group,
+                            sequence.load(Ordering::Acquire),
+                            limit,
+                        )
+                        .await
+                }
+                None => {
+                    outbox
+                        .reserve_publisher_events(&group, sequence.load(Ordering::Acquire))
+                        .await
+                }
+            };
+            match result {
                 Ok(events) => {
                     for event in events {
                         sequence.fetch_max(event.critical_sequence.unwrap_or(0), Ordering::Release);
                         fresh.insert(event.event_id, event);
                     }
+                    break;
+                }
+                Err(super::OutboxStoreError::CapturePaused(capacity)) => {
+                    capture.refused(capacity);
+                    paused.extend(group.iter().map(|event| event.event_id));
                     break;
                 }
                 Err(super::OutboxStoreError::InvalidRecord(error)) => {
@@ -911,6 +1241,11 @@ async fn prepare_durable_batch(
                             rejected.insert(group[0].event_id);
                             break;
                         }
+                        Err(super::OutboxStoreError::CapturePaused(capacity))=>{
+                            capture.refused(capacity);
+                            paused.insert(group[0].event_id);
+                            break;
+                        }
                         Err(error) => log::warn!(
                             "Critical publisher DLQ unavailable; retaining event: {error}"
                         ),
@@ -927,7 +1262,9 @@ async fn prepare_durable_batch(
     let mut ready = Vec::with_capacity(batch.len());
     for mut queued in batch {
         if let Some(receipt) = queued.durable_receipt.take() {
-            let result = if rejected.contains(&queued.event.event_id) {
+            let result = if paused.contains(&queued.event.event_id) {
+                Err(EventBusError::CloudCapturePaused)
+            } else if rejected.contains(&queued.event.event_id) {
                 Err(EventBusError::Publish(
                     "local outbox rejected event identity".into(),
                 ))
@@ -936,7 +1273,13 @@ async fn prepare_durable_batch(
             };
             let _ = receipt.send(result);
         }
-        if rejected.contains(&queued.event.event_id) {
+        if paused.contains(&queued.event.event_id) {
+            let _ = bus.publish_telemetry(
+                EventSubject::provisional(&queued.event.runtime_id, &queued.event.strategy_id),
+                queued.event.clone(),
+            );
+            counters.pending_critical.fetch_sub(1, Ordering::Relaxed);
+        } else if rejected.contains(&queued.event.event_id) {
             counters.failures.fetch_add(1, Ordering::Relaxed);
             counters.pending_critical.fetch_sub(1, Ordering::Relaxed);
         } else if queued.event.priority != EventPriority::Critical {
@@ -1024,12 +1367,13 @@ async fn persist_or_publish_critical_batch(
 
     let results = futures::future::join_all(awaiting.into_iter().map(
         |(started, event, handle, memory)| async move {
-            let accepted =
+            let accepted = local_acknowledges(
                 tokio::time::timeout(config.nats_unavailable_fallback_after, handle.wait())
                     .await
                     .ok()
-                    .and_then(Result::ok)
-                    .is_some();
+                    .and_then(Result::ok),
+                event.event_id,
+            );
             (started, event, accepted, memory)
         },
     ))
@@ -1051,6 +1395,13 @@ async fn persist_or_publish_critical_batch(
     }
     let retired = retire_publisher_payloads(emergency_outbox, &accepted_ids).await;
     used_emergency_outbox || !retired
+}
+
+/// A reply is not necessarily a durable handoff. In particular, a rejection,
+/// remote cursor, or acknowledgement for another envelope must never retire the
+/// only locally retained payload. Keep this check shared by live and replay.
+fn local_acknowledges(reply: Option<SyncAcknowledgement>, event_id: EventId) -> bool {
+    matches!(reply, Some(SyncAcknowledgement::LocalAccepted { event_ids }) if event_ids.contains(&event_id))
 }
 
 async fn retire_publisher_payloads(outbox: Option<&OutboxStore>, ids: &[EventId]) -> bool {
@@ -1198,12 +1549,13 @@ async fn replay_emergency_outbox(
         }
         let results = futures::future::join_all(awaiting.into_iter().map(
             |(started, event, handle)| async move {
-                let locally_accepted =
+                let locally_accepted = local_acknowledges(
                     tokio::time::timeout(config.nats_unavailable_fallback_after, handle.wait())
                         .await
                         .ok()
-                        .and_then(Result::ok)
-                        .is_some();
+                        .and_then(Result::ok),
+                    event.event_id,
+                );
                 (started, event, locally_accepted)
             },
         ))
@@ -1354,6 +1706,102 @@ mod tests {
             EventKind::InsightProjection,
             serde_json::json!({"revision": revision}),
         )
+    }
+
+    #[test]
+    fn only_an_exact_local_acceptance_retires_payloads() {
+        let id = uuid::Uuid::new_v4();
+        assert!(local_acknowledges(
+            Some(SyncAcknowledgement::LocalAccepted {
+                event_ids: vec![uuid::Uuid::new_v4(), id],
+            }),
+            id
+        ));
+        assert!(!local_acknowledges(
+            Some(SyncAcknowledgement::LocalAccepted {
+                event_ids: vec![uuid::Uuid::new_v4()],
+            }),
+            id
+        ));
+        assert!(!local_acknowledges(
+            Some(SyncAcknowledgement::Persisted {
+                critical_through: 999,
+                telemetry_revisions: vec![],
+            }),
+            id
+        ));
+        assert!(!local_acknowledges(
+            Some(SyncAcknowledgement::Rejected {
+                event_id: id,
+                reason: super::super::SyncRejectionReason::PermanentlyRejected,
+            }),
+            id
+        ));
+        assert!(!local_acknowledges(None, id));
+    }
+
+    #[tokio::test]
+    async fn unrelated_ack_is_retained_until_exact_ack_arrives_on_replay() {
+        let path = std::env::temp_dir().join(format!("aqe-ack-proof-{}.db", uuid::Uuid::new_v4()));
+        let outbox = OutboxStore::open(path).await.unwrap();
+        let bus = InProcessEventBus::acknowledged();
+        let subject = EventSubject::for_priority("runtime", "strategy", EventPriority::Critical);
+        let mut subscription = bus.subscribe(subject.clone()).await.unwrap();
+        let wrong_reply = Arc::new(AtomicBool::new(true));
+        let wrong_reply_worker = wrong_reply.clone();
+        let responder_bus = bus.clone();
+        let responder = tokio::spawn(async move {
+            while let Some(delivery) = subscription.recv().await {
+                let id = if wrong_reply_worker.load(Ordering::Acquire) {
+                    uuid::Uuid::new_v4()
+                } else {
+                    delivery.event.event_id
+                };
+                responder_bus
+                    .acknowledge(
+                        &delivery,
+                        SyncAcknowledgement::LocalAccepted {
+                            event_ids: vec![id],
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let publisher = LocalEventPublisher::spawn(
+            Arc::new(bus),
+            Some(outbox.clone()),
+            LocalEventPublisherConfig {
+                critical_batch_delay: Duration::from_millis(1),
+                nats_unavailable_fallback_after: Duration::from_millis(50),
+                ..Default::default()
+            },
+        );
+        publisher
+            .queue_durable(subject, event(EventPriority::Critical, "retained", 1))
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while publisher.health().publish_failures == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(publisher.health().publish_failures > 0);
+        assert_eq!(publisher.health().locally_accepted_critical, 0);
+        assert_eq!(outbox.health().await.unwrap().pending_critical, 1);
+        assert_eq!(publisher.critical_sequence_cursor(), 1);
+        wrong_reply.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while outbox.health().await.unwrap().pending_critical != 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(outbox.health().await.unwrap().pending_critical, 0);
+        assert!(publisher.health().locally_accepted_critical > 0);
+        publisher.shutdown(Duration::from_secs(2)).await;
+        assert!(publisher.shutdown_complete());
+        responder.abort();
+        let _ = responder.await;
     }
 
     #[tokio::test]
@@ -1653,6 +2101,7 @@ mod tests {
                     subject: subject.clone(),
                     event,
                     durable_receipt: None,
+                    recovery: false,
                     _memory: QueuedMemory {
                         counters: counters.clone(),
                         bytes,
@@ -1668,6 +2117,7 @@ mod tests {
                 batch,
                 &counters,
                 &AtomicU64::new(0),
+                &CaptureController::new(None),
             ),
         )
         .await

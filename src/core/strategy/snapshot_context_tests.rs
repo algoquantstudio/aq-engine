@@ -392,6 +392,7 @@ async fn snapshot_context_unrelated_refresh_does_not_retry_other_dependency_owne
         .set_symbols(&["ETHUSD".into(), "SOLUSD".into()])
         .unwrap();
     let quote = |symbol: &str| crate::core::broker::types::Quote {
+        profit_model: None,
         symbol: symbol.into(),
         bid: 100.0,
         ask: 101.0,

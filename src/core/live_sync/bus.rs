@@ -12,6 +12,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+mod telemetry;
+use telemetry::TelemetryDispatcher;
 
 const LOCAL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 // async-nats defaults every subscription to 65,536 buffered messages. AQS subscriptions either
@@ -26,6 +28,10 @@ pub enum EventBusError {
     Connect(String),
     Publish(String),
     PublisherCapacity,
+    /// New cloud capture was not accepted. This is NOT a storage failure or a
+    /// request to stop broker execution; the owner must record/retain a gap and
+    /// reconcile current state before resuming capture.
+    CloudCapturePaused,
     Subscribe(String),
     Request(String),
     Codec(String),
@@ -46,6 +52,10 @@ impl fmt::Display for EventBusError {
             Self::PublisherCapacity => write!(
                 formatter,
                 "local publisher capacity unavailable; event was not accepted"
+            ),
+            Self::CloudCapturePaused => write!(
+                formatter,
+                "new cloud capture is paused; accepted evidence is retained and current-state reconciliation is required before resuming"
             ),
             Self::Subscribe(message) => write!(formatter, "event bus subscribe failed: {message}"),
             Self::Request(message) => write!(formatter, "event bus request failed: {message}"),
@@ -74,7 +84,8 @@ impl std::error::Error for EventBusError {}
 pub struct EventDelivery {
     pub subject: EventSubject,
     pub event: CloudEvent,
-    reply_to: Option<String>,
+    // Internal ingestion must distinguish lossy heads from request/reply work.
+    pub(super) reply_to: Option<String>,
 }
 
 pub struct EventSubscription {
@@ -338,6 +349,7 @@ impl LocalEventBus for InProcessEventBus {
 #[derive(Clone)]
 pub struct NatsEventBus {
     client: async_nats::Client,
+    telemetry: Arc<Mutex<Option<TelemetryDispatcher>>>,
 }
 
 impl NatsEventBus {
@@ -347,11 +359,14 @@ impl NatsEventBus {
             .connect(url)
             .await
             .map_err(|error| EventBusError::Connect(error.to_string()))?;
-        Ok(Self { client })
+        Ok(Self::from_client(client))
     }
 
     pub fn from_client(client: async_nats::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            telemetry: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Sends a small control-plane request over the private loopback NATS server. This is kept
@@ -423,17 +438,22 @@ impl LocalEventBus for NatsEventBus {
     fn publish_telemetry(
         &self,
         subject: EventSubject,
-        mut event: CloudEvent,
+        event: CloudEvent,
     ) -> Result<(), EventBusError> {
-        event.latency.mark_local_bus_published();
-        let payload = FlatbufferEventCodec::encode(&event)
-            .map_err(|error| EventBusError::Codec(error.to_string()))?;
-        validate_encoded_size(event.event_id, payload.len())?;
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let _ = client.publish(subject.to_string(), payload.into()).await;
-        });
-        Ok(())
+        let dispatcher = {
+            let mut telemetry = self.telemetry.lock();
+            if telemetry.is_none() {
+                let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+                    EventBusError::Publish("local telemetry requires an async runtime".into())
+                })?;
+                *telemetry = Some(TelemetryDispatcher::spawn(self.client.clone(), &runtime));
+            }
+            telemetry
+                .as_ref()
+                .expect("telemetry dispatcher initialized")
+                .clone()
+        };
+        dispatcher.publish(subject, event)
     }
 
     async fn subscribe(&self, subject: EventSubject) -> Result<EventSubscription, EventBusError> {

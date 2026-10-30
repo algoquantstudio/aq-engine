@@ -30,8 +30,16 @@ async fn protected_copied_launch_delivers_in_background_and_acknowledges_its_out
                     HttpResponse::Ok().json(serde_json::json!({"token":"owned-fixture-grant","expiresAtUs":super::super::now_epoch_micros()+3_600_000_000i64}))
                 }
             }))
-            .route("/v1/batch", web::post().to(move |request: HttpRequest, batch: web::Json<super::super::LiveSyncBatch>| {
+            .route("/v1/batch", web::post().to(move |request: HttpRequest, bytes: web::Bytes| {
                 let delivered = delivered.clone(); let events = events.clone(); async move {
+                    // Small batches now use the production Protobuf transport.
+                    // Exercise it rather than silently rejecting it in a stale
+                    // JSON-only fixture or changing the client's real format.
+                    let batch: super::super::LiveSyncBatch = match request.headers().get("content-type").and_then(|value| value.to_str().ok()) {
+                        Some(aqe_live_protocol::protobuf::MIME) => aqe_live_protocol::protobuf::decode(&bytes).unwrap(),
+                        Some("application/json") => serde_json::from_slice(&bytes).unwrap(),
+                        other => panic!("Unexpected copied-launch batch format: {other:?}"),
+                    };
                     assert_eq!(request.headers().get("authorization").unwrap(), "Bearer owned-fixture-grant");
                     assert_eq!(batch.strategy_id, "copied-fixture");
                     assert!(batch.events().all(|e| e.run_id.is_some()));
@@ -72,6 +80,7 @@ async fn protected_copied_launch_delivers_in_background_and_acknowledges_its_out
                 .into_owned(),
         }),
         fill_export: true,
+        capture:None,
     };
     crate::launch_config::write_private(&launch_path, &config).unwrap();
     let config = crate::launch_config::read_private(&launch_path).unwrap();

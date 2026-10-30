@@ -3,6 +3,417 @@ use crate::core::live_sync::{EventEnvelope, EventKind, InProcessEventBus, Reconc
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+fn recovery_start_event(generation: &str) -> (ReconciliationStart, CloudEvent) {
+    let start = ReconciliationStart {
+        purpose: aqe_live_protocol::ReconciliationPurpose::CaptureRecovery,
+        critical_replay_through: Some(10),
+        generation: generation.into(),
+        runtime_id: "runtime".into(),
+        strategy_id: "strategy".into(),
+        live_session_id: "session".into(),
+        run_id: Some("run".into()),
+        snapshot_complete: true,
+        broker_features: vec![],
+        critical_cutoff: Some(10),
+        total_chunks: 0,
+        total_records: 0,
+    };
+    let mut event = EventEnvelope::new(
+        "runtime", "strategy", "session", format!("reconciliation:{generation}:start"),
+        1, EventPriority::Reconciliation, EventKind::ReconciliationStart,
+        serde_json::to_value(&start).unwrap(),
+    );
+    event.run_id = start.run_id.clone();
+    (start, event)
+}
+
+#[tokio::test]
+async fn refused_recovery_start_does_not_supersede_accepted_recovery() {
+    let path = std::env::temp_dir().join(format!("recovery-refusal-{}.db", Uuid::new_v4()));
+    let outbox = OutboxStore::open(&path).await.unwrap();
+    let (old_start, old) = recovery_start_event("old");
+    outbox.insert_events(&[old.clone()]).await.unwrap();
+    outbox.begin_reconciliation_job(&old_start).await.unwrap();
+    let bus = InProcessEventBus::acknowledged();
+    let subject = EventSubject::for_priority("runtime", "strategy", EventPriority::Reconciliation);
+    let mut subscription = bus.subscribe(subject.clone()).await.unwrap();
+    let (_, new) = recovery_start_event("new");
+    let handle = bus.publish_critical(subject, new).await.unwrap();
+    let first = subscription.recv().await.unwrap();
+    assert!(matches!(SyncAgent::accept_critical_batch(&bus, &outbox, first, &mut subscription, Some(1)).await,
+        Err(SyncAgentError::Outbox(OutboxStoreError::CapturePaused(_)))));
+    assert!(tokio::time::timeout(Duration::from_millis(20), handle.wait()).await.is_err(),
+        "refused payload must not receive a durable handoff acknowledgement");
+    let pending = outbox.pending_batch(EventPriority::Reconciliation, 100, 128 * 1024).await.unwrap();
+    assert_eq!(pending.iter().map(|record|record.event.event_id).collect::<Vec<_>>(), vec![old.event_id]);
+    let progress = outbox.health().await.unwrap().reconciliation.unwrap();
+    assert_eq!(progress.generation, old_start.generation);
+    assert_ne!(progress.status, "superseded");
+    drop(outbox);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn recovery_microbatch_keeps_only_the_last_generation_pending() {
+    let path = std::env::temp_dir().join(format!("recovery-microbatch-{}.db", Uuid::new_v4()));
+    let outbox = OutboxStore::open(&path).await.unwrap();
+    let bus = InProcessEventBus::acknowledged();
+    let subject = EventSubject::for_priority("runtime", "strategy", EventPriority::Reconciliation);
+    let mut subscription = bus.subscribe(subject.clone()).await.unwrap();
+    let (_, first) = recovery_start_event("first");
+    let (last_start, last) = recovery_start_event("last");
+    let handles = [
+        bus.publish_critical(subject.clone(), first.clone()).await.unwrap(),
+        bus.publish_critical(subject, last.clone()).await.unwrap(),
+    ];
+    let first_delivery = subscription.recv().await.unwrap();
+    SyncAgent::accept_critical_batch(&bus, &outbox, first_delivery, &mut subscription, None).await.unwrap();
+    for handle in handles {
+        let SyncAcknowledgement::LocalAccepted { event_ids } = handle.wait().await.unwrap() else {
+            panic!("expected durable local acknowledgement")
+        };
+        assert_eq!(event_ids, vec![first.event_id, last.event_id]);
+    }
+    let pending = outbox.pending_batch(EventPriority::Reconciliation, 100, 128 * 1024).await.unwrap();
+    assert_eq!(pending.iter().map(|record|record.event.event_id).collect::<Vec<_>>(), vec![last.event_id]);
+    assert_eq!(outbox.health().await.unwrap().reconciliation.unwrap().generation, last_start.generation);
+    drop(outbox);
+    let _ = std::fs::remove_file(path);
+}
+
+#[derive(Default)]
+struct FullTelemetryBus {
+    local: InProcessEventBus,
+    rejected: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LocalEventBus for FullTelemetryBus {
+    async fn publish_critical(
+        &self,
+        subject: EventSubject,
+        event: CloudEvent,
+    ) -> Result<crate::core::live_sync::LocalDeliveryHandle, EventBusError> {
+        self.local.publish_critical(subject, event).await
+    }
+    fn publish_telemetry(&self, _: EventSubject, _: CloudEvent) -> Result<(), EventBusError> {
+        self.rejected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(EventBusError::PublisherCapacity)
+    }
+    async fn subscribe(
+        &self,
+        subject: EventSubject,
+    ) -> Result<crate::core::live_sync::EventSubscription, EventBusError> {
+        self.local.subscribe(subject).await
+    }
+    async fn acknowledge(
+        &self,
+        delivery: &crate::core::live_sync::EventDelivery,
+        acknowledgement: SyncAcknowledgement,
+    ) -> Result<(), EventBusError> {
+        self.local.acknowledge(delivery, acknowledgement).await
+    }
+}
+
+#[tokio::test]
+async fn full_best_effort_health_queue_does_not_stop_critical_delivery() {
+    let path = std::env::temp_dir().join(format!("health-preview-cap-{}.db", Uuid::new_v4()));
+    let outbox = OutboxStore::open(&path).await.unwrap();
+    let mut event = EventEnvelope::new(
+        "runtime",
+        "strategy",
+        "session",
+        "lifecycle",
+        1,
+        EventPriority::Critical,
+        EventKind::StrategyLifecycle,
+        serde_json::json!({"state":"stopped"}),
+    );
+    event.critical_sequence = Some(1);
+    let id = event.event_id;
+    outbox.insert_events(&[event]).await.unwrap();
+    let bus = Arc::new(FullTelemetryBus::default());
+    let sink = Arc::new(RecordingSink::default());
+    let mut config = SyncAgentConfig::new("runtime", "strategy", "session");
+    config.health_interval = Duration::from_millis(5);
+    let agent = SyncAgent::new(config, bus.clone(), outbox.clone(), sink.clone());
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(agent.run(receiver));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while bus.rejected.load(std::sync::atomic::Ordering::Relaxed) < 3
+            || outbox.pending_count().await.unwrap() != 0
+        {
+            assert!(
+                !task.is_finished(),
+                "health backpressure stopped critical workers"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    assert!(
+        sink.batches
+            .lock()
+            .iter()
+            .any(|batch| batch.events().any(|event| event.event_id == id))
+    );
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(outbox);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn capped_receiver_keeps_the_durable_owner_until_capacity_allows_an_exact_handoff() {
+    use crate::core::live_sync::{
+        CloudCaptureState, FlatbufferEventCodec, LocalEventPublisher, LocalEventPublisherConfig,
+    };
+    let target =
+        OutboxStore::open(std::env::temp_dir().join(format!("receiver-cap-{}.db", Uuid::new_v4())))
+            .await
+            .unwrap();
+    let source = OutboxStore::open(
+        std::env::temp_dir().join(format!("publisher-owner-{}.db", Uuid::new_v4())),
+    )
+    .await
+    .unwrap();
+    let mut old = EventEnvelope::new(
+        "other-runtime",
+        "strategy",
+        "session",
+        "old",
+        1,
+        EventPriority::Critical,
+        EventKind::InsightProjection,
+        serde_json::json!({"data":"x".repeat(2048)}),
+    );
+    old.critical_sequence = Some(1);
+    let current = EventEnvelope::new(
+        "runtime",
+        "strategy",
+        "session",
+        "current",
+        1,
+        EventPriority::Critical,
+        EventKind::InsightProjection,
+        serde_json::json!({"data":"x".repeat(2048)}),
+    );
+    let limit = FlatbufferEventCodec::encode_with_local_commit(&old, now_epoch_micros())
+        .unwrap()
+        .len() as u64;
+    target.insert_events(&[old.clone()]).await.unwrap();
+    let bus = Arc::new(InProcessEventBus::acknowledged());
+    let mut health = bus
+        .subscribe(EventSubject::sync_status("runtime", "strategy"))
+        .await
+        .unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    let mut config = SyncAgentConfig::new("runtime", "strategy", "session");
+    config.capture_limit_bytes = Some(limit);
+    let agent = SyncAgent::new(config, bus.clone(), target.clone(), sink.clone());
+    agent.pause_cloud_delivery("fixture cloud quota exhausted".into());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(agent.run(shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(2), health.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let publisher = LocalEventPublisher::spawn(
+        bus.clone(),
+        Some(source.clone()),
+        LocalEventPublisherConfig {
+            capture_limit_bytes: Some(limit * 4),
+            nats_unavailable_fallback_after: Duration::from_millis(30),
+            ..Default::default()
+        },
+    );
+    assert!(
+        publisher
+            .wait_for_capture_initialization(Duration::from_secs(2))
+            .await
+    );
+    let subject = EventSubject::for_priority("runtime", "strategy", EventPriority::Critical);
+    let id = current.event_id;
+    assert_eq!(
+        publisher
+            .queue_durable(subject, current)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap(),
+        id
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if publisher.health().publish_failures > 0
+            && publisher.health().emergency_outbox_writes > 0
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !task.is_finished(),
+        "capacity refusal must not tear down health/safety/ingestion workers"
+    );
+    assert_eq!(
+        publisher.health().locally_accepted_critical,
+        0,
+        "no receiver ACK before its durable commit"
+    );
+    assert_eq!(
+        source.pending_count().await.unwrap(),
+        1,
+        "the accepted source payload must remain owned"
+    );
+    assert_eq!(
+        target
+            .pending_count_for_scope("strategy", "session")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(target.capture_retained_bytes().await.unwrap() <= limit);
+    assert!(target.capture_pause_for_scope("runtime","strategy","session").await.unwrap().is_none(),
+        "a deferred retry still has a durable source; it is not missing history");
+    let receiver_health = loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), health.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let status: RemoteSyncHealth = serde_json::from_value(event.event.payload).unwrap();
+        if status
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.state==CloudCaptureState::Paused && capture.retained_bytes>=limit)
+        {
+            break status;
+        }
+    };
+    let capture=receiver_health.capture.unwrap();
+    assert_eq!(capture.state,CloudCaptureState::Paused);
+    assert_eq!(capture.generation,None,"buffer pressure must not invent a history-gap generation");
+    target
+        .mark_remote_committed(&[old.event_id], Some(1))
+        .await
+        .unwrap();
+    target.prune_committed(0).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while source.pending_count().await.unwrap() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(source.pending_count().await.unwrap(), 0);
+    assert!(publisher.health().locally_accepted_critical > 0);
+    let accepted = target
+        .pending_batch_for_runtime_scope(
+            EventPriority::Critical,
+            "runtime",
+            "strategy",
+            "session",
+            10,
+            100_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].event.event_id, id);
+    assert!(
+        sink.batches.lock().is_empty(),
+        "local capacity recovery must not bypass remote cloud quota"
+    );
+    assert!(!publisher.admission_failed());
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    publisher.shutdown(Duration::from_secs(1)).await;
+    assert!(publisher.shutdown_complete());
+}
+
+#[tokio::test]
+async fn safety_delivery_is_independent_of_quota_pause_and_keeps_full_evidence_pending() {
+    #[derive(Default)]
+    struct PausedSink(Mutex<Vec<aqe_live_protocol::SafetyObservation>>);
+    #[async_trait]
+    impl RemoteBatchSink for PausedSink {
+        fn safety_run_id(&self) -> Option<&str> {
+            Some("run")
+        }
+        async fn persist_safety(
+            &self,
+            o: &aqe_live_protocol::SafetyObservation,
+        ) -> Result<bool, RemoteSyncError> {
+            self.0.lock().push(o.clone());
+            Ok(true)
+        }
+        async fn persist_batch(
+            &self,
+            _: &LiveSyncBatch,
+        ) -> Result<LiveSyncBatchResult, RemoteSyncError> {
+            panic!("quota-paused ordinary data must not be sent by the safety worker")
+        }
+    }
+    let path = std::env::temp_dir().join(format!("aqe-safety-paused-{}.db", Uuid::new_v4()));
+    let outbox = OutboxStore::open(&path).await.unwrap();
+    let mut event = EventEnvelope::new(
+        "runtime",
+        "strategy",
+        "session",
+        "lifecycle",
+        1,
+        EventPriority::Critical,
+        EventKind::StrategyLifecycle,
+        serde_json::json!({"state":"stopped"}),
+    );
+    event.run_id = Some("run".into());
+    event.critical_sequence = Some(1);
+    outbox.insert_events(&[event]).await.unwrap();
+    let sink = Arc::new(PausedSink::default());
+    let agent = SyncAgent::new(
+        SyncAgentConfig::new("runtime", "strategy", "session"),
+        Arc::new(InProcessEventBus::default()),
+        outbox.clone(),
+        sink.clone(),
+    );
+    agent.pause_cloud_delivery("quota test".into());
+    agent.flush_due().await.unwrap();
+    safety::flush(&agent.outbox, &agent.sink, "runtime", "strategy", "session")
+        .await
+        .unwrap();
+    assert_eq!(sink.0.lock().len(), 1);
+    assert!(
+        outbox
+            .pending_safety_observations("runtime", "strategy", "session", "run")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        outbox
+            .pending_count_for_scope("strategy", "session")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        agent.cloud_pause_remaining().is_some(),
+        "safety success must not grant data quota"
+    );
+    drop(agent);
+    drop(outbox);
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn runtime_health_interval_is_one_second() {
     assert_eq!(
@@ -229,6 +640,160 @@ struct SelectiveRejectSink {
 
 struct TransientFailureSink;
 
+#[tokio::test]
+async fn accepted_batches_report_capture_pressure_and_recover_without_changing_delivery_state() {
+    let dir = std::env::temp_dir().join(format!("aqe-capture-health-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let outbox = OutboxStore::open(dir.join("outbox.db")).await.unwrap();
+    let bus = Arc::new(InProcessEventBus::default());
+    let mut status = bus.subscribe(EventSubject::sync_status("runtime", "strategy")).await.unwrap();
+    let mut config = SyncAgentConfig::new("runtime", "strategy", "session");
+    config.capture_limit_bytes = Some(1);
+    let agent = SyncAgent::new(config, bus, outbox.clone(), Arc::new(RecordingSink::default()));
+    agent.set_health_state("cloud_accepted", None);
+    let event = EventEnvelope::new("runtime", "strategy", "session", "heartbeat", 1,
+        EventPriority::Telemetry, EventKind::Heartbeat, serde_json::json!({}));
+    outbox.insert_events(&[event.clone()]).await.unwrap();
+    agent.publish_health().await.unwrap();
+    let health: RemoteSyncHealth = serde_json::from_value(status.recv().await.unwrap().event.payload).unwrap();
+    assert_eq!(health.capture.unwrap().state, super::super::CloudCaptureState::Paused);
+    assert_eq!(health.sync_state, "capture_paused");
+    assert_eq!(agent.health_state.lock().sync_state, "cloud_accepted", "reporting cannot mutate the delivery worker");
+    outbox.mark_remote_committed(&[event.event_id], Some(1)).await.unwrap();
+    outbox.prune_committed(0).await.unwrap();
+    agent.publish_health().await.unwrap();
+    let health: RemoteSyncHealth = serde_json::from_value(status.recv().await.unwrap().event.payload).unwrap();
+    assert_eq!(health.capture.unwrap().state, super::super::CloudCaptureState::Active);
+    assert_eq!(health.sync_state, "cloud_accepted", "a prior pause must not latch after recovery");
+    drop(agent);
+    drop(outbox);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[derive(Default)]
+struct CloudPausedSink {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[tokio::test]
+async fn retained_failures_do_not_impersonate_current_worker_connectivity() {
+    let dir = std::env::temp_dir().join(format!("aqe-worker-health-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let outbox = OutboxStore::open(dir.join("outbox.db")).await.unwrap();
+    let bus = Arc::new(InProcessEventBus::default());
+    let mut status = bus.subscribe(EventSubject::sync_status("runtime", "strategy")).await.unwrap();
+    let agent = SyncAgent::new(SyncAgentConfig::new("runtime", "strategy", "session"),
+        bus, outbox.clone(), Arc::new(RecordingSink::default()));
+    let event = EventEnvelope::new("retired", "strategy", "old-session", "heartbeat", 1,
+        EventPriority::Telemetry, EventKind::Heartbeat, serde_json::json!({}));
+    outbox.insert_events(&[event.clone()]).await.unwrap();
+    outbox.move_to_dead_letter(event.event_id, "retained historical failure").await.unwrap();
+    agent.publish_health().await.unwrap();
+    let event = status.recv().await.unwrap().event;
+    let health: RemoteSyncHealth = serde_json::from_value(event.payload).unwrap();
+    assert_eq!(health.sync_state, "healthy");
+    assert_eq!(health.dlq_count, 0);
+    assert_eq!(outbox.health().await.unwrap().dead_letters, 1);
+    agent.set_health_state("blocked", Some("current authentication failure".into()));
+    agent.publish_health().await.unwrap();
+    let event = status.recv().await.unwrap().event;
+    let health: RemoteSyncHealth = serde_json::from_value(event.payload).unwrap();
+    assert_eq!(health.sync_state, "blocked", "real delivery failures must remain visible");
+    assert_eq!(health.reason.as_deref(), Some("current authentication failure"));
+    drop(agent);
+    drop(outbox);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[async_trait]
+impl RemoteBatchSink for CloudPausedSink {
+    async fn persist_batch(
+        &self,
+        _: &LiveSyncBatch,
+    ) -> Result<LiveSyncBatchResult, RemoteSyncError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(RemoteSyncError {
+            kind: RemoteSyncErrorKind::CloudPaused,
+            message: "Cloud paused".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn cloud_pause_retains_work_stops_retry_fanout_and_keeps_shutdown_responsive() {
+    let path = std::env::temp_dir().join(format!("aqe-cloud-pause-{}.db", Uuid::new_v4()));
+    let outbox = OutboxStore::open(&path).await.unwrap();
+    let sink = Arc::new(CloudPausedSink::default());
+    let agent = SyncAgent::new(
+        SyncAgentConfig::new("runtime", "strategy", "session"),
+        Arc::new(InProcessEventBus::default()),
+        outbox.clone(),
+        sink.clone(),
+    );
+    let event = EventEnvelope::new(
+        "runtime",
+        "strategy",
+        "session",
+        "account:one",
+        1,
+        EventPriority::Telemetry,
+        EventKind::AccountProjection,
+        serde_json::json!({"equity":100_000}),
+    );
+    outbox.insert_events(&[event]).await.unwrap();
+    agent
+        .flush_priority(EventPriority::Telemetry, 100, 128 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(agent.health_state.lock().sync_state, "cloud_paused");
+    let queries = outbox.diagnostic_query_counts();
+    for _ in 0..100 {
+        agent
+            .flush_priority(EventPriority::Telemetry, 100, 128 * 1024)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        outbox.diagnostic_query_counts(),
+        queries,
+        "paused lanes must not poll SQLite"
+    );
+    assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let health = outbox.health().await.unwrap();
+    assert_eq!(health.pending_telemetry, 1);
+    assert_eq!(health.dead_letters, 0);
+    assert!(health.current_retry_delay_ms >= 59_000);
+    agent.set_health_state("healthy", None);
+    assert_eq!(
+        agent.health_state.lock().sync_state,
+        "cloud_paused",
+        "late lane cannot hide pause"
+    );
+    // Health is still publishable; no broker/control worker is gated.
+    agent.publish_health().await.unwrap();
+    let (sender, mut receiver) = watch::channel(false);
+    sender.send_replace(true);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            agent.wait_for_cloud_resume(&mut receiver)
+        )
+        .await
+        .unwrap()
+    );
+    agent.health_state.lock().cloud_pause_until =
+        Some(std::time::Instant::now() - Duration::from_secs(1));
+    agent
+        .periodic_step(periodic::Job::CloudHeartbeat)
+        .await
+        .unwrap();
+    assert_eq!(agent.health_state.lock().sync_state, "recovering");
+    drop(agent);
+    drop(outbox);
+    let _ = std::fs::remove_file(path);
+}
+
 struct PanickingHealthSink;
 
 #[async_trait]
@@ -331,6 +896,8 @@ async fn unrelated_backlog_does_not_starve_history_or_startup_reconciliation() {
         serde_json::json!({"state":"Filled"}),
     );
     let start = ReconciliationStart {
+        purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
+        critical_replay_through: None,
         generation: "startup".into(),
         runtime_id: "runtime".into(),
         strategy_id: "strategy".into(),

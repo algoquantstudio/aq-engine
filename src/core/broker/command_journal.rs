@@ -4,7 +4,7 @@ use super::commands::{
     BrokerCommand, BrokerCommandCompletion, BrokerCommandError, BrokerCommandId,
     BrokerCommandOutcome,
 };
-use std::{fs::File, path::Path};
+use std::{fs::File, path::{Path,PathBuf}};
 use turso::{Connection, params};
 
 mod checkpoints;
@@ -14,6 +14,12 @@ pub(crate) mod marks;
 pub use fills::ExecutionFillBatch;
 pub(crate) mod lifecycle;
 mod reconciliation;
+mod cancellation_recovery;
+mod analytics_capture;
+mod cloud_history;
+pub use analytics_capture::{AnalyticsCapturePause,AnalyticsCaptureHandoffReceipt,AnalyticsCaptureStatus};
+mod exited_capture;
+pub use exited_capture::{ExitedAnalyticsCapture,ExitedAnalyticsCaptureError};
 pub(crate) mod recovery;
 pub(crate) use checkpoints::{ExecutionCheckpointBatch, ExecutionCheckpointPage, ExecutionIntent};
 
@@ -62,6 +68,9 @@ pub(crate) struct RecoveryCommand {
 /// Two live processes must not dispatch the same strategy/account journal.
 pub struct BrokerCommandJournal {
     connection: Connection,
+    path: PathBuf,
+    analytics_capture_budget: Option<crate::core::live_sync::PhysicalCaptureLimit>,
+    cloud_history: Option<cloud_history::CloudHistoryStore>,
     strategy_id: String,
     account_id: String,
     evidence_source_id: String,
@@ -93,6 +102,26 @@ impl BrokerCommandJournal {
         account_id: &str,
         state_history_enabled: bool,
     ) -> Result<Self, BrokerCommandError> {
+        Self::open_configured(path,strategy_id,account_id,state_history_enabled,None).await
+    }
+
+    /// Startup-only capacity selection, including resuming a previously
+    /// refused optional-history copy. Never deletes accepted history to fit.
+    /// The exclusive broker lock must be available; a running owner is refused.
+    pub async fn open_with_cloud_history_capacity(
+        path: impl AsRef<Path>,strategy_id:&str,account_id:&str,
+        limit:crate::core::live_sync::PhysicalCaptureLimit,
+    )->Result<Self,BrokerCommandError>{
+        let limit=limit.validate().map_err(journal_error)?;
+        let mut journal=Self::open_configured(path,strategy_id,account_id,false,Some(limit)).await?;
+        Box::pin(cloud_history::migrate(&mut journal,limit)).await?;
+        journal.with_analytics_capture_budget(limit).await
+    }
+
+    async fn open_configured(
+        path: impl AsRef<Path>,strategy_id:&str,account_id:&str,state_history_enabled:bool,
+        cloud_capacity:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+    )->Result<Self,BrokerCommandError>{
         let strategy_id = strategy_id.trim().to_owned();
         let account_id = account_id.trim().to_owned();
         if strategy_id.is_empty() || account_id.is_empty() {
@@ -134,7 +163,6 @@ impl BrokerCommandJournal {
             "PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              PRAGMA cache_size = -2048;
-             PRAGMA wal_autocheckpoint = 256;
              CREATE TABLE IF NOT EXISTS broker_command_scope (
                  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                  strategy_id TEXT NOT NULL, account_id TEXT NOT NULL
@@ -171,6 +199,7 @@ impl BrokerCommandJournal {
              INSERT INTO broker_execution_recovery_meta(singleton,graph_version,graph_cursor,graph_complete)
                  VALUES(1,1,'',0) ON CONFLICT(singleton) DO NOTHING;"
         ).await.map_err(journal_error)?;
+        connection.execute_batch(cancellation_recovery::SCHEMA).await.map_err(journal_error)?;
         connection.execute(
             "INSERT INTO broker_command_scope(singleton,strategy_id,account_id) VALUES(1,?1,?2) ON CONFLICT(singleton) DO NOTHING",
             params![strategy_id.clone(), account_id.clone()],
@@ -202,20 +231,24 @@ impl BrokerCommandJournal {
         let evidence_source_id = evidence::install_source(&connection).await?;
         let lifecycle = lifecycle::ExecutionLifecycle::install(&connection).await?;
         checkpoints::install_owner_epochs(&connection, lifecycle.epoch).await?;
-        connection
-            .execute_batch(fills::SCHEMA)
-            .await
-            .map_err(journal_error)?;
-        connection.execute_batch(marks::SCHEMA).await.map_err(journal_error)?;
-        Ok(Self {
+        if !cloud_history::has_location(&connection).await? {
+            connection.execute_batch(fills::SCHEMA).await.map_err(journal_error)?;
+            connection.execute_batch(marks::SCHEMA).await.map_err(journal_error)?;
+        }
+        let mut journal = Self {
             connection,
+            path,
+            analytics_capture_budget: None,
+            cloud_history: None,
             strategy_id,
             account_id,
             evidence_source_id,
             state_history_enabled,
             lifecycle,
             _process_lock: process_lock,
-        })
+        };
+        Box::pin(cloud_history::reopen(&mut journal,cloud_capacity)).await?;
+        Ok(journal)
     }
 
     pub fn scope(&self) -> (&str, &str) {

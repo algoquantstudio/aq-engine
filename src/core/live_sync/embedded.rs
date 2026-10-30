@@ -21,6 +21,11 @@ pub struct HostedSyncConfig {
     namespace: String,
     database: String,
     launch_run_id: Option<String>,
+    capture_limit_bytes: Option<u64>,
+    receiver_capture_limit_bytes: Option<u64>,
+    physical_capture_budget: Option<super::PhysicalCaptureBudget>,
+    receiver_capture_budget: Option<super::PhysicalCaptureBudget>,
+    source_journal_limit: Option<super::PhysicalCaptureLimit>,
 }
 
 impl HostedSyncConfig {
@@ -33,6 +38,11 @@ impl HostedSyncConfig {
             namespace: "aqs".into(),
             database: "aqs".into(),
             launch_run_id: None,
+            capture_limit_bytes: None,
+            receiver_capture_limit_bytes: None,
+            physical_capture_budget: None,
+            receiver_capture_budget: None,
+            source_journal_limit: None,
         })
     }
 
@@ -44,6 +54,66 @@ impl HostedSyncConfig {
         self.namespace = namespace.into();
         self.database = database.into();
         self
+    }
+
+    /// Explicit generic payload-admission budget for both owned outboxes.
+    /// This does not bound physical pages/WAL or enable a billing policy. Leave
+    /// unset until the deployment's producer/recovery readers are compatible.
+    pub fn with_capture_payload_limit_bytes(mut self, bytes: u64) -> Result<Self, String> {
+        if bytes == 0 || bytes > i64::MAX as u64 {
+            return Err("Hosted capture payload limit is zero or exceeds the storage range".into());
+        }
+        self.capture_limit_bytes = Some(self.physical_capture_budget.map_or(bytes,|policy|bytes.min(policy.payload_limit_bytes)));
+        self.receiver_capture_limit_bytes=Some(self.receiver_capture_budget.map_or(bytes,|policy|bytes.min(policy.payload_limit_bytes)));
+        Ok(self)
+    }
+
+    /// Opt-in physical admission for each owned cloud outbox independently.
+    /// Not a combined source-journal/filesystem quota. The broker execution
+    /// journal remains separate; a deployment must budget it independently.
+    pub fn with_physical_capture_budget(mut self,budget:super::PhysicalCaptureBudget)->Result<Self,String> {
+        let budget=budget.validate().map_err(|error|error.to_string())?;
+        self.capture_limit_bytes=Some(self.capture_limit_bytes.unwrap_or(budget.payload_limit_bytes).min(budget.payload_limit_bytes));
+        self.receiver_capture_limit_bytes=Some(self.receiver_capture_limit_bytes.unwrap_or(budget.payload_limit_bytes).min(budget.payload_limit_bytes));
+        self.physical_capture_budget=Some(budget);
+        self.receiver_capture_budget=Some(budget);
+        Ok(self)
+    }
+
+    pub(crate) fn with_protected_capture(mut self,policy:crate::launch_config::CloudCaptureConfig)->Result<Self,String>{
+        policy.validate()?;
+        let receiver=policy.embedded_receiver.ok_or("Embedded capture requires a receiver partition")?;
+        self=self.with_physical_capture_budget(policy.publisher.into())?
+            .with_source_journal_capture_limit(policy.source_journal.into())?;
+        self.receiver_capture_budget=Some(receiver.into());
+        self.receiver_capture_limit_bytes=Some(receiver.payload_limit_bytes);
+        Ok(self)
+    }
+
+    /// Separate optional-analytics partition on the broker command journal.
+    /// Mandatory execution/checkpoint/stop writes remain outside admission.
+    /// Requires explicitly budgeted outboxes; this is not a filesystem quota.
+    pub fn with_source_journal_capture_limit(mut self,limit:super::PhysicalCaptureLimit)->Result<Self,String> {
+        let limit=limit.validate().map_err(|error|error.to_string())?;
+        if self.physical_capture_budget.is_none() {
+            return Err("Source capture requires an explicit physical budget for both hosted outboxes".into());
+        }
+        self.source_journal_limit=Some(limit);
+        Ok(self)
+    }
+
+    async fn open_outbox(&self,path:PathBuf)->Result<OutboxStore,String> {
+        match self.physical_capture_budget {
+            Some(budget)=>OutboxStore::open_with_physical_capture_budget(path,budget).await,
+            None=>OutboxStore::open(path).await,
+        }.map_err(|error|error.to_string())
+    }
+
+    async fn open_receiver_outbox(&self,path:PathBuf)->Result<OutboxStore,String>{
+        match self.receiver_capture_budget {
+            Some(budget)=>OutboxStore::open_with_physical_capture_budget(path,budget).await,
+            None=>OutboxStore::open(path).await,
+        }.map_err(|error|error.to_string())
     }
 
     /// AQS has already selected this execution fence in its protected launch
@@ -89,24 +159,32 @@ impl EmbeddedHostedSync {
         let directory = config.outbox_directory.join(scope);
         let (lock, runtime_id) = open_runtime(&directory)?;
         let lock = Arc::new(lock);
-        let run_id = config.launch_run_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let run_id = config
+            .launch_run_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let capture_owner = Arc::new(super::CaptureOwnerLease::acquire(
+            &directory.join("publisher.db"), &runtime_id, &auth.strategy_id, session, &run_id,
+        ).map_err(|error|error.to_string())?);
         if config.launch_run_id.is_some() {
             // The DB makes terminal states sticky for an execution fence. A
             // copied launch is single-use, not an auto-restart service. Never
             // run the broker again under a stopped or already-admitted config.
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
             let marker = options.open(directory.join(format!("launch-{run_id}.used")))
                 .map_err(|_| "This copied launch has already been attempted or cannot be claimed. Stop/recover it in AQS and copy a fresh live command.")?;
-            marker.sync_all().map_err(|_| "Cannot persist copied launch ownership")?;
+            marker
+                .sync_all()
+                .map_err(|_| "Cannot persist copied launch ownership")?;
         }
-        let outbox = OutboxStore::open(directory.join("sync.db"))
-            .await
-            .map_err(|e| e.to_string())?;
-        let emergency = OutboxStore::open(directory.join("publisher.db"))
-            .await
-            .map_err(|e| e.to_string())?;
+        let outbox = config.open_receiver_outbox(directory.join("sync.db")).await?;
+        let emergency = config.open_outbox(directory.join("publisher.db")).await?;
         let initial_sequence = emergency
             .critical_sequence_cursor_for_runtime_scope(&runtime_id, &auth.strategy_id, session)
             .await
@@ -115,6 +193,8 @@ impl EmbeddedHostedSync {
         // snapshot. This is local metadata only, not an authoritative empty snapshot.
         // The actual broker snapshot fills in this same generation after startup.
         let start = ReconciliationStart {
+            purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
+            critical_replay_through: None,
             generation: deterministic_event_id(&format!(
                 "aqs-reconciliation-v4:{}:{}:{}",
                 auth.strategy_id, session, run_id
@@ -137,20 +217,27 @@ impl EmbeddedHostedSync {
                 .map_err(|e| e.to_string())?;
         }
         let sink = Arc::new(
-            HttpBatchSink::new(sink_config(config, auth, &runtime_id, &run_id, session)?, &config.gateway_url)
-                .map_err(|e| e.to_string())?,
+            HttpBatchSink::new(
+                sink_config(config, auth, &runtime_id, &run_id, session)?,
+                &config.gateway_url,
+            )
+            .map_err(|e| e.to_string())?,
         );
         if config.launch_run_id.is_some() {
             // Copied commands did not claim an execution route in AQS. Refuse
             // initial broker startup if credentials cannot be admitted. Cloud
             // outages after admission still use the existing background outbox.
-            sink.hosted_gateway().admit_prepared_run().await
+            sink.hosted_gateway()
+                .admit_prepared_run()
+                .await
                 .map_err(|error| format!("Copied live launch was not admitted: {error}"))?;
         }
         let bus = Arc::new(InProcessEventBus::acknowledged());
         let (shutdown, receiver) = watch::channel(false);
+        let mut agent_config = SyncAgentConfig::new(&runtime_id, &auth.strategy_id, session);
+        agent_config.capture_limit_bytes = config.receiver_capture_limit_bytes;
         let agent = SyncAgent::new(
-            SyncAgentConfig::new(&runtime_id, &auth.strategy_id, session),
+            agent_config,
             bus.clone(),
             outbox.clone(),
             sink.clone(),
@@ -183,6 +270,30 @@ impl EmbeddedHostedSync {
         let action_session = session.to_string();
         let action_bus = bus.clone();
         let action_receiver = receiver.clone();
+        // Emergency publisher acceptance is durable even when the local bus is
+        // unavailable. Its compact safety facts must not depend on bus replay.
+        let safety_store = emergency.clone();
+        let safety_sink: Arc<dyn super::RemoteBatchSink> = sink.clone();
+        let safety_runtime = runtime_id.clone();
+        let safety_strategy = auth.strategy_id.clone();
+        let safety_session = session.to_string();
+        let safety_receiver = receiver.clone();
+        let safety_lock = lock.clone();
+        let safety_worker = tokio::spawn(async move {
+            let _lock = safety_lock;
+            if let Err(error) = super::sync_agent::safety::run(
+                safety_store,
+                safety_sink,
+                safety_runtime,
+                safety_strategy,
+                safety_session,
+                safety_receiver,
+            )
+            .await
+            {
+                log::warn!("Hosted operational delivery stopped; durable facts retained: {error}");
+            }
+        });
         let retirement = (
             sink.clone(),
             outbox.clone(),
@@ -210,12 +321,17 @@ impl EmbeddedHostedSync {
             let _lock = maintenance_lock;
             maintain_publisher_outbox(maintenance_store, receiver).await;
         });
-        let publisher = LocalEventPublisher::spawn_owned_with_initial_sequence(
+        let publisher = LocalEventPublisher::spawn_owned_with_capture_lease(
             bus,
             emergency,
-            LocalEventPublisherConfig::default(),
+            LocalEventPublisherConfig {
+                capture_limit_bytes: config.capture_limit_bytes,
+                source_journal_limit: config.source_journal_limit,
+                ..Default::default()
+            },
             initial_sequence,
             lock.clone(),
+            capture_owner,
         );
         Ok(Self {
             publisher,
@@ -223,7 +339,12 @@ impl EmbeddedHostedSync {
             run_id,
             retirement,
             shutdown,
-            workers: vec![sync_worker, action_worker, maintenance_worker],
+            workers: vec![
+                sync_worker,
+                action_worker,
+                maintenance_worker,
+                safety_worker,
+            ],
             _lock: lock,
         })
     }
@@ -244,9 +365,43 @@ impl EmbeddedHostedSync {
         }
         self.workers.clear();
         let (sink, outbox, publisher_outbox, strategy, session) = &self.retirement;
+        let safety_sink: Arc<dyn super::RemoteBatchSink> = sink.clone();
+        // Best-effort final direct commit. A timeout retains the exact original
+        // and compact facts on disk; it does not pretend the data queue drained.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            super::sync_agent::safety::flush(
+                publisher_outbox,
+                &safety_sink,
+                &self.runtime_id,
+                strategy,
+                session,
+            )
+            .await?;
+            super::sync_agent::safety::flush(
+                outbox,
+                &safety_sink,
+                &self.runtime_id,
+                strategy,
+                session,
+            )
+            .await
+        })
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            super::sync_agent::gaps::flush(publisher_outbox, &safety_sink, strategy, session).await?;
+            super::sync_agent::gaps::flush(outbox, &safety_sink, strategy, session).await
+        }).await;
         // Never seal after a timed-out publisher flush, or while any lane/DLQ still
         // owns work. Retained local files remain available to a later restart.
         if self.publisher.shutdown_complete()
+            && !publisher_outbox
+                .has_untransferred_capture_pause_for_scope(strategy, session)
+                .await
+                .unwrap_or(true)
+            && !outbox
+                .has_untransferred_capture_pause_for_scope(strategy, session)
+                .await
+                .unwrap_or(true)
             && outbox
                 .retirement_uncommitted_for_scope(strategy, session)
                 .await
@@ -469,6 +624,63 @@ mod tests {
         assert_eq!(sink.run_id, "run");
         assert!(sink.bearer_token.is_empty());
         assert!(HostedSyncConfig::new("http://untrusted.example", "/unused").is_err());
+    }
+
+    #[test]
+    fn hosted_capture_payload_budget_is_explicit_validated_and_default_off() {
+        let config = HostedSyncConfig::new("http://127.0.0.1:9080", "/unused").unwrap();
+        assert_eq!(config.capture_limit_bytes, None);
+        assert_eq!(config.receiver_capture_limit_bytes,None);
+        assert_eq!(config.physical_capture_budget, None);
+        assert_eq!(config.receiver_capture_budget,None);
+        assert_eq!(config.source_journal_limit,None);
+        for invalid in [0, u64::MAX] {
+            assert!(config.clone().with_capture_payload_limit_bytes(invalid).is_err());
+        }
+        let configured = config.with_capture_payload_limit_bytes(1024).unwrap()
+            .with_database("fixture", "fixture");
+        assert_eq!(configured.capture_limit_bytes, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn protected_capture_installs_distinct_owned_partitions_and_requires_receiver_allocation(){
+        use crate::launch_config::{CloudCaptureConfig,CapturePartitionConfig,CaptureOutboxConfig};
+        let root=std::env::temp_dir().join(format!("hosted-partitions-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let partition=CapturePartitionConfig{physical_limit_bytes:32*1024*1024,operational_headroom_bytes:super::super::MIN_OPERATIONAL_HEADROOM_BYTES};
+        let publisher=CaptureOutboxConfig{payload_limit_bytes:1024,physical:partition};
+        let receiver=CaptureOutboxConfig{payload_limit_bytes:2048,physical:CapturePartitionConfig{physical_limit_bytes:64*1024*1024,..partition}};
+        let policy=CloudCaptureConfig{version:1,source_journal:partition,publisher,embedded_receiver:Some(receiver)};
+        let config=HostedSyncConfig::new("http://127.0.0.1:9080",&root).unwrap();
+        assert!(config.clone().with_source_journal_capture_limit(partition.into()).is_err());
+        assert!(config.clone().with_protected_capture(CloudCaptureConfig{embedded_receiver:None,..policy}).is_err());
+        let configured=config.with_protected_capture(policy).unwrap();
+        assert_eq!(configured.capture_limit_bytes,Some(1024));
+        assert_eq!(configured.receiver_capture_limit_bytes,Some(2048));
+        assert_eq!(configured.source_journal_limit,Some(partition.into()));
+        let producer=configured.open_outbox(root.join("publisher.db")).await.unwrap();
+        let consumer=configured.open_receiver_outbox(root.join("sync.db")).await.unwrap();
+        assert_eq!(producer.physical_capture_usage().await.unwrap().unwrap().limit_bytes,partition.physical_limit_bytes);
+        assert_eq!(consumer.physical_capture_usage().await.unwrap().unwrap().limit_bytes,receiver.physical.physical_limit_bytes);
+        drop(producer);drop(consumer);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_physical_admission_is_explicit_and_respects_the_physical_payload_ceiling() {
+        let directory=std::env::temp_dir().join(format!("hosted-physical-{}",uuid::Uuid::new_v4()));
+        let budget=super::super::PhysicalCaptureBudget{payload_limit_bytes:4096,physical_limit_bytes:32*1024*1024,
+            operational_headroom_bytes:super::super::MIN_OPERATIONAL_HEADROOM_BYTES};
+        let config=HostedSyncConfig::new("http://127.0.0.1:9080",&directory).unwrap()
+            .with_capture_payload_limit_bytes(1024).unwrap().with_physical_capture_budget(budget).unwrap();
+        assert_eq!(config.capture_limit_bytes,Some(1024));
+        assert_eq!(config.receiver_capture_limit_bytes,Some(1024),"the existing shared-budget builder must keep both payload ceilings");
+        let config=config.with_capture_payload_limit_bytes(8192).unwrap();
+        assert_eq!(config.capture_limit_bytes,Some(4096));
+        let first=config.open_outbox(directory.join("sync.db")).await.unwrap();
+        let second=config.open_outbox(directory.join("publisher.db")).await.unwrap();
+        assert_eq!(first.physical_capture_budget(),Some(budget));
+        assert_eq!(second.physical_capture_budget(),Some(budget));
+        drop(first);drop(second);std::fs::remove_dir_all(directory).unwrap();
     }
 
     async fn wait_for_release(directory: &Path) {

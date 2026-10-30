@@ -22,7 +22,7 @@ pub fn write_private(path: &Path, config: &LaunchConfig) -> Result<(), String> {
     {
         return Err("AQE launch directory must not be a symlink".into());
     }
-    protect(parent, true)?;
+    protect_private_path(parent, true)?;
     // Unique immutable filenames avoid overwriting a running process's config.
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -35,7 +35,7 @@ pub fn write_private(path: &Path, config: &LaunchConfig) -> Result<(), String> {
         .open(path)
         .map_err(|_| "Cannot create private AQE launch configuration")?;
     let result = (|| {
-        protect(path, false)?;
+        protect_private_path(path, false)?;
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| "Cannot save AQE launch configuration".to_string())
@@ -94,7 +94,24 @@ pub fn read_private(path: &Path) -> Result<LaunchConfig, String> {
     Ok(config)
 }
 
-fn protect(path: &Path, directory: bool) -> Result<(), String> {
+/// Restrict an existing regular file/directory to its current user. Windows uses
+/// the current SID and inheritable directory rules, never an unqualified name.
+/// Refuse links rather than changing permissions on an unintended target.
+pub fn protect_private_path(path: &Path, directory: bool) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "Cannot inspect private path")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err("Private paths must not be links or reparse points".into());
+        }
+    }
+    if metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err("Private paths must be regular files or directories, not links".into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -102,7 +119,7 @@ fn protect(path: &Path, directory: bool) -> Result<(), String> {
             path,
             fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
         )
-        .map_err(|_| "Cannot restrict AQE launch permissions")?;
+        .map_err(|_| "Cannot restrict private path permissions")?;
     }
     #[cfg(windows)]
     windows_acl(path, directory, false)?;

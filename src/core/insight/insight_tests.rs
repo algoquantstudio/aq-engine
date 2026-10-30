@@ -304,6 +304,7 @@ impl StrategyContext for MockStrategyContext {
 
     fn latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
         Ok(Quote {
+            profit_model: None,
             symbol: symbol.to_string(),
             bid: 1.15,
             ask: 1.15,

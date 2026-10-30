@@ -41,7 +41,7 @@ pub struct SnapshotRefreshHealth {
     pub exited_tasks: usize,
 }
 
-/// Four long-lived read-only tasks, regardless of insight count. Account and
+/// Five long-lived read-only tasks, regardless of insight count. Account and
 /// position completion cannot block one another or the bounded quote fanout.
 /// Explicit stop waits for task release; Drop aborts rather than detaching them.
 pub struct SnapshotRefreshWorker {
@@ -52,6 +52,15 @@ pub struct SnapshotRefreshWorker {
 }
 
 trait SnapshotSource: Send + Sync {
+    fn cash_flows(
+        &self,
+        _account: &str,
+        _source: Option<&str>,
+        _after: u64,
+    ) -> impl Future<Output = Result<Option<aqe_live_protocol::AccountCashFlowPage>, BrokerError>> + Send
+    {
+        async { Ok(None) }
+    }
     fn orders(&self) -> impl Future<Output = Result<Vec<Order>, BrokerError>> + Send;
     fn account(&self) -> impl Future<Output = Result<Account, BrokerError>> + Send;
     fn positions(&self) -> impl Future<Output = Result<Vec<Position>, BrokerError>> + Send;
@@ -62,6 +71,17 @@ struct Sources<E, D> {
     data: Arc<D>,
 }
 impl<E: OrderManagementProvider, D: DataProvider> SnapshotSource for Sources<E, D> {
+    async fn cash_flows(
+        &self,
+        account: &str,
+        source: Option<&str>,
+        after: u64,
+    ) -> Result<Option<aqe_live_protocol::AccountCashFlowPage>, BrokerError> {
+        match self.execution.account_cash_flow_reader() {
+            Some(reader) => reader.read(account, source, after).await,
+            None => Ok(None),
+        }
+    }
     async fn orders(&self) -> Result<Vec<Order>, BrokerError> {
         self.execution.get_orders().await
     }
@@ -171,6 +191,72 @@ impl SnapshotRefreshWorker {
                 }
             }
         });
+        let flow_source = Arc::clone(&source);
+        let flow_cache = Arc::clone(&cache);
+        tasks.spawn(async move {
+            let mut captured: Option<crate::core::broker::account_cash_flow::AccountCashFlows> =
+                None;
+            let mut delay = Duration::from_millis(100);
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(generation) = flow_cache.request_generation(identity) else {
+                    return;
+                };
+                let Ok(account) = flow_cache.account() else {
+                    delay = Duration::from_secs(1);
+                    continue;
+                };
+                let (source, after) = captured
+                    .as_ref()
+                    .map_or((None, 0), |s| (Some(s.source_id.as_str()), s.cursor));
+                let result = tokio::time::timeout(
+                    config.request_timeout,
+                    flow_source.cash_flows(&account.account_id, source, after),
+                )
+                .await;
+                match result {
+                    Ok(Ok(Some(page))) => {
+                        if page.validate(&account.account_id).is_err()
+                            || page.currency != account.currency
+                        {
+                            delay = Duration::from_secs(60);
+                            continue;
+                        }
+                        let state = if captured.as_ref().is_some_and(|s| {
+                            s.source_id == page.source_id && page.after_sequence == s.cursor
+                        }) {
+                            captured.as_mut().unwrap().apply(&page).map(|_| ())
+                        } else {
+                            crate::core::broker::account_cash_flow::AccountCashFlows::from_page(
+                                &page,
+                            )
+                            .map(|s| {
+                                captured = Some(s);
+                            })
+                        };
+                        if state.is_err() {
+                            if let Some(state) = captured.as_ref().filter(|s| s.capacity_exceeded) {
+                                flow_cache.publish_cash_flows(generation, state.clone());
+                            }
+                            delay = Duration::from_secs(60);
+                            continue;
+                        }
+                        flow_cache
+                            .publish_cash_flows(generation, captured.as_ref().unwrap().clone());
+                        delay = if page.next_sequence < page.through_sequence {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(15)
+                        };
+                    }
+                    // Older/unsupported adapters are not repeatedly called on
+                    // the account refresh path and never block order decisions.
+                    _ => {
+                        delay = Duration::from_secs(60);
+                    }
+                }
+            }
+        });
         let quote_cache = Arc::clone(&cache);
         let quote_counts = Arc::clone(&counts);
         tasks.spawn(async move {
@@ -235,7 +321,7 @@ impl SnapshotRefreshWorker {
             account_failures: self.counts.account_failures.load(Ordering::Relaxed),
             position_failures: self.counts.position_failures.load(Ordering::Relaxed),
             quote_failures: self.counts.quote_failures.load(Ordering::Relaxed),
-            exited_tasks: 4 - self.tasks.len(),
+            exited_tasks: 5 - self.tasks.len(),
         }
     }
 

@@ -1,6 +1,6 @@
 use super::types::live_metrics::{
-    HistoricalClosedInsightMetric, LIVE_METRICS_CHECKPOINT_VERSION, LiveMetricsCheckpoint,
-    LiveMetricsSnapshot,
+    EquityRiskReconciliation, HistoricalClosedInsightMetric, LIVE_METRICS_CHECKPOINT_VERSION,
+    LiveMetricsCheckpoint, LiveMetricsSnapshot,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -14,6 +14,7 @@ pub(crate) use trade_history::TradeRecoveryToken;
 #[derive(Clone, Debug, Default)]
 pub struct LivePerformanceTracker {
     account_id: Option<String>,
+    equity_risk_reconciliation: Option<EquityRiskReconciliation>,
     history_recovery_complete: bool,
     starting_cash: f64,
     current_equity: f64,
@@ -62,13 +63,60 @@ impl LivePerformanceTracker {
         checkpoints: impl IntoIterator<Item = LiveMetricsCheckpoint>,
     ) -> Option<LiveMetricsCheckpoint> {
         let account_id = account_id.trim();
-        checkpoints
+        let candidates: Vec<_> = checkpoints
             .into_iter()
             .filter(|checkpoint| {
                 checkpoint.version == LIVE_METRICS_CHECKPOINT_VERSION
                     && checkpoint.account_id.trim() == account_id
             })
-            .max_by_key(|checkpoint| checkpoint.updated_at)
+            .collect();
+        let mut selected = candidates
+            .iter()
+            .max_by_key(|checkpoint| checkpoint.updated_at)?
+            .clone();
+        // Fresh trade counters do not make known-contaminated risk history
+        // authoritative. Rebase only risk fields, never add/drop trade ledgers.
+        if let Some(repaired) = candidates
+            .iter()
+            .filter(|checkpoint| {
+                checkpoint
+                    .equity_risk_reconciliation
+                    .as_ref()
+                    .is_some_and(|proof| {
+                        !proof.repair_id.trim().is_empty()
+                            && proof.through >= checkpoint.executed_at
+                    })
+                    && checkpoint.peak_equity.is_finite()
+                    && checkpoint.peak_equity > 0.0
+                    && checkpoint.max_drawdown.is_finite()
+                    && checkpoint.max_drawdown >= 0.0
+                    && checkpoint.max_drawdown_duration_secs >= 0
+                    && checkpoint.executed_at == selected.executed_at
+            })
+            .max_by_key(|checkpoint| {
+                checkpoint
+                    .equity_risk_reconciliation
+                    .as_ref()
+                    .unwrap()
+                    .through
+            })
+        {
+            let proof = repaired.equity_risk_reconciliation.as_ref().unwrap();
+            if selected
+                .equity_risk_reconciliation
+                .as_ref()
+                .is_none_or(|current| {
+                    current.repair_id != proof.repair_id || selected.updated_at <= proof.through
+                })
+            {
+                selected.peak_equity = repaired.peak_equity;
+                selected.max_drawdown = repaired.max_drawdown;
+                selected.underwater_start = repaired.underwater_start;
+                selected.max_drawdown_duration_secs = repaired.max_drawdown_duration_secs;
+                selected.equity_risk_reconciliation = Some(proof.clone());
+            }
+        }
+        Some(selected)
     }
 
     pub fn initialize(
@@ -93,6 +141,7 @@ impl LivePerformanceTracker {
         self.account_id = account_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        self.equity_risk_reconciliation = None;
         self.history_recovery_complete = true;
         self.starting_cash = starting_cash;
         self.current_equity = current_equity;
@@ -154,6 +203,7 @@ impl LivePerformanceTracker {
 
         self.trade_recovery = None;
         self.account_id = Some(account_id.to_string());
+        self.equity_risk_reconciliation = checkpoint.equity_risk_reconciliation;
         self.history_recovery_complete = checkpoint.history_recovery_complete;
         self.starting_cash = checkpoint.starting_cash;
         self.current_equity = current_equity;
@@ -239,6 +289,7 @@ impl LivePerformanceTracker {
         let checkpoint = LiveMetricsCheckpoint {
             version: LIVE_METRICS_CHECKPOINT_VERSION,
             account_id,
+            equity_risk_reconciliation: None,
             history_recovery_complete: false,
             starting_cash: snapshot.starting_cash,
             current_equity: snapshot.final_equity,
@@ -290,6 +341,7 @@ impl LivePerformanceTracker {
         Some(LiveMetricsCheckpoint {
             version: LIVE_METRICS_CHECKPOINT_VERSION,
             account_id: self.account_id.clone()?,
+            equity_risk_reconciliation: self.equity_risk_reconciliation.clone(),
             history_recovery_complete: self.history_recovery_complete,
             starting_cash: self.starting_cash,
             current_equity: self.current_equity,
@@ -381,6 +433,40 @@ impl LivePerformanceTracker {
             && self.gross_loss_abs >= historical.gross_loss_abs
             && self.max_drawdown >= historical.max_drawdown
         {
+            if let Some(proof) = historical
+                .equity_risk_reconciliation
+                .as_ref()
+                .filter(|proof| {
+                    !proof.repair_id.is_empty()
+                        && proof.through >= historical.executed_at
+                        && historical.peak_equity.is_finite()
+                        && historical.peak_equity > 0.0
+                        && historical.max_drawdown.is_finite()
+                        && historical.max_drawdown >= 0.0
+                })
+            {
+                if self
+                    .equity_risk_reconciliation
+                    .as_ref()
+                    .is_none_or(|current| {
+                        current.repair_id != proof.repair_id
+                            || self.updated_at.is_some_and(|at| at <= proof.through)
+                    })
+                {
+                    self.peak_equity = historical.peak_equity.max(self.current_equity);
+                    self.max_drawdown = historical
+                        .max_drawdown
+                        .max((self.peak_equity - self.current_equity) / self.peak_equity * 100.0);
+                    self.underwater_start = if self.current_equity < self.peak_equity {
+                        historical.underwater_start
+                    } else {
+                        None
+                    };
+                    self.max_drawdown_duration_secs = historical.max_drawdown_duration_secs;
+                    self.equity_risk_reconciliation = Some(proof.clone());
+                    self.last_persisted_checkpoint = None;
+                }
+            }
             return Ok(());
         }
         let current_started_at = self
@@ -404,6 +490,7 @@ impl LivePerformanceTracker {
             );
         }
         self.starting_cash = historical.starting_cash;
+        self.equity_risk_reconciliation = historical.equity_risk_reconciliation;
         self.peak_equity = self.peak_equity.max(historical.peak_equity);
         self.max_drawdown = self.max_drawdown.max(historical.max_drawdown);
         self.total_trades += historical.total_trades;

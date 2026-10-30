@@ -30,6 +30,7 @@ pub enum Mt5RpcAction {
     EstimateMargin,
     GetPositions,
     GetAccount,
+    GetAccountCashFlows,
     SubmitOrder,
     CancelOrder,
     UpdateOrder,
@@ -56,6 +57,7 @@ impl Mt5RpcAction {
                 | Self::EstimateMargin
                 | Self::GetPositions
                 | Self::GetAccount
+                | Self::GetAccountCashFlows
                 | Self::SubscribeBars
                 | Self::UnsubscribeBars
         )

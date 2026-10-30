@@ -683,7 +683,8 @@ async fn interrupted_owner_metadata_upgrade_retries_backfill_without_rebuilding_
     assert_eq!(owner.execution_epoch, 1);
     // This retired checkpoint is intentionally unreadable. Subsequent opens
     // must neither scan its JSON for ownership nor rebuild its scalar index.
-    journal.connection.execute("UPDATE broker_insight_checkpoints SET checkpoint_json='retired-invalid-json' WHERE insight_id=?1", params![owner.insight_id.clone()]).await.unwrap();
+    // SQL expression indexes require valid JSON; checkpoint decoding must still fail.
+    journal.connection.execute(r#"UPDATE broker_insight_checkpoints SET checkpoint_json='{"fixture_corruption":true}' WHERE insight_id=?1"#, params![owner.insight_id.clone()]).await.unwrap();
     drop(journal);
     let journal = BrokerCommandJournal::open_with_state_history(
         fixture.0.join("commands.db"),

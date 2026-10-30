@@ -1,3 +1,5 @@
+#[path = "outbox/scoped_health.rs"]
+mod scoped_health;
 use super::{
     CloudEvent, EventEnvelope, EventId, EventKind, EventPriority, FlatbufferEventCodec,
     LOCAL_EVENT_HARD_LIMIT_BYTES, RECONCILIATION_TARGET_BYTES, ReconciliationChunk,
@@ -10,8 +12,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use turso::{Builder, Connection, params};
 
+mod capture;
 mod publisher_reservations;
+mod publisher_scope;
+mod physical;
+mod safety;
+mod safety_headroom;
+mod gap_notices;
+mod journal_gaps;
+mod source_suspensions;
+mod source_lifecycle;
+mod legacy;
+mod job_cleanup;
 mod types;
+pub use capture::{CaptureCapacity, CapturePauseRecord};
+pub use physical::{PhysicalCaptureBudget,PhysicalCaptureLimit,PhysicalCaptureUsage,MIN_OPERATIONAL_HEADROOM_BYTES};
+pub(crate) use physical::{install_physical_capture_spill_control,measure_physical_capture};
 pub use types::{
     DeadLetterRecord, OutboxEventRecord, OutboxHealth, OutboxStoreError, ReconciliationJobProgress,
 };
@@ -98,14 +114,39 @@ pub struct OutboxStore {
     connection: Arc<Connection>,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
     priority_notify: Arc<[Arc<tokio::sync::Notify>; 4]>,
+    safety_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     query_counts: Arc<[std::sync::atomic::AtomicUsize; 3]>,
+    #[cfg(test)]
+    mutation_pause: Arc<parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     last_maintenance: Arc<parking_lot::Mutex<Option<Instant>>>,
     health_cache: Arc<tokio::sync::Mutex<Option<(Instant, OutboxHealth)>>>,
+    capture_initialized: Arc<std::sync::atomic::AtomicBool>,
+    physical_budget: Option<PhysicalCaptureBudget>,
+    legacy_envelope_limit_bytes: usize,
 }
 
 impl OutboxStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, OutboxStoreError> {
+        Self::open_configured(path, None).await
+    }
+
+    pub(super) async fn open_configured(
+        path: impl AsRef<Path>,
+        physical_budget: Option<PhysicalCaptureBudget>,
+    ) -> Result<Self, OutboxStoreError> {
+        Self::open_configured_for_legacy_upgrade(
+            path,
+            physical_budget,
+            legacy::MAX_LEGACY_ENVELOPE_BYTES,
+        ).await
+    }
+
+    async fn open_configured_for_legacy_upgrade(
+        path: impl AsRef<Path>,
+        physical_budget: Option<PhysicalCaptureBudget>,
+        legacy_envelope_limit_bytes: usize,
+    ) -> Result<Self, OutboxStoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -125,13 +166,22 @@ impl OutboxStore {
             priority_notify: Arc::new(std::array::from_fn(
                 |_| Arc::new(tokio::sync::Notify::new()),
             )),
+            safety_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             query_counts: Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicUsize::new(0)
             })),
             last_maintenance: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            mutation_pause: Arc::new(parking_lot::Mutex::new(None)),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            capture_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            physical_budget,
+            legacy_envelope_limit_bytes,
         };
+        if physical_budget.is_some() {
+            install_physical_capture_spill_control(&store.connection).await?;
+        }
         store.initialize().await?;
         Ok(store)
     }
@@ -280,15 +330,17 @@ impl OutboxStore {
             .map_err(|error| OutboxStoreError::Database(error.to_string()))?
             .is_some()
         {}
-        self.connection
-            .execute_batch(
+        drop(journal_mode);
+        // Reclaim an old process's checkpointable WAL before considering any
+        // schema write. A pinned reader remains a nonblocking refusal.
+        self.try_reclaim_physical_wal().await?;
+        self.connection.execute_batch(
+            "PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -8192;",
+        ).await.map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        // Pinned Turso does not implement wal_autocheckpoint/journal_size_limit.
+        // Startup DDL is transactional and admitted before any WAL commit.
+        self.execute_bounded_metadata_batch(
                 r#"
-                PRAGMA synchronous = NORMAL;
-                PRAGMA busy_timeout = 5000;
-                PRAGMA cache_size = -8192;
-                PRAGMA wal_autocheckpoint = 256;
-                PRAGMA journal_size_limit = 8388608;
-
                 CREATE TABLE IF NOT EXISTS outbox_events (
                     event_id TEXT PRIMARY KEY,
                     runtime_id TEXT,
@@ -312,6 +364,24 @@ impl OutboxStore {
                     ON outbox_events(state, priority, next_attempt_at_us, critical_sequence, created_at_us);
                 CREATE INDEX IF NOT EXISTS idx_outbox_entity_revision
                     ON outbox_events(strategy_id, entity_id, entity_revision);
+
+                -- Compact operational recovery only. Never acknowledges or
+                -- deletes the original contiguous trading-event stream.
+                CREATE TABLE IF NOT EXISTS safety_observations (
+                    runtime_id TEXT NOT NULL, strategy_id TEXT NOT NULL,
+                    live_session_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                    entity_key TEXT NOT NULL, event_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, terminal INTEGER NOT NULL,
+                    state_rank INTEGER NOT NULL, observation TEXT NOT NULL,
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_us INTEGER NOT NULL DEFAULT 0,
+                    full_evidence_required INTEGER NOT NULL DEFAULT 1,
+                    updated_at_us INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(runtime_id,strategy_id,live_session_id,run_id,entity_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_safety_pending ON safety_observations(
+                    runtime_id,strategy_id,live_session_id,run_id,delivered,next_attempt_at_us);
+                CREATE INDEX IF NOT EXISTS idx_safety_event ON safety_observations(event_id,delivered);
 
                 CREATE TABLE IF NOT EXISTS outbox_batches (
                     batch_id TEXT PRIMARY KEY,
@@ -353,6 +423,8 @@ impl OutboxStore {
                     fingerprint BLOB NOT NULL,
                     UNIQUE(runtime_id, strategy_id, live_session_id, critical_sequence)
                 );
+                CREATE INDEX IF NOT EXISTS idx_publisher_reservations_scope
+                    ON publisher_event_reservations(strategy_id,live_session_id);
 
                 CREATE TABLE IF NOT EXISTS dead_letters (
                     event_id TEXT PRIMARY KEY,
@@ -419,6 +491,8 @@ impl OutboxStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_latency_traces_retention
                     ON latency_traces(retained_at_us);
+                CREATE INDEX IF NOT EXISTS idx_latency_traces_scope
+                    ON latency_traces(strategy_id,live_session_id);
 
                 CREATE TABLE IF NOT EXISTS latency_samples (
                     event_id TEXT NOT NULL,
@@ -429,16 +503,19 @@ impl OutboxStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_latency_samples_bucket
                     ON latency_samples(observed_at_us, stage);
+                CREATE INDEX IF NOT EXISTS idx_latency_samples_stage_duration
+                    ON latency_samples(stage, duration_us, observed_at_us);
                 "#,
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            ?;
 
         self.ensure_runtime_scope_column().await?;
         self.ensure_sync_cursor_runtime_scope().await?;
         self.ensure_reconciliation_job_columns().await?;
-        self.connection
-            .execute_batch(
+        self.ensure_safety_headroom_columns().await?;
+        self.ensure_gap_notice_schema().await?;
+        self.execute_bounded_metadata_batch(
                 r#"
                 CREATE INDEX IF NOT EXISTS idx_outbox_runtime_pending
                     ON outbox_events(runtime_id, strategy_id, live_session_id, state, priority,
@@ -468,10 +545,15 @@ impl OutboxStore {
                 "#,
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            ?;
         self.discard_terminal_log_events().await?;
         self.requeue_retryable_dead_letters().await?;
         self.reset_pending_contention_backoff().await?;
+        if self.physical_budget.is_some() {
+            // Compatibility conversion inserts new bounded envelopes. Install
+            // its aggregate before calling the ordinary capped insertion path.
+            self.ensure_capture_capacity_schema().await?;
+        }
         self.upgrade_legacy_reconciliation_snapshots().await
     }
 
@@ -479,20 +561,23 @@ impl OutboxStore {
     /// rows created by older runtime-host versions before they can consume remote batch capacity.
     async fn discard_terminal_log_events(&self) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute_batch(
+        loop {
+            let mut rows=self.connection.query("SELECT 1 FROM outbox_events WHERE event_kind='log' LIMIT 1",())
+                .await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+            let more=rows.next().await.map_err(|error|OutboxStoreError::Database(error.to_string()))?.is_some();
+            drop(rows);
+            if !more {return Ok(());}
+            self.execute_bounded_metadata_batch(
                 r#"
-                BEGIN IMMEDIATE;
                 DELETE FROM latency_samples
-                    WHERE event_id IN (SELECT event_id FROM outbox_events WHERE event_kind = 'log');
+                    WHERE event_id IN (SELECT event_id FROM outbox_events WHERE event_kind = 'log' ORDER BY event_id LIMIT 64);
                 DELETE FROM latency_traces
-                    WHERE event_id IN (SELECT event_id FROM outbox_events WHERE event_kind = 'log');
-                DELETE FROM outbox_events WHERE event_kind = 'log';
-                COMMIT;
+                    WHERE event_id IN (SELECT event_id FROM outbox_events WHERE event_kind = 'log' ORDER BY event_id LIMIT 64);
+                DELETE FROM outbox_events WHERE event_id IN (SELECT event_id FROM outbox_events WHERE event_kind = 'log' ORDER BY event_id LIMIT 64);
                 "#,
             )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))
+            .await?;
+        }
     }
 
     /// Older sync agents treated SurrealDB transaction contention as an invalid payload. Recover
@@ -501,25 +586,26 @@ impl OutboxStore {
     async fn requeue_retryable_dead_letters(&self) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
         let now = now_epoch_micros();
-        self.connection
-            .execute(
+        loop { let changed=self.execute_bounded_metadata(
                 "UPDATE outbox_events
                  SET state = 'pending', attempt_count = 0, next_attempt_at_us = ?1,
                      last_error = NULL
-                 WHERE state = 'dead_letter' AND priority != 'reconciliation' AND event_id IN (
+                 WHERE event_id IN (SELECT event_id FROM outbox_events
+                     WHERE state='dead_letter' AND priority!='reconciliation' AND event_id IN (
                      SELECT event_id FROM dead_letters
                      WHERE lower(reason) LIKE '%transaction conflict%'
                         OR lower(reason) LIKE '%resource busy%'
                         OR lower(reason) LIKE '%database is locked%'
                         OR lower(reason) LIKE '%this transaction can be retried%'
-                 )",
+                 ) LIMIT 64)",
                 params![now],
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        self.connection
-            .execute(
-                "DELETE FROM dead_letters WHERE event_id IN (
+            ?;
+            if changed==0 {break;}
+        }
+        loop { let changed=self.execute_bounded_metadata(
+                "DELETE FROM dead_letters WHERE rowid IN (SELECT rowid FROM dead_letters WHERE event_id IN (
                     SELECT event_id FROM outbox_events
                     WHERE state = 'pending' AND priority != 'reconciliation'
                  ) AND (
@@ -527,11 +613,13 @@ impl OutboxStore {
                     OR lower(reason) LIKE '%resource busy%'
                     OR lower(reason) LIKE '%database is locked%'
                     OR lower(reason) LIKE '%this transaction can be retried%'
-                 )",
+                 ) LIMIT 64)",
                 (),
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            ?;
+            if changed==0 {break;}
+        }
         Ok(())
     }
 
@@ -543,22 +631,23 @@ impl OutboxStore {
     async fn reset_pending_contention_backoff(&self) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
         let now = now_epoch_micros();
-        self.connection
-            .execute(
+        loop { let changed=self.execute_bounded_metadata(
                 "UPDATE outbox_events
                  SET attempt_count = 0, next_attempt_at_us = ?1, last_error = NULL
-                 WHERE state = 'pending' AND priority != 'reconciliation'
+                 WHERE event_id IN (SELECT event_id FROM outbox_events WHERE state = 'pending' AND priority != 'reconciliation'
                    AND last_error IS NOT NULL
                    AND (
                        lower(last_error) LIKE '%transaction conflict%'
                        OR lower(last_error) LIKE '%resource busy%'
                        OR lower(last_error) LIKE '%database is locked%'
                        OR lower(last_error) LIKE '%this transaction can be retried%'
-                   )",
+                   ) LIMIT 64)",
                 params![now],
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            ?;
+            if changed==0 {break;}
+        }
         Ok(())
     }
 
@@ -566,33 +655,11 @@ impl OutboxStore {
     /// deterministic protocol-v2 messages. The original row is marked committed only after all
     /// replacement rows are durable, so a process crash cannot lose reconciliation work.
     async fn upgrade_legacy_reconciliation_snapshots(&self) -> Result<(), OutboxStoreError> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT event_id, wire_payload FROM outbox_events
-                 WHERE state = 'pending' AND event_kind = 'reconciliation_snapshot'",
-                (),
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut legacy = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            legacy.push((event_id, payload));
-        }
-        drop(rows);
-
-        for (stored_event_id, payload) in legacy {
-            let event = match FlatbufferEventCodec::decode(&payload) {
+        let mut after=None;
+        while let Some((stored_event_id,payload))=self.next_legacy_envelope(
+            "state='pending' AND event_kind='reconciliation_snapshot'",after.as_deref()).await? {
+            after=Some(stored_event_id.clone());
+            let mut event = match FlatbufferEventCodec::decode(&payload) {
                 Ok(event) => event,
                 Err(error) => {
                     if let Ok(event_id) = EventId::parse_str(&stored_event_id) {
@@ -606,7 +673,7 @@ impl OutboxStore {
                 }
             };
             let snapshot =
-                match serde_json::from_value::<ReconciliationSnapshot>(event.payload.clone()) {
+                match serde_json::from_value::<ReconciliationSnapshot>(std::mem::take(&mut event.payload)) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
                         self.move_to_dead_letter(
@@ -617,11 +684,13 @@ impl OutboxStore {
                         continue;
                     }
                 };
-            let chunks = bounded_reconciliation_chunks(snapshot.records.clone());
-            let total_chunks = chunks.len() as u32;
             let total_records = snapshot.records.len() as u64;
+            let chunks = bounded_reconciliation_chunks(snapshot.records);
+            let total_chunks = chunks.len() as u32;
             let mut replacements = Vec::with_capacity(chunks.len() + 2);
             let start = ReconciliationStart {
+                purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
+                critical_replay_through: None,
                 generation: snapshot.generation.clone(),
                 runtime_id: snapshot.runtime_id.clone(),
                 strategy_id: snapshot.strategy_id.clone(),
@@ -681,9 +750,14 @@ impl OutboxStore {
                 .await?;
                 continue;
             }
-            self.insert_events(&replacements).await?;
-            self.connection
-                .execute(
+            // Offline allocations can contain more than 256 bounded chunks.
+            // Commit finite pages; deterministic IDs make a crash before the
+            // original-row acknowledgement an exact, resumable retry.
+            for page in replacements.chunks(64) {
+                self.insert_events(page).await?;
+            }
+            self
+                .execute_bounded_metadata(
                     "UPDATE outbox_events
                      SET state = 'committed', remote_committed_at_us = ?2,
                          last_error = 'upgraded to bounded protocol-v2 reconciliation'
@@ -691,7 +765,7 @@ impl OutboxStore {
                     params![event.event_id.to_string(), now_epoch_micros()],
                 )
                 .await
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+                ?;
         }
         Ok(())
     }
@@ -718,47 +792,12 @@ impl OutboxStore {
         }
         drop(columns);
         if !has_runtime_id {
-            self.connection
-                .execute("ALTER TABLE outbox_events ADD COLUMN runtime_id TEXT", ())
+            self.execute_bounded_metadata("ALTER TABLE outbox_events ADD COLUMN runtime_id TEXT", ())
                 .await
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+                ?;
         }
 
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT event_id, wire_payload FROM outbox_events
-                 WHERE runtime_id IS NULL OR runtime_id = ''",
-                (),
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut backfill = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let event = FlatbufferEventCodec::decode(&payload)?;
-            backfill.push((event_id, event.runtime_id));
-        }
-        drop(rows);
-        for (event_id, runtime_id) in backfill {
-            self.connection
-                .execute(
-                    "UPDATE outbox_events SET runtime_id = ?2 WHERE event_id = ?1",
-                    params![event_id, runtime_id],
-                )
-                .await
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        }
-        Ok(())
+        self.backfill_legacy_runtime_scope().await
     }
 
     /// Migrates the remote persistence cursor from strategy/session scope to the exact runtime
@@ -786,10 +825,8 @@ impl OutboxStore {
             return Ok(());
         }
 
-        self.connection
-            .execute_batch(
+        self.execute_bounded_metadata_batch(
                 r#"
-                BEGIN IMMEDIATE;
                 ALTER TABLE sync_cursors RENAME TO sync_cursors_legacy;
                 CREATE TABLE sync_cursors (
                     runtime_id TEXT NOT NULL DEFAULT '',
@@ -812,11 +849,9 @@ impl OutboxStore {
                        strategy_id, live_session_id, critical_through, updated_at_us
                 FROM sync_cursors_legacy AS legacy;
                 DROP TABLE sync_cursors_legacy;
-                COMMIT;
                 "#,
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))
     }
 
     async fn ensure_reconciliation_job_columns(&self) -> Result<(), OutboxStoreError> {
@@ -840,6 +875,8 @@ impl OutboxStore {
         let additions = [
             ("live_session_id", "TEXT NOT NULL DEFAULT ''"),
             ("run_id", "TEXT"),
+            ("purpose", "TEXT NOT NULL DEFAULT 'startup'"),
+            ("critical_replay_through", "INTEGER"),
             ("candidate_count", "INTEGER NOT NULL DEFAULT 0"),
             ("classified_count", "INTEGER NOT NULL DEFAULT 0"),
             ("unresolved_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -848,13 +885,12 @@ impl OutboxStore {
         ];
         for (name, definition) in additions {
             if !columns.contains(name) {
-                self.connection
-                    .execute(
+                self.execute_bounded_metadata(
                         format!("ALTER TABLE reconciliation_jobs ADD COLUMN {name} {definition}"),
                         (),
                     )
                     .await
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+                    ?;
             }
         }
         Ok(())
@@ -867,131 +903,66 @@ impl OutboxStore {
         &self,
         start: &ReconciliationStart,
     ) -> Result<(), OutboxStoreError> {
-        let _operation = self.operation_gate.lock().await;
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT event_id, wire_payload FROM outbox_events
-                 WHERE state = 'pending' AND priority = 'reconciliation'
-                   AND strategy_id = ?1 AND live_session_id = ?2",
-                params![start.strategy_id.clone(), start.live_session_id.clone()],
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut superseded_event_ids = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            if FlatbufferEventCodec::decode(&payload)
-                .ok()
-                .and_then(|event| {
-                    event
-                        .payload
-                        .get("generation")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .is_some_and(|generation| generation != start.generation)
-            {
-                superseded_event_ids.push(event_id);
-            }
+        if !start.valid_purpose() {
+            return Err(OutboxStoreError::InvalidRecord(
+                "capture recovery requires a run and critical cut-off".into(),
+            ));
         }
-        drop(rows);
-
-        let mut dead_letters = self
-            .connection
-            .query(
-                "SELECT event_id, reason, wire_payload FROM dead_letters
-                 WHERE strategy_id = ?1",
-                params![start.strategy_id.clone()],
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut retry_event_ids = Vec::new();
-        while let Some(row) = dead_letters
+        let _operation = self.operation_gate.lock().await;
+        let mut identity=self.connection.query(
+            "SELECT strategy_id,live_session_id,run_id,purpose,critical_cutoff,critical_replay_through FROM reconciliation_jobs WHERE generation=?1",
+            params![start.generation.clone()],
+        ).await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+        if let Some(row) = identity
             .next()
             .await
             .map_err(|error| OutboxStoreError::Database(error.to_string()))?
         {
-            let event_id: String = row
+            let strategy: String = row
                 .get(0)
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let reason: String = row
+            let session: String = row
                 .get(1)
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let payload: Vec<u8> = row
+            let run: Option<String> = row
                 .get(2)
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let retryable = {
-                let reason = reason.to_ascii_lowercase();
-                reason.contains("transaction conflict")
-                    || reason.contains("resource busy")
-                    || reason.contains("database is locked")
-                    || reason.contains("this transaction can be retried")
-            };
-            let current_generation = FlatbufferEventCodec::decode(&payload)
-                .ok()
-                .filter(|event| event.live_session_id == start.live_session_id)
-                .and_then(|event| {
-                    event
-                        .payload
-                        .get("generation")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .is_some_and(|generation| generation == start.generation);
-            if retryable && current_generation {
-                retry_event_ids.push(event_id);
+            let purpose: String = row
+                .get(3)
+                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            let cutoff: Option<i64> = row.get(4)
+                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            let barrier: Option<i64> = row.get(5)
+                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            if strategy != start.strategy_id
+                || session != start.live_session_id
+                || run != start.run_id
+                || purpose != start.purpose.as_str()
+                || (!start.purpose.is_startup() &&
+                    (cutoff != start.critical_cutoff.map(|value|value as i64)
+                     || barrier != start.critical_replay_through.map(|value|value as i64)))
+            {
+                return Err(OutboxStoreError::InvalidRecord(
+                    "reconciliation generation identity or purpose changed".into(),
+                ));
             }
         }
-        drop(dead_letters);
-
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        drop(identity);
+        let transaction = turso::transaction::Transaction::new_unchecked(
+            &self.connection,
+            turso::transaction::TransactionBehavior::Immediate,
+        )
+        .await
+        .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let result = async {
-            for event_id in superseded_event_ids {
-                self.connection
-                    .execute(
-                        "UPDATE outbox_events SET state = 'committed', remote_committed_at_us = ?2,
-                         last_error = 'superseded by a newer reconciliation run'
-                         WHERE event_id = ?1 AND state = 'pending'",
-                        params![event_id, now_epoch_micros()],
-                    )
-                    .await
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            }
-            self.connection
-                .execute(
-                    "UPDATE reconciliation_jobs SET status = 'superseded', updated_at_us = ?3
-                     WHERE strategy_id = ?1 AND live_session_id = ?2
-                       AND generation != ?4 AND status NOT IN ('completed', 'superseded')",
-                    params![
-                        start.strategy_id.clone(),
-                        start.live_session_id.clone(),
-                        now_epoch_micros(),
-                        start.generation.clone(),
-                    ],
-                )
-                .await
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
             self.connection
                 .execute(
                     "INSERT INTO reconciliation_jobs(
                         generation, strategy_id, live_session_id, run_id, status,
                         uploaded_records, processed_records, candidate_count, classified_count,
                         unresolved_count, retry_count, snapshot_complete, critical_cutoff,
-                        updated_at_us, last_error
-                     ) VALUES (?1, ?2, ?3, ?4, 'queued', 0, 0, 0, 0, 0, 0, ?5, ?6, ?7, NULL)
+                        updated_at_us, last_error, purpose, critical_replay_through
+                     ) VALUES (?1, ?2, ?3, ?4, 'queued', 0, 0, 0, 0, 0, 0, ?5, ?6, ?7, NULL, ?8, ?9)
                      ON CONFLICT(generation) DO UPDATE SET
                         run_id = excluded.run_id,
                         snapshot_complete = excluded.snapshot_complete,
@@ -1005,41 +976,28 @@ impl OutboxStore {
                         i64::from(start.snapshot_complete),
                         start.critical_cutoff.map(|value| value as i64),
                         now_epoch_micros(),
+                        start.purpose.as_str(),
+                        start.critical_replay_through.map(|value|value as i64),
                     ],
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            for event_id in retry_event_ids {
-                self.connection
-                    .execute(
-                        "UPDATE outbox_events SET state = 'pending', attempt_count = 0,
-                         next_attempt_at_us = ?2, last_error = NULL WHERE event_id = ?1",
-                        params![event_id.clone(), now_epoch_micros()],
-                    )
-                    .await
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-                self.connection
-                    .execute(
-                        "DELETE FROM dead_letters WHERE event_id = ?1",
-                        params![event_id],
-                    )
-                    .await
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            }
-            Ok(())
+            self.check_operational_physical_in_transaction().await
         }
         .await;
         match result {
-            Ok(()) => self
-                .connection
-                .execute_batch("COMMIT")
+            Ok(()) => transaction.commit()
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string())),
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
-        }
+        }?;
+        // Persist the replacement job BEFORE retiring old optional snapshots.
+        // Cleanup commits bounded, idempotent pages. A crash/refusal retains
+        // both the current job and every not-yet-transferred old row.
+        self.cleanup_reconciliation_pages(start).await
     }
 
     pub async fn update_reconciliation_progress(
@@ -1047,8 +1005,7 @@ impl OutboxStore {
         progress: &ReconciliationJobProgress,
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute(
+        self.execute_bounded_metadata(
                 "UPDATE reconciliation_jobs SET status = ?2, candidate_count = ?3,
                  classified_count = ?4, processed_records = ?4, unresolved_count = ?5,
                  current_cursor = ?6, retry_count = MAX(retry_count, ?7), last_error = ?8,
@@ -1067,7 +1024,6 @@ impl OutboxStore {
             )
             .await
             .map(|_| ())
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))
     }
 
     pub async fn record_reconciliation_retry(
@@ -1076,8 +1032,7 @@ impl OutboxStore {
         error: &str,
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute(
+        self.execute_bounded_metadata(
                 "UPDATE reconciliation_jobs SET retry_count = retry_count + 1,
                  last_error = ?2, status = 'retrying', updated_at_us = ?3
                  WHERE generation = ?1",
@@ -1089,7 +1044,6 @@ impl OutboxStore {
             )
             .await
             .map(|_| ())
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))
     }
 
     pub async fn insert_events(&self, events: &[CloudEvent]) -> Result<usize, OutboxStoreError> {
@@ -1107,19 +1061,28 @@ impl OutboxStore {
         if events.is_empty() {
             return Ok(0);
         }
+        if self.physical_budget.is_some() && events.len()>256 {
+            return Err(OutboxStoreError::InvalidRecord("capture batch exceeds 256 events".into()));
+        }
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let result = self.insert_events_in_transaction(&events).await;
+        let transaction=turso::transaction::Transaction::new_unchecked(
+            &self.connection,turso::transaction::TransactionBehavior::Immediate)
+            .await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+        let result = async {
+            if let Some(policy)=self.physical_budget {
+                self.check_capture_capacity_in_transaction(&events,policy.payload_limit_bytes).await?;
+            }
+            self.insert_events_in_transaction(&events).await
+        }.await;
         match result {
             Ok(inserted) => {
-                self.connection
-                    .execute_batch("COMMIT")
-                    .await
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+                transaction.commit().await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
                 if inserted != 0 {
+                    if events.iter().any(|event| {
+                        aqe_live_protocol::SafetyObservation::from_event(event).is_some()
+                    }) {
+                        self.safety_notify.notify_waiters();
+                    }
                     for priority in [
                         EventPriority::Critical,
                         EventPriority::Telemetry,
@@ -1135,8 +1098,12 @@ impl OutboxStore {
                 }
                 Ok(inserted)
             }
+            Err(OutboxStoreError::CapturePaused(capacity)) => {
+                transaction.rollback().await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+                Err(OutboxStoreError::CapturePaused(self.normalize_physical_refusal(capacity).await?))
+            }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1260,8 +1227,7 @@ impl OutboxStore {
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
         let now = now_epoch_micros();
-        self.connection
-            .execute(
+        self.execute_bounded_metadata(
                 "INSERT INTO sync_cursors(runtime_id, strategy_id, live_session_id, critical_through, updated_at_us)
                  VALUES ('', ?1, ?2, ?3, ?4)
                  ON CONFLICT(runtime_id, strategy_id, live_session_id) DO UPDATE SET
@@ -1274,8 +1240,7 @@ impl OutboxStore {
                     now,
                 ],
             )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            .await?;
         Ok(())
     }
 
@@ -1288,8 +1253,7 @@ impl OutboxStore {
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
         let now = now_epoch_micros();
-        self.connection
-            .execute(
+        self.execute_bounded_metadata(
                 "INSERT INTO publisher_sequence_cursors(
                     runtime_id, strategy_id, live_session_id, critical_through, updated_at_us
                  ) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1307,8 +1271,7 @@ impl OutboxStore {
                     now,
                 ],
             )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            .await?;
         Ok(())
     }
 
@@ -1350,8 +1313,12 @@ impl OutboxStore {
         live_session_id: &str,
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute(
+        if self.physical_budget.is_some()
+            && [action_id, strategy_id, live_session_id].iter().any(|v| v.is_empty() || v.len() > 512)
+        {
+            return Err(OutboxStoreError::InvalidRecord("action receipt identity exceeds its bound".into()));
+        }
+        self.execute_bounded_metadata(
                 "INSERT OR IGNORE INTO processed_actions(
                     action_id, strategy_id, live_session_id, accepted_at_us
                  ) VALUES (?1, ?2, ?3, ?4)",
@@ -1364,13 +1331,18 @@ impl OutboxStore {
             )
             .await
             .map(|_| ())
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))
     }
 
     async fn insert_events_in_transaction(
         &self,
         events: &[CloudEvent],
     ) -> Result<usize, OutboxStoreError> {
+        self.insert_events_with_payload_check_in_transaction(events,false).await
+    }
+
+    async fn insert_events_with_payload_check_in_transaction(
+        &self, events:&[CloudEvent], exact_payload:bool,
+    ) -> Result<usize,OutboxStoreError> {
         let mut inserted = 0usize;
         for event in events {
             let committed_at = now_epoch_micros();
@@ -1401,12 +1373,15 @@ impl OutboxStore {
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
             inserted += affected as usize;
+            if affected != 0 {
+                self.record_safety_in_transaction(event).await?;
+            }
             if affected == 0 {
                 let mut rows = self
                     .connection
                     .query(
                         "SELECT runtime_id, priority, strategy_id, live_session_id, entity_id,
-                                entity_revision, critical_sequence, event_kind
+                                entity_revision, critical_sequence, event_kind, wire_payload
                          FROM outbox_events WHERE event_id = ?1",
                         params![event.event_id.to_string()],
                     )
@@ -1460,10 +1435,21 @@ impl OutboxStore {
                         event.event_id
                     )));
                 }
+                if exact_payload {
+                    let payload:Vec<u8>=row.get(8)
+                        .map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+                    let saved=FlatbufferEventCodec::decode(&payload)?;
+                    if !capture::same_accepted_payload(&saved,event) {
+                        return Err(OutboxStoreError::InvalidRecord(
+                            "accepted handoff event identity has a different payload".into()));
+                    }
+                }
             }
         }
-        self.set_health_value("last_local_ack_at_us", &now_epoch_micros().to_string())
-            .await?;
+        if inserted>0 {
+            self.set_health_value("last_local_ack_at_us", &now_epoch_micros().to_string()).await?;
+            self.check_physical_capture_in_transaction().await?;
+        }
         Ok(inserted)
     }
 
@@ -1471,14 +1457,36 @@ impl OutboxStore {
         &self,
         event: &CloudEvent,
     ) -> Result<(), OutboxStoreError> {
+        self.insert_telemetry_latest_with_optional_capacity(event, None)
+            .await
+    }
+
+    pub async fn capture_telemetry_latest_with_capacity(
+        &self,
+        event: &CloudEvent,
+        limit_bytes: u64,
+    ) -> Result<(), OutboxStoreError> {
+        self.ensure_capture_capacity_schema().await?;
+        self.insert_telemetry_latest_with_optional_capacity(event, Some(limit_bytes))
+            .await
+    }
+
+    async fn insert_telemetry_latest_with_optional_capacity(
+        &self,
+        event: &CloudEvent,
+        capacity: Option<u64>,
+    ) -> Result<(), OutboxStoreError> {
+        let capacity=match self.physical_budget {
+            Some(policy)=>Some(capacity.unwrap_or(policy.payload_limit_bytes).min(policy.payload_limit_bytes)),
+            None=>capacity,
+        };
         if event.kind == EventKind::Log {
             return Ok(());
         }
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let transaction=turso::transaction::Transaction::new_unchecked(
+            &self.connection,turso::transaction::TransactionBehavior::Immediate)
+            .await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
         let result = async {
             let mut rows = self
                 .connection
@@ -1528,24 +1536,33 @@ impl OutboxStore {
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            if let Some(limit) = capacity {
+                self.check_capture_capacity_in_transaction(std::slice::from_ref(event), limit)
+                    .await?;
+            }
             self.insert_events_in_transaction(std::slice::from_ref(event))
                 .await
         }
         .await;
         match result {
             Ok(inserted) => {
-                self.connection
-                    .execute_batch("COMMIT")
-                    .await
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+                transaction.commit().await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
                 if inserted != 0 {
                     self.priority_change_notifier(EventPriority::Telemetry)
                         .notify_waiters();
                 }
                 Ok(())
             }
+            Err(OutboxStoreError::CapturePaused(capacity)) => {
+                transaction.rollback().await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+                let capacity=self.normalize_physical_refusal(capacity).await?;
+                self.record_capture_pause_locked(std::slice::from_ref(event), capacity)
+                    .await?;
+                self.safety_notify.notify_waiters();
+                Err(OutboxStoreError::CapturePaused(capacity))
+            }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1681,12 +1698,17 @@ impl OutboxStore {
         if event_ids.is_empty() {
             return Ok(());
         }
+        if self.physical_budget.is_some() && event_ids.len()>256 {
+            return Err(OutboxStoreError::InvalidRecord("cloud commit receipt exceeds its batch bound".into()));
+        }
         let _operation = self.operation_gate.lock().await;
         let now = now_epoch_micros();
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let transaction = turso::transaction::Transaction::new_unchecked(
+            &self.connection,
+            turso::transaction::TransactionBehavior::Immediate,
+        )
+        .await
+        .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let result = async {
             for event_id in event_ids {
                 self.connection
@@ -1743,19 +1765,19 @@ impl OutboxStore {
                 }
             }
             self.set_health_value("last_remote_commit_at_us", &now.to_string())
-                .await
+                .await?;
+            self.check_operational_physical_in_transaction().await
         }
         .await;
         match result {
             Ok(()) => {
-                self.connection
-                    .execute_batch("COMMIT")
+                transaction.commit()
                     .await
                     .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
                 Ok(())
             }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1772,11 +1794,16 @@ impl OutboxStore {
         if events.is_empty() {
             return Ok(());
         }
+        if self.physical_budget.is_some() && events.len()>256 {
+            return Err(OutboxStoreError::InvalidRecord("cloud latency receipt exceeds its batch bound".into()));
+        }
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let transaction = turso::transaction::Transaction::new_unchecked(
+            &self.connection,
+            turso::transaction::TransactionBehavior::Immediate,
+        )
+        .await
+        .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let result = async {
             for event in events {
                 let mut trace = event.latency.clone();
@@ -1828,17 +1855,15 @@ impl OutboxStore {
                         .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
                 }
             }
-            Ok(())
+            self.check_physical_capture_in_transaction().await
         }
         .await;
         match result {
-            Ok(()) => self
-                .connection
-                .execute_batch("COMMIT")
+            Ok(()) => transaction.commit()
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string())),
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1853,48 +1878,51 @@ impl OutboxStore {
         let now = now_epoch_micros();
         let current_bucket = now - now.rem_euclid(MINUTE_US);
         let from = current_bucket.saturating_sub(MINUTE_US);
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT stage, duration_us, observed_at_us FROM latency_samples
-                 WHERE observed_at_us >= ?1 ORDER BY observed_at_us ASC",
-                params![from],
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut samples: BTreeMap<(i64, String), Vec<i64>> = BTreeMap::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let stage: String = row
-                .get(0)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let duration_us: i64 = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let observed_at_us: i64 = row
-                .get(2)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            let bucket = observed_at_us - observed_at_us.rem_euclid(MINUTE_US);
-            samples
-                .entry((bucket, stage))
-                .or_default()
-                .push(duration_us);
+        // Exact quantiles, without materializing every duration in Rust or a
+        // SQL temporary sort. The covering index streams ordered durations;
+        // memory depends on the fixed stage directory, not event throughput.
+        let mut samples = BTreeMap::<(i64, String), (i64, [i64; 4])>::new();
+        for bucket in [from, current_bucket] {
+            let end = bucket.saturating_add(MINUTE_US);
+            let mut counts = self.connection.query(
+                "SELECT stage, COUNT(*) FROM latency_samples INDEXED BY idx_latency_samples_stage_duration
+                 WHERE observed_at_us>=?1 AND observed_at_us<?2 GROUP BY stage",
+                params![bucket,end],
+            ).await.map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            while let Some(row) = counts.next().await.map_err(|error|OutboxStoreError::Database(error.to_string()))? {
+                let stage:String=row.get(0).map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+                let count:i64=row.get(1).map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+                if samples.len()>=64 || stage.len()>128 || count<=0 {
+                    return Err(OutboxStoreError::InvalidRecord("latency stage directory exceeds its bound".into()));
+                }
+                samples.insert((bucket,stage),(count,[0;4]));
+            }
         }
-        // End the read transaction before beginning maintenance writes and before a WAL
-        // checkpoint is attempted by the periodic maintenance pass.
-        drop(rows);
+        for ((bucket,stage),(count,values)) in &mut samples {
+            let ranks=[50i64,95,99,100].map(|p|(((*count-1) as u64*p as u64).div_ceil(100)) as i64);
+            let mut rows=self.connection.query(
+                "SELECT duration_us FROM latency_samples INDEXED BY idx_latency_samples_stage_duration
+                 WHERE stage=?1 AND observed_at_us>=?2 AND observed_at_us<?3 ORDER BY duration_us",
+                params![stage.clone(),*bucket,bucket.saturating_add(MINUTE_US)],
+            ).await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+            let mut index=0;
+            while let Some(row)=rows.next().await.map_err(|error|OutboxStoreError::Database(error.to_string()))? {
+                for (rank,value) in ranks.iter().zip(values.iter_mut()) {
+                    if index==*rank { *value=row.get(0).map_err(|error|OutboxStoreError::Database(error.to_string()))?; }
+                }
+                index+=1;
+            }
+            if index!=*count { return Err(OutboxStoreError::InvalidRecord("latency samples changed during serialized maintenance".into())); }
+        }
 
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let transaction = turso::transaction::Transaction::new_unchecked(
+            &self.connection,
+            turso::transaction::TransactionBehavior::Immediate,
+        )
+        .await
+        .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let result = async {
-            for ((bucket, stage), mut values) in samples {
-                values.sort_unstable();
-                let count = values.len();
+            for ((bucket, stage), (count, values)) in samples {
                 self.connection
                     .execute(
                         "INSERT INTO latency_rollups (
@@ -1909,11 +1937,8 @@ impl OutboxStore {
                         params![
                             bucket,
                             stage,
-                            count as i64,
-                            percentile(&values, 50),
-                            percentile(&values, 95),
-                            percentile(&values, 99),
-                            values.last().copied().unwrap_or(0),
+                            count,
+                            values[0], values[1], values[2], values[3],
                         ],
                     )
                     .await
@@ -1922,51 +1947,49 @@ impl OutboxStore {
             let cutoff = now.saturating_sub(TRACE_RETENTION_US);
             self.connection
                 .execute(
-                    "DELETE FROM latency_traces WHERE retained_at_us < ?1",
+                    "DELETE FROM latency_traces WHERE rowid IN (SELECT rowid FROM latency_traces WHERE retained_at_us < ?1 LIMIT 256)",
                     params![cutoff],
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
             self.connection
                 .execute(
-                    "DELETE FROM latency_samples WHERE observed_at_us < ?1",
+                    "DELETE FROM latency_samples WHERE rowid IN (SELECT rowid FROM latency_samples WHERE observed_at_us < ?1 LIMIT 256)",
                     params![now.saturating_sub(RAW_LATENCY_SAMPLE_RETENTION_US)],
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
             self.connection
                 .execute(
-                    "DELETE FROM latency_rollups WHERE bucket_start_us < ?1",
+                    "DELETE FROM latency_rollups WHERE rowid IN (SELECT rowid FROM latency_rollups WHERE bucket_start_us < ?1 LIMIT 256)",
                     params![now.saturating_sub(LATENCY_ROLLUP_RETENTION_US)],
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
             self.connection
                 .execute(
-                    "DELETE FROM processed_actions WHERE accepted_at_us < ?1",
+                    "DELETE FROM processed_actions WHERE rowid IN (SELECT rowid FROM processed_actions WHERE accepted_at_us < ?1 LIMIT 256)",
                     params![now.saturating_sub(AUXILIARY_RETENTION_US)],
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
             self.connection
                 .execute(
-                    "DELETE FROM reconciliation_jobs
-                     WHERE updated_at_us < ?1 AND status IN ('completed', 'superseded')",
+                    "DELETE FROM reconciliation_jobs WHERE rowid IN (SELECT rowid FROM reconciliation_jobs
+                     WHERE updated_at_us < ?1 AND status IN ('completed', 'superseded') LIMIT 256)",
                     params![now.saturating_sub(AUXILIARY_RETENTION_US)],
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            Ok(())
+            self.check_physical_capture_in_transaction().await
         }
         .await;
         match result {
-            Ok(()) => self
-                .connection
-                .execute_batch("COMMIT")
+            Ok(()) => transaction.commit()
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string())),
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1979,9 +2002,16 @@ impl OutboxStore {
         error: &str,
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
+        if self.physical_budget.is_some() && (event_ids.len() > 256 || error.len() > 4096) {
+            return Err(OutboxStoreError::InvalidRecord("cloud retry metadata exceeds its bound".into()));
+        }
         let next_attempt =
             now_epoch_micros().saturating_add((delay_seconds as i64).saturating_mul(1_000_000));
-        for event_id in event_ids {
+        let tx = turso::transaction::Transaction::new_unchecked(
+            &self.connection, turso::transaction::TransactionBehavior::Immediate,
+        ).await.map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let result = async {
+          for event_id in event_ids {
             self.connection
                 .execute(
                     "UPDATE outbox_events
@@ -1993,8 +2023,13 @@ impl OutboxStore {
                 )
                 .await
                 .map_err(|database_error| OutboxStoreError::Database(database_error.to_string()))?;
+          }
+          self.check_operational_physical_in_transaction().await
+        }.await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(|error| OutboxStoreError::Database(error.to_string())),
+            Err(error) => { let _ = tx.rollback().await; Err(error) }
         }
-        Ok(())
     }
 
     pub async fn move_to_dead_letter(
@@ -2004,10 +2039,12 @@ impl OutboxStore {
     ) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
         let now = now_epoch_micros();
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let transaction = turso::transaction::Transaction::new_unchecked(
+            &self.connection,
+            turso::transaction::TransactionBehavior::Immediate,
+        )
+        .await
+        .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let result = async {
             self.connection
                 .execute(
@@ -2025,30 +2062,53 @@ impl OutboxStore {
                 )
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            Ok(())
+            self.check_operational_physical_in_transaction().await
         }
         .await;
         match result {
-            Ok(()) => self
-                .connection
-                .execute_batch("COMMIT")
+            Ok(()) => transaction.commit()
                 .await
                 .map_err(|error| OutboxStoreError::Database(error.to_string())),
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
     }
 
     pub async fn prune_committed(&self, retention_micros: i64) -> Result<u64, OutboxStoreError> {
+        // Checkpoint before cleanup; once an external reader releases its WAL
+        // pin, a prior metadata refusal must not prevent eventual reclamation.
+        self.try_reclaim_physical_wal().await?;
         let _operation = self.operation_gate.lock().await;
         let cutoff = now_epoch_micros().saturating_sub(retention_micros.max(0));
+        let tx = turso::transaction::Transaction::new_unchecked(
+            &self.connection, turso::transaction::TransactionBehavior::Immediate,
+        ).await.map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let result = async {
+        // Retain compact operational facts until BOTH their safety receipt and
+        // the original event's durable handoff completed. Never prune pending
+        // safety work merely because its trading-data copy changed ownership.
+        self.connection.execute(
+            "DELETE FROM safety_observations WHERE rowid IN (
+                SELECT rowid FROM safety_observations WHERE delivered=1 AND event_id IN (
+                  SELECT event_id FROM outbox_events WHERE state='committed' AND remote_committed_at_us<?1 LIMIT 256)
+                LIMIT 256)",
+            params![cutoff]).await.map_err(|error|OutboxStoreError::Database(error.to_string()))?;
+        self.connection
+            .execute(
+                "DELETE FROM safety_observations WHERE rowid IN (
+             SELECT rowid FROM safety_observations WHERE full_evidence_required=0 AND delivered=1 AND updated_at_us<?1 LIMIT 256)",
+                params![cutoff],
+            )
+            .await
+            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let deleted = self
             .connection
             .execute(
-                "DELETE FROM outbox_events
-                 WHERE state = 'committed' AND remote_committed_at_us < ?1",
+                "DELETE FROM outbox_events WHERE event_id IN (
+                 SELECT event_id FROM outbox_events AS e WHERE state = 'committed' AND remote_committed_at_us < ?1
+                 AND NOT EXISTS (SELECT 1 FROM safety_observations AS s WHERE s.event_id=e.event_id AND s.delivered=0) LIMIT 256)",
                 params![cutoff],
             )
             .await
@@ -2058,10 +2118,15 @@ impl OutboxStore {
             .await
             .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         Ok(deleted)
+        }.await;
+        match result {
+            Ok(deleted) => { self.commit_bounded_metadata(tx).await?; Ok(deleted) }
+            Err(error) => { let _ = tx.rollback().await; Err(error) }
+        }
     }
 
     /// Checkpoints WAL pages after retention work. A passive checkpoint never waits for readers;
-    /// the configured journal-size limit bounds the reusable WAL after a successful reset.
+    /// truncation is explicit: the pinned engine ignores journal_size_limit.
     pub async fn checkpoint_wal(&self, truncate: bool) -> Result<(), OutboxStoreError> {
         let _operation = self.operation_gate.lock().await;
         let pragma = if truncate {
@@ -2098,18 +2163,20 @@ impl OutboxStore {
             return Ok(0);
         }
 
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let transaction = turso::transaction::Transaction::new_unchecked(
+            &self.connection,
+            turso::transaction::TransactionBehavior::Immediate,
+        )
+        .await
+        .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
         let result = async {
             let mut deleted = 0u64;
             deleted = deleted.saturating_add(
                 self.connection
                     .execute(
-                        "DELETE FROM outbox_events
-                         WHERE state = 'committed'
-                           AND priority IN ('telemetry', 'reconciliation')",
+                        "DELETE FROM outbox_events WHERE event_id IN (SELECT event_id FROM outbox_events
+                         WHERE state = 'committed' AND priority IN ('telemetry', 'reconciliation')
+                         AND NOT EXISTS(SELECT 1 FROM safety_observations s WHERE s.event_id=outbox_events.event_id AND s.delivered=0) LIMIT 256)",
                         (),
                     )
                     .await
@@ -2118,24 +2185,26 @@ impl OutboxStore {
             if self.database_bytes() >= soft_limit_bytes {
                 deleted = deleted.saturating_add(
                     self.connection
-                        .execute("DELETE FROM outbox_events WHERE state = 'committed'", ())
+                        .execute("DELETE FROM outbox_events WHERE event_id IN (SELECT event_id FROM outbox_events
+                            WHERE state = 'committed' AND NOT EXISTS(SELECT 1 FROM safety_observations s
+                              WHERE s.event_id=outbox_events.event_id AND s.delivered=0) LIMIT 256)", ())
                         .await
                         .map_err(|error| OutboxStoreError::Database(error.to_string()))?,
                 );
             }
+            self.check_operational_physical_in_transaction().await?;
             Ok(deleted)
         }
         .await;
         match result {
             Ok(deleted) => {
-                self.connection
-                    .execute_batch("COMMIT")
+                transaction.commit()
                     .await
                     .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
                 Ok(deleted)
             }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -2269,6 +2338,7 @@ impl OutboxStore {
                 .get(9)
                 .map_err(|error| OutboxStoreError::Database(error.to_string()))?,
             database_bytes: self.database_bytes(),
+            physical_capture: self.physical_usage_in_transaction().await?,
             reconciliation,
         })
     }
@@ -2314,8 +2384,13 @@ impl OutboxStore {
         let mut rows = self
             .connection
             .query(
-                "SELECT COUNT(*) FROM outbox_events INDEXED BY idx_outbox_scope_state
-             WHERE state != 'committed' AND strategy_id = ?1 AND live_session_id = ?2",
+                "SELECT
+                    (SELECT COUNT(*) FROM outbox_events INDEXED BY idx_outbox_scope_state
+                     WHERE state != 'committed' AND strategy_id = ?1 AND live_session_id = ?2) +
+                    (SELECT COUNT(*) FROM safety_observations
+                     WHERE strategy_id=?1 AND live_session_id=?2 AND delivered=0) +
+                    (SELECT COUNT(*) FROM capture_gap_notices
+                     WHERE strategy_id=?1 AND live_session_id=?2)",
                 params![strategy_id.to_string(), live_session_id.to_string()],
             )
             .await
@@ -2536,8 +2611,8 @@ impl OutboxStore {
                 "legacy runtime {runtime_id} requires an unsafe number of sequence checkpoints ({max_sequence})"
             )));
         }
-        self.connection
-            .execute(
+        self
+            .execute_bounded_metadata(
                 "UPDATE outbox_events
                  SET state = 'pending', next_attempt_at_us = 0
                  WHERE state = 'committed' AND priority = 'critical'
@@ -2549,7 +2624,7 @@ impl OutboxStore {
                 ],
             )
             .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            ?;
         let mut rows = self
             .connection
             .query(
@@ -2612,7 +2687,9 @@ impl OutboxStore {
 
     /// Ensures an unexpectedly exited managed process leaves a durable terminal lifecycle event.
     /// AQE normally emits this during graceful teardown; the runtime host supplies it only when
-    /// the process is gone and the scoped outbox has otherwise drained.
+    /// the process is gone and the publisher outbox has been fully imported.
+    /// Remote data may still be paused: this terminal fact uses the independent
+    /// operational path, while its original event stays in sequence.
     pub async fn ensure_runtime_stopped_lifecycle(
         &self,
         runtime_id: &str,
@@ -2663,11 +2740,14 @@ impl OutboxStore {
             .transpose()?;
         drop(rows);
         if latest.as_ref().is_some_and(|event| {
-            event
-                .payload
-                .get("state")
-                .and_then(serde_json::Value::as_str)
-                != Some("running")
+            run_id.is_none_or(|run| event.run_id.as_deref() == Some(run))
+                && matches!(
+                    event
+                        .payload
+                        .get("state")
+                        .and_then(serde_json::Value::as_str),
+                    Some("stopped" | "failed")
+                )
         }) {
             return Ok(false);
         }
@@ -2696,7 +2776,11 @@ impl OutboxStore {
         drop(sequence_rows);
         drop(operation);
 
-        let revision = now_epoch_micros().max(1) as u64;
+        let revision = (now_epoch_micros().max(1) as u64).max(
+            latest
+                .as_ref()
+                .map_or(1, |event| event.entity_revision.saturating_add(1)),
+        );
         let mut event = EventEnvelope::new(
             runtime_id,
             strategy_id,
@@ -2850,6 +2934,7 @@ fn latency_stage_durations(trace: &super::LatencyTrace) -> Vec<(&'static str, i6
     durations
 }
 
+#[cfg(test)]
 fn percentile(values: &[i64], percentile: usize) -> i64 {
     if values.is_empty() {
         return 0;

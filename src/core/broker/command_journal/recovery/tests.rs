@@ -52,7 +52,8 @@ async fn recovery_loads_explicit_closed_dependency_then_releases_it_with_consume
         .into_iter()
         .collect();
     save(&mut journal, vec![target, unrelated.clone(), active]).await;
-    journal.connection.execute("UPDATE broker_insight_checkpoints SET checkpoint_json='not decoded' WHERE insight_id=?1", params![unrelated.insight_id.to_string()]).await.unwrap();
+    // Keep SQL JSON valid for expression indexes, but invalid as a checkpoint.
+    journal.connection.execute(r#"UPDATE broker_insight_checkpoints SET checkpoint_json='{"fixture_corruption":true}' WHERE insight_id=?1"#, params![unrelated.insight_id.to_string()]).await.unwrap();
     drop(journal);
     let mut journal = fixture.open().await;
     let recovered = journal.load_execution_recovery(32).await.unwrap();
@@ -205,7 +206,7 @@ async fn recovery_loads_connected_live_graph_but_not_retired_stack_histories() {
     .await;
     // A cold historical blob must not be decoded on active execution startup.
     // Corruption injection is confined to this disposable test journal.
-    journal.connection.execute("UPDATE broker_insight_checkpoints SET checkpoint_json='not decoded' WHERE insight_id=?1", params![retired_id.to_string()]).await.unwrap();
+    journal.connection.execute(r#"UPDATE broker_insight_checkpoints SET checkpoint_json='{"fixture_corruption":true}' WHERE insight_id=?1"#, params![retired_id.to_string()]).await.unwrap();
     let recovered = journal.load_execution_recovery(32).await.unwrap();
     assert_eq!(
         recovered.rows.keys().copied().collect::<BTreeSet<_>>(),
@@ -338,7 +339,7 @@ async fn interrupted_graph_index_upgrade_resumes_committed_key_and_runs_only_onc
         .await
         .unwrap();
     let last = saved[32].insight_id.to_string();
-    journal.connection.execute("UPDATE broker_insight_checkpoints SET checkpoint_json='interrupted legacy row' WHERE insight_id=?1", params![last.clone()]).await.unwrap();
+    journal.connection.execute(r#"UPDATE broker_insight_checkpoints SET checkpoint_json='{"fixture_corruption":true}' WHERE insight_id=?1"#, params![last.clone()]).await.unwrap();
     assert!(journal.ensure_execution_graph_index().await.is_err());
     let mut state = journal
         .connection
@@ -356,7 +357,7 @@ async fn interrupted_graph_index_upgrade_resumes_committed_key_and_runs_only_onc
     assert_eq!(marker.get::<i64>(1).unwrap(), 0);
     drop(state);
     // Earlier pages need not be decoded again after a process interruption.
-    journal.connection.execute("UPDATE broker_insight_checkpoints SET checkpoint_json='cold row must not be revisited' WHERE insight_id=?1", params![saved[0].insight_id.to_string()]).await.unwrap();
+    journal.connection.execute(r#"UPDATE broker_insight_checkpoints SET checkpoint_json='{"fixture_corruption":true}' WHERE insight_id=?1"#, params![saved[0].insight_id.to_string()]).await.unwrap();
     journal
         .connection
         .execute(

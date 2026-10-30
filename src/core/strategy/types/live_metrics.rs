@@ -4,6 +4,13 @@ use surrealdb::types::SurrealValue;
 
 pub const LIVE_METRICS_CHECKPOINT_VERSION: u16 = 1;
 
+/// Identity of an explicitly audited risk-history repair, not a trading reset.
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue, PartialEq)]
+pub struct EquityRiskReconciliation {
+    pub repair_id: String,
+    pub through: DateTime<Utc>,
+}
+
 /// Versioned persistence state for the online live-performance accumulator.
 /// The public metrics snapshot alone is not sufficient to resume Welford
 /// variance, downside deviation, or an in-progress drawdown exactly.
@@ -11,6 +18,8 @@ pub const LIVE_METRICS_CHECKPOINT_VERSION: u16 = 1;
 pub struct LiveMetricsCheckpoint {
     pub version: u16,
     pub account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equity_risk_reconciliation: Option<EquityRiskReconciliation>,
     #[serde(default)]
     pub history_recovery_complete: bool,
     pub starting_cash: f64,

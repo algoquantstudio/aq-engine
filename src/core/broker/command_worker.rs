@@ -15,12 +15,22 @@ use super::{
     snapshots::{BrokerSnapshotCache, SnapshotUnavailable},
     traits::OrderManagementProvider,
 };
+use crate::core::live_sync::CloudCaptureGate;
 use std::{collections::VecDeque, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 mod account_lane;
 mod host_account_lock;
 mod stop;
+mod analytics_capture;
 use stop::StopFence;
+
+fn check_analytics_capture(capture: &Option<CloudCaptureGate>) -> Result<(), BrokerCommandError> {
+    if capture.as_ref().is_some_and(CloudCaptureGate::is_paused) {
+        Err(BrokerCommandError::CapturePaused)
+    } else {
+        Ok(())
+    }
+}
 
 fn entry_account_rejection(
     action: &BrokerCommandAction,
@@ -42,6 +52,24 @@ fn entry_account_rejection(
 }
 
 enum JournalRequest {
+    CompleteAnalyticsCapture {
+        receipt: super::command_journal::AnalyticsCaptureHandoffReceipt,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<bool,BrokerCommandError>>,
+    },
+    AnalyticsCaptureStatus {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<Option<super::command_journal::AnalyticsCaptureStatus>, BrokerCommandError>>,
+    },
+    AnalyticsCapturePause {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<Option<super::command_journal::AnalyticsCapturePause>, BrokerCommandError>>,
+    },
+    AcknowledgeAnalyticsCaptureHandoff {
+        receipt: super::command_journal::AnalyticsCaptureHandoffReceipt,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<bool, BrokerCommandError>>,
+    },
     PrepareMarkExport {
         _permit:tokio::sync::OwnedSemaphorePermit,
         reply:oneshot::Sender<Result<Option<aqe_live_protocol::PositionMarkTransfer>,BrokerCommandError>>,
@@ -57,10 +85,12 @@ enum JournalRequest {
     },
     RecordPositionMarks {
         batch:super::command_journal::marks::PositionMarkBatch,_permit:tokio::sync::OwnedSemaphorePermit,
+        capture: Option<CloudCaptureGate>,
         reply:oneshot::Sender<Result<usize,BrokerCommandError>>,
     },
     FillHistoryOwners {
         after: String,
+        active_only: bool,
         _permit: tokio::sync::OwnedSemaphorePermit,
         reply: oneshot::Sender<Result<super::fill_history::FillHistoryOwnerPage, BrokerCommandError>>,
     },
@@ -75,6 +105,7 @@ enum JournalRequest {
     },
     RecordFills {
         batch: ExecutionFillBatch,
+        capture: Option<CloudCaptureGate>,
         _permit: tokio::sync::OwnedSemaphorePermit,
         reply: oneshot::Sender<Result<(), BrokerCommandError>>,
     },
@@ -172,8 +203,9 @@ struct QueuedCommand {
     queued_at_us: i64,
 }
 
-const MAX_SUBMISSION_RECONCILIATIONS: usize = 256;
-const SUBMISSION_RECONCILIATION_DELAYS: [Duration; 6] = [
+const MAX_COMMAND_RECONCILIATIONS: usize = 256;
+const MAX_CANCEL_RECOVERY_ATTEMPTS: usize = 6;
+const COMMAND_RECONCILIATION_DELAYS: [Duration; 6] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(5),
@@ -182,7 +214,7 @@ const SUBMISSION_RECONCILIATION_DELAYS: [Duration; 6] = [
     Duration::from_secs(60),
 ];
 
-struct SubmissionReconciliation {
+struct AmbiguousCommandReconciliation {
     command: BrokerCommand,
     attempt: usize,
     due: tokio::time::Instant,
@@ -194,25 +226,25 @@ enum MarginPreflight {
     Declined(String),
 }
 
-fn schedule_submission_reconciliation(
-    pending: &mut VecDeque<SubmissionReconciliation>,
+fn schedule_command_reconciliation(
+    pending: &mut VecDeque<AmbiguousCommandReconciliation>,
     command: &BrokerCommand,
 ) {
-    if pending.len() >= MAX_SUBMISSION_RECONCILIATIONS
+    if pending.len() >= MAX_COMMAND_RECONCILIATIONS
         || pending.iter().any(|item| item.command.id == command.id)
-        || !matches!(command.action, BrokerCommandAction::Submit { .. })
+        || !matches!(command.action, BrokerCommandAction::Submit { .. } | BrokerCommandAction::Cancel { .. })
     {
         return;
     }
-    pending.push_back(SubmissionReconciliation {
+    pending.push_back(AmbiguousCommandReconciliation {
         command: command.clone(),
         attempt: 0,
-        due: tokio::time::Instant::now() + SUBMISSION_RECONCILIATION_DELAYS[0],
+        due: tokio::time::Instant::now() + COMMAND_RECONCILIATION_DELAYS[0],
     });
 }
 
-fn next_submission_reconciliation_at(
-    pending: &VecDeque<SubmissionReconciliation>,
+fn next_command_reconciliation_at(
+    pending: &VecDeque<AmbiguousCommandReconciliation>,
 ) -> tokio::time::Instant {
     pending
         .iter()
@@ -221,9 +253,9 @@ fn next_submission_reconciliation_at(
         .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))
 }
 
-fn take_due_submission_reconciliation(
-    pending: &mut VecDeque<SubmissionReconciliation>,
-) -> Option<SubmissionReconciliation> {
+fn take_due_command_reconciliation(
+    pending: &mut VecDeque<AmbiguousCommandReconciliation>,
+) -> Option<AmbiguousCommandReconciliation> {
     let now = tokio::time::Instant::now();
     let index = pending
         .iter()
@@ -234,12 +266,12 @@ fn take_due_submission_reconciliation(
     pending.remove(index)
 }
 
-fn reschedule_submission_reconciliation(
-    pending: &mut VecDeque<SubmissionReconciliation>,
-    mut item: SubmissionReconciliation,
+fn reschedule_command_reconciliation(
+    pending: &mut VecDeque<AmbiguousCommandReconciliation>,
+    mut item: AmbiguousCommandReconciliation,
 ) {
     item.attempt = item.attempt.saturating_add(1);
-    let Some(delay) = SUBMISSION_RECONCILIATION_DELAYS.get(item.attempt) else {
+    let Some(delay) = COMMAND_RECONCILIATION_DELAYS.get(item.attempt) else {
         return;
     };
     item.due = tokio::time::Instant::now() + *delay;
@@ -418,58 +450,81 @@ impl BrokerCommandSender {
         &self,
         batch: ExecutionFillBatch,
     ) -> Result<(), BrokerCommandError> {
+        self.record_execution_fills_for_capture(batch, None).await
+    }
+
+    pub(crate) async fn record_execution_fills_for_capture(
+        &self,
+        batch: ExecutionFillBatch,
+        capture: Option<CloudCaptureGate>,
+    ) -> Result<(), BrokerCommandError> {
+        check_analytics_capture(&capture)?;
         // Admission may wait for an existing analytics read, but never drops a
         // one-shot fill merely because the inspector/exporter held the permit.
         let permit = Arc::clone(&self.evidence_capacity)
             .acquire_owned().await.map_err(|_| BrokerCommandError::Closed)?;
+        check_analytics_capture(&capture)?;
         let (reply, receiver) = oneshot::channel();
         self.journal_requests.send(JournalRequest::RecordFills {
-            batch, _permit: permit, reply,
+            batch, capture, _permit: permit, reply,
         }).await.map_err(|_| BrokerCommandError::Closed)?;
         BrokerJournalReply(receiver).wait().await
     }
 
     pub(crate) fn try_position_mark_owners(&self,minute:i64,after:Option<(String,String)>)->Result<BrokerJournalReply<super::command_journal::marks::PositionMarkOwners>,BrokerCommandError> {
-        let permit=Arc::clone(&self.evidence_capacity).try_acquire_owned().map_err(|_|BrokerCommandError::QueueFull)?;
+        let permit=self.try_analytics_permit()?;
         let (reply,receiver)=oneshot::channel();
-        self.try_journal_request(JournalRequest::PositionMarkOwners{minute,after,_permit:permit,reply})?;Ok(BrokerJournalReply(receiver))
+        self.try_analytics_request(JournalRequest::PositionMarkOwners{minute,after,_permit:permit,reply})?;Ok(BrokerJournalReply(receiver))
     }
-    pub(crate) async fn record_position_marks(&self,batch:super::command_journal::marks::PositionMarkBatch)->Result<usize,BrokerCommandError> {
+    pub(crate) async fn record_position_marks_for_capture(
+        &self,
+        batch: super::command_journal::marks::PositionMarkBatch,
+        capture: Option<CloudCaptureGate>,
+    ) -> Result<usize, BrokerCommandError> {
+        check_analytics_capture(&capture)?;
         // Scheduled analytics may skip a busy minute; never wait ahead of an
         // actual fill/correction for the shared bounded evidence permit.
-        let permit=Arc::clone(&self.evidence_capacity).try_acquire_owned().map_err(|_|BrokerCommandError::QueueFull)?;
-        let (reply,receiver)=oneshot::channel();
-        self.try_journal_request(JournalRequest::RecordPositionMarks{batch,_permit:permit,reply})?;
+        let permit = self.try_analytics_permit()?;
+        let (reply, receiver) = oneshot::channel();
+        self.try_analytics_request(JournalRequest::RecordPositionMarks {
+            batch, capture, _permit: permit, reply,
+        })?;
         BrokerJournalReply(receiver).wait().await
     }
     pub(crate) fn try_prepare_position_mark_export(&self)->Result<BrokerJournalReply<Option<aqe_live_protocol::PositionMarkTransfer>>,BrokerCommandError> {
-        let permit=Arc::clone(&self.evidence_capacity).try_acquire_owned().map_err(|_|BrokerCommandError::QueueFull)?;
+        let permit=self.try_analytics_permit()?;
         let (reply,receiver)=oneshot::channel();
-        self.try_journal_request(JournalRequest::PrepareMarkExport{_permit:permit,reply})?;
+        self.try_analytics_request(JournalRequest::PrepareMarkExport{_permit:permit,reply})?;
         Ok(BrokerJournalReply(receiver))
     }
     pub(crate) fn try_acknowledge_position_mark_export(&self,receipt:aqe_live_protocol::PositionMarkExportReceipt)->Result<BrokerJournalReply<()>,BrokerCommandError> {
-        let permit=Arc::clone(&self.evidence_capacity).try_acquire_owned().map_err(|_|BrokerCommandError::QueueFull)?;
+        let permit=self.try_analytics_permit()?;
         let (reply,receiver)=oneshot::channel();
-        self.try_journal_request(JournalRequest::AcknowledgeMarkExport{receipt,_permit:permit,reply})?;
+        self.try_analytics_request(JournalRequest::AcknowledgeMarkExport{receipt,_permit:permit,reply})?;
         Ok(BrokerJournalReply(receiver))
     }
     pub(crate) fn try_fill_history_owners(&self, after: String)
         -> Result<BrokerJournalReply<super::fill_history::FillHistoryOwnerPage>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity).try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::FillHistoryOwners { after, _permit:permit, reply })?;
+        self.try_analytics_request(JournalRequest::FillHistoryOwners { after, active_only:false, _permit:permit, reply })?;
+        Ok(BrokerJournalReply(receiver))
+    }
+
+    pub(crate) fn try_active_fill_history_owners(&self, after: String)
+        -> Result<BrokerJournalReply<super::fill_history::FillHistoryOwnerPage>, BrokerCommandError> {
+        let permit = self.try_analytics_permit()?;
+        let (reply, receiver) = oneshot::channel();
+        self.try_analytics_request(JournalRequest::FillHistoryOwners { after, active_only:true, _permit:permit, reply })?;
         Ok(BrokerJournalReply(receiver))
     }
 
     pub fn try_execution_fill_page(
         &self, after: u64, through: Option<u64>, limit: usize,
     ) -> Result<BrokerJournalReply<aqe_live_protocol::ExecutionFillPage>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity)
-            .try_acquire_owned().map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::FillPage {
+        self.try_analytics_request(JournalRequest::FillPage {
             after, through, limit: limit.clamp(1, 128), _permit: permit, reply,
         })?;
         Ok(BrokerJournalReply(receiver))
@@ -477,19 +532,17 @@ impl BrokerCommandSender {
 
     pub fn try_prepare_execution_fill_export(&self)
         -> Result<BrokerJournalReply<Option<aqe_live_protocol::ExecutionFillTransfer>>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity).try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::PrepareFillExport { _permit: permit, reply })?;
+        self.try_analytics_request(JournalRequest::PrepareFillExport { _permit: permit, reply })?;
         Ok(BrokerJournalReply(receiver))
     }
 
     pub fn try_acknowledge_execution_fill_export(&self, receipt: aqe_live_protocol::ExecutionFillExportReceipt)
         -> Result<BrokerJournalReply<()>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity).try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::AcknowledgeFillExport { receipt, _permit: permit, reply })?;
+        self.try_analytics_request(JournalRequest::AcknowledgeFillExport { receipt, _permit: permit, reply })?;
         Ok(BrokerJournalReply(receiver))
     }
 
@@ -504,11 +557,9 @@ impl BrokerCommandSender {
         limit: usize,
     ) -> Result<BrokerJournalReply<aqe_live_protocol::ExecutionEvidencePage>, BrokerCommandError>
     {
-        let permit = Arc::clone(&self.evidence_capacity)
-            .try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::EvidencePage {
+        self.try_analytics_request(JournalRequest::EvidencePage {
             epoch,
             after,
             through,
@@ -527,11 +578,9 @@ impl BrokerCommandSender {
         through: Option<u64>,
         limit: usize,
     ) -> Result<BrokerJournalReply<aqe_live_protocol::ExecutionEvidenceFeedPage>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity)
-            .try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::EvidenceFeedPage {
+        self.try_analytics_request(JournalRequest::EvidenceFeedPage {
             after,
             through,
             limit: limit.clamp(1, 128),
@@ -543,20 +592,32 @@ impl BrokerCommandSender {
 
     pub fn try_prepare_execution_evidence_export(&self)
         -> Result<BrokerJournalReply<Option<aqe_live_protocol::ExecutionEvidenceFeedPage>>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity).try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::PrepareEvidenceExport { _permit: permit, reply })?;
+        self.try_analytics_request(JournalRequest::PrepareEvidenceExport { _permit: permit, reply })?;
         Ok(BrokerJournalReply(receiver))
     }
 
     pub fn try_acknowledge_execution_evidence_export(&self, receipt: aqe_live_protocol::ExecutionEvidenceExportReceipt)
         -> Result<BrokerJournalReply<()>, BrokerCommandError> {
-        let permit = Arc::clone(&self.evidence_capacity).try_acquire_owned()
-            .map_err(|_| BrokerCommandError::QueueFull)?;
+        let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
-        self.try_journal_request(JournalRequest::AcknowledgeEvidenceExport { receipt, _permit: permit, reply })?;
+        self.try_analytics_request(JournalRequest::AcknowledgeEvidenceExport { receipt, _permit: permit, reply })?;
         Ok(BrokerJournalReply(receiver))
+    }
+
+    fn try_analytics_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, BrokerCommandError> {
+        Arc::clone(&self.evidence_capacity).try_acquire_owned().map_err(|error| match error {
+            tokio::sync::TryAcquireError::NoPermits => BrokerCommandError::AnalyticsBusy,
+            tokio::sync::TryAcquireError::Closed => BrokerCommandError::Closed,
+        })
+    }
+
+    fn try_analytics_request(&self, request: JournalRequest) -> Result<(), BrokerCommandError> {
+        self.try_journal_request(request).map_err(|error| match error {
+            BrokerCommandError::QueueFull => BrokerCommandError::AnalyticsQueueFull,
+            other => other,
+        })
     }
 
     fn try_journal_request(&self, request: JournalRequest) -> Result<(), BrokerCommandError> {
@@ -784,6 +845,14 @@ trait CommandExecutor: Send + Sync {
     ) -> impl Future<Output = Result<SubmissionResolution, super::types::BrokerError>> + Send {
         async { Ok(SubmissionResolution::Unsupported) }
     }
+    fn pending_cancellation_recovery(&self, _account: &str, _order: &str)
+        -> impl Future<Output = Result<Option<super::types::OrderLifecycleSnapshot>, super::types::BrokerError>> + Send {
+        async { Ok(None) }
+    }
+    fn retry_cancellation(&self, _account: &str, _order: &str)
+        -> impl Future<Output = BrokerCommandOutcome> + Send {
+        async { BrokerCommandOutcome::Ambiguous { reason: "cancellation recovery unsupported".into() } }
+    }
     fn estimate_order_margin(
         &self,
         _request: &BrokerOrderRequest,
@@ -869,6 +938,19 @@ impl<E: OrderManagementProvider> CommandExecutor for E {
         OrderManagementProvider::reconcile_submission(self, account_id, request).await
     }
 
+    async fn pending_cancellation_recovery(&self, account: &str, order: &str)
+        -> Result<Option<super::types::OrderLifecycleSnapshot>, super::types::BrokerError> {
+        OrderManagementProvider::pending_cancellation_recovery(self, account, order).await
+    }
+
+    async fn retry_cancellation(&self, account: &str, order: &str) -> BrokerCommandOutcome {
+        match OrderManagementProvider::retry_cancellation(self, account, order).await {
+            Ok(true) => BrokerCommandOutcome::Acknowledged,
+            Ok(false) => BrokerCommandOutcome::Ambiguous { reason: "cancellation still lacks terminal broker evidence".into() },
+            Err(error) => BrokerCommandOutcome::Ambiguous { reason: error.to_string() },
+        }
+    }
+
     async fn estimate_order_margin(
         &self,
         request: &BrokerOrderRequest,
@@ -923,11 +1005,12 @@ async fn run<E: CommandExecutor>(
     // consumes all queue slots into an unbounded side buffer nor spins on reads.
     let mut parked_entry: Option<QueuedCommand> = None;
     let mut parked_control: Option<QueuedCommand> = None;
-    let mut submission_reconciliations = VecDeque::new();
+    let mut command_reconciliations = VecDeque::new();
+    let mut cancellation_attempts = std::collections::HashMap::<BrokerCommandId, usize>::new();
     let mut admission_retry = tokio::time::interval(Duration::from_millis(25));
     admission_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     'commands: loop {
-        let reconciliation_due = next_submission_reconciliation_at(&submission_reconciliations);
+        let reconciliation_due = next_command_reconciliation_at(&command_reconciliations);
         let (account_ready, entry_ready, entry_cancelled, account_wake) = {
             let gate = gate.lock();
             let ready = gate
@@ -972,17 +1055,29 @@ async fn run<E: CommandExecutor>(
                 handle_journal_request(&mut journal, request, &events.ready).await;
                 continue;
             }
-            _ = tokio::time::sleep_until(reconciliation_due), if !submission_reconciliations.is_empty() => {
-                let Some(item) = take_due_submission_reconciliation(&mut submission_reconciliations) else {
+            _ = tokio::time::sleep_until(reconciliation_due), if !command_reconciliations.is_empty() => {
+                let Some(item) = take_due_command_reconciliation(&mut command_reconciliations) else {
                     continue;
                 };
-                let still_ambiguous = journal.get(&item.command.id).await?.is_some_and(|record| {
+                let saved = journal.get(&item.command.id).await?;
+                let still_ambiguous = saved.as_ref().is_some_and(|record| {
                     record.state == JournalCommandState::Completed
-                        && record.completion.is_some_and(|completion| {
+                        && record.completion.as_ref().is_some_and(|completion| {
                             matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. })
                         })
                 });
                 if !still_ambiguous {
+                    cancellation_attempts.remove(&item.command.id);
+                    continue;
+                }
+                if matches!(item.command.action, BrokerCommandAction::Cancel { .. }) {
+                    // Re-enter the ordinary control lane, with the same immutable
+                    // command. No broker mutation occurs in this timer branch.
+                    if parked_control.is_none() {
+                        parked_control = Some(QueuedCommand { command: item.command.clone(),
+                            queued_at_us: saved.expect("checked above").queued_at_us });
+                    }
+                    reschedule_command_reconciliation(&mut command_reconciliations, item);
                     continue;
                 }
                 let BrokerCommandAction::Submit { request } = &item.command.action else {
@@ -1011,7 +1106,7 @@ async fn run<E: CommandExecutor>(
                     }
                     Ok(Ok(SubmissionResolution::Unsupported)) => {}
                     Ok(Ok(SubmissionResolution::Unknown)) | Ok(Err(_)) | Err(_) => {
-                        reschedule_submission_reconciliation(&mut submission_reconciliations, item);
+                        reschedule_command_reconciliation(&mut command_reconciliations, item);
                     }
                 }
                 continue;
@@ -1057,7 +1152,8 @@ async fn run<E: CommandExecutor>(
         };
         // Durable result replay is safe in both event-before-response and crash
         // recovery paths. The strategy reducer uses receipt.id for deduplication.
-        if let Some(completion) = record.completion {
+        let mut cancellation_proof = None;
+        if let Some(completion) = record.completion.clone() {
             let completion = reconcile_ambiguous_submission(
                 executor.as_ref(),
                 &mut journal,
@@ -1065,21 +1161,46 @@ async fn run<E: CommandExecutor>(
                 completion,
             )
             .await?;
-            if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. }) {
-                schedule_submission_reconciliation(&mut submission_reconciliations, &command);
+            if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. })
+                && cancellation_attempts.get(&command.id).copied().unwrap_or(0) < MAX_CANCEL_RECOVERY_ATTEMPTS
+                && (cancellation_attempts.contains_key(&command.id) || cancellation_attempts.len() < MAX_COMMAND_RECONCILIATIONS)
+                && let BrokerCommandAction::Cancel { order_id } = &command.action {
+                let read = tokio::time::timeout(Duration::from_secs(10),
+                    executor.pending_cancellation_recovery(&command.account_id, order_id));
+                tokio::pin!(read);
+                cancellation_proof = loop {
+                    tokio::select! {
+                        biased;
+                        _ = events.closed() => break None,
+                        _ = events.stop.notify.notified() => {
+                            events.stop.persist(&mut journal, &events.ready).await?;
+                        }
+                        result = &mut read => break result.ok().and_then(Result::ok).flatten(),
+                        Some(request) = journal_requests.recv() => {
+                            handle_journal_request(&mut journal, request, &events.ready).await;
+                        }
+                    }
+                }
+                    .filter(|proof| proof.order_id == *order_id
+                        && proof.status == super::types::OrderLifecycleStatus::Pending);
             }
-            if !deliver_event(
-                &events,
-                BrokerCommandWorkerEvent::Completion(completion),
-                &mut journal,
-                &mut journal_requests,
-            )
-            .await
-            {
-                break;
+            if cancellation_proof.is_none() {
+                if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. })
+                    && cancellation_attempts.get(&command.id).copied().unwrap_or(0) < MAX_CANCEL_RECOVERY_ATTEMPTS {
+                    schedule_command_reconciliation(&mut command_reconciliations, &command);
+                }
+                if !deliver_event(
+                    &events, BrokerCommandWorkerEvent::Completion(completion),
+                    &mut journal, &mut journal_requests,
+                ).await {
+                    break;
+                }
+                continue;
             }
-            continue;
+            // Keep the old completion intact until the guarded retry obtains
+            // authoritative terminal evidence. Never retry an entry Submit.
         }
+        let mut cancellation_attempt = None;
         let mut dispatched_at_us = record.dispatched_at_us;
         let mut account_permit = None;
         let mut host_account_permit = None;
@@ -1224,14 +1345,36 @@ async fn run<E: CommandExecutor>(
                 }
             }
             let dispatch_time = chrono::Utc::now().timestamp_micros();
-            journal.mark_dispatched(&command.id, dispatch_time).await?;
-            dispatched_at_us = Some(dispatch_time);
+            if let Some(proof) = cancellation_proof.as_ref() {
+                cancellation_attempt = journal.begin_cancellation_recovery(&command, proof, dispatch_time).await?;
+                if cancellation_attempt.is_none() {
+                    cancellation_attempts.remove(&command.id);
+                    continue 'commands;
+                }
+                *cancellation_attempts.entry(command.id.clone()).or_default() += 1;
+                log::info!("Retrying broker-confirmed pending cancellation for command {} under its original durable intent", command.id);
+            } else {
+                journal.mark_dispatched(&command.id, dispatch_time).await?;
+                dispatched_at_us = Some(dispatch_time);
+            }
             // Stop can arrive while the dispatch journal is being fsynced. Gate
             // the first poll as well as admission, without holding a lock over I/O.
             let is_entry = command.action.is_entry();
             let command_id = command.id.clone();
             let account_id = command.account_id.clone();
-            let mut future = std::pin::pin!(executor.execute(command.action.clone()));
+            let execution_action = command.action.clone();
+            let execution_account = command.account_id.clone();
+            let retry_cancel = cancellation_attempt.is_some();
+            let executor_ref = executor.as_ref();
+            // Construct both kinds of future outside the snapshot lock. An
+            // adapter may invalidate its cache while constructing a future;
+            // only the transport's first poll belongs under the freshness gate.
+            let future = if retry_cancel && let BrokerCommandAction::Cancel { order_id } = &execution_action {
+                futures::future::Either::Left(executor_ref.retry_cancellation(&execution_account, order_id))
+            } else {
+                futures::future::Either::Right(executor_ref.execute(execution_action.clone()))
+            };
+            let mut future = std::pin::pin!(future);
             let mut started = false;
             let operation = std::future::poll_fn(|cx| {
                 if !started {
@@ -1343,7 +1486,7 @@ async fn run<E: CommandExecutor>(
             };
             match attempt {
                 Ok(outcome) => {
-                    if !started {
+                    if !started && cancellation_attempt.is_none() {
                         // Local risk refusal has proof that transport was never
                         // polled. Restore journal evidence before completing it.
                         journal
@@ -1357,9 +1500,9 @@ async fn run<E: CommandExecutor>(
                     // The future was never polled. Only this live in-process
                     // evidence permits returning the intent to Queued; a crash
                     // before this write is conservatively recovered as ambiguous.
-                    journal
-                        .defer_unpolled_dispatch(&command.id, dispatch_time)
-                        .await?;
+                    if cancellation_attempt.is_none() {
+                        journal.defer_unpolled_dispatch(&command.id, dispatch_time).await?;
+                    }
                     if reason == SnapshotUnavailable::AccountChanged {
                         gate.lock().stopped = true;
                         events.stop.request();
@@ -1391,12 +1534,23 @@ async fn run<E: CommandExecutor>(
             completed_at_us: chrono::Utc::now().timestamp_micros(),
             outcome,
         };
-        journal.complete(&completion).await?;
+        let completion = if let Some(attempt) = cancellation_attempt {
+            let Some(completion) = journal.finish_cancellation_recovery(&command, attempt, &completion).await?
+                else { cancellation_attempts.remove(&command.id); continue 'commands; };
+            if !matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. }) {
+                cancellation_attempts.remove(&command.id);
+            }
+            completion
+        } else {
+            journal.complete(&completion).await?;
+            completion
+        };
         let completion =
             reconcile_ambiguous_submission(executor.as_ref(), &mut journal, &command, completion)
                 .await?;
-        if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. }) {
-            schedule_submission_reconciliation(&mut submission_reconciliations, &command);
+        if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. })
+            && cancellation_attempts.get(&command.id).copied().unwrap_or(0) < MAX_CANCEL_RECOVERY_ATTEMPTS {
+            schedule_command_reconciliation(&mut command_reconciliations, &command);
         }
         if let Some(permit) = &account_permit {
             permit.finish_entry(
@@ -1435,6 +1589,31 @@ async fn handle_journal_request(
     ready: &tokio::sync::Notify,
 ) {
     match request {
+        JournalRequest::CompleteAnalyticsCapture { receipt, _permit, reply }=>{
+            let result=journal.complete_analytics_capture_with_handoff(&receipt).await;
+            drop(_permit);let _=reply.send(result);
+        }
+        JournalRequest::AnalyticsCaptureStatus { _permit, reply } => {
+            if !reply.is_closed() {
+                let result=journal.analytics_capture_status().await;
+                drop(_permit);
+                let _=reply.send(result);
+            }
+        }
+        JournalRequest::AnalyticsCapturePause { _permit, reply } => {
+            if !reply.is_closed() {
+                let result = journal.analytics_capture_pause().await;
+                drop(_permit);
+                let _ = reply.send(result);
+            }
+        }
+        JournalRequest::AcknowledgeAnalyticsCaptureHandoff { receipt, _permit, reply } => {
+            // Persist an exact local quality receipt even if its observer goes
+            // away. This never resumes capture or mutates a broker command.
+            let result = journal.acknowledge_analytics_capture_handoff(&receipt).await;
+            drop(_permit);
+            let _ = reply.send(result);
+        }
         JournalRequest::PrepareMarkExport{_permit,reply}=>{
             let result=journal.prepare_position_mark_export().await;
             drop(_permit);let _=reply.send(result);
@@ -1446,12 +1625,22 @@ async fn handle_journal_request(
         JournalRequest::PositionMarkOwners{minute,after,_permit,reply}=>{
             if !reply.is_closed(){let result=journal.position_mark_owners(minute,after).await;drop(_permit);let _=reply.send(result);}
         },
-        JournalRequest::RecordPositionMarks{batch,_permit,reply}=>{
-            let result=journal.record_position_marks(batch).await;drop(_permit);let _=reply.send(result);
-        },
-        JournalRequest::FillHistoryOwners { after, _permit, reply } => {
+        JournalRequest::RecordPositionMarks { batch, capture, _permit, reply } => {
+            let result = match check_analytics_capture(&capture) {
+                Ok(()) => {
+                    let result=journal.record_position_marks(batch).await;
+                    analytics_capture::observe_refusal(journal,&capture,&result).await;
+                    result
+                },
+                Err(error) => Err(error),
+            };
+            drop(_permit);
+            let _ = reply.send(result);
+        }
+        JournalRequest::FillHistoryOwners { after, active_only, _permit, reply } => {
             if !reply.is_closed() {
-                let result = journal.fill_history_owner_page(&after).await;
+                let result = if active_only { journal.active_fill_history_owner_page(&after).await }
+                    else { journal.fill_history_owner_page(&after).await };
                 drop(_permit);
                 let _ = reply.send(result);
             }
@@ -1470,9 +1659,18 @@ async fn handle_journal_request(
                 let _ = reply.send(result);
             }
         }
-        JournalRequest::RecordFills { batch, _permit, reply } => {
-            // Persist even if the observer went away after admission.
-            let result = journal.record_execution_fills(&batch).await;
+        JournalRequest::RecordFills { batch, capture, _permit, reply } => {
+            // Recheck after queue/permit waits, before admitting new analytics.
+            // Once the transaction begins it still commits if its observer
+            // disappears; previously accepted facts are never pruned here.
+            let result = match check_analytics_capture(&capture) {
+                Ok(()) => {
+                    let result=journal.record_execution_fills(&batch).await;
+                    analytics_capture::observe_refusal(journal,&capture,&result).await;
+                    result
+                },
+                Err(error) => Err(error),
+            };
             drop(_permit);
             let _ = reply.send(result);
         }

@@ -16,15 +16,24 @@ impl<S: Strategy, E: Broker + OrderManagementProvider, D: DataFeed + DataProvide
     pub(super) async fn persist_live_fill_evidence(
         &self,
         fills: Vec<aqe_live_protocol::ExecutionFillInput>,
+        capture: Option<&crate::core::live_sync::CloudCaptureGate>,
     ) -> Result<(), BrokerCommandError> {
         if fills.is_empty() {
             return Ok(());
+        }
+        if capture.is_some_and(|gate| gate.is_paused()) {
+            // No serialization/journal queue work for intentionally uncaptured
+            // analytics. The trading reducer still consumes the broker event.
+            return Err(BrokerCommandError::CapturePaused);
         }
         let batch = crate::core::broker::command_journal::ExecutionFillBatch::new(fills)?;
         let driver = self.command_driver.as_ref().ok_or_else(|| {
             BrokerCommandError::Journal("execution fill journal is unavailable".into())
         })?;
-        driver.sender().record_execution_fills(batch).await
+        driver
+            .sender()
+            .record_execution_fills_for_capture(batch, capture.cloned())
+            .await
     }
 
     pub(super) fn live_execution_journal_path(&self, strategy: &str, account: &str) -> PathBuf {
@@ -71,6 +80,15 @@ impl<S: Strategy, E: Broker + OrderManagementProvider, D: DataFeed + DataProvide
         &mut self,
         analytics: Option<&mut super::live_event_projection::LocalBatchSyncState>,
     ) -> Result<(), BrokerError> {
+        self.finish_live_execution_retaining_journal(analytics).await.0
+    }
+
+    /// Return exclusive ownership only after awaiting the worker. A source-aware
+    /// publisher can retain that immutable owner through its final drain.
+    pub(super) async fn finish_live_execution_retaining_journal(
+        &mut self,
+        analytics:Option<&mut super::live_event_projection::LocalBatchSyncState>,
+    )->(Result<(),BrokerError>,Option<crate::core::broker::command_journal::BrokerCommandJournal>){
         let settled = match self.live_execution_failure() {
             Some(error) => Err(BrokerError::OrderError(error.to_string())),
             None if self.live_execution_pending() || self.insights.active_insight_count() != 0 => {
@@ -99,8 +117,13 @@ impl<S: Strategy, E: Broker + OrderManagementProvider, D: DataFeed + DataProvide
                 log::warn!("Final execution analytics delivery deferred: {error}");
             }
         }
-        let release = self.stop_live_execution_worker().await;
-        settled.and(release)
+        match self.command_driver.take() {
+            Some(driver)=>match driver.stop().await {
+                Ok(journal)=>(settled,Some(journal)),
+                Err(error)=>(settled.and(Err(BrokerError::OrderError(format!("live execution worker shutdown failed: {error}")))),None),
+            },
+            None=>(settled,None),
+        }
     }
 }
 
@@ -114,6 +137,19 @@ impl<
         &mut self,
         auth: Option<&AqsAuth>,
     ) -> Result<(), BrokerError> {
+        self.start_live_execution_with_capture(auth,None).await
+    }
+
+    pub(super) async fn start_live_execution_with_capture(
+        &mut self,auth:Option<&AqsAuth>,capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+    )->Result<(),BrokerError>{
+        self.start_live_execution_with_source_observation(auth,capture,None).await
+    }
+
+    pub(super) async fn start_live_execution_with_source_observation(
+        &mut self,auth:Option<&AqsAuth>,capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+        observer:Option<&crate::core::live_sync::LocalEventPublisher>,
+    )->Result<(),BrokerError>{
         let account = self.broker.account_snapshot()?;
         let cache = self.broker.live_snapshot_cache().ok_or_else(|| {
             BrokerError::OrderError(
@@ -128,12 +164,14 @@ impl<
             ));
         }
         let path = self.live_execution_journal_path(strategy, &account.account_id);
-        self.start_command_driver_with_recovery_signal(
+        self.start_command_driver_with_source_observation(
             path,
             strategy,
             account.account_id.trim(),
             Default::default(),
             false,
+            capture,
+            observer,
         )
         .await
         .map_err(|error| {
@@ -152,18 +190,22 @@ impl<
     pub(super) async fn resume_after_recovered_stop(
         &mut self,
         auth: Option<&AqsAuth>,
+        capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+        observer:Option<&crate::core::live_sync::LocalEventPublisher>,
     ) -> Result<(), BrokerError> {
         self.finish_live_execution(None).await?;
         self.prepare_recovered_live_restart()?;
         let account = self.broker.account_snapshot()?;
         let key = self.live_metrics_strategy_key(auth);
         let strategy = scope_strategy_id(&key);
-        self.start_command_driver_with_recovery_signal(
+        self.start_command_driver_with_source_observation(
             self.live_execution_journal_path(strategy, &account.account_id),
             strategy,
             account.account_id.trim(),
             Default::default(),
             false,
+            capture,
+            observer,
         )
         .await
         .map_err(|error| BrokerError::OrderError(error.to_string()))?;

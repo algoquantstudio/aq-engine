@@ -5,7 +5,7 @@ use crate::core::broker::commands::{
 };
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
 use crate::core::broker::types::BrokerError;
-use crate::core::broker::types::{Account, Asset, BarData, Quote};
+use crate::core::broker::types::{Account, Asset, BarData, Position, Quote};
 use crate::core::broker::{
     BrokerFeature, DataFeedFeature, UnifiedBroker, effective_buying_power_from,
 };
@@ -212,6 +212,14 @@ pub trait StrategyContext {
     /// Transport-free decision snapshot. Missing/stale live data returns a typed
     /// SnapshotUnavailable error; pipes must defer instead of rejecting the insight.
     fn account(&self) -> Result<Account, BrokerError>;
+    /// Current individual broker positions, including entry IDs. Reads the
+    /// account-scoped snapshot only; stale/missing data is an error, not flat.
+    fn get_positions(&self) -> Result<Vec<Position>, BrokerError> {
+        Err(BrokerError::SnapshotUnavailable {
+            kind: crate::core::broker::snapshots::SnapshotKind::Positions,
+            reason: crate::core::broker::snapshots::SnapshotUnavailable::Missing,
+        })
+    }
     /// Non-blocking broker snapshot for hot-path capacity checks. Never performs I/O.
     fn cached_account(&self) -> Option<Account> {
         None

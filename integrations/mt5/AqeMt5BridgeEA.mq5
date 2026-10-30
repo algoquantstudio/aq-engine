@@ -3,7 +3,7 @@
 //| Local RPC bridge EA for AlgoQuant Engine MT5 runtime integration.|
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.425"
+#property version "1.427"
 
 #include <Trade/Trade.mqh>
 
@@ -1777,20 +1777,209 @@ ENUM_TIMEFRAMES TimeframeFromCode(string code)
    return PERIOD_M1;
 }
 
+// BEGIN read-only account cash-flow observations. Non-trade money operations
+// have no order/Insight ownership. Capture is bounded and never sends an order.
+struct AccountCashFlowFact
+{
+   ulong deal;
+   long sequence;
+   string kind;
+   double amount;
+   long broker_time_ms;
+   long occurred_at_us;
+   long observed_at_us;
+   bool deleted;
+};
+AccountCashFlowFact g_account_cash_flows[256];
+int g_account_cash_flow_head = 0;
+int g_account_cash_flow_count = 0;
+long g_account_cash_flow_sequence = 0;
+long g_account_cash_flow_account = 0;
+string g_account_cash_flow_currency = "";
+string g_account_cash_flow_server = "";
+string g_account_cash_flow_source = "";
+long g_account_cash_flow_from_us = 0;
+
+void EnsureAccountCashFlowScope()
+{
+   long account = AccountInfoInteger(ACCOUNT_LOGIN);
+   string currency = AccountInfoString(ACCOUNT_CURRENCY);
+   string server = AccountInfoString(ACCOUNT_SERVER);
+   if(g_account_cash_flow_source != "" && account == g_account_cash_flow_account
+      && currency == g_account_cash_flow_currency && server == g_account_cash_flow_server) return;
+   g_account_cash_flow_account = account;
+   g_account_cash_flow_currency = currency;
+   g_account_cash_flow_server = server;
+   g_account_cash_flow_source = "mt5-flow:" + IntegerToString(account) + ":"
+      + IntegerToString((long)TimeGMT()) + ":" + IntegerToString((long)GetMicrosecondCount());
+   g_account_cash_flow_from_us = (long)TimeGMT() * 1000000;
+   g_account_cash_flow_head = 0;
+   g_account_cash_flow_count = 0;
+   g_account_cash_flow_sequence = 0;
+}
+
+string AccountCashFlowKind(long type)
+{
+   switch((ENUM_DEAL_TYPE)type)
+   {
+      case DEAL_TYPE_BALANCE: return "balance"; // NOT proof of deposit/withdrawal.
+      case DEAL_TYPE_CREDIT: return "credit";
+      case DEAL_TYPE_CHARGE: return "charge";
+      case DEAL_TYPE_CORRECTION: return "correction";
+      case DEAL_TYPE_BONUS: return "bonus";
+      case DEAL_TYPE_COMMISSION:
+      case DEAL_TYPE_COMMISSION_DAILY:
+      case DEAL_TYPE_COMMISSION_MONTHLY:
+      case DEAL_TYPE_COMMISSION_AGENT_DAILY:
+      case DEAL_TYPE_COMMISSION_AGENT_MONTHLY: return "commission";
+      case DEAL_TYPE_INTEREST: return "interest";
+      case DEAL_DIVIDEND:
+      case DEAL_DIVIDEND_FRANKED: return "dividend";
+      case DEAL_TAX: return "tax";
+      case DEAL_TYPE_BUY_CANCELED:
+      case DEAL_TYPE_SELL_CANCELED: return "cancelled_trade";
+   }
+   return "unknown";
+}
+
+void ObserveAccountCashFlow(const MqlTradeTransaction &trans, long observed_at_us)
+{
+   if(trans.deal == 0 || (trans.type != TRADE_TRANSACTION_DEAL_ADD
+      && trans.type != TRADE_TRANSACTION_DEAL_UPDATE && trans.type != TRADE_TRANSACTION_DEAL_DELETE)) return;
+   // The normal fill hot path does not scan the retained money-operation book.
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD
+      && (trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL)) return;
+   EnsureAccountCashFlowScope();
+   int previous = -1;
+   for(int i = g_account_cash_flow_count - 1; i >= 0; i--)
+   {
+      int index = (g_account_cash_flow_head + i) % 256;
+      if(g_account_cash_flows[index].deal == trans.deal) { previous = index; break; }
+   }
+   AccountCashFlowFact fact;
+   if(trans.type == TRADE_TRANSACTION_DEAL_DELETE)
+   {
+      // An unknown deleted trading deal must not become a zero cash movement.
+      if(previous < 0) return;
+      fact = g_account_cash_flows[previous];
+      fact.deleted = true;
+   }
+   else
+   {
+      if(!HistoryDealSelect(trans.deal)) return;
+      long type = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+      if(type == DEAL_TYPE_BUY || type == DEAL_TYPE_SELL)
+      {
+         if(previous < 0) return;
+         // A broker revision which reclassifies a previously recorded money
+         // operation invalidates that old fact; it is not another transfer.
+         fact = g_account_cash_flows[previous];
+         fact.deleted = true;
+      }
+      else
+      {
+      fact.deal = trans.deal;
+      fact.kind = AccountCashFlowKind(type);
+      fact.amount = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+         + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION)
+         + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+         + HistoryDealGetDouble(trans.deal, DEAL_FEE);
+      if(!MathIsValidNumber(fact.amount)) return;
+      fact.broker_time_ms = HistoryDealGetInteger(trans.deal, DEAL_TIME_MSC);
+      fact.occurred_at_us = 0;
+      long utc_us = (fact.broker_time_ms - (long)g_history_utc_offset_seconds * 1000) * 1000;
+      if(g_history_utc_offset_seconds >= -50400 && g_history_utc_offset_seconds <= 50400
+         && g_history_clock_utc_from > 0 && g_history_clock_last_observed > 0
+         && observed_at_us - (long)g_history_clock_last_observed * 1000000 <= 3000000
+         && utc_us >= (long)g_history_clock_utc_from * 1000000
+         && utc_us <= (long)g_history_clock_last_observed * 1000000 + 999999)
+         fact.occurred_at_us = utc_us;
+      fact.deleted = false;
+      }
+   }
+   if(previous >= 0)
+   {
+      AccountCashFlowFact old = g_account_cash_flows[previous];
+      if(old.kind == fact.kind && old.amount == fact.amount && old.deleted == fact.deleted
+         && old.broker_time_ms == fact.broker_time_ms && old.occurred_at_us == fact.occurred_at_us) return;
+   }
+   fact.observed_at_us = observed_at_us;
+   fact.sequence = ++g_account_cash_flow_sequence;
+   int slot;
+   if(g_account_cash_flow_count < 256)
+   {
+      slot = (g_account_cash_flow_head + g_account_cash_flow_count) % 256;
+      g_account_cash_flow_count++;
+   }
+   else { slot = g_account_cash_flow_head; g_account_cash_flow_head = (g_account_cash_flow_head + 1) % 256; }
+   g_account_cash_flows[slot] = fact;
+}
+
+string AccountCashFlowsJson(string account_id, string source_id, long after)
+{
+   EnsureAccountCashFlowScope();
+   if(account_id != IntegerToString(g_account_cash_flow_account) || after < 0) return "null";
+   long first = g_account_cash_flow_count == 0 ? g_account_cash_flow_sequence
+      : g_account_cash_flows[g_account_cash_flow_head].sequence - 1;
+   if(source_id != g_account_cash_flow_source || after < first) after = first;
+   if(after > g_account_cash_flow_sequence) return "null";
+   string records = "";
+   long next = after;
+   int emitted = 0;
+   for(int i = 0; i < g_account_cash_flow_count && emitted < 32; i++)
+   {
+      AccountCashFlowFact fact = g_account_cash_flows[(g_account_cash_flow_head + i) % 256];
+      if(fact.sequence <= after) continue;
+      if(emitted > 0) records += ",";
+      records += "{\"sequence\":" + IntegerToString(fact.sequence)
+         + ",\"event_id\":\"" + (string)fact.deal + "\",\"kind\":\"" + fact.kind + "\""
+         + ",\"amount\":" + DoubleToString(fact.amount, 8)
+         + ",\"occurred_at_us\":" + (fact.occurred_at_us > 0 ? IntegerToString(fact.occurred_at_us) : "null")
+         + ",\"observed_at_us\":" + IntegerToString(fact.observed_at_us)
+         + ",\"broker_time_ms\":" + (fact.broker_time_ms > 0 ? IntegerToString(fact.broker_time_ms) : "null")
+         + ",\"deleted\":" + (fact.deleted ? "true" : "false") + "}";
+      next = fact.sequence; emitted++;
+   }
+   long through_us = MathMax(g_account_cash_flow_from_us, (long)TimeGMT() * 1000000);
+   return "{\"version\":1,\"provider\":\"mt5-account-deals-v1\",\"source_id\":\"" + g_account_cash_flow_source
+      + "\",\"account_id\":\"" + account_id + "\",\"currency\":\"" + JsonEscape(g_account_cash_flow_currency)
+      + "\",\"from_us\":" + IntegerToString(g_account_cash_flow_from_us)
+      + ",\"through_us\":" + IntegerToString(through_us) + ",\"coverage\":\"observed_only\""
+      + ",\"first_after_sequence\":" + IntegerToString(first) + ",\"after_sequence\":" + IntegerToString(after)
+      + ",\"next_sequence\":" + IntegerToString(next) + ",\"through_sequence\":" + IntegerToString(g_account_cash_flow_sequence)
+      + ",\"records\":[" + records + "]}";
+}
+// END read-only account cash-flow observations.
+
 string AccountJson()
 {
+   // Reachable EA != a broker-confirmed account observation. MT5 may return
+   // zero placeholders during login/reconnection; never publish those as money.
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return "null";
+   ResetLastError();
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   string currency = AccountInfoString(ACCOUNT_CURRENCY);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double cash = AccountInfoDouble(ACCOUNT_BALANCE);
+   double buying_power = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    long max_total_orders = AccountInfoInteger(ACCOUNT_LIMIT_ORDERS);
+   long leverage = AccountInfoInteger(ACCOUNT_LEVERAGE);
+   if(GetLastError() != 0 || login <= 0 || currency == ""
+      || !MathIsValidNumber(equity) || !MathIsValidNumber(cash) || !MathIsValidNumber(buying_power)
+      || !TerminalInfoInteger(TERMINAL_CONNECTED)
+      || login != AccountInfoInteger(ACCOUNT_LOGIN) || currency != AccountInfoString(ACCOUNT_CURRENCY)) return "null";
    if(max_total_orders <= 0) max_total_orders = 4096;
    return "{"
-      "\"account_id\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\","
+      "\"snapshotConfirmed\":true,"
+      "\"account_id\":\"" + IntegerToString(login) + "\","
       "\"account_type\":\"Live\","
-      "\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + ","
-      "\"cash\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ","
-      "\"currency\":\"" + JsonEscape(AccountInfoString(ACCOUNT_CURRENCY)) + "\","
-      "\"buying_power\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + ","
+      "\"equity\":" + DoubleToString(equity, 2) + ","
+      "\"cash\":" + DoubleToString(cash, 2) + ","
+      "\"currency\":\"" + JsonEscape(currency) + "\","
+      "\"buying_power\":" + DoubleToString(buying_power, 2) + ","
       "\"shorting_enabled\":true,"
       "\"max_total_orders\":" + IntegerToString(max_total_orders) + ","
-      "\"leverage\":" + IntegerToString((int)MathMin(255, AccountInfoInteger(ACCOUNT_LEVERAGE))) +
+      "\"leverage\":" + IntegerToString((int)MathMin(255, leverage)) +
    "}";
 }
 
@@ -2013,6 +2202,69 @@ string AssetJson(string symbol)
    "}";
 }
 
+// Native calibration includes the contract multiplier and current account FX.
+// Only supported contracts linear in price can be revalued by the consumer.
+double QuoteProfitCoefficient(double native_profit, double exposure, double profit_coefficient, double loss_coefficient, double tolerance)
+{
+   // OrderCalcProfit can round to account-currency digits. Select a validated
+   // full-precision native tick value instead of amplifying that rounding.
+   double profit_error = MathAbs(MathAbs(native_profit) - exposure * profit_coefficient);
+   double loss_error = MathAbs(MathAbs(native_profit) - exposure * loss_coefficient);
+   if(!MathIsValidNumber(native_profit) || native_profit == 0
+      || MathMin(profit_error, loss_error) > tolerance) return 0;
+   return profit_error <= loss_error ? profit_coefficient : loss_coefficient;
+}
+
+string QuoteProfitModelJson(string symbol, MqlTick &tick)
+{
+   long mode = SymbolInfoInteger(symbol, SYMBOL_TRADE_CALC_MODE);
+   bool linear = mode == SYMBOL_CALC_MODE_FOREX || mode == SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE
+      || mode == SYMBOL_CALC_MODE_CFD || mode == SYMBOL_CALC_MODE_CFDINDEX
+      || mode == SYMBOL_CALC_MODE_CFDLEVERAGE || mode == SYMBOL_CALC_MODE_EXCH_STOCKS
+      || mode == SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX || mode == SYMBOL_CALC_MODE_FUTURES
+      || mode == SYMBOL_CALC_MODE_EXCH_FUTURES || mode == SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS;
+   if(!linear || !TerminalInfoInteger(TERMINAL_CONNECTED) || tick.bid <= 0 || tick.ask < tick.bid) return "null";
+   long account = AccountInfoInteger(ACCOUNT_LOGIN);
+   string currency = AccountInfoString(ACCOUNT_CURRENCY);
+   if(account <= 0 || currency == "") return "null";
+   double minimum_quantity = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double quantity = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_profit = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_PROFIT);
+   double tick_loss = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   int currency_digits = (int)AccountInfoInteger(ACCOUNT_CURRENCY_DIGITS);
+   double step = MathMax(tick_size, tick.bid * 0.25);
+   if(minimum_quantity <= 0 || quantity < minimum_quantity || step <= 0 || step >= tick.bid * 0.5
+      || tick_size <= 0 || tick_profit <= 0 || tick_loss <= 0 || currency_digits < 0 || currency_digits > 8
+      || !MathIsValidNumber(tick_profit) || !MathIsValidNumber(tick_loss)) return "null";
+   double buy_gain=0, buy_loss=0, sell_gain=0, sell_loss=0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, symbol, quantity, tick.bid-step, tick.bid, buy_gain)
+      || !OrderCalcProfit(ORDER_TYPE_BUY, symbol, quantity, tick.bid+step, tick.bid, buy_loss)
+      || !OrderCalcProfit(ORDER_TYPE_SELL, symbol, quantity, tick.ask+step, tick.ask, sell_gain)
+      || !OrderCalcProfit(ORDER_TYPE_SELL, symbol, quantity, tick.ask-step, tick.ask, sell_loss)) return "null";
+   if(buy_gain <= 0 || sell_gain <= 0 || buy_loss >= 0 || sell_loss >= 0) return "null";
+   double tolerance = 0.500001 * MathPow(10.0, -currency_digits) + 1e-9;
+   double exposure = quantity * step;
+   buy_gain = QuoteProfitCoefficient(buy_gain, exposure, tick_profit/tick_size, tick_loss/tick_size, tolerance);
+   buy_loss = QuoteProfitCoefficient(buy_loss, exposure, tick_profit/tick_size, tick_loss/tick_size, tolerance);
+   sell_gain = QuoteProfitCoefficient(sell_gain, exposure, tick_profit/tick_size, tick_loss/tick_size, tolerance);
+   sell_loss = QuoteProfitCoefficient(sell_loss, exposure, tick_profit/tick_size, tick_loss/tick_size, tolerance);
+   if(!MathIsValidNumber(buy_gain) || !MathIsValidNumber(buy_loss)
+      || !MathIsValidNumber(sell_gain) || !MathIsValidNumber(sell_loss)
+      || buy_gain <= 0 || buy_loss <= 0 || sell_gain <= 0 || sell_loss <= 0) return "null";
+   MqlTick after;
+   if(!SymbolInfoTick(symbol, after) || tick.time_msc != after.time_msc || tick.bid != after.bid || tick.ask != after.ask
+      || !TerminalInfoInteger(TERMINAL_CONNECTED) || account != AccountInfoInteger(ACCOUNT_LOGIN)
+      || currency != AccountInfoString(ACCOUNT_CURRENCY)
+      || tick_profit != SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_PROFIT)
+      || tick_loss != SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_LOSS)) return "null";
+   return "{\"version\":1,\"account_id\":\"" + IntegerToString(account)
+      + "\",\"currency\":\"" + JsonEscape(currency)
+      + "\",\"symbol\":\"" + JsonEscape(symbol) + "\",\"as_of_us\":" + IntegerToString((long)TimeGMT()*1000000)
+      + ",\"buy_gain\":" + DoubleToString(buy_gain,16) + ",\"buy_loss\":" + DoubleToString(buy_loss,16)
+      + ",\"sell_gain\":" + DoubleToString(sell_gain,16) + ",\"sell_loss\":" + DoubleToString(sell_loss,16) + "}";
+}
+
 string QuoteJsonWithOffset(string symbol, int broker_offset_seconds)
 {
    MqlTick tick;
@@ -2031,7 +2283,8 @@ string QuoteJsonWithOffset(string symbol, int broker_offset_seconds)
       "\"ask_size\":0.0,"
       "\"last\":" + DoubleToString(last, digits) + ","
       "\"last_size\":null,"
-      "\"timestamp\":\"" + IsoTimeMillis(quote_time_ms) + "\""
+      "\"timestamp\":\"" + IsoTimeMillis(quote_time_ms) + "\","
+      "\"profit_model\":" + QuoteProfitModelJson(symbol, tick) +
    "}";
 }
 
@@ -2670,6 +2923,7 @@ string PositionsJson()
       if(emitted > 0) positions += ",";
       positions += "{"
          "\"account_id\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\","
+         "\"order_id\":\"" + IntegerToString((long)ticket) + "\","
          "\"asset\":" + AssetJson(symbol) + ","
          "\"avg_entry_price\":" + DoubleToString(entry, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)) + ","
          "\"qty\":" + DoubleToString(qty, 8) + ","
@@ -3568,7 +3822,16 @@ void ExecuteRpcRequest(int bridge_index, string json)
    }
    if(action == "GET_ACCOUNT")
    {
-      SendRpcResponse(bridge_index, request_id, true, "", AccountJson(), action);
+      string account = AccountJson();
+      SendRpcResponse(bridge_index, request_id, account != "null",
+         account == "null" ? "Broker-confirmed MT5 account observation unavailable" : "", account, action);
+      return;
+   }
+   if(action == "GET_ACCOUNT_CASH_FLOWS")
+   {
+      SendRpcResponse(bridge_index, request_id, true, "", AccountCashFlowsJson(
+         ExtractString(json, "accountId"), ExtractString(json, "sourceId"),
+         (long)ExtractNumber(json, "afterSequence", 0.0)), action);
       return;
    }
    if(action == "GET_TICKER_INFO")
@@ -4640,6 +4903,7 @@ void ProcessTradeTransaction(
    long adapter_queued_at_us
 )
 {
+   ObserveAccountCashFlow(trans, adapter_queued_at_us);
    if(trans.order == 0) return;
    // Only these transactions describe an order lifecycle change. History records
    // may confirm cancellation, but must not manufacture late Accepted events.
@@ -4850,7 +5114,7 @@ void OnTradeTransaction(
    const MqlTradeResult &result
 )
 {
-   if(trans.order == 0)
+   if(trans.order == 0 && trans.deal == 0)
       return;
    QueueTradeTransaction(trans, request, result, ((long)TimeGMT()) * 1000000);
 }

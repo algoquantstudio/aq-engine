@@ -117,41 +117,15 @@ impl ExecutionFillTransfer {
     }
 
     pub fn page(&self) -> Result<ExecutionFillPage, String> {
-        if self.body.is_empty()
-            || self.body.len() > EXECUTION_FILL_TRANSFER_BYTES
-            || ![
-                EXECUTION_FILL_VERSION,
-                EXECUTION_FILL_PAGE_VERSION,
-                EXECUTION_POSITION_CHECK_PAGE_VERSION,
-            ]
-            .contains(&self.schema_version)
-            || self.transfer_id
-                != crate::execution_evidence_transfer::checksum(self.body.as_bytes())
-        {
-            return Err("invalid execution fill transfer size/checksum/version".into());
-        }
-        let page: ExecutionFillPage =
-            serde_json::from_str(&self.body).map_err(|e| e.to_string())?;
-        validate_execution_fill_page(&page)?;
-        if self.schema_version != page.version {
-            return Err("execution fill envelope version mismatch".into());
-        }
-        if (
-            &self.source_id,
-            &self.strategy_id,
-            &self.account_id,
-            self.after_sequence,
-            self.next_sequence,
-        ) != (
-            &page.source_id,
-            &page.strategy_id,
-            &page.account_id,
-            page.after_sequence,
-            page.next_sequence,
-        ) {
-            return Err("execution fill envelope scope mismatch".into());
-        }
-        Ok(page)
+        decode_page(self.into())
+    }
+
+    /// Validate an event's retained JSON payload without copying its envelope
+    /// strings or encoded body. The decoded, validated page remains owned.
+    pub fn page_from_value(value: &serde_json::Value) -> Result<ExecutionFillPage, String> {
+        let envelope = crate::transfer_envelope::Envelope::deserialize(value)
+            .map_err(|_| "invalid execution fill payload".to_owned())?;
+        decode_page(envelope)
     }
 
     pub fn receipt(&self) -> ExecutionFillExportReceipt {
@@ -162,4 +136,42 @@ impl ExecutionFillTransfer {
             next_sequence: self.next_sequence,
         }
     }
+}
+
+fn decode_page(envelope: crate::transfer_envelope::Envelope<'_>) -> Result<ExecutionFillPage, String> {
+    if envelope.body.is_empty()
+        || envelope.body.len() > EXECUTION_FILL_TRANSFER_BYTES
+        || ![
+            EXECUTION_FILL_VERSION,
+            EXECUTION_FILL_PAGE_VERSION,
+            EXECUTION_POSITION_CHECK_PAGE_VERSION,
+        ]
+        .contains(&envelope.schema_version)
+        || envelope.transfer_id
+            != crate::execution_evidence_transfer::checksum(envelope.body.as_bytes())
+    {
+        return Err("invalid execution fill transfer size/checksum/version".into());
+    }
+    let page: ExecutionFillPage =
+        serde_json::from_str(envelope.body).map_err(|e| e.to_string())?;
+    validate_execution_fill_page(&page)?;
+    if envelope.schema_version != page.version {
+        return Err("execution fill envelope version mismatch".into());
+    }
+    if (
+        envelope.source_id,
+        envelope.strategy_id,
+        envelope.account_id,
+        envelope.after_sequence,
+        envelope.next_sequence,
+    ) != (
+        page.source_id.as_str(),
+        page.strategy_id.as_str(),
+        page.account_id.as_str(),
+        page.after_sequence,
+        page.next_sequence,
+    ) {
+        return Err("execution fill envelope scope mismatch".into());
+    }
+    Ok(page)
 }

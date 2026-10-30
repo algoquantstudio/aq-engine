@@ -43,6 +43,7 @@ mod tests {
 
     include!("stop_burst_tests.rs");
     include!("live_memory_regression_tests.rs");
+    include!("cloud_capture_startup_tests.rs");
     include!("lifecycle_reconciliation_tests.rs");
     include!("exit_level_regression_tests.rs");
     include!("indicator_runtime_tests.rs");
@@ -138,15 +139,24 @@ mod tests {
             let watcher = {
                 let broker = state.broker.execution.clone();
                 let stop = state.shutdown_tx.clone();
+                let telemetry=state.runtime_telemetry.snapshot_handle();
                 Some(tokio::spawn(async move {
                     if recovering_stop {
                         // Recovery cancels the old pending entry rather than
                         // submitting it as a new order in this execution.
-                        while !broker.is_connected() {
-                            tokio::task::yield_now().await;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Connection alone does not prove the old stop recovery
+                        // and entry into this run have completed. An arbitrary
+                        // sleep races the legitimate early-stop path under load.
+                        let accepted=tokio::time::timeout(Duration::from_secs(5),async {
+                            loop {
+                                let entered=telemetry.read().unwrap().events.iter()
+                                    .any(|event|event.message=="Live strategy started after recovery");
+                                if entered {break;}
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        }).await;
                         stop.send_replace(true);
+                        accepted.expect("new live run must enter execution after old stop recovery");
                         return;
                     }
                     let accepted = tokio::time::timeout(Duration::from_secs(5), async {
@@ -535,6 +545,7 @@ mod tests {
                 .get(0)
                 .unwrap_or_default();
             Ok(Quote {
+                profit_model: None,
                 symbol: symbol.to_string(),
                 bid: close,
                 ask: close,
@@ -731,6 +742,7 @@ mod tests {
 
         async fn get_latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
             Ok(Quote {
+                profit_model: None,
                 symbol: symbol.to_string(),
                 bid: 100.0,
                 ask: 100.0,
@@ -1130,6 +1142,7 @@ mod tests {
 
         async fn get_latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
             Ok(Quote {
+                profit_model: None,
                 symbol: symbol.to_string(),
                 bid: 100.0,
                 ask: 100.0,
@@ -2982,6 +2995,7 @@ mod tests {
         submit_gate: Option<Arc<TestSubmitGate>>,
         fail_submit: bool,
         fail_close: bool,
+        recover_pending_cancel: bool,
         features: &'static [BrokerFeature],
     }
 
@@ -3007,6 +3021,7 @@ mod tests {
                 submit_gate: None,
                 fail_submit: false,
                 fail_close: false,
+                recover_pending_cancel: false,
                 features,
             }
         }
@@ -3168,6 +3183,24 @@ mod tests {
     }
 
     impl OrderManagementProvider for TestExecutionBroker {
+        async fn pending_cancellation_recovery(&self,account:&str,order:&str)
+            -> Result<Option<crate::core::broker::types::OrderLifecycleSnapshot>,BrokerError> {
+            if !self.recover_pending_cancel {return Ok(None);}
+            assert_eq!(account,"test");
+            Ok(Some(crate::core::broker::types::OrderLifecycleSnapshot {order_id:order.into(),
+                status:crate::core::broker::types::OrderLifecycleStatus::Pending,
+                position_id:None,position_qty:None,symbol:Some("AAPL".into()),detail:None,close_details:None}))
+        }
+        async fn retry_cancellation(&self,account:&str,order:&str)->Result<bool,BrokerError> {
+            assert!(self.recover_pending_cancel);
+            assert_eq!(account,"test");
+            self.cancel_requests.lock().unwrap().push(order.into());
+            let mut confirmed=self.cancel_acknowledgements.lock().unwrap().remove(order)
+                .expect("fixture requires authoritative terminal evidence");
+            confirmed.status=TradeUpdateEvent::Cancelled;
+            self.emit(confirmed,TradeUpdateEvent::Cancelled);
+            Ok(true) // fake adapter's authoritative cancellation proof
+        }
         async fn submit_order(
             &self,
             insight: crate::core::broker::BrokerOrderRequest,

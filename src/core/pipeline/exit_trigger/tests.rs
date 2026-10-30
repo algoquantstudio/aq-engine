@@ -201,6 +201,7 @@ impl StrategyContext for Context {
 }
 fn quote(bid: f64, ask: f64) -> Quote {
     Quote {
+        profit_model: None,
         symbol: "ETHUSD".into(),
         bid,
         ask,

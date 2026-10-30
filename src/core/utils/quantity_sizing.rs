@@ -681,6 +681,7 @@ pub(crate) mod tests {
 
         fn latest_quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
             Ok(Quote {
+                profit_model: None,
                 symbol: symbol.to_string(),
                 bid: 99.0,
                 ask: 100.0,

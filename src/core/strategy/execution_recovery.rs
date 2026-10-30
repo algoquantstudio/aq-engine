@@ -133,11 +133,7 @@ where
                 "cannot replace initialized insight ownership during execution recovery".into(),
             ));
         }
-        let context = if let Some(state) = self.broker.backtest_state.clone() {
-            InsightStrategyContext::new(move || state.read().current_time)
-        } else {
-            InsightStrategyContext::new(chrono::Utc::now)
-        };
+        let context = self.broker.insight_context();
         let restored = rebuild_insights(recovery, context)?;
         for (id, cursor) in restored.pipeline {
             if let Err(error) = self

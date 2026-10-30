@@ -8,15 +8,17 @@ pub(super) enum Job {
     Reconciliation,
     Health,
     Maintenance,
+    CloudHeartbeat,
 }
 
 impl Job {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Telemetry,
         Self::Audit,
         Self::Reconciliation,
         Self::Health,
         Self::Maintenance,
+        Self::CloudHeartbeat,
     ];
 
     fn interval(self, config: &SyncAgentConfig) -> Duration {
@@ -25,6 +27,7 @@ impl Job {
             Self::Reconciliation => config.reconciliation_flush_interval,
             Self::Health => config.health_interval,
             Self::Maintenance => Duration::from_secs(60),
+            Self::CloudHeartbeat => Duration::from_secs(30),
         };
         // Public configuration must not panic an owned task with a zero interval.
         duration.max(Duration::from_millis(1))
@@ -76,6 +79,9 @@ impl SyncAgent {
         let mut next_flush = tokio::time::Instant::now();
         loop {
             if *shutdown.borrow() {
+                return Ok(());
+            }
+            if self.wait_for_cloud_resume(&mut shutdown).await {
                 return Ok(());
             }
             // Keep the configured micro-batch cadence during bursts. A stream
@@ -149,6 +155,21 @@ impl SyncAgent {
                 }
             }
             Job::Health => self.publish_health().await?,
+            Job::CloudHeartbeat => {
+                if self.cloud_pause_remaining().is_none() {
+                    match self.sink.heartbeat().await {
+                        Err(error) if error.kind == RemoteSyncErrorKind::CloudPaused => {
+                            self.pause_cloud_delivery(error.message)
+                        }
+                        Ok(()) => {
+                            if self.health_state.lock().sync_state == "cloud_paused" {
+                                self.set_health_state("recovering", None);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Job::Maintenance => {
                 if !self
                     .outbox

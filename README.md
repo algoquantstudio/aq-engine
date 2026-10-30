@@ -1,8 +1,8 @@
 # AlgoQuant Engine
 
-AlgoQuant Engine, or AQE, is the Rust runtime behind AlgoQuant Studio. It provides the strategy lifecycle, insight state machine, broker and datafeed traits, backtest runner, live runner, and optional AQS Cloud sync used by the Studio desktop application.
+AlgoQuant Engine (AQE) is a modular Rust framework for algorithmic trading. Build reusable strategy components and run them across backtesting and live execution, with control over your data, brokers and infrastructure.
 
-AQE is early alpha software. APIs can still change while the runtime, broker integrations, and AQS Cloud workflow mature.
+Use AQE independently or connect it to AlgoQuant Studio, the desktop workspace for research, visual strategy composition, backtest review and live monitoring. AQE provides the strategy lifecycle, insight state machine, broker and datafeed traits, backtest runner, live runner and optional AQS Cloud synchronisation.
 
 AQE is independently buildable: no AlgoQuant Studio checkout, private research
 crate, hosted gateway or AQS database schema is needed. The
@@ -15,7 +15,7 @@ infrastructure live in the private Studio repository.
 - A strategy lifecycle built around `on_start`, `universe`, `init`, `on_bar`, `generate_insights`, `insight_pipeline`, and `on_teardown`.
 - First-class `Insight` objects for trade intent, state history, entries, fills, closes, rejections, cancellations, child insights, and order context.
 - A unified broker surface that separates execution brokers from market data feeds.
-- Backtest execution with result artifacts written to `metrics.json` and `backtest.db`.
+- Backtest execution with result artefacts written to `metrics.json` and `backtest.db`.
 - Live execution with optional AQS Cloud sync for active strategy monitoring in AlgoQuant Studio.
 - Paper broker and Yahoo Finance datafeed support.
 - Experimental MT5 broker and datafeed bridge support.
@@ -109,9 +109,9 @@ The default alpha path is:
 Backtest persistence writes:
 
 - `metrics.json` for summary metrics.
-- `backtest.db` for larger historical artifacts that can be opened by AQS or regular SQLite readers.
+- `backtest.db` for larger historical artefacts that can be opened by AQS or regular SQLite readers.
 
-AlgoQuant Studio can read these artifacts and present the backtest review UI.
+AlgoQuant Studio can read these artefacts and present the backtest review UI.
 
 ## Live Running
 
@@ -217,22 +217,67 @@ cargo check -p aq-engine --features runtime
 cargo test -p aq-engine --features runtime
 ```
 
-## Status
+When AQE is consumed from another Cargo project (including a Git dependency),
+Cargo does not inherit AQE's `[patch.crates-io]` section. The consuming workspace
+must select the equivalent `zstd` and `quick-xml` security backports itself; see
+`vendor/zstd/AQS-PATCH.txt` and `vendor/quick-xml/AQS-PATCH.txt`. A standalone
+checkout of AQE selects these patches directly. Do not treat a successful build
+of an unpatched downstream dependency graph as security qualification.
 
-AQE is under active development. The public repository is intended for early adopters who are comfortable testing alpha trading infrastructure, reading release notes carefully, and validating broker behaviour before using any live execution path.
+Git dependencies are also pinned by the consuming project's `Cargo.lock`.
+Pushing a new `main` commit makes it available to new resolutions, but an
+existing project must intentionally refresh its AQE lockfile revision before
+rebuilding to use that commit. This does not update an already running strategy.
 
-## License and ownership
+<a id="status"></a>
+
+### Reading the position for an Insight
+
+Inside a strategy or pipe, `insight.get_position()` reads the latest broker
+snapshot for that Insight's saved order ID and symbol without network I/O:
+
+`ctx.get_positions()` returns all individual positions from the same scoped
+snapshot as `Result<Vec<Position>, BrokerError>`, including separate entries on
+one symbol. It is available through the object-safe `StrategyContext` interface
+in strategies, alpha models and pipes. Missing/stale live snapshots return an
+error; they are never reported as an empty portfolio.
+
+```rust,ignore
+match insight.get_position() {
+    Ok(Some(position)) => {
+        println!("{:?} {} P&L: {}", position.order_id, position.asset.symbol, position.unrealized_pnl);
+    }
+    Ok(None) => {} // No open position, including an unfilled pending order.
+    Err(error) => {} // Snapshot unavailable/stale: defer the decision.
+}
+```
+
+The live lookup is indexed by order ID and checks the broker account and snapshot
+freshness. It does not submit orders, change Insight state, or copy P&L into the
+Insight. Legacy position payloads without an order ID remain readable, but cannot
+be used for an exact lookup. Symbol aggregates expose `order_id: None` when they
+combine multiple entries. MT5 reports position profit in account currency;
+commissions and swap remain separate. Paper positions use the paper execution
+model's valuation.
+
+## Release and API Compatibility
+
+Current release status: alpha. APIs may change between releases. Read the release notes, validate broker behaviour with backtests and paper sessions, and assess execution risks before using a live account. A version number alone does not establish production suitability or latency guarantees.
+
+<a id="license-and-ownership"></a>
+
+## Licence and ownership
 
 AQE and its live protocol crate are owned by AlgoQuantStudio and made
 source-available under the [PolyForm Shield License 1.0.0](LICENSE), with the
 required attribution and protected line of business in [NOTICE](NOTICE).
-This is not an OSI-approved open-source license or a blanket non-commercial
-license. It has no scheduled conversion to MIT or Apache-2.0.
+This is not an OSI-approved open-source licence or a blanket non-commercial
+licence. It has no scheduled conversion to MIT or Apache-2.0.
 
 You may use and modify AQE for your own research, backtesting and live trading,
-including internal commercial trading operations, subject to the license.
-The license does not require you to publish your private strategy code.
-Non-competing distributions must retain the license and required notices.
+including internal commercial trading operations, subject to the licence.
+The licence does not require you to publish your private strategy code.
+Non-competing distributions must retain the licence and required notices.
 
 You may not use AQE to provide a product or service that competes with AQE or
 with a product AlgoQuantStudio provides using AQE, including AlgoQuant Studio
@@ -240,7 +285,7 @@ and AQS Cloud. This applies to desktop applications and hosted services, even
 if offered free of charge. Contact AlgoQuantStudio for separate written
 permission if your proposed use is competitive or you are unsure.
 
-The license text controls over this summary. It restricts competitive use of
+The licence text controls over this summary. It restricts competitive use of
 AQE; it is not a claim over independently written software. It does not license
 the private AQS application, gateway, runtime host, research implementation,
-hosted services or branding. Third-party dependencies retain their own licenses.
+hosted services or branding. Third-party dependencies retain their own licences.

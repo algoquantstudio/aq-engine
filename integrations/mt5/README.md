@@ -203,7 +203,13 @@ You can inspect the bridge without placing an order:
 curl http://127.0.0.1:18080/health
 ```
 
-The response includes `transportConnected`, `brokerConnected`, `datafeedConnected`, the last heartbeat, poll, market-data, subscription-sync, and recovery timestamps, the latest terminal status, and the current ordered trade and market-data ingress depths. When AQE recovers, its logs report the reconnect reason, subscription replay, and broker-state refresh result.
+The unauthenticated health response contains connection status only. Include
+`X-AQE-MT5-Token` with the configured bridge token to retrieve detailed account,
+session and command diagnostics. Invalid supplied tokens return HTTP 401. Keep
+the bridge on a trusted private network; plain HTTP/WebSocket is not an encrypted
+Internet transport.
+
+The response includes `transportConnected`, `brokerConnected` and `datafeedConnected`. The authenticated response additionally includes the last heartbeat, poll, market-data, subscription-sync, and recovery timestamps, the latest terminal status, and the current ordered trade and market-data ingress depths. When AQE recovers, its logs report the reconnect reason, subscription replay, and broker-state refresh result.
 
 For an explicitly authorized read-only terminal check, the dedicated ignored
 test starts a temporary listener and reads account, asset, quote, current orders,
@@ -509,7 +515,57 @@ only validates RPC compatibility, not quote freshness, economic values or clock
 coverage. Neither probe invokes a strategy or sends trading commands.
 
 - MT5 is live-only in v1. Use Paper/Yahoo for backtests.
+
+The strategy/Insight position-access probe uses an already configured **extra**
+EA endpoint, and refuses the primary endpoint. It constructs a context without
+starting a strategy or opening an execution journal. A test-only allowlist
+blocks trading RPCs before queueing, including submit/cancel/close requests:
+
+```bash
+node scripts/test-mt5-position-reads.mjs --port 18070
+```
+
+Run this from the AQS workspace. The spare port must already appear in the EA's
+`InpBridgeConnections` and be unused. On macOS the runner reads the private token
+from the saved Default chart profile without printing it; set
+`AQE_MT5_EA_PROFILE` for another profile path. The probe checks exact Insight
+lookups, `ctx.get_positions()`, refreshed P&L, and transport-free repeated reads.
+- `GET_POSITIONS` includes each position's `order_id` (the position ticket used
+  by AQE's entry mapping) and explicit `symbol`. Recompile the EA to supply these
+  fields to updated AQE builds. The bridge retains separate same-symbol tickets;
+  legacy responses without IDs cannot support an exact Insight position lookup.
 - Bracket orders map to MT5 TP/SL values where possible.
 - Trailing stops are maintained by the EA timer after the related MT5 position is open.
 - `wss://` is not currently used for the loopback bridge. Keep the listener private and use `http://`/`ws://` on the execution machine.
 - If the persistent bridge disconnects, the EA reconnects with exponential backoff and uses HTTP fallback in `Auto`. AQE then restores subscriptions and refreshes broker state.
+
+
+### Quote-driven account-currency P&L (EA 1.427)
+
+`Quote.profit_model` is optional and backward compatible on the wire. For linear
+Forex, CFD, stock and futures contracts, the EA calibrates four coefficients
+using native `OrderCalcProfit`: buy/sell, each with gain/loss conversion. This
+includes the terminal’s current contract rules and account-currency FX. Full-precision
+native tick values are checked against those calculations, avoiding amplification
+of account-currency rounding from small calibration amounts. Bonds,
+collateral, unavailable native calculations and a tick changing during calibration
+return no model. The function performs no order or position modification.
+
+AQS values confirmed filled insights from their session-scoped broker account,
+saved entry-order ID, remaining quantity and side-correct bid/ask. It prefers a
+known broker average entry price. Quote valuations are transient browser values,
+not Insight lifecycle revisions or per-tick database writes. Minute marks remain
+separate historical evidence and a timestamped fallback for older EAs. The existing
+active-price refresh setting controls quote delivery (default one second).
+
+Recompile/reload EA 1.427 and rebuild AQS to enable the fast path. The running
+strategy does not need a restart: old AQE clients ignore the optional quote field,
+while the rebuilt AQS datafeed reader consumes it. An execution-account mismatch
+cannot use another account’s calibration, even with the same symbol. If a strategy
+uses an unrelated price feed, it retains the broker-snapshot fallback.
+
+Run `node aq-engine/integrations/mt5/test-quote-profit.mjs` for the executable
+MQL-body regression and `cargo test -p aqe-live-protocol quote_profit` for the
+shared calculator. These source/fixture checks do not establish live terminal
+parity or replace a MetaEditor build. Native MT5 rules are documented in
+[OrderCalcProfit](https://www.mql5.com/en/book/automation/experts/experts_ordercalcprofit).

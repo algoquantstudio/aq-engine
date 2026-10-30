@@ -7,6 +7,8 @@ pub enum OutboxStoreError {
     Database(String),
     Codec(FlatbufferEventCodecError),
     InvalidRecord(String),
+    /// Nonfatal data-capture backpressure, not a failed accepted write.
+    CapturePaused(super::CaptureCapacity),
 }
 
 impl fmt::Display for OutboxStoreError {
@@ -15,6 +17,17 @@ impl fmt::Display for OutboxStoreError {
             Self::Database(message) => write!(formatter, "outbox database error: {message}"),
             Self::Codec(error) => write!(formatter, "outbox codec error: {error}"),
             Self::InvalidRecord(message) => write!(formatter, "invalid outbox record: {message}"),
+            Self::CapturePaused(capacity) if capacity.physical.is_some() => {
+                let physical=capacity.physical.as_ref().unwrap();
+                write!(formatter,
+                    "cloud capture paused at local capacity ({} projected disk bytes / {} limit, {} operational headroom); accepted evidence is retained",
+                    physical.projected_commit_bytes,physical.limit_bytes,physical.operational_headroom_bytes)
+            }
+            Self::CapturePaused(capacity) => write!(
+                formatter,
+                "cloud capture paused at local capacity ({} retained + {} requested / {} bytes); accepted evidence is retained",
+                capacity.retained_bytes, capacity.requested_bytes, capacity.limit_bytes
+            ),
         }
     }
 }
@@ -58,6 +71,7 @@ pub struct OutboxHealth {
     pub current_retry_delay_ms: u64,
     pub last_error: Option<String>,
     pub database_bytes: u64,
+    pub physical_capture: Option<super::PhysicalCaptureUsage>,
     pub reconciliation: Option<ReconciliationJobProgress>,
 }
 

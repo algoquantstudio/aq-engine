@@ -79,6 +79,79 @@ mod live_memory_regressions {
     const RECONCILIATION_CRASH_FIXTURE_PATH: &str =
         "AQE_TEST_RECONCILIATION_CRASH_PATH";
 
+    #[tokio::test]
+    async fn startup_capture_boundary_requires_exact_durable_gap_and_preserves_real_failure() {
+        use crate::core::strategy::live_projection::StartupCloudBoundary;
+        let (mut state,auth,mut healthy)=fixture();
+        assert_eq!(state.establish_startup_cloud_boundary(&mut healthy,&auth).await.unwrap(),
+            StartupCloudBoundary::LocallyAccepted);
+        healthy.shutdown(Duration::from_secs(1)).await;
+        let missing_directory = std::env::temp_dir().join(format!("missing-startup-gap-{}", uuid::Uuid::new_v4()));
+        let missing_store = OutboxStore::open(missing_directory.join("capture.db")).await.unwrap();
+        let unavailable = LocalEventPublisher::spawn(
+            Arc::new(InProcessEventBus::default()),
+            Some(missing_store),
+            crate::core::live_sync::LocalEventPublisherConfig {
+                // A failed budget initialization must not manufacture a gap
+                // receipt. The public hosted builder rejects this value.
+                capture_limit_bytes: Some(0),
+                ..Default::default()
+            },
+        );
+        let mut missing_gap = LocalBatchSyncState::new(unavailable, &auth);
+        assert!(missing_gap.publisher.cloud_capture_paused());
+        assert!(
+            state.establish_startup_cloud_boundary(&mut missing_gap, &auth).await.is_err(),
+            "an unavailable capture budget without durable gap proof is not a successful boundary"
+        );
+        missing_gap.shutdown(Duration::from_secs(1)).await;
+        drop(missing_gap);
+        std::fs::remove_dir_all(missing_directory).unwrap();
+        let capture=crate::core::live_sync::capture_test_fixture::CaptureFixture::active().await;
+        capture.pause().await;
+        let mut sync=LocalBatchSyncState::new(capture.publisher.clone(),&auth);
+        sync.runtime_id="runtime".into();sync.run_id="run".into();
+        let mut row=Insight::default();row.state_log(Some("not exported at startup".into()));
+        state.insights.add_insight(row);
+        assert_eq!(state.establish_startup_cloud_boundary(&mut sync,&auth).await.unwrap(),
+            StartupCloudBoundary::DeferredCaptureGap);
+        assert!(state.insights.has_dirty_insights());
+        assert!(!sync.publisher.admission_failed());
+        sync.runtime_id="another-runtime".into();
+        assert!(state.establish_startup_cloud_boundary(&mut sync,&auth).await.is_err(),
+            "a previous/foreign runtime gap is not this owner's startup receipt");
+        sync.runtime_id="runtime".into();sync.publisher.mark_admission_failed();
+        assert!(state.establish_startup_cloud_boundary(&mut sync,&auth).await.is_err(),
+            "a durable gap cannot hide a real local admission failure");
+        drop(sync);
+        capture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recorded_cloud_gap_defers_stop_analytics_without_claiming_a_full_history_drain() {
+        let (mut state,auth,_)=fixture();
+        let store=OutboxStore::open(std::env::temp_dir().join(format!("stop-gap-history-{}.db",uuid::Uuid::new_v4()))).await.unwrap();
+        let publisher=LocalEventPublisher::spawn(Arc::new(InProcessEventBus::default()),Some(store),
+            crate::core::live_sync::LocalEventPublisherConfig{capture_limit_bytes:Some(1024),..Default::default()});
+        assert!(publisher.wait_for_capture_initialization(Duration::from_secs(2)).await);
+        let mut sync=LocalBatchSyncState::new(publisher.clone(),&auth);
+        let mut row=Insight::default();row.state_log(Some("not exported".into()));
+        state.insights.add_insight(row);
+        assert!(!sync.defer_final_cloud_capture_for_stop().await.unwrap());
+        let refused=sync.event("oversized-capture",crate::core::live_sync::EventPriority::Critical,
+            crate::core::live_sync::EventKind::InsightProjection,serde_json::json!({"data":"x".repeat(4096)}),None);
+        assert!(!sync.publish_projection_batch_durable(vec![refused],vec![]).await);
+        assert!(sync.defer_final_cloud_capture_for_stop().await.unwrap());
+        assert!(state.insights.has_dirty_insights());
+        assert!(state.drain_final_insights_to_local_bus(&mut sync,&auth,Duration::ZERO).await.is_err(),
+            "deferred cloud capture is not a successful full-history export");
+        assert!(state.insights.has_dirty_insights());
+        publisher.mark_admission_failed();
+        assert!(!sync.defer_final_cloud_capture_for_stop().await.unwrap(),
+            "a real failed-admission guard must not be hidden by a cloud pause");
+        publisher.shutdown(Duration::from_secs(1)).await;
+    }
+
     #[test]
     #[ignore = "subprocess crash fixture"]
     fn reconciliation_crash_fixture() {
@@ -136,6 +209,32 @@ mod live_memory_regressions {
         assert_eq!(publisher.health().locally_accepted_critical, total);
         assert_eq!(publisher.pending_critical_count(), 0);
         publisher.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn history_planning_respects_a_partially_drained_queue_watermark() {
+        let (mut state,auth,_)=fixture();
+        let bus=Arc::new(BlockingBus::default());
+        let publisher=LocalEventPublisher::spawn(bus.clone(),None,Default::default());
+        let mut sync=LocalBatchSyncState::new(publisher.clone(),&auth);
+        let subject=EventSubject::for_priority(&sync.runtime_id,&auth.strategy_id,crate::core::live_sync::EventPriority::Critical);
+        for index in 0..4090 {
+            let event=crate::core::live_sync::EventEnvelope::new(&sync.runtime_id,&auth.strategy_id,&sync.live_session_id,
+                format!("filler:{index}"),1,crate::core::live_sync::EventPriority::Critical,
+                crate::core::live_sync::EventKind::InsightProjection,json!({"index":index}));
+            publisher.try_publish_critical(subject.clone(),event).unwrap();
+        }
+        let mut row=Insight::default();
+        for index in 0..32 {row.state_log(Some(format!("history {index}")));}
+        let id=row.insight_id;
+        state.insights.add_insight(row);
+        state.publish_dirty_insights_to_local_bus(&mut sync,&auth,Some(128),true).await;
+        assert_eq!(publisher.pending_critical_count(),4096);
+        assert_eq!(sync.history_offsets.get(&id.to_string()),Some(&5));
+        assert!(state.insights.has_dirty_insights(),"unplanned history remains owned by its source");
+        bus.release.add_permits(4096);
+        publisher.shutdown(Duration::from_secs(3)).await;
+        assert_eq!(publisher.pending_critical_count(),0);
     }
 
     #[tokio::test]

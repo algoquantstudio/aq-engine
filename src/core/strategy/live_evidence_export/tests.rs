@@ -1,4 +1,5 @@
 use super::*;
+mod scheduling;
 
 #[test]
 fn marks_default_on_but_fill_and_duplicate_state_delivery_remain_opt_in() {
@@ -475,6 +476,7 @@ async fn failed_or_wrong_scope_handoff_keeps_frozen_source_page() {
         publish_page(&publisher, &wrong, &page)
             .await
             .unwrap_err()
+            .to_string()
             .contains("scope")
     );
     assert_eq!(

@@ -129,7 +129,7 @@ pub async fn run_action_forwarder(
                         action,
                     ).await;
                 }
-                if live_subscription.is_none() {
+                if live_subscription.is_none() && !sink.hosted_safety_registered().await {
                     match sink.subscribe_pending_actions().await {
                         Ok(subscription) => live_subscription = Some(subscription),
                         Err(error) => {

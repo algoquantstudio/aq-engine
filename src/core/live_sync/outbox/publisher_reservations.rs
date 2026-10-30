@@ -202,13 +202,29 @@ impl OutboxStore {
         let digest = Sha256::digest(&content);
         let id = uuid::Uuid::new_v5(&event.event_id, &digest);
         let _operation = self.operation_gate.lock().await;
-        self.connection.execute(
+        let transaction=turso::transaction::Transaction::new_unchecked(
+            &self.connection,turso::transaction::TransactionBehavior::Immediate).await.map_err(db)?;
+        let result=async {
+        let inserted=self.connection.execute(
             "INSERT OR IGNORE INTO dead_letters
              (event_id, strategy_id, reason, wire_payload, failed_at_us) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id.to_string(), event.strategy_id.clone(),
                 format!("publisher event {} rejected: {reason}", event.event_id), payload, now_epoch_micros()],
         ).await.map_err(db)?;
+        if inserted>0 {self.check_physical_capture_in_transaction().await?;}
         Ok(())
+        }.await;
+        match result {
+            Ok(())=>transaction.commit().await.map_err(db),
+            Err(OutboxStoreError::CapturePaused(capacity))=>{
+                transaction.rollback().await.map_err(db)?;
+                let capacity=self.normalize_physical_refusal(capacity).await?;
+                self.record_capture_pause_locked(std::slice::from_ref(event),capacity).await?;
+                self.safety_notify.notify_waiters();
+                Err(OutboxStoreError::CapturePaused(capacity))
+            }
+            Err(error)=>{let _=transaction.rollback().await;Err(error)}
+        }
     }
 
     /// Atomically deduplicate and assign contiguous critical sequences, retaining
@@ -223,31 +239,78 @@ impl OutboxStore {
         events: &[CloudEvent],
         initial_sequence: u64,
     ) -> Result<Vec<CloudEvent>, OutboxStoreError> {
+        self.reserve_publisher_events_with_optional_capacity(events, initial_sequence, None)
+            .await
+    }
+
+    /// New producer capture only. A capacity refusal rolls back payloads,
+    /// identities AND sequence allocations; it is not an accepted event/DLQ.
+    pub(crate) async fn reserve_publisher_events_with_capacity(
+        &self,
+        events: &[CloudEvent],
+        initial_sequence: u64,
+        limit_bytes: u64,
+    ) -> Result<Vec<CloudEvent>, OutboxStoreError> {
+        self.ensure_capture_capacity_schema().await?;
+        self.reserve_publisher_events_with_optional_capacity(
+            events,
+            initial_sequence,
+            Some(limit_bytes),
+        )
+        .await
+    }
+
+    async fn reserve_publisher_events_with_optional_capacity(
+        &self,
+        events: &[CloudEvent],
+        initial_sequence: u64,
+        capacity: Option<u64>,
+    ) -> Result<Vec<CloudEvent>, OutboxStoreError> {
+        let capacity=match self.physical_budget {
+            Some(policy)=>Some(capacity.unwrap_or(policy.payload_limit_bytes).min(policy.payload_limit_bytes)),
+            None=>capacity,
+        };
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        if capacity.is_some() && events.len() > 256 {
+            return Err(OutboxStoreError::InvalidRecord(
+                "capture batch exceeds 256 events".into(),
+            ));
+        }
         let _operation = self.operation_gate.lock().await;
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .await
-            .map_err(db)?;
+        let transaction=turso::transaction::Transaction::new_unchecked(
+            &self.connection,turso::transaction::TransactionBehavior::Immediate).await.map_err(db)?;
         let result = self
-            .reserve_publisher_events_in_transaction(events, initial_sequence)
+            .reserve_publisher_events_in_transaction(events, initial_sequence, capacity)
             .await;
         match result {
             Ok(fresh) => {
-                if let Err(error) = self.connection.execute_batch("COMMIT").await {
-                    let _ = self.connection.execute_batch("ROLLBACK").await;
-                    return Err(db(error));
-                }
+                transaction.commit().await.map_err(db)?;
                 if !fresh.is_empty() {
+                    if fresh.iter().any(|event| {
+                        aqe_live_protocol::SafetyObservation::from_event(event).is_some()
+                    }) {
+                        self.safety_notify.notify_waiters();
+                    }
                     self.priority_change_notifier(EventPriority::Critical)
                         .notify_waiters();
                 }
                 Ok(fresh)
             }
+            Err(OutboxStoreError::CapturePaused(capacity)) => {
+                transaction.rollback().await.map_err(db)?;
+                let capacity=self.normalize_physical_refusal(capacity).await?;
+                // Legacy identity upgrade is already accepted evidence. A
+                // metadata-only refusal must not fabricate missing history.
+                if capacity.requested_bytes>0 || capacity.physical.is_none() {
+                    self.record_capture_pause_locked(events, capacity).await?;
+                    self.safety_notify.notify_waiters();
+                }
+                Err(OutboxStoreError::CapturePaused(capacity))
+            }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -257,8 +320,10 @@ impl OutboxStore {
         &self,
         events: &[CloudEvent],
         initial_sequence: u64,
+        capacity: Option<u64>,
     ) -> Result<Vec<CloudEvent>, OutboxStoreError> {
         let mut fresh = Vec::with_capacity(events.len());
+        let mut upgraded_legacy=false;
         for event in events {
             if event.priority != EventPriority::Critical || event.kind == EventKind::Log {
                 return Err(OutboxStoreError::InvalidRecord(
@@ -386,9 +451,18 @@ impl OutboxStore {
                 let mut event = event.clone();
                 event.critical_sequence = Some(sequence as u64);
                 fresh.push(event);
+            } else {
+                upgraded_legacy=true;
             }
         }
+        if let Some(limit) = capacity {
+            self.check_capture_capacity_in_transaction(&fresh, limit)
+                .await?;
+        }
         self.insert_events_in_transaction(&fresh).await?;
+        if fresh.is_empty() && upgraded_legacy {
+            self.check_physical_capture_in_transaction().await?;
+        }
         Ok(fresh)
     }
 }

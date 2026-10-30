@@ -5,6 +5,60 @@ mod lifecycle_reconciliation_regressions {
     };
 
     struct CancelHistory(Arc<Mutex<Vec<String>>>);
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn stuck_cancel_startup_recovers_same_journal_then_opens_exactly_one_new_epoch() {
+        use crate::core::{broker::{command_journal::{BrokerCommandJournal,ExecutionCheckpointBatch,ExecutionIntent,lifecycle::ExecutionPhase},
+            commands::{BrokerCommand,BrokerCommandAction,BrokerCommandCompletion,BrokerCommandOutcome}},
+            insight::{execution_checkpoint::InsightExecutionCheckpoint,operations::{PendingInsightMutation,MutationKind,MutationEffect}}};
+        let directory=std::env::temp_dir().join(format!("aqe-stuck-cancel-startup-{}",uuid::Uuid::new_v4()));
+        let mut broker=TestExecutionBroker::with_features(&[]);
+        broker.recover_pending_cancel=true;
+        let teardown=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut state=StrategyState::new("CancelRecovery".into(),"1".into(),
+            LiveCommandLifecycleFixture {teardown_calls:teardown.clone(),cleanup:true},
+            UnifiedBroker::new(broker.clone(),FixedScaleOutDataFeed::new()),StrategyMode::Live,
+            TimeFrame::new(1,TimeFrameUnit::Minute)).with_artifact_root(&directory);
+        let key=state.live_metrics_strategy_key(None);
+        let path=state.live_execution_journal_path(&key,"test");
+        let mut saved=row("2025202590",false);
+        saved.cancelling=true;
+        broker.acknowledge_cancel(test_request_order("2025202590",&(&saved).into(),
+            TradeUpdateEvent::Cancelled,saved.side.clone(),None));
+        let command=BrokerCommand::new(&key,"test",&saved.insight_id.to_string(),
+            BrokerCommandAction::Cancel {order_id:"2025202590".into()},None);
+        saved.pending_mutations.push(PendingInsightMutation {kind:MutationKind::Cancel,receipt:command.receipt(),effect:MutationEffect::Cancel});
+        let mut journal=BrokerCommandJournal::open(&path,&key,"test").await.unwrap();
+        journal.persist_execution_batch(&ExecutionCheckpointBatch::with_intents(
+            vec![InsightExecutionCheckpoint::capture(&saved,1,true,None)],vec![],
+            vec![ExecutionIntent {command:command.clone(),admission_order:1,queued_at_us:1}]).unwrap()).await.unwrap();
+        journal.mark_dispatched(&command.id,2).await.unwrap();
+        journal.complete(&BrokerCommandCompletion {receipt:command.receipt(),queued_at_us:1,dispatched_at_us:Some(2),
+            completed_at_us:3,outcome:BrokerCommandOutcome::Ambiguous {reason:"old MT5 CancelOrder timeout".into()}}).await.unwrap();
+        journal.request_execution_stop().await.unwrap();
+        drop(journal);
+        let shutdown=state.shutdown_tx.clone();
+        let stop=async {
+            while broker.cancel_requests.lock().unwrap().is_empty(){tokio::task::yield_now().await;}
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert_eq!(teardown.load(std::sync::atomic::Ordering::SeqCst),0,"recovery must not invoke user teardown");
+            shutdown.send_replace(true);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15),async {
+            let(result,())=tokio::join!(state.run_live(None),stop);
+            result.unwrap();
+        }).await.expect("confirmed pending cancellation must not strand startup");
+        assert_eq!(broker.cancel_requests.lock().unwrap().as_slice(),&["2025202590"]);
+        assert!(broker.submit_requests.lock().unwrap().is_empty(),"never replay entries while recovering");
+        assert!(broker.close_requests.lock().unwrap().is_empty(),"never turn a cancellation into a position close");
+        let journal=BrokerCommandJournal::open(&path,&key,"test").await.unwrap();
+        assert_eq!(journal.execution_lifecycle().epoch,2);
+        assert_eq!(journal.execution_lifecycle().phase,ExecutionPhase::Stopped);
+        assert!(journal.recovery_page(0,256).await.unwrap().is_empty());
+        assert_eq!(journal.get(&command.id).await.unwrap().unwrap().state,
+            crate::core::broker::command_journal::JournalCommandState::Applied);
+        drop(journal);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn normal_teardown_without_broker_confirmation_has_unconditional_deadline() {
         use crate::core::broker::command_journal::{BrokerCommandJournal, lifecycle::ExecutionPhase};

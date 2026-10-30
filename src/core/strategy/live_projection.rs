@@ -5,7 +5,7 @@ use super::live_event_projection::{
 };
 use super::traits::{Strategy, StrategyContext};
 use crate::core::broker::traits::{Broker, DataFeed, DataProvider, OrderManagementProvider};
-use crate::core::broker::types::Account;
+use crate::core::broker::types::{Account, BrokerError};
 use crate::core::insight::InsightSnapshot;
 use crate::core::insight::types::InsightState;
 use crate::core::live_sync::{
@@ -25,6 +25,12 @@ const PROJECTION_QUEUE_HIGH_WATER: u64 = 4096;
 const PROJECTION_QUEUE_BYTES_HIGH_WATER: u64 = 16 * 1024 * 1024;
 const ACCOUNT_PROJECTION_HEARTBEAT: Duration = Duration::from_secs(1);
 const METRICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupCloudBoundary {
+    LocallyAccepted,
+    DeferredCaptureGap,
+}
 
 fn projection_backpressured(sync: &LocalBatchSyncState) -> bool {
     sync.publisher.pending_critical_count() >= PROJECTION_QUEUE_HIGH_WATER
@@ -159,6 +165,7 @@ where
         max_insights: Option<usize>,
         consume_dirty: bool,
     ) -> bool {
+        if sync.publisher.cloud_capture_paused() { return false; }
         let insight_ids = self
             .insights
             .insight_ids_for_live_sync_limited(false, max_insights);
@@ -167,7 +174,12 @@ where
         let mut history_events = Vec::new();
         let mut rollbacks = Vec::new();
         // Shutdown uses repeated bounded turns too, never an unlimited enqueue.
-        let mut event_budget = MAX_PROJECTION_EVENTS_PER_FLUSH;
+        // Planning does not enqueue yet. Account for the whole planned batch,
+        // not just the publisher's unchanged count inside the history loop.
+        // Otherwise a partially drained queue at e.g. 4,090 could receive 256
+        // more events and overshoot the projection high-water mark.
+        let mut event_budget = MAX_PROJECTION_EVENTS_PER_FLUSH.min(
+            PROJECTION_QUEUE_HIGH_WATER.saturating_sub(sync.publisher.pending_critical_count()) as usize);
 
         for insight_id in insight_ids {
             if event_budget == 0 || projection_backpressured(sync) {
@@ -431,6 +443,41 @@ where
         }
     }
 
+    /// Local execution must not roll back because a known, durably recorded
+    /// cloud capture pause refused this optional synchronization boundary.
+    /// Unknown scope, real admission failure and missing gap proof still fail.
+    pub(super) async fn establish_startup_cloud_boundary(
+        &self,
+        sync: &mut LocalBatchSyncState,
+        auth: &AqsAuth,
+    ) -> Result<StartupCloudBoundary, BrokerError> {
+        if !sync.publisher.admission_failed()
+            && self
+                .publish_startup_reconciliation_to_local_bus(sync, auth)
+                .await
+        {
+            return Ok(StartupCloudBoundary::LocallyAccepted);
+        }
+        let recorded = sync
+            .publisher
+            .has_recorded_capture_gap(
+                &sync.runtime_id,
+                &sync.strategy_id,
+                &sync.live_session_id,
+                &sync.run_id,
+            )
+            .await
+            .map_err(|error| BrokerError::ConnectionError(error.to_string()))?;
+        if recorded {
+            log::warn!("Cloud startup synchronization deferred by a durable capture gap; local broker execution continues and missing cloud history is not acknowledged");
+            Ok(StartupCloudBoundary::DeferredCaptureGap)
+        } else {
+            Err(BrokerError::ConnectionError(
+                "Startup reconciliation could not be committed to the local event journal".into(),
+            ))
+        }
+    }
+
     /// Publishes the one broker-evidence reconciliation generation for this process run.
     ///
     /// Persisted insights are selected remotely by their run ownership, so copying AQE's local
@@ -441,6 +488,10 @@ where
         sync: &mut LocalBatchSyncState,
         auth: &AqsAuth,
     ) -> bool {
+        if sync.publisher.cloud_capture_paused() {
+            // Do not collect/serialize a broker snapshot that cannot be admitted.
+            return false;
+        }
         let generation = deterministic_event_id(&format!(
             "aqs-reconciliation-v4:{}:{}:{}",
             auth.strategy_id, sync.live_session_id, sync.run_id
@@ -487,6 +538,8 @@ where
         let chunks = chunk_reconciliation_records(records);
         let total_chunks = chunks.len() as u32;
         let start = ReconciliationStart {
+            purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
+            critical_replay_through: None,
             generation: generation.clone(),
             runtime_id: sync.runtime_id.clone(),
             strategy_id: auth.strategy_id.clone(),
@@ -557,9 +610,14 @@ where
         force_account_heartbeat: bool,
     ) {
         let captured_at = chrono::Utc::now();
+        if let Some(cache) = self.broker.live_snapshot_cache() {
+            if let Ok(flows) = cache.account_cash_flows() {
+                sync.publish_account_cash_flows(&flows);
+            }
+        }
         // A heartbeat is not evidence that an old cached broker value is fresh.
         // Both MT5 and paper use the broker-neutral snapshot readiness check.
-        let fresh_account = self.broker.account_snapshot().ok();
+        let fresh_account = self.broker.is_broker_connected().then(|| self.broker.account_snapshot().ok()).flatten();
         let account = account.and(fresh_account.as_deref());
         if let Some(account) = account {
             self.live_metrics
@@ -582,6 +640,7 @@ where
                     EventKind::AccountProjection,
                     serde_json::json!({
                         "account": account,
+                        "account_confirmed": true,
                         "captured_at": captured_at,
                         "complete": force_account_heartbeat,
                         "revision": revision,
@@ -608,6 +667,7 @@ where
                     EventKind::EquityProjection,
                     serde_json::json!({
                         "account_id": account.account_id.trim(),
+                        "account_confirmed": true,
                         "currency": account.currency,
                         "equity": account.equity,
                         "cash": account.cash,

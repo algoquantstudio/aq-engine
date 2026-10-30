@@ -24,6 +24,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+mod source_observation;
+pub(crate) use source_observation::SourceObservationPreparation;
 
 #[derive(Clone, Debug)]
 pub enum BrokerCommandProgress {
@@ -108,6 +110,7 @@ pub struct StrategyCommandDriver {
     progress_revision: u64,
     last_admission_order: u64,
     restoring: bool,
+    source_observation_preparation: Option<SourceObservationPreparation>,
 }
 
 impl StrategyCommandDriver {
@@ -155,6 +158,7 @@ impl StrategyCommandDriver {
             progress_revision: 0,
             last_admission_order,
             restoring: false,
+            source_observation_preparation: None,
         })
     }
 
@@ -171,8 +175,35 @@ impl StrategyCommandDriver {
         ),
         BrokerCommandError,
     > {
-        let mut journal = BrokerCommandJournal::open(path, strategy_id, account_id).await?;
+        Self::start_recovering_with_capture(broker,path,strategy_id,account_id,config,None).await
+    }
+
+    pub(crate) async fn start_recovering_with_capture<E: OrderManagementProvider + 'static>(
+        broker: Arc<E>,path:impl AsRef<Path>,strategy_id:&str,account_id:&str,
+        config:BrokerCommandWorkerConfig,
+        capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+    )->Result<(Self,crate::core::broker::command_journal::recovery::ExecutionRecovery),BrokerCommandError>{
+        Self::start_recovering_with_source_observation(broker,path,strategy_id,account_id,config,capture,None).await
+    }
+
+    pub(crate) async fn start_recovering_with_source_observation<E: OrderManagementProvider + 'static>(
+        broker: Arc<E>,path:impl AsRef<Path>,strategy_id:&str,account_id:&str,
+        config:BrokerCommandWorkerConfig,
+        capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+        observer:Option<&crate::core::live_sync::LocalEventPublisher>,
+    )->Result<(Self,crate::core::broker::command_journal::recovery::ExecutionRecovery),BrokerCommandError>{
+        // Select the approved capacity before reopening an interrupted legacy
+        // copy; otherwise a smaller old cap can permanently block its resume.
+        // Both paths retain the same exclusive broker-recovery ownership.
+        let mut journal = match capture {
+            Some(limit)=>Box::pin(BrokerCommandJournal::open_with_cloud_history_capacity(path,strategy_id,account_id,limit)).await?,
+            None=>Box::pin(BrokerCommandJournal::open(path,strategy_id,account_id)).await?,
+        };
         journal.begin_execution_epoch().await?;
+        let preparation = match observer {
+            Some(observer) => Some(source_observation::prepare(&journal, observer).await?),
+            None => None,
+        };
         let capacity = config
             .entry_capacity
             .saturating_add(config.control_capacity)
@@ -180,6 +211,7 @@ impl StrategyCommandDriver {
         let recovery = journal.load_execution_recovery(capacity).await?;
         let order = journal.last_admission_order().await?;
         let mut driver = Self::from_journal(broker, journal, config, order)?;
+        driver.source_observation_preparation = preparation;
         driver.restoring = true;
         for row in recovery.rows.values() {
             driver
@@ -230,6 +262,10 @@ impl StrategyCommandDriver {
             driver.awaiting_completion += 1;
         }
         Ok((driver, recovery))
+    }
+
+    pub(crate) fn source_observation_preparation(&self) -> Option<&SourceObservationPreparation> {
+        self.source_observation_preparation.as_ref()
     }
 
     pub(super) fn finish_recovery(&mut self) {
@@ -1078,17 +1114,36 @@ where
         config: BrokerCommandWorkerConfig,
         signal_recovered_stop: bool,
     ) -> Result<(), BrokerCommandError> {
+        self.start_command_driver_with_capture(path,strategy_id,account_id,config,signal_recovered_stop,None).await
+    }
+
+    pub(super) async fn start_command_driver_with_capture(
+        &mut self,path:impl AsRef<Path>,strategy_id:&str,account_id:&str,
+        config:BrokerCommandWorkerConfig,signal_recovered_stop:bool,
+        capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+    )->Result<(),BrokerCommandError>{
+        self.start_command_driver_with_source_observation(path,strategy_id,account_id,config,signal_recovered_stop,capture,None).await
+    }
+
+    pub(super) async fn start_command_driver_with_source_observation(
+        &mut self,path:impl AsRef<Path>,strategy_id:&str,account_id:&str,
+        config:BrokerCommandWorkerConfig,signal_recovered_stop:bool,
+        capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
+        observer:Option<&crate::core::live_sync::LocalEventPublisher>,
+    )->Result<(),BrokerCommandError>{
         if self.command_driver.is_some() {
             return Err(BrokerCommandError::Invalid(
                 "strategy already owns a command driver".into(),
             ));
         }
-        let (mut driver, recovery) = StrategyCommandDriver::start_recovering(
+        let (mut driver, recovery) = StrategyCommandDriver::start_recovering_with_source_observation(
             Arc::clone(&self.broker.execution),
             path,
             strategy_id,
             account_id,
             config,
+            capture,
+            observer,
         )
         .await?;
         let recovering_stop = recovery.stopping;

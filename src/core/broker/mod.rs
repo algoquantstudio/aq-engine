@@ -1,6 +1,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod backtest_state;
+pub mod account_cash_flow;
 pub mod command_journal;
 pub mod command_worker;
 pub mod commands;
@@ -324,6 +325,11 @@ where
     pub fn get_positions_sync(&self) -> Result<Vec<types::Position>, BrokerError> {
         Ok(self.positions_snapshot()?.to_vec())
     }
+
+    /// Exact entry lookup from a fresh decision snapshot. Never performs I/O.
+    pub fn get_position_by_order_id_sync(&self, order_id: &str, symbol: &str) -> Result<Option<types::Position>, BrokerError> {
+        self.insight_context().position(order_id,symbol)
+    }
 }
 
 // ─────────────────────── OMS delegation ───────────────────────
@@ -333,6 +339,9 @@ where
     E: traits::Broker + traits::OrderManagementProvider,
     D: traits::DataFeed + traits::DataProvider,
 {
+    fn account_cash_flow_reader(&self) -> Option<Arc<dyn account_cash_flow::AccountCashFlowReader>> {
+        self.execution.account_cash_flow_reader()
+    }
     async fn reconcile_submission(
         &self,
         account_id: &str,
@@ -341,6 +350,15 @@ where
         self.execution
             .reconcile_submission(account_id, request)
             .await
+    }
+
+    async fn pending_cancellation_recovery(&self, account: &str, order: &str)
+        -> Result<Option<types::OrderLifecycleSnapshot>, BrokerError> {
+        self.execution.pending_cancellation_recovery(account, order).await
+    }
+
+    async fn retry_cancellation(&self, account: &str, order: &str) -> Result<bool, BrokerError> {
+        self.execution.retry_cancellation(account, order).await
     }
 
     async fn submit_order(&self, insight: BrokerOrderRequest) -> Result<Order, BrokerError> {
@@ -425,6 +443,10 @@ where
 
     async fn get_position(&self, symbol: &str) -> Result<types::Position, BrokerError> {
         self.execution.get_position(symbol).await
+    }
+
+    async fn get_position_by_order_id(&self, order_id: &str, symbol: &str) -> Result<Option<types::Position>, BrokerError> {
+        self.execution.get_position_by_order_id(order_id,symbol).await
     }
 
     async fn get_account(&self) -> Result<types::Account, BrokerError> {
@@ -1119,6 +1141,20 @@ pub mod traits {
         > + Send {
             async { Ok(super::commands::SubmissionResolution::Unsupported) }
         }
+        /// Read-only, account/ticket-exact proof that a previously uncertain
+        /// cancellation still targets a pending order. Absence is not proof.
+        fn pending_cancellation_recovery(&self, _account: &str, _order: &str)
+            -> impl std::future::Future<Output = Result<Option<OrderLifecycleSnapshot>, BrokerError>> + Send {
+            async { Ok(None) }
+        }
+        /// Only the durable command worker may call this after recording a
+        /// recovery attempt. Must never submit/close/replace an order and must
+        /// confirm cancellation from authoritative terminal evidence, not ACK,
+        /// delivering that evidence through the normal broker event reducer.
+        fn retry_cancellation(&self, _account: &str, _order: &str)
+            -> impl std::future::Future<Output = Result<bool, BrokerError>> + Send {
+            async { Err(BrokerError::UnsupportedOperation("cancellation recovery unsupported".into())) }
+        }
         /// Creates an owned resolver for restart reconciliation. The default is deliberately
         /// unsupported so adding a broker never makes unsafe lifecycle assumptions.
         fn lifecycle_reconciler(&self) -> Option<Arc<dyn OrderLifecycleReconciler>> {
@@ -1130,6 +1166,12 @@ pub mod traits {
         fn execution_fill_history_reader(
             &self,
         ) -> Option<Arc<dyn super::fill_history::ExecutionFillHistoryReader>> {
+            None
+        }
+
+        /// Optional read-only account funding/adjustment observations. Never
+        /// derive these from changes in account equity or order/Insight state.
+        fn account_cash_flow_reader(&self) -> Option<Arc<dyn super::account_cash_flow::AccountCashFlowReader>> {
             None
         }
 
@@ -1267,6 +1309,21 @@ pub mod traits {
         ) -> impl std::future::Future<Output = Result<Vec<Position>, BrokerError>> + Send;
         async fn get_position(&self, symbol: &str) -> Result<Position, BrokerError>;
 
+        /// Explicit asynchronous broker refresh. For hot-path Insight reads use
+        /// `insight.get_position()` or UnifiedBroker's snapshot lookup instead.
+        async fn get_position_by_order_id(&self, order_id: &str, symbol: &str) -> Result<Option<Position>, BrokerError> {
+            let positions=self.get_positions().await?;
+            let mut matching=positions.iter().filter(|p|p.order_id.as_deref()==Some(order_id));
+            let result=matching.next().cloned();
+            if matching.next().is_some() || result.as_ref().is_some_and(|p|p.asset.symbol!=symbol) {
+                return Err(BrokerError::PositionError("Ambiguous broker position identity".into()));
+            }
+            if result.is_none() && positions.iter().any(|p|p.order_id.is_none()) {
+                return Err(BrokerError::PositionError("Broker snapshot does not include order IDs".into()));
+            }
+            Ok(result)
+        }
+
         // Account Management
         fn get_account(
             &self,
@@ -1281,6 +1338,12 @@ pub mod traits {
         /// Transport-free positions for deterministic in-memory execution. Live strategy
         /// reads use the timestamped refresh cache, not this untimestamped adapter hook.
         fn get_cached_positions(&self) -> Option<Vec<Position>> {
+            None
+        }
+
+        /// Exact in-memory position lookup for simulation/custom adapters.
+        /// Live strategies use the timestamped cache instead of this hook.
+        fn position_snapshot_reader(&self) -> Option<super::types::PositionSnapshotReader> {
             None
         }
 

@@ -13,6 +13,11 @@ use aqe_live_protocol::{
 };
 use std::time::{Duration, Instant};
 use tokio::{sync::oneshot, task::JoinHandle};
+mod health;
+mod scheduler;
+pub(super) use health::EvidenceExportHealth;
+use health::{ExportError, SharedBacklog};
+pub(super) use scheduler::ExecutionExportScheduler;
 
 #[derive(Clone)]
 pub(super) struct ExportIdentity {
@@ -22,25 +27,16 @@ pub(super) struct ExportIdentity {
     pub run_id: String,
 }
 
-#[derive(Default, serde::Serialize)]
-pub(super) struct EvidenceExportHealth {
-    pub enabled: bool,
-    /// Source-local cursor acknowledged by the outbox, not its transport cursor.
-    pub last_exported_source_sequence: Option<u64>,
-    pub last_error: Option<String>,
-    pub last_attempt_at_us: Option<i64>,
-    /// A local handoff is not cloud persistence or broker reconciliation.
-    pub delivery_basis: &'static str,
-}
-
 type ExportTask = (
     JoinHandle<()>,
-    oneshot::Receiver<Result<Option<u64>, String>>,
+    oneshot::Receiver<Result<Option<u64>, ExportError>>,
 );
 pub(super) struct ExecutionEvidenceExporter {
     stream: EvidenceStream,
     active: Option<ExportTask>,
     next_attempt: Instant,
+    last_warning_at: Option<Instant>,
+    backlog: SharedBacklog,
     pub health: EvidenceExportHealth,
 }
 #[derive(Clone, Copy)]
@@ -49,12 +45,27 @@ enum EvidenceStream {
     Fills,
     Marks,
 }
+impl EvidenceStream {
+    fn label(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Fills => "fills",
+            Self::Marks => "marks",
+        }
+    }
+}
 
 fn export_enabled(stream: EvidenceStream, value: Option<&str>) -> bool {
-    value.map_or(matches!(stream, EvidenceStream::Marks), |v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    value.map_or(matches!(stream, EvidenceStream::Marks), |v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    })
 }
 
 impl ExecutionEvidenceExporter {
+    pub(super) fn has_inflight(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn new() -> Self {
         Self::for_stream(EvidenceStream::State)
     }
@@ -75,81 +86,90 @@ impl ExecutionEvidenceExporter {
             EvidenceStream::Fills => "AQE_EXECUTION_FILL_EXPORT",
             EvidenceStream::Marks => "AQE_POSITION_MARK_EXPORT",
         })
-        .ok().flatten();
+        .ok()
+        .flatten();
         let enabled = export_enabled(stream, setting.as_deref());
         Self {
             stream,
             active: None,
             next_attempt: Instant::now(),
+            last_warning_at: None,
+            backlog: Default::default(),
             health: EvidenceExportHealth {
                 enabled,
+                stream: stream.label(),
+                status: if enabled { "idle" } else { "disabled" },
                 delivery_basis: "durable_local_outbox_only",
                 ..Default::default()
             },
         }
     }
 
-    /// Constant-time polling and at most one bounded background task. No I/O,
-    /// checkpoint serialization or historical scan on the strategy loop.
+    #[cfg(test)]
     pub fn poll(
         &mut self,
         sender: Option<BrokerCommandSender>,
         publisher: &LocalEventPublisher,
         identity: ExportIdentity,
     ) {
+        self.poll_completion();
+        self.try_start(sender, publisher, &identity);
+    }
+
+    /// Constant-time completion polling. No I/O or historical scan on the owner.
+    fn poll_completion(&mut self) {
         if let Some((_, reply)) = self.active.as_mut() {
             let result = match reply.try_recv() {
                 Ok(result) => result,
                 Err(oneshot::error::TryRecvError::Empty) => return,
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    Err("execution evidence export task ended".into())
-                }
+                Err(oneshot::error::TryRecvError::Closed) => Err(ExportError::Failure(
+                    "execution evidence export task ended".into(),
+                )),
             };
             self.active.take();
-            match result {
-                Ok(Some(sequence)) => {
-                    self.health.last_exported_source_sequence = Some(sequence);
-                    self.health.last_error = None;
-                    self.next_attempt = Instant::now() + Duration::from_millis(250);
-                }
-                Ok(None) => {
-                    self.health.last_error = None;
-                    self.next_attempt = Instant::now() + Duration::from_secs(2);
-                }
-                Err(error) => {
-                    if self.health.last_error.as_ref() != Some(&error) {
-                        log::warn!("Execution analytics delivery deferred: {error}");
-                    }
-                    self.health.last_error = Some(error);
-                    self.next_attempt = Instant::now() + Duration::from_secs(5);
-                }
-            }
+            self.record_result(result, Instant::now());
         }
+    }
+
+    fn try_start(
+        &mut self,
+        sender: Option<BrokerCommandSender>,
+        publisher: &LocalEventPublisher,
+        identity: &ExportIdentity,
+    ) -> bool {
         if !self.health.enabled
+            || self.active.is_some()
+            || publisher.cloud_capture_paused()
             || self.next_attempt > Instant::now()
             || !publisher.supports_durable_admission()
         {
-            return;
+            return false;
         }
         let Some(sender) = sender else {
-            return;
+            return false;
         };
         let publisher = publisher.clone();
+        let identity = identity.clone();
         let (reply, receiver) = oneshot::channel();
         self.health.last_attempt_at_us = Some(chrono::Utc::now().timestamp_micros());
+        self.health.status = "exporting";
         let stream = self.stream;
+        let backlog = self.backlog.clone();
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(
                 Duration::from_secs(30),
-                export_stream(&sender, &publisher, &identity, stream),
+                export_stream(&sender, &publisher, &identity, stream, &backlog),
             )
             .await
             .unwrap_or_else(|_| {
-                Err("execution evidence durable admission timed out; page retained".into())
+                Err(ExportError::Failure(
+                    "execution evidence durable admission timed out; page retained".into(),
+                ))
             });
             let _ = reply.send(result);
         });
         self.active = Some((task, receiver));
+        true
     }
 
     /// Drain the final checkpoint before journal ownership stops. This only
@@ -187,7 +207,10 @@ impl ExecutionEvidenceExporter {
                 );
             }
             loop {
-                match export_stream(sender, publisher, identity, self.stream).await? {
+                match export_stream(sender, publisher, identity, self.stream, &self.backlog)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
                     Some(sequence) => self.health.last_exported_source_sequence = Some(sequence),
                     None => return Ok(self.health.last_exported_source_sequence),
                 }
@@ -205,6 +228,12 @@ impl ExecutionEvidenceExporter {
             let _ = task.await;
         }
         self.health.last_error = result.as_ref().err().cloned();
+        self.health.status = if result.is_ok() {
+            "idle"
+        } else {
+            "deferred_on_stop"
+        };
+        self.refresh_health();
         result
     }
 }
@@ -221,24 +250,36 @@ async fn export_one(
     sender: &BrokerCommandSender,
     publisher: &LocalEventPublisher,
     identity: &ExportIdentity,
-) -> Result<Option<u64>, String> {
+    backlog: &SharedBacklog,
+) -> Result<Option<u64>, ExportError> {
+    let sampled = chrono::Utc::now().timestamp_micros();
     let Some(page) = sender
-        .try_prepare_execution_evidence_export()
-        .map_err(|e| e.to_string())?
+        .try_prepare_execution_evidence_export()?
         .wait()
-        .await
-        .map_err(|e| e.to_string())?
+        .await?
     else {
+        backlog.lock().empty(sampled);
         return Ok(None);
     };
+    backlog.lock().page(
+        page.generated_at_us,
+        page.after_sequence,
+        page.through_sequence,
+        page.observations.len(),
+        page.observations
+            .iter()
+            .map(|o| o.record.recorded_at_us)
+            .min(),
+    );
     let receipt = publish_page(publisher, identity, &page).await?;
     let sequence = receipt.next_sequence;
-    sender
-        .try_acknowledge_execution_evidence_export(receipt)
-        .map_err(|e| e.to_string())?
-        .wait()
-        .await
-        .map_err(|e| e.to_string())?;
+    acknowledge_when_available(|| {
+        sender
+            .try_acknowledge_execution_evidence_export(receipt.clone())
+            .map(|reply| reply.wait())
+    })
+    .await?;
+    backlog.lock().acknowledged();
     Ok(Some(sequence))
 }
 
@@ -247,56 +288,87 @@ async fn export_stream(
     publisher: &LocalEventPublisher,
     identity: &ExportIdentity,
     stream: EvidenceStream,
-) -> Result<Option<u64>, String> {
+    backlog: &SharedBacklog,
+) -> Result<Option<u64>, ExportError> {
     if matches!(stream, EvidenceStream::State) {
-        return export_one(sender, publisher, identity).await;
+        return export_one(sender, publisher, identity, backlog).await;
     }
+    let sampled = chrono::Utc::now().timestamp_micros();
     if matches!(stream, EvidenceStream::Marks) {
-        let Some(transfer) = sender
-            .try_prepare_position_mark_export()
-            .map_err(|e| e.to_string())?
-            .wait()
-            .await
-            .map_err(|e| e.to_string())?
-        else {
+        let Some(transfer) = sender.try_prepare_position_mark_export()?.wait().await? else {
+            backlog.lock().empty(sampled);
             return Ok(None);
         };
-        let receipt = publish_mark_page(publisher, identity, &transfer).await?;
+        let receipt = publish_mark_page_observed(publisher, identity, &transfer, backlog).await?;
         let sequence = receipt.next_sequence;
-        sender
-            .try_acknowledge_position_mark_export(receipt)
-            .map_err(|e| e.to_string())?
-            .wait()
-            .await
-            .map_err(|e| e.to_string())?;
+        acknowledge_when_available(|| {
+            sender
+                .try_acknowledge_position_mark_export(receipt.clone())
+                .map(|reply| reply.wait())
+        })
+        .await?;
+        backlog.lock().acknowledged();
         return Ok(Some(sequence));
     }
-    let Some(transfer) = sender
-        .try_prepare_execution_fill_export()
-        .map_err(|e| e.to_string())?
-        .wait()
-        .await
-        .map_err(|e| e.to_string())?
-    else {
+    let Some(transfer) = sender.try_prepare_execution_fill_export()?.wait().await? else {
+        backlog.lock().empty(sampled);
         return Ok(None);
     };
-    let receipt = publish_fill_page(publisher, identity, &transfer).await?;
+    let receipt = publish_fill_page_observed(publisher, identity, &transfer, backlog).await?;
     let sequence = receipt.next_sequence;
-    sender
-        .try_acknowledge_execution_fill_export(receipt)
-        .map_err(|e| e.to_string())?
-        .wait()
-        .await
-        .map_err(|e| e.to_string())?;
+    acknowledge_when_available(|| {
+        sender
+            .try_acknowledge_execution_fill_export(receipt.clone())
+            .map(|reply| reply.wait())
+    })
+    .await?;
+    backlog.lock().acknowledged();
     Ok(Some(sequence))
 }
 
+/// Durable outbox admission already succeeded. Brief journal contention must
+/// retry only its acknowledgement, not republish the frozen page. The caller's
+/// 30-second task/stop budget owns cancellation; no permit is held while waiting.
+async fn acknowledge_when_available<T, R>(
+    mut request: impl FnMut() -> Result<R, crate::core::broker::commands::BrokerCommandError>,
+) -> Result<T, ExportError>
+where
+    R: std::future::Future<Output = Result<T, crate::core::broker::commands::BrokerCommandError>>,
+{
+    loop {
+        match request() {
+            Ok(reply) => return reply.await.map_err(Into::into),
+            Err(error) if error.is_analytics_backpressure() => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(test)]
 async fn publish_mark_page(
     publisher: &LocalEventPublisher,
     identity: &ExportIdentity,
     transfer: &aqe_live_protocol::PositionMarkTransfer,
 ) -> Result<aqe_live_protocol::PositionMarkExportReceipt, String> {
+    publish_mark_page_observed(publisher, identity, transfer, &SharedBacklog::default()).await.map_err(|e| e.to_string())
+}
+
+async fn publish_mark_page_observed(
+    publisher: &LocalEventPublisher,
+    identity: &ExportIdentity,
+    transfer: &aqe_live_protocol::PositionMarkTransfer,
+    backlog: &SharedBacklog,
+) -> Result<aqe_live_protocol::PositionMarkExportReceipt, ExportError> {
     let page = transfer.page()?;
+    backlog.lock().page(
+        page.generated_at_us,
+        page.after_sequence,
+        page.through_sequence,
+        page.records.len(),
+        page.records.iter().map(|r| r.recorded_at_us).min(),
+    );
     if identity
         .strategy_id
         .strip_prefix("strategy:")
@@ -338,19 +410,40 @@ async fn publish_mark_page(
             ),
             event,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| ExportError::admission(publisher, e))?
         .await
         .map_err(|_| "position mark receipt channel closed")?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ExportError::admission(publisher, e))?;
     Ok(transfer.receipt())
 }
 
+#[cfg(test)]
 async fn publish_fill_page(
     publisher: &LocalEventPublisher,
     identity: &ExportIdentity,
     transfer: &aqe_live_protocol::ExecutionFillTransfer,
 ) -> Result<aqe_live_protocol::ExecutionFillExportReceipt, String> {
+    publish_fill_page_observed(publisher, identity, transfer, &SharedBacklog::default()).await.map_err(|e| e.to_string())
+}
+
+async fn publish_fill_page_observed(
+    publisher: &LocalEventPublisher,
+    identity: &ExportIdentity,
+    transfer: &aqe_live_protocol::ExecutionFillTransfer,
+    backlog: &SharedBacklog,
+) -> Result<aqe_live_protocol::ExecutionFillExportReceipt, ExportError> {
     let page = transfer.page()?;
+    backlog.lock().page(
+        page.generated_at_us,
+        page.after_sequence,
+        page.through_sequence,
+        page.records.len() + page.position_checks.len(),
+        page.records
+            .iter()
+            .map(|r| r.recorded_at_us)
+            .chain(page.position_checks.iter().map(|r| r.recorded_at_us))
+            .min(),
+    );
     if identity.strategy_id.trim_start_matches("strategy:")
         != page.strategy_id.trim_start_matches("strategy:")
     {
@@ -386,10 +479,10 @@ async fn publish_fill_page(
             ),
             event,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| ExportError::admission(publisher, e))?
         .await
         .map_err(|_| "execution fill receipt channel closed")?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ExportError::admission(publisher, e))?;
     Ok(transfer.receipt())
 }
 
@@ -397,7 +490,7 @@ async fn publish_page(
     publisher: &LocalEventPublisher,
     identity: &ExportIdentity,
     page: &ExecutionEvidenceFeedPage,
-) -> Result<ExecutionEvidenceExportReceipt, String> {
+) -> Result<ExecutionEvidenceExportReceipt, ExportError> {
     if identity.strategy_id.trim_start_matches("strategy:")
         != page.strategy_id.trim_start_matches("strategy:")
     {
@@ -445,14 +538,14 @@ async fn publish_page(
             .ok_or("invalid evidence snapshot time")?;
         let durable = publisher
             .queue_durable(subject.clone(), event)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ExportError::admission(publisher, e))?;
         receipts.push(durable);
     }
     for durable in receipts {
         durable
             .await
             .map_err(|_| "execution evidence receipt channel closed")?
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ExportError::admission(publisher, e))?;
     }
     Ok(receipt)
 }

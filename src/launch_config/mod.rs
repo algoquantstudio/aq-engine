@@ -1,13 +1,16 @@
 //! A launch file contains credentials, not strategy source or arbitrary code.
 //! Never derive Debug or include its contents in an error/log message.
 use serde::{Deserialize, Serialize};
+mod capture;
+pub use capture::BOUNDED_METADATA_SUPPORT_MARKER;
+pub use capture::{CloudCaptureConfig,CaptureOutboxConfig,CapturePartitionConfig,CAPTURE_SUPPORT_MARKER,SOURCE_OBSERVATION_SUPPORT_MARKER,JOURNAL_RECOVERY_SUPPORT_MARKER,SEPARATE_HISTORY_SUPPORT_MARKER,MIN_CAPTURE_OPERATIONAL_HEADROOM_BYTES};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod private_file;
 #[cfg(not(target_arch = "wasm32"))]
 mod process;
 #[cfg(not(target_arch = "wasm32"))]
-pub use private_file::{read_private, write_private};
+pub use private_file::{protect_private_path, read_private, write_private};
 #[cfg(not(target_arch = "wasm32"))]
 pub use process::{from_process, setting};
 
@@ -30,6 +33,8 @@ pub struct LaunchConfig {
     pub delivery: Option<DeliveryConfig>,
     #[serde(default)]
     pub fill_export: bool,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub capture:Option<CloudCaptureConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -104,6 +109,18 @@ impl LaunchConfig {
             }
         } else if self.delivery.is_some() {
             return Err(invalid());
+        }
+        if let Some(capture)=self.capture {
+            capture.validate()?;
+            let cloud=self.cloud.as_ref().ok_or_else(invalid)?;
+            if cloud.strategy_id.len()>128
+                ||match &self.delivery {
+                    Some(DeliveryConfig::EmbeddedGateway{..})=>capture.embedded_receiver.is_none(),
+                    Some(DeliveryConfig::ManagedNats{..})=>capture.embedded_receiver.is_some(),
+                    None=>true,
+                } {
+                return Err(invalid());
+            }
         }
         if let Some(mt5) = &self.mt5 {
             if mt5.bind_addr.parse::<std::net::SocketAddr>().is_err() || !bounded(&mt5.token, 4096)

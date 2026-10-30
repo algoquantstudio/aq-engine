@@ -199,7 +199,10 @@ struct State {
     next_membership: u64,
     account_changed: bool,
     account: Option<Timed<Account>>,
+    cash_flows: Option<(u64, Arc<super::account_cash_flow::AccountCashFlows>)>,
     positions: Option<Timed<[Position]>>,
+    positions_by_order: HashMap<String, usize>,
+    position_ids_complete: bool,
     orders: Option<Timed<OrderCapacitySnapshot>>,
     capacity_symbols: HashSet<String>,
     quotes: HashMap<String, QuoteSlot>,
@@ -245,7 +248,10 @@ impl BrokerSnapshotCache {
                 next_membership: 0,
                 account_changed: false,
                 account: None,
+                cash_flows: None,
                 positions: None,
+                positions_by_order: HashMap::new(),
+                position_ids_complete: false,
                 orders: None,
                 capacity_symbols: HashSet::new(),
                 quotes: HashMap::new(),
@@ -307,6 +313,44 @@ impl BrokerSnapshotCache {
 
     pub fn account(&self) -> Result<Arc<Account>, SnapshotUnavailable> {
         self.account_at(Instant::now())
+    }
+
+    /// Observations only. Availability does not imply complete broker history.
+    pub fn account_cash_flows(
+        &self,
+    ) -> Result<Arc<super::account_cash_flow::AccountCashFlows>, SnapshotUnavailable> {
+        self.account()?;
+        let state = self.state.read();
+        let (generation, flows) = state
+            .cash_flows
+            .as_ref()
+            .ok_or(SnapshotUnavailable::Missing)?;
+        if state.closed || state.account_changed || *generation != state.generation {
+            return Err(SnapshotUnavailable::Stale);
+        }
+        Ok(flows.clone())
+    }
+
+    fn publish_cash_flows(
+        &self,
+        generation: u64,
+        flows: super::account_cash_flow::AccountCashFlows,
+    ) {
+        let mut state = self.state.write();
+        if state.closed
+            || state.account_changed
+            || state.generation != generation
+            || flows.account_id != self.expected_account
+            || state
+                .account
+                .as_ref()
+                .is_none_or(|a| a.value.currency != flows.currency)
+        {
+            return;
+        }
+        state.cash_flows = Some((generation, Arc::new(flows)));
+        drop(state);
+        self.changed();
     }
 
     /// Linearize the first (non-blocking) mutation poll with cache invalidation
@@ -460,6 +504,25 @@ impl BrokerSnapshotCache {
             .as_ref()
             .ok_or(SnapshotUnavailable::Missing)?
             .read(now, self.freshness.positions)
+    }
+
+    /// O(1), account/freshness-fenced lookup in the same immutable snapshot.
+    pub fn position_by_order_id(&self, order: &str, symbol: &str) -> Result<Option<Position>, SnapshotUnavailable> {
+        if order.trim().is_empty() || order.len()>512 || symbol.trim().is_empty() { return Err(SnapshotUnavailable::Invalid); }
+        let state=self.state.read();
+        if state.account_changed { return Err(SnapshotUnavailable::AccountChanged); }
+        let now=Instant::now();
+        state.account.as_ref().ok_or(SnapshotUnavailable::Missing)?.read(now,self.freshness.account)?;
+        let positions=state.positions.as_ref().ok_or(SnapshotUnavailable::Missing)?.read(now,self.freshness.positions)?;
+        if let Some(index)=state.positions_by_order.get(order) {
+            let position=&positions[*index];
+            if position.asset.symbol!=symbol {
+                return Err(SnapshotUnavailable::Invalid);
+            }
+            return Ok(Some(position.clone()));
+        }
+        if !state.position_ids_complete { return Err(SnapshotUnavailable::Missing); }
+        Ok(None)
     }
 
     pub fn order_capacity(&self) -> Result<Arc<OrderCapacitySnapshot>, SnapshotUnavailable> {
@@ -841,6 +904,14 @@ impl BrokerSnapshotCache {
         let account_changed = positions
             .iter()
             .any(|p| p.account_id.trim() != self.expected_account);
+        let mut index=HashMap::with_capacity(positions.len());
+        let mut complete=true;
+        for (offset,position) in positions.iter().enumerate().filter(|_|!account_changed) {
+            match position.order_id.as_deref().filter(|id|!id.trim().is_empty()) {
+                Some(id) if id.len()<=512 => { if index.insert(id.to_owned(),offset).is_some() { return; } }
+                _ => complete=false,
+            }
+        }
         if !account_changed
             && positions.iter().any(|p| {
                 [
@@ -881,6 +952,8 @@ impl BrokerSnapshotCache {
             state.account = None;
         }
         let retired = std::mem::replace(&mut state.positions, value);
+        state.positions_by_order=index;
+        state.position_ids_complete=complete;
         let revision = state.next_revision();
         state.positions_revision = revision;
         if account_changed {

@@ -3,9 +3,9 @@ use super::backtest_state::{BacktestResults, BacktestState};
 use super::commands::BrokerOrderRequest;
 use super::traits::{Broker, OrderManagementProvider};
 use super::types::{
-    Account, AccountType, Asset, AssetFees, Bar, BrokerError, BrokerLifecycleSnapshot, Order,
-    OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, Position, TradeRecord, TradeRecordType,
-    TradeUpdateEvent,
+    Account, AccountType, Asset, AssetFees, Bar, BrokerError, BrokerLifecycleSnapshot,
+    BrokerOrderEvent, Order, OrderClass, OrderLeg, OrderLegs, OrderSide, OrderType, Position,
+    TradeRecord, TradeRecordType, TradeUpdateEvent,
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod execution;
 mod valuation;
 
 fn is_terminal_leg_status(status: &TradeUpdateEvent) -> bool {
@@ -43,6 +44,7 @@ fn update_order_leg(leg: Option<&mut OrderLeg>, order_id: &str, price: f64, now_
 struct ClosePositionResult {
     fully_closed: bool,
     qty: f64,
+    gross_pnl: f64,
     net_pnl: f64,
     entry_commission: f64,
     exit_commission: f64,
@@ -84,11 +86,12 @@ pub struct PaperBroker {
     close_orders_queue: Arc<Mutex<VecDeque<(String, f64, Option<f64>)>>>,
 
     // Trade events queue — collected during process_step, drained by StrategyState
-    trade_events: Arc<Mutex<VecDeque<(Order, TradeUpdateEvent)>>>,
+    trade_events: Arc<Mutex<VecDeque<BrokerOrderEvent>>>,
 
     // Trade event subscribers (for live streaming)
     #[allow(clippy::type_complexity)]
-    trade_stream_subscribers: Arc<Mutex<Vec<Arc<dyn Fn((Order, TradeUpdateEvent)) + Send + Sync>>>>,
+    trade_stream_subscribers: Arc<Mutex<Vec<Arc<dyn Fn(BrokerOrderEvent) + Send + Sync>>>>,
+    execution_history: Arc<Mutex<execution::PaperExecutionHistory>>,
 
     // Time management for backtest
     current_time: Arc<RwLock<DateTime<Utc>>>,
@@ -133,6 +136,7 @@ impl PaperBroker {
             close_orders_queue: Arc::new(Mutex::new(VecDeque::new())),
             trade_events: Arc::new(Mutex::new(VecDeque::new())),
             trade_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
+            execution_history: Arc::new(Mutex::new(Default::default())),
             current_time: Arc::new(RwLock::new(Utc::now())),
             valuation_gate: Arc::new(RwLock::new(())),
             valuation_as_of_us: Arc::new(RwLock::new(None)),
@@ -292,7 +296,8 @@ impl PaperBroker {
                     self.record_entry_trade(&order, fill_price, current_time);
 
                     // Emit Filled trade event
-                    self.emit_trade_event(&order, TradeUpdateEvent::Filled);
+                    let fill = self.entry_execution(&order, fill_price, current_time);
+                    self.emit_execution_event(&order, TradeUpdateEvent::Filled, Some(fill));
 
                     // Move to active (for bracket leg tracking) or closed
                     if order.legs.is_some() {
@@ -541,7 +546,16 @@ impl PaperBroker {
                         self.cancel_remaining_legs(&mut order);
 
                         // Emit Closed trade event
-                        self.emit_trade_event(&order, TradeUpdateEvent::Closed);
+                        let fill = close_result.map(|result| {
+                            self.exit_execution(
+                                &order,
+                                &order.order_id,
+                                close_price,
+                                current_time,
+                                result,
+                            )
+                        });
+                        self.emit_execution_event(&order, TradeUpdateEvent::Closed, fill);
                         self.mark_order_terminal_for_release(&oid);
 
                         to_remove.push(oid.clone());
@@ -575,6 +589,7 @@ impl PaperBroker {
 
         let position = Position {
             account_id: self.account.read().account_id.clone(),
+            order_id: Some(order_id.clone()),
             asset: order.asset.clone(),
             avg_entry_price: fill_price,
             qty: order.filled_qty,
@@ -711,6 +726,7 @@ impl PaperBroker {
                 ClosePositionResult {
                     fully_closed,
                     qty: requested_qty,
+                    gross_pnl,
                     net_pnl,
                     entry_commission,
                     exit_commission,
@@ -747,7 +763,8 @@ impl PaperBroker {
             let bar = bars.get(entry.key());
             if let Some(bar) = bar {
                 if bar.close.is_finite() && bar.timestamp <= observed_at {
-                    self.valuation_mark_times.insert(entry.key().clone(), bar.timestamp.timestamp_micros());
+                    self.valuation_mark_times
+                        .insert(entry.key().clone(), bar.timestamp.timestamp_micros());
                 } else {
                     self.valuation_mark_times.remove(entry.key());
                 }
@@ -858,7 +875,14 @@ impl PaperBroker {
                                 "PaperBroker::process_close_queue emitting Closed for order_id={}",
                                 order_id
                             );
-                            self.emit_trade_event(&o, TradeUpdateEvent::Closed);
+                            let fill = self.exit_execution(
+                                &o,
+                                &order_id,
+                                fill_price,
+                                current_time,
+                                close_result,
+                            );
+                            self.emit_execution_event(&o, TradeUpdateEvent::Closed, Some(fill));
                             self.mark_order_terminal_for_release(&order_id);
                         } else {
                             o.qty = remaining_qty;
@@ -882,7 +906,18 @@ impl PaperBroker {
                                 "PaperBroker::process_close_queue emitting PartialFilled for order_id={} remaining_qty={:.4}",
                                 order_id, o.qty
                             );
-                            self.emit_trade_event(&exit, TradeUpdateEvent::PartialFilled);
+                            let fill = self.exit_execution(
+                                &o,
+                                &exit.order_id,
+                                fill_price,
+                                current_time,
+                                close_result,
+                            );
+                            self.emit_execution_event(
+                                &exit,
+                                TradeUpdateEvent::PartialFilled,
+                                Some(fill),
+                            );
                         }
                     }
 
@@ -936,16 +971,7 @@ impl PaperBroker {
     }
 
     fn emit_trade_event(&self, order: &Order, event: TradeUpdateEvent) {
-        // Collect for synchronous drain (Backtests)
-        self.trade_events
-            .lock()
-            .push_back((order.clone(), event.clone()));
-
-        // Emit to async live subscribers
-        let subscribers = self.trade_stream_subscribers.lock();
-        for sub in subscribers.iter() {
-            sub((order.clone(), event.clone()));
-        }
+        self.emit_execution_event(order, event, None);
     }
 
     fn cancel_remaining_legs(&self, order: &mut Order) {
@@ -1164,6 +1190,8 @@ impl PaperBroker {
             match agg {
                 None => agg = Some(pos.clone()),
                 Some(ref mut a) => {
+                    // Multiple positions must not inherit one entry's identity.
+                    a.order_id = None;
                     // Weighted average entry price
                     let total_qty = a.qty + pos.qty;
                     if total_qty > 0.0 {
@@ -1382,6 +1410,14 @@ impl Broker for PaperBroker {
 // ─────────────────────── OrderManagementProvider Trait ───────────────────────
 
 impl OrderManagementProvider for PaperBroker {
+    fn account_cash_flow_reader(&self) -> Option<Arc<dyn super::account_cash_flow::AccountCashFlowReader>> {
+        Some(Arc::new(self.clone()))
+    }
+    fn execution_fill_history_reader(
+        &self,
+    ) -> Option<Arc<dyn super::fill_history::ExecutionFillHistoryReader>> {
+        Some(Arc::new(self.clone()))
+    }
     fn position_valuation_reader(
         &self,
     ) -> Option<Arc<dyn super::position_valuation::PositionValuationReader>> {
@@ -1936,20 +1972,28 @@ impl OrderManagementProvider for PaperBroker {
     }
 
     fn get_cached_positions(&self) -> Option<Vec<Position>> {
-        // Return aggregated positions (one per symbol)
-        let mut result = Vec::new();
-        for entry in self.positions.iter() {
-            let symbol = entry.key();
-            if let Some(agg) = self.get_aggregate_position(symbol) {
-                result.push(agg);
-            }
+        // Preserve exact entry identities, including opposing/split positions
+        // on one symbol. get_position(symbol) remains the aggregate helper.
+        let mut positions=Vec::new();
+        for by_symbol in self.positions.iter() {
+            positions.extend(by_symbol.value().iter().map(|position|position.value().clone()));
         }
-        Some(result)
+        Some(positions)
+    }
+
+    fn position_snapshot_reader(&self) -> Option<super::types::PositionSnapshotReader> {
+        let positions=Arc::clone(&self.positions);
+        Some(Arc::new(move |order_id,symbol| Ok(positions.get(symbol)
+            .and_then(|by_order|by_order.get(order_id).map(|p|p.value().clone())))))
     }
 
     async fn get_position(&self, symbol: &str) -> Result<Position, BrokerError> {
         self.get_aggregate_position(symbol)
             .ok_or(BrokerError::PositionError("Position not found".into()))
+    }
+
+    async fn get_position_by_order_id(&self, order_id: &str, symbol: &str) -> Result<Option<Position>, BrokerError> {
+        Ok(self.positions.get(symbol).and_then(|positions|positions.get(order_id).map(|position|position.value().clone())))
     }
 
     async fn get_account(&self) -> Result<Account, BrokerError> {
@@ -1961,15 +2005,14 @@ impl OrderManagementProvider for PaperBroker {
     }
 
     fn drain_trade_events_bounded(&self, max_events: usize) -> Vec<(Order, TradeUpdateEvent)> {
-        let mut queue = self.trade_events.lock();
-        let count = max_events.min(queue.len());
-        let events = queue.drain(..count).collect();
-        let drained = queue.is_empty();
-        drop(queue);
-        if drained && count != 0 {
-            self.release_terminal_orders();
-        }
-        events
+        self.drain_execution_events(max_events)
+            .into_iter()
+            .map(|e| e.event)
+            .collect()
+    }
+
+    fn drain_broker_events(&self) -> Vec<BrokerOrderEvent> {
+        self.drain_execution_events(usize::MAX)
     }
 
     fn has_pending_trade_events(&self) -> bool {
@@ -1981,7 +2024,15 @@ impl OrderManagementProvider for PaperBroker {
         on_trade: Arc<dyn Fn((Order, TradeUpdateEvent)) + Send + Sync>,
     ) -> Result<(), BrokerError> {
         let mut subscribers = self.trade_stream_subscribers.lock();
-        subscribers.push(on_trade);
+        subscribers.push(Arc::new(move |event| on_trade(event.event)));
+        Ok(())
+    }
+
+    async fn subscribe_to_broker_event_stream(
+        &self,
+        on_trade: Arc<dyn Fn(BrokerOrderEvent) + Send + Sync>,
+    ) -> Result<(), BrokerError> {
+        self.trade_stream_subscribers.lock().push(on_trade);
         Ok(())
     }
 

@@ -52,6 +52,7 @@ fn row(id: u128, symbol: &str) -> Insight {
 }
 fn quote(symbol: &str, bid: f64) -> Quote {
     Quote {
+        profit_model: None,
         symbol: symbol.into(),
         bid,
         ask: bid + 1.0,

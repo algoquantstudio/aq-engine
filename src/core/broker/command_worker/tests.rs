@@ -7,6 +7,7 @@ use crate::core::broker::{
     types::{AccountType, OrderClass, OrderSide, OrderType},
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+mod cancellation_recovery;
 
 fn checkpoint_batch(receipt: &BrokerCommandReceipt) -> ExecutionCheckpointBatch {
     let mut insight = crate::core::insight::Insight::default();
@@ -85,15 +86,15 @@ fn quantity_limited_entry(id: &str, quantity: f64, limit: f64) -> BrokerCommand 
 fn submission_reconciliation_schedule_is_identity_deduplicated_and_bounded() {
     let mut pending = VecDeque::new();
     let duplicate = entry("duplicate");
-    schedule_submission_reconciliation(&mut pending, &duplicate);
-    schedule_submission_reconciliation(&mut pending, &duplicate);
+    schedule_command_reconciliation(&mut pending, &duplicate);
+    schedule_command_reconciliation(&mut pending, &duplicate);
     assert_eq!(pending.len(), 1);
-    for index in 1..MAX_SUBMISSION_RECONCILIATIONS {
-        schedule_submission_reconciliation(&mut pending, &entry(&format!("command-{index}")));
+    for index in 1..MAX_COMMAND_RECONCILIATIONS {
+        schedule_command_reconciliation(&mut pending, &entry(&format!("command-{index}")));
     }
-    assert_eq!(pending.len(), MAX_SUBMISSION_RECONCILIATIONS);
-    schedule_submission_reconciliation(&mut pending, &entry("overflow"));
-    assert_eq!(pending.len(), MAX_SUBMISSION_RECONCILIATIONS);
+    assert_eq!(pending.len(), MAX_COMMAND_RECONCILIATIONS);
+    schedule_command_reconciliation(&mut pending, &entry("overflow"));
+    assert_eq!(pending.len(), MAX_COMMAND_RECONCILIATIONS);
 }
 
 fn cancel(id: &str) -> BrokerCommand {
@@ -1057,10 +1058,10 @@ async fn analytics_page_admission_is_bounded_across_sender_clones_and_read_only(
     ).unwrap();
     let sender = worker.sender.clone();
     let permit = worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
-    assert!(matches!(sender.try_execution_evidence_page(1, 0, None, 128), Err(BrokerCommandError::QueueFull)));
-    assert!(matches!(sender.try_execution_evidence_feed_page(0, None, 128), Err(BrokerCommandError::QueueFull)));
-    assert!(matches!(sender.try_execution_fill_page(0, None, 128), Err(BrokerCommandError::QueueFull)));
-    assert!(matches!(sender.try_prepare_execution_evidence_export(), Err(BrokerCommandError::QueueFull)));
+    assert!(matches!(sender.try_execution_evidence_page(1, 0, None, 128), Err(BrokerCommandError::AnalyticsBusy)));
+    assert!(matches!(sender.try_execution_evidence_feed_page(0, None, 128), Err(BrokerCommandError::AnalyticsBusy)));
+    assert!(matches!(sender.try_execution_fill_page(0, None, 128), Err(BrokerCommandError::AnalyticsBusy)));
+    assert!(matches!(sender.try_prepare_execution_evidence_export(), Err(BrokerCommandError::AnalyticsBusy)));
     drop(permit);
     let page = sender.try_execution_evidence_page(1, 0, None, 128).unwrap().wait().await.unwrap();
     assert!(page.records.is_empty());
@@ -1072,6 +1073,28 @@ async fn analytics_page_admission_is_bounded_across_sender_clones_and_read_only(
     assert!(fills.records.is_empty());assert_eq!(fills.source_id,page.source_id);
     assert!(sender.try_prepare_execution_evidence_export().unwrap().wait().await.unwrap().is_none());
     assert!(probe.calls.lock().is_empty(), "analytics must not invoke a broker mutation");
+    drop(sender);
+    drop(finish(worker).await);
+}
+
+#[tokio::test]
+async fn analytics_permit_busy_is_not_actual_journal_queue_saturation() {
+    let fixture = Fixture::new();
+    let probe = Arc::new(Probe::new(false));
+    let worker = BrokerCommandWorker::start_executor(probe.clone(), fixture.journal().await, Default::default()).unwrap();
+    let mut sender = worker.sender.clone();
+    let (queue, _held_receiver) = mpsc::channel(1);
+    let (reply, _) = oneshot::channel();
+    assert!(queue.try_send(JournalRequest::CompleteStop { reply }).is_ok());
+    sender.journal_requests = queue;
+    assert!(matches!(sender.try_prepare_execution_fill_export(), Err(BrokerCommandError::AnalyticsQueueFull)));
+    // Rejected queue admission releases the permit; it cannot poison unrelated
+    // source writes or disguise channel saturation as a held analytics reader.
+    assert_eq!(sender.evidence_capacity.available_permits(), 1);
+    let held = sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    assert!(matches!(sender.try_prepare_position_mark_export(), Err(BrokerCommandError::AnalyticsBusy)));
+    drop(held);
+    assert!(probe.calls.lock().is_empty());
     drop(sender);
     drop(finish(worker).await);
 }
@@ -1160,6 +1183,447 @@ async fn fill_journal_waits_for_bounded_admission_without_broker_mutations() {
     assert!(probe.calls.lock().is_empty());
     let journal=finish(worker).await;
     assert_eq!(journal.execution_fill_page(0,None,128).await.unwrap().records,page.records);
+}
+
+fn capture_fill(id: &str) -> ExecutionFillBatch {
+    let fill=serde_json::from_value(serde_json::json!({"insight_id":null,"fill":{
+        "version":1,"provider":"capture-fixture","fill_id":id,"order_id":"order","position_id":null,
+        "symbol":"CUSTOM","side":"sell","effect":"entry","quantity":2.0,"price":10.0,
+        "occurred_at_us":100,"as_of_us":200,"cash":null,"account_notional":null
+    }})).unwrap();
+    ExecutionFillBatch::new(vec![fill]).unwrap()
+}
+
+#[tokio::test]
+async fn source_capture_pause_preserves_accepted_fills_receipts_and_stop_controls() {
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let mut worker=BrokerCommandWorker::start_executor(probe.clone(),fixture.journal().await,Default::default()).unwrap();
+    let capture=crate::core::live_sync::capture_test_fixture::CaptureFixture::active().await;
+    let gate=Some(capture.publisher.cloud_capture_gate());
+    worker.sender.record_execution_fills_for_capture(capture_fill("accepted"),gate.clone()).await.unwrap();
+    let frozen=worker.sender.try_prepare_execution_fill_export().unwrap().wait().await.unwrap().unwrap();
+    capture.pause().await;
+    for n in 0..100 {
+        assert_eq!(worker.sender.record_execution_fills_for_capture(capture_fill(&format!("refused-{n}")),gate.clone()).await,
+            Err(BrokerCommandError::CapturePaused));
+    }
+    let pending=worker.sender.try_prepare_execution_fill_export().unwrap().wait().await.unwrap().unwrap();
+    assert_eq!(pending.transfer_id,frozen.transfer_id);assert_eq!(pending.body,frozen.body);
+    worker.sender.try_acknowledge_execution_fill_export(frozen.receipt()).unwrap().wait().await.unwrap();
+    assert!(worker.sender.try_prepare_execution_fill_export().unwrap().wait().await.unwrap().is_none());
+    assert_eq!(worker.sender.try_execution_fill_page(0,None,128).unwrap().wait().await.unwrap().records.len(),1);
+    // Capture is not an execution gate: cleanup can dispatch and its mandatory
+    // journal/stop lifecycle continues independently of optional analytics.
+    worker.sender.try_enqueue(cancel("quota-safe-cleanup")).unwrap();
+    assert!(matches!(next(&mut worker).await.outcome,BrokerCommandOutcome::Acknowledged));
+    assert_eq!(probe.calls.lock().as_slice(),["cancel:quota-safe-cleanup"]);
+    worker.sender.request_execution_stop();wait_stop_persisted(&worker).await;
+    let journal=finish(worker).await;
+    assert_eq!(journal.execution_fill_page(0,None,128).await.unwrap().records.len(),1);
+    capture.shutdown().await;
+}
+
+#[tokio::test]
+async fn analytics_disk_pressure_does_not_block_broker_cleanup_or_durable_stop() {
+    use crate::core::live_sync::{PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES};
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let journal=fixture.journal().await.with_analytics_capture_budget(PhysicalCaptureLimit {
+        physical_limit_bytes:MIN_OPERATIONAL_HEADROOM_BYTES+1,
+        operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES,
+    }).await.unwrap();
+    let mut worker=BrokerCommandWorker::start_executor(probe.clone(),journal,Default::default()).unwrap();
+    for index in 0..20 {
+        assert_eq!(worker.sender.record_execution_fills(capture_fill(&format!("omitted-{index}"))).await,
+            Err(BrokerCommandError::CapturePaused));
+    }
+    worker.sender.try_enqueue(cancel("source-disk-safe-cleanup")).unwrap();
+    assert!(matches!(next(&mut worker).await.outcome,BrokerCommandOutcome::Acknowledged));
+    worker.sender.request_execution_stop();
+    wait_stop_persisted(&worker).await;
+    let journal=finish(worker).await;
+    assert_eq!(probe.calls.lock().as_slice(),["cancel:source-disk-safe-cleanup"]);
+    let pause=journal.analytics_capture_pause().await.unwrap().unwrap();
+    assert_eq!(pause.generation,1,"retries did not expand the durable pause record");
+    assert!(journal.execution_fill_page(0,None,128).await.unwrap().records.is_empty());
+    assert_eq!(journal.execution_lifecycle().phase,crate::core::broker::command_journal::lifecycle::ExecutionPhase::Stopping);
+}
+
+#[tokio::test]
+async fn journal_quality_handoff_requests_are_bounded_and_stop_independent() {
+    use crate::core::live_sync::{CaptureOwnerLease,OutboxStore,PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES};
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let journal=fixture.journal().await.with_analytics_capture_budget(PhysicalCaptureLimit {
+        physical_limit_bytes:MIN_OPERATIONAL_HEADROOM_BYTES+1,
+        operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES,
+    }).await.unwrap();
+    let mut worker=BrokerCommandWorker::start_executor(probe.clone(),journal,Default::default()).unwrap();
+    assert_eq!(worker.sender.record_execution_fills(capture_fill("refused-for-handoff")).await,Err(BrokerCommandError::CapturePaused));
+    let held=worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    assert!(matches!(worker.sender.try_analytics_capture_pause(),Err(BrokerCommandError::AnalyticsBusy)));
+    // The independent stop fence persists while analytics cannot acquire its
+    // permit; waiting on external handoff does not occupy the journal worker.
+    worker.sender.request_execution_stop();wait_stop_persisted(&worker).await;
+    worker.sender.try_enqueue(cancel("quality-safe-cleanup")).unwrap();
+    assert!(matches!(next(&mut worker).await.outcome,BrokerCommandOutcome::Acknowledged));
+    drop(held);
+    let source=worker.sender.try_analytics_capture_pause().unwrap().wait().await.unwrap().unwrap();
+    let path=fixture.0.join("publisher.db");
+    let store=OutboxStore::open(&path).await.unwrap();
+    let lease=CaptureOwnerLease::acquire(&path,"runtime","strategy","session","run").unwrap();
+    let receipt=store.handoff_analytics_capture_pause(&lease,&source,100_000).await.unwrap().unwrap();
+    let held=worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    assert!(matches!(worker.sender.try_acknowledge_analytics_capture_handoff(receipt.clone()),Err(BrokerCommandError::AnalyticsBusy)));
+    drop(held);
+    assert!(worker.sender.try_acknowledge_analytics_capture_handoff(receipt.clone()).unwrap().wait().await.unwrap());
+    assert!(worker.sender.try_acknowledge_analytics_capture_handoff(receipt.clone()).unwrap().wait().await.unwrap());
+    assert_eq!(worker.sender.try_analytics_capture_pause().unwrap().wait().await.unwrap(),Some(source.clone()));
+    let journal=finish(worker).await;
+    assert_eq!(journal.analytics_capture_handoff_receipt().await.unwrap(),Some(receipt));
+    assert_eq!(journal.analytics_capture_pause().await.unwrap(),Some(source));
+    assert_eq!(store.pending_count().await.unwrap(),0);
+    assert!(journal.execution_fill_page(0,None,128).await.unwrap().records.is_empty());
+    assert_eq!(probe.calls.lock().as_slice(),["cancel:quality-safe-cleanup"]);
+}
+
+#[tokio::test]
+async fn actual_journal_pressure_synchronously_latches_the_required_publisher_gate() {
+    use crate::core::live_sync::{CaptureOwnerLease,OutboxStore,PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES,LocalEventPublisher,LocalEventPublisherConfig,InProcessEventBus};
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let policy=PhysicalCaptureLimit{physical_limit_bytes:MIN_OPERATIONAL_HEADROOM_BYTES+1,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES};
+    let journal=fixture.journal().await.with_analytics_capture_budget(policy).await.unwrap();
+    let mut worker=BrokerCommandWorker::start_executor(probe.clone(),journal,Default::default()).unwrap();
+    let path=fixture.0.join("publisher.db");let store=OutboxStore::open(&path).await.unwrap();
+    let lease=Arc::new(CaptureOwnerLease::acquire(&path,"runtime","strategy","session","run").unwrap());
+    let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(Arc::new(InProcessEventBus::default()),store.clone(),
+        LocalEventPublisherConfig{capture_limit_bytes:Some(100_000),source_journal_limit:Some(policy),..Default::default()},0,Arc::new(()),lease);
+    let held=worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    assert!(matches!(worker.sender.try_analytics_capture_status(),Err(BrokerCommandError::AnalyticsBusy)));drop(held);
+    let monitor=publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    assert!(publisher.monitor_source_journal(worker.sender.clone()).is_err());
+    tokio::time::timeout(Duration::from_secs(3),async {while publisher.cloud_capture_paused(){tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+    assert_eq!(worker.sender.record_execution_fills_for_capture(capture_fill("physical-pressure"),Some(publisher.cloud_capture_gate())).await,Err(BrokerCommandError::CapturePaused));
+    assert!(publisher.cloud_capture_paused(),"the worker latched source pressure before replying");
+    tokio::time::timeout(Duration::from_secs(4),async {
+        while !publisher.cloud_capture_status().source_journal.as_ref().is_some_and(|status|status.handoff_receipt.is_some()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("the owned monitor automatically hands off and acknowledges the source fact");
+    assert!(publisher.cloud_capture_paused());assert!(!publisher.admission_failed());
+    drop(monitor);
+    worker.sender.request_execution_stop();wait_stop_persisted(&worker).await;
+    worker.sender.try_enqueue(cancel("latched-source-safe-cleanup")).unwrap();
+    assert!(matches!(next(&mut worker).await.outcome,BrokerCommandOutcome::Acknowledged));
+    let journal=finish(worker).await;
+    assert!(journal.analytics_capture_pause().await.unwrap().is_some());assert_eq!(store.pending_count().await.unwrap(),0);
+    assert_eq!(probe.calls.lock().as_slice(),["cancel:latched-source-safe-cleanup"]);
+    publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn restarting_the_source_monitor_preserves_an_interruption_until_reconciliation() {
+    use crate::core::live_sync::{CaptureOwnerLease,OutboxStore,PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES,LocalEventPublisher,LocalEventPublisherConfig,InProcessEventBus,CloudCaptureState};
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let policy=PhysicalCaptureLimit{physical_limit_bytes:32*1024*1024,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES};
+    let journal=fixture.journal().await.with_analytics_capture_budget(policy).await.unwrap();
+    let worker=BrokerCommandWorker::start_executor(probe.clone(),journal,Default::default()).unwrap();
+    let path=fixture.0.join("publisher.db");let store=OutboxStore::open(&path).await.unwrap();
+    let lease=Arc::new(CaptureOwnerLease::acquire(&path,"runtime","strategy","session","run").unwrap());
+    let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(Arc::new(InProcessEventBus::default()),store.clone(),
+        LocalEventPublisherConfig{capture_limit_bytes:Some(100_000),source_journal_limit:Some(policy),..Default::default()},0,Arc::new(()),lease);
+    let monitor=publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async{while publisher.cloud_capture_paused(){tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+    monitor.shutdown().await;assert!(publisher.cloud_capture_paused());
+    let monitor=publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async{while publisher.cloud_capture_status().state!=CloudCaptureState::ReconciliationRequired{tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+    let gap=publisher.cloud_capture_status().pause.unwrap();
+    assert_eq!(gap.origin_runtime_id.as_deref(),Some("runtime"));assert_eq!(gap.origin_run_id.as_deref(),Some("run"));
+    assert_eq!(gap.capacity.requested_bytes,0);assert_eq!(store.pending_count().await.unwrap(),0);
+    assert!(publisher.cloud_capture_paused(),"fresh source evidence does not erase an intentional observation interruption");
+    assert!(publisher.cloud_capture_status().source_journal.unwrap().pause.is_none(),"no journal-cap refusal was invented");
+    drop(monitor);let journal=finish(worker).await;
+    assert!(journal.analytics_capture_pause().await.unwrap().is_none());assert!(probe.calls.lock().is_empty());
+    publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn unexpected_source_monitor_exit_is_durably_fenced_before_reobservation(){
+    use crate::core::live_sync::{CaptureOwnerLease,OutboxStore,PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES,LocalEventPublisher,LocalEventPublisherConfig,InProcessEventBus,CloudCaptureState};
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let policy=PhysicalCaptureLimit{physical_limit_bytes:32*1024*1024,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES};
+    let journal=fixture.journal().await.with_analytics_capture_budget(policy).await.unwrap();
+    let mut worker=BrokerCommandWorker::start_executor(probe.clone(),journal,Default::default()).unwrap();
+    let path=fixture.0.join("publisher.db");let store=OutboxStore::open(&path).await.unwrap();
+    let lease=Arc::new(CaptureOwnerLease::acquire(&path,"runtime","strategy","session","run").unwrap());
+    let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(Arc::new(InProcessEventBus::default()),store.clone(),
+        LocalEventPublisherConfig{capture_limit_bytes:Some(100_000),source_journal_limit:Some(policy),..Default::default()},0,Arc::new(()),lease);
+    let mut monitor=publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async{while publisher.cloud_capture_paused(){tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+    let cached=publisher.cloud_capture_status().source_journal.unwrap();
+    monitor.abort_task_for_test().await;
+    assert!(publisher.cloud_capture_paused(),"unexpected task exit must close capture even while the old sample is still fresh");
+    tokio::time::timeout(Duration::from_secs(3),async{while store.latest_capture_pause().await.unwrap().is_none(){tokio::time::sleep(Duration::from_millis(5)).await;}}).await.expect("the publisher independently persists an exited monitor's interruption");
+    let gap=store.latest_capture_pause().await.unwrap().unwrap();
+    assert_eq!(gap.capacity.requested_bytes,0);
+    assert!(publisher.observe_source_journal(cached).await.is_err(),"pre-exit status cannot clear the fence");
+    worker.sender.try_enqueue(cancel("monitor-exit-safe-cleanup")).unwrap();
+    assert!(matches!(next(&mut worker).await.outcome,BrokerCommandOutcome::Acknowledged));
+    let replacement=publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async{while publisher.cloud_capture_status().state!=CloudCaptureState::ReconciliationRequired{tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+    assert_eq!(store.latest_capture_pause().await.unwrap().unwrap().generation,gap.generation);
+    assert!(publisher.cloud_capture_paused(),"re-observation is not current-state replay");
+    assert_eq!(probe.calls.lock().as_slice(),["cancel:monitor-exit-safe-cleanup"]);
+    assert_eq!(publisher.critical_sequence_cursor(),0);
+    replacement.shutdown().await;drop(monitor);let _journal=finish(worker).await;
+    publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+async fn fresh_observed_source_fixture() -> (Fixture, BrokerCommandWorker,
+    crate::core::live_sync::LocalEventPublisher, crate::core::live_sync::OutboxStore, Arc<Probe>) {
+    use crate::core::live_sync::{CaptureOwnerLease, OutboxStore, PhysicalCaptureLimit,
+        MIN_OPERATIONAL_HEADROOM_BYTES, LocalEventPublisher, LocalEventPublisherConfig, InProcessEventBus};
+    let fixture = Fixture::new();
+    let probe = Arc::new(Probe::new(false));
+    let policy = PhysicalCaptureLimit { physical_limit_bytes: 32 * 1024 * 1024,
+        operational_headroom_bytes: MIN_OPERATIONAL_HEADROOM_BYTES };
+    let journal = fixture.journal().await.with_analytics_capture_budget(policy).await.unwrap();
+    let worker = BrokerCommandWorker::start_executor(probe.clone(), journal, Default::default()).unwrap();
+    let path = fixture.0.join("publisher.db");
+    let store = OutboxStore::open(&path).await.unwrap();
+    let lease = Arc::new(CaptureOwnerLease::acquire(&path, "runtime", "strategy", "session", "run").unwrap());
+    let publisher = LocalEventPublisher::spawn_owned_with_capture_lease(
+        Arc::new(InProcessEventBus::default()), store.clone(), LocalEventPublisherConfig {
+            capture_limit_bytes: Some(100_000), source_journal_limit: Some(policy), ..Default::default()
+        }, 0, Arc::new(()), lease);
+    publisher.refresh_source_journal(&worker.sender).await.unwrap();
+    assert!(!publisher.cloud_capture_paused());
+    (fixture, worker, publisher, store, probe)
+}
+
+#[tokio::test]
+async fn transient_source_observation_contention_does_not_invent_a_capture_gap() {
+    let (_fixture, worker, publisher, store, probe) = fresh_observed_source_fixture().await;
+    let first = publisher.cloud_capture_status().source_journal.unwrap().observed_at_us;
+    // A page reader owns this permit briefly; it does not make the last
+    // qualified source observation false or stale.
+    let held = worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    let monitor = publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!publisher.cloud_capture_paused(), "normal analytics contention must not suspend fresh capture");
+    assert!(store.latest_capture_pause().await.unwrap().is_none(), "busy is not missing history");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while publisher.cloud_capture_status().source_journal.as_ref().unwrap().observed_at_us <= first {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(!publisher.cloud_capture_paused());
+    assert!(store.latest_capture_pause().await.unwrap().is_none());
+    monitor.shutdown().await;
+    drop(finish(worker).await);
+    publisher.shutdown(Duration::from_secs(1)).await;
+    assert!(probe.calls.lock().is_empty(), "observation never submits broker operations");
+}
+
+#[tokio::test]
+async fn source_observation_queue_pressure_does_not_discard_a_fresh_sample() {
+    let (_fixture, worker, publisher, store, probe) = fresh_observed_source_fixture().await;
+    let mut observer = worker.sender.clone();
+    let (queue, _receiver) = mpsc::channel(1);
+    let (reply, _) = oneshot::channel();
+    queue.try_send(JournalRequest::CompleteStop { reply }).unwrap();
+    observer.journal_requests = queue;
+    let monitor = publisher.monitor_source_journal(observer).unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!publisher.cloud_capture_paused());
+    assert!(store.latest_capture_pause().await.unwrap().is_none());
+    monitor.shutdown().await;
+    drop(finish(worker).await);
+    publisher.shutdown(Duration::from_secs(1)).await;
+    assert!(probe.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn source_observation_contention_still_expires_and_requires_reconciliation() {
+    use crate::core::live_sync::CloudCaptureState;
+    let (_fixture, worker, publisher, store, probe) = fresh_observed_source_fixture().await;
+    let held = worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    let monitor = publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(13), async {
+        while store.latest_capture_pause().await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("normal contention cannot extend the original ten-second freshness deadline");
+    assert!(publisher.cloud_capture_paused());
+    let generation = store.latest_capture_pause().await.unwrap().unwrap().generation;
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while publisher.cloud_capture_status().state != CloudCaptureState::ReconciliationRequired {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(publisher.cloud_capture_paused(), "a new sample cannot skip current-state replay");
+    assert_eq!(store.latest_capture_pause().await.unwrap().unwrap().generation, generation);
+    monitor.shutdown().await;
+    drop(finish(worker).await);
+    publisher.shutdown(Duration::from_secs(1)).await;
+    assert!(probe.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn source_monitor_cannot_interrupt_an_owned_recovery_operation() {
+    let (_fixture, worker, publisher, store, probe) = coordinated_source_fixture().await;
+    let generation = store.latest_capture_pause().await.unwrap().unwrap().generation;
+    let operation = publisher.hold_source_operation_for_test().await;
+    let monitor = publisher.monitor_source_journal(worker.sender.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(publisher.cloud_capture_reconciliation_required());
+    assert_eq!(store.latest_capture_pause().await.unwrap().unwrap().generation, generation,
+        "a monitor tick cannot create a newer gap while recovery owns the operation gate");
+    drop(operation);
+    monitor.shutdown().await;
+    drop(finish(worker).await);
+    publisher.shutdown(Duration::from_secs(1)).await;
+    assert!(probe.calls.lock().is_empty());
+}
+
+async fn coordinated_source_fixture()->(Fixture,BrokerCommandWorker,crate::core::live_sync::LocalEventPublisher,crate::core::live_sync::OutboxStore,Arc<Probe>) {
+    use crate::core::live_sync::{CaptureOwnerLease,OutboxStore,PhysicalCaptureLimit,MIN_OPERATIONAL_HEADROOM_BYTES,LocalEventPublisher,LocalEventPublisherConfig,InProcessEventBus};
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let policy=PhysicalCaptureLimit{physical_limit_bytes:32*1024*1024,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES};
+    let mut journal=fixture.journal().await.with_analytics_capture_budget(PhysicalCaptureLimit{physical_limit_bytes:MIN_OPERATIONAL_HEADROOM_BYTES+1,..policy}).await.unwrap();
+    assert_eq!(journal.record_execution_fills(&capture_fill("pre-recovery-refusal")).await,Err(BrokerCommandError::CapturePaused));
+    let journal=journal.with_analytics_capture_budget(policy).await.unwrap();
+    let worker=BrokerCommandWorker::start_executor(probe.clone(),journal,Default::default()).unwrap();
+    let path=fixture.0.join("publisher.db");let store=OutboxStore::open(&path).await.unwrap();
+    let lease=Arc::new(CaptureOwnerLease::acquire(&path,"runtime","strategy","session","run").unwrap());
+    let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(Arc::new(InProcessEventBus::default()),store.clone(),
+        LocalEventPublisherConfig{capture_limit_bytes:Some(100_000),source_journal_limit:Some(policy),..Default::default()},0,Arc::new(()),lease);
+    publisher.refresh_source_journal(&worker.sender).await.unwrap();
+    assert!(publisher.cloud_capture_reconciliation_required());
+    (fixture,worker,publisher,store,probe)
+}
+
+async fn coordinated_status(sender:&BrokerCommandSender)->crate::core::broker::command_journal::AnalyticsCaptureStatus {
+    tokio::time::timeout(Duration::from_secs(2),async {
+        loop {
+            match sender.try_analytics_capture_status() {
+                Ok(reply)=>return reply.wait().await.unwrap().unwrap(),
+                Err(BrokerCommandError::AnalyticsBusy)=>tokio::time::sleep(Duration::from_millis(1)).await,
+                Err(error)=>panic!("source status failed: {error}"),
+            }
+        }
+    }).await.unwrap()
+}
+
+#[tokio::test]
+async fn coordinated_completion_is_bounded_and_clears_source_then_destination() {
+    let (_fixture,mut worker,publisher,store,probe)=coordinated_source_fixture().await;
+    let generation=publisher.cloud_capture_status().pause.unwrap().generation;
+    assert!(!publisher.complete_capture_reconciliation(generation).await.unwrap());
+    let status=coordinated_status(&worker.sender).await;
+    let held=worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    assert!(matches!(worker.sender.try_complete_analytics_capture(status.handoff_receipt.unwrap()),Err(BrokerCommandError::AnalyticsBusy)));
+    drop(held);
+    assert!(publisher.complete_capture_reconciliation_with_source(generation,&worker.sender).await.unwrap());
+    assert!(!publisher.cloud_capture_paused());
+    assert!(coordinated_status(&worker.sender).await.pause.is_none());
+    assert_eq!(store.pending_count().await.unwrap(),0);
+    worker.sender.try_enqueue(cancel("coordinated-safe-cleanup")).unwrap();
+    assert!(matches!(next(&mut worker).await.outcome,BrokerCommandOutcome::Acknowledged));
+    worker.sender.request_execution_stop();wait_stop_persisted(&worker).await;
+    let journal=finish(worker).await;
+    assert!(journal.analytics_capture_pause().await.unwrap().is_none());
+    assert_eq!(probe.calls.lock().as_slice(),["cancel:coordinated-safe-cleanup"]);
+    publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn lost_source_completion_ack_keeps_capture_gated_until_destination_completion() {
+    let (_fixture,worker,publisher,store,probe)=coordinated_source_fixture().await;
+    let generation=publisher.cloud_capture_status().pause.unwrap().generation;
+    let receipt=coordinated_status(&worker.sender).await.handoff_receipt.unwrap();
+    drop(worker.sender.try_complete_analytics_capture(receipt).unwrap());
+    assert!(coordinated_status(&worker.sender).await.pause.is_none(),"the exact queued transition committed despite a lost reply");
+    assert!(publisher.cloud_capture_paused());assert!(store.capture_pause_for_scope("runtime","strategy","session").await.unwrap().unwrap().resumed_at_us.is_none());
+    assert_eq!(worker.sender.record_execution_fills_for_capture(capture_fill("cannot-capture-between-transitions"),Some(publisher.cloud_capture_gate())).await,Err(BrokerCommandError::CapturePaused));
+    assert!(publisher.complete_capture_reconciliation_with_source(generation,&worker.sender).await.unwrap());
+    assert!(!publisher.cloud_capture_paused());
+    let journal=finish(worker).await;
+    assert!(journal.execution_fill_page(0,None,128).await.unwrap().records.is_empty());assert!(probe.calls.lock().is_empty());
+    publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn a_new_destination_pause_fences_a_source_already_cleared_by_an_older_attempt() {
+    use crate::core::live_sync::{EventEnvelope,EventPriority,EventKind};
+    let (_fixture,worker,publisher,store,probe)=coordinated_source_fixture().await;
+    let old=publisher.cloud_capture_status().pause.unwrap().generation;
+    let receipt=coordinated_status(&worker.sender).await.handoff_receipt.unwrap();
+    assert!(worker.sender.try_complete_analytics_capture(receipt).unwrap().wait().await.unwrap());
+    let mut refused=EventEnvelope::new("runtime","strategy","session","later-refusal",1,EventPriority::Critical,EventKind::StrategyEvent,serde_json::json!({"body":"x".repeat(2048)}));
+    refused.run_id=Some("run".into());
+    assert!(matches!(store.capture_events_with_capacity(&[refused],1).await,Err(crate::core::live_sync::OutboxStoreError::CapturePaused(_))));
+    assert!(!publisher.complete_capture_reconciliation_with_source(old,&worker.sender).await.unwrap());
+    assert!(publisher.cloud_capture_paused());
+    let next=publisher.cloud_capture_status().pause.unwrap().generation;assert!(next>old);
+    assert!(coordinated_status(&worker.sender).await.pause.is_none());
+    // A subsequent owner replay must use the new destination generation.
+    // This fixture has an empty current-state set and no accepted payloads.
+    assert!(publisher.complete_capture_reconciliation_with_source(next,&worker.sender).await.unwrap());
+    assert!(!publisher.cloud_capture_paused());
+    drop(finish(worker).await);assert!(probe.calls.lock().is_empty());publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn publisher_restart_after_source_completion_restores_the_open_destination_gate() {
+    use crate::core::live_sync::{CaptureOwnerLease,LocalEventPublisher,LocalEventPublisherConfig,InProcessEventBus};
+    let (fixture,worker,publisher,store,probe)=coordinated_source_fixture().await;
+    let original=publisher.cloud_capture_status().pause.unwrap();
+    let source=coordinated_status(&worker.sender).await;
+    let policy=source.physical_limit();
+    assert!(worker.sender.try_complete_analytics_capture(source.handoff_receipt.unwrap()).unwrap().wait().await.unwrap());
+    publisher.shutdown(Duration::from_secs(1)).await;drop(publisher);
+    let path=fixture.0.join("publisher.db");
+    let owner=Arc::new(CaptureOwnerLease::acquire(&path,"next-runtime","strategy","session","next-run").unwrap());
+    let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(Arc::new(InProcessEventBus::default()),store.clone(),
+        LocalEventPublisherConfig{capture_limit_bytes:Some(100_000),source_journal_limit:Some(policy),..Default::default()},0,Arc::new(()),owner);
+    publisher.refresh_source_journal(&worker.sender).await.unwrap();
+    let adopted=publisher.cloud_capture_status().pause.unwrap();
+    assert!(publisher.cloud_capture_paused());assert_eq!(adopted.owner_run_id.as_deref(),Some("next-run"));
+    assert_eq!(adopted.origin_runtime_id,None);assert_eq!(adopted.origin_run_id,None);
+    assert!(adopted.generation>original.generation);
+    assert!(!publisher.complete_capture_reconciliation_with_source(original.generation,&worker.sender).await.unwrap());
+    assert!(publisher.complete_capture_reconciliation_with_source(adopted.generation,&worker.sender).await.unwrap());
+    assert!(!publisher.cloud_capture_paused());assert_eq!(store.pending_count().await.unwrap(),0);
+    let journal=finish(worker).await;assert!(journal.analytics_capture_pause().await.unwrap().is_none());
+    assert!(probe.calls.lock().is_empty());publisher.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn source_capture_rechecks_after_analytics_permit_and_serialized_queue_waits() {
+    let fixture=Fixture::new();let probe=Arc::new(Probe::new(false));
+    let worker=BrokerCommandWorker::start_executor(probe.clone(),fixture.journal().await,Default::default()).unwrap();
+    let capture=crate::core::live_sync::capture_test_fixture::CaptureFixture::active().await;
+    let held=worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
+    let sender=worker.sender.clone();let gate=Some(capture.publisher.cloud_capture_gate());
+    let waiting_gate=gate.clone();
+    let writer=tokio::spawn(async move {sender.record_execution_fills_for_capture(capture_fill("waited"),waiting_gate).await});
+    tokio::time::sleep(Duration::from_millis(20)).await;assert!(!writer.is_finished());
+    // This request was constructed while capture was active, like a request
+    // already waiting behind a broker operation on the journal owner's queue.
+    let (reply,receive)=oneshot::channel();
+    let queued=JournalRequest::RecordFills {batch:capture_fill("queued"),capture:gate,
+        _permit:Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap(),reply};
+    capture.pause().await;drop(held);
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2),writer).await.unwrap().unwrap(),Err(BrokerCommandError::CapturePaused));
+    let journal=finish(worker).await;
+    drop(journal);
+    let mut journal=fixture.journal().await;
+    handle_journal_request(&mut journal,queued,&tokio::sync::Notify::new()).await;
+    assert_eq!(receive.await.unwrap(),Err(BrokerCommandError::CapturePaused));
+    assert!(journal.execution_fill_page(0,None,128).await.unwrap().records.is_empty());
+    assert!(probe.calls.lock().is_empty());
+    capture.shutdown().await;
 }
 
 impl Probe {

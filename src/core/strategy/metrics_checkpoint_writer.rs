@@ -136,6 +136,11 @@ pub(super) fn write_checkpoint(
     use std::io::{BufWriter, Write};
     let parent = path.parent().ok_or("checkpoint has no parent directory")?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if !super::metrics_risk_fence::accepts(path, &stored.strategy_key, &stored.checkpoint)? {
+        // Preserve the existing recovery file until Cloud continuity supplies
+        // the audited repair. No acknowledgement of order/event data is involved.
+        return Ok(());
+    }
     let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let result = (|| -> Result<(), String> {
         let file = OpenOptions::new()

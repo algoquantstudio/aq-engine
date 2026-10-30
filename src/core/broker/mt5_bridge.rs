@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -50,10 +50,13 @@ const MARKET_DATA_INGRESS_CAPACITY: usize = 2;
 const MT5_TRANSPORT_FRESH_SECS: i64 = 15;
 const MT5_MARKET_DATA_FRESH_SECS: i64 = 15;
 const MT5_RECOVERY_COOLDOWN_SECS: i64 = 5;
+const MT5_V2_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const MT5_V2_MAX_AUTH_BYTES: usize = 16 * 1024;
+const MT5_V2_MAX_AUTH_CONNECTIONS: usize = 8;
 
 static SHARED_MT5_BRIDGE: OnceLock<Arc<Mt5Bridge>> = OnceLock::new();
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Mt5BridgeConfig {
     pub bind_addr: SocketAddr,
     pub token: String,
@@ -76,6 +79,9 @@ impl Mt5BridgeConfig {
         let token = crate::launch_config::setting("AQE_MT5_BRIDGE_TOKEN")
             .map_err(BrokerError::ConnectionError)?
             .ok_or_else(|| BrokerError::ConnectionError("MT5 bridge token is required (launch config or AQE_MT5_BRIDGE_TOKEN)".to_string()))?;
+        if token.trim().is_empty() {
+            return Err(BrokerError::ConnectionError("MT5 bridge token must not be empty".into()));
+        }
 
         let request_timeout = Duration::from_millis(read_env_u64(
             "AQE_MT5_REQUEST_TIMEOUT_MS",
@@ -138,6 +144,12 @@ fn parse_symbol_map(value: Option<String>) -> HashMap<String, String> {
 
 #[derive(Clone)]
 pub struct Mt5Bridge {
+    #[cfg(test)]
+    read_only_probe: Arc<AtomicBool>,
+    #[cfg(test)]
+    probe_read_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    probe_denied_count: Arc<AtomicU64>,
     config: Mt5BridgeConfig,
     reverse_symbol_map: Arc<HashMap<String, String>>,
     session_id: Arc<RwLock<String>>,
@@ -164,6 +176,7 @@ pub struct Mt5Bridge {
     server_control: Arc<Mutex<Option<actix_web::dev::ServerHandle>>>,
     server_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     active_transport_generation: Arc<AtomicU64>,
+    v2_auth_slots: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -348,6 +361,12 @@ impl Mt5Bridge {
         Self {
             config,
             reverse_symbol_map,
+            #[cfg(test)]
+            read_only_probe: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            probe_read_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            probe_denied_count: Arc::new(AtomicU64::new(0)),
             session_id: Arc::new(RwLock::new(Uuid::new_v4().to_string())),
             state: Arc::new(RwLock::new(Mt5BridgeState::default())),
             rpc_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -372,11 +391,23 @@ impl Mt5Bridge {
             server_control: Arc::new(Mutex::new(None)),
             server_handle: Arc::new(Mutex::new(None)),
             active_transport_generation: Arc::new(AtomicU64::new(0)),
+            v2_auth_slots: Arc::new(Semaphore::new(MT5_V2_MAX_AUTH_CONNECTIONS)),
         }
     }
 
     pub fn config(&self) -> &Mt5BridgeConfig {
         &self.config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_read_only_position_probe(&self) {
+        assert!(!self.server_started.load(Ordering::SeqCst));
+        self.read_only_probe.store(true,Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_only_position_probe_stats(&self) -> (u64,u64) {
+        (self.probe_read_count.load(Ordering::SeqCst),self.probe_denied_count.load(Ordering::SeqCst))
     }
 
     pub fn aqe_symbol(&self, mt5_symbol: &str) -> String {
@@ -1052,6 +1083,8 @@ impl Mt5Bridge {
     }
 
     fn schedule_runtime_recovery(self: &Arc<Self>, reason: &'static str) {
+        #[cfg(test)]
+        if self.read_only_probe.load(Ordering::SeqCst) { return; }
         let bridge = Arc::clone(self);
         self.recovery_task.schedule(async move {
             warn!("MT5 bridge transport recovered ({reason}); restoring runtime state");
@@ -1076,6 +1109,7 @@ impl Mt5Bridge {
     }
 
     pub fn account(&self) -> Result<Account, BrokerError> {
+        if let Some(error) = self.terminal_connection_error() { return Err(error); }
         self.state
             .read()
             .account
@@ -1084,10 +1118,14 @@ impl Mt5Bridge {
     }
 
     pub async fn request_account(&self) -> Result<Account, BrokerError> {
+        if let Some(error) = self.terminal_connection_error() { return Err(error); }
         let payload = self
             .request_rpc(Mt5RpcAction::GetAccount, serde_json::json!({}))
             .await?;
+        if let Some(error) = self.terminal_connection_error() { return Err(error); }
+        let confirmed = payload.get("snapshotConfirmed").and_then(Value::as_bool);
         let mut account = deserialize_payload::<Account>(payload, "MT5 account")?;
+        Self::validate_account_observation(&account, confirmed)?;
         account.max_total_orders = Some(
             account
                 .max_total_orders
@@ -1096,6 +1134,19 @@ impl Mt5Bridge {
         );
         self.state.write().account = Some(account.clone());
         Ok(account)
+    }
+
+    fn validate_account_observation(account: &Account, confirmed: Option<bool>) -> Result<(), BrokerError> {
+        if confirmed == Some(false) || account.account_id.trim().is_empty() || account.account_id.trim() == "0"
+            || account.currency.trim().is_empty()
+            || ![account.equity, account.cash, account.buying_power, account.accrued_commission].iter().all(|v|v.is_finite())
+            // Legacy EAs have no per-read proof. Their all-zero placeholder is
+            // ambiguous, not a confirmed wipeout. Updated EAs can attest real
+            // zero/negative equity, which must remain visible as genuine risk.
+            || (confirmed != Some(true) && account.equity == 0.0 && account.cash == 0.0 && account.buying_power == 0.0) {
+            return Err(BrokerError::AccountError("MT5 account observation is unconfirmed or invalid".into()));
+        }
+        Ok(())
     }
 
     pub fn orders(&self) -> Vec<Order> {
@@ -1175,21 +1226,20 @@ impl Mt5Bridge {
         }
         let mut state = self.state.write();
         state.positions.clear();
-        for position in &positions {
+        for (offset,position) in positions.iter().enumerate() {
             state
                 .positions
-                .insert(position.asset.symbol.clone(), position.clone());
+                .insert(position.order_id.clone().unwrap_or_else(||format!("legacy:{offset}:{}",position.asset.symbol)), position.clone());
         }
         Ok(positions)
     }
 
     pub fn position(&self, symbol: &str) -> Result<Position, BrokerError> {
-        self.state
-            .read()
-            .positions
-            .get(symbol)
-            .cloned()
-            .ok_or_else(|| BrokerError::PositionError(format!("MT5 position {} not found", symbol)))
+        let state=self.state.read();
+        let mut matches=state.positions.values().filter(|position|position.asset.symbol==symbol);
+        let position=matches.next().cloned().ok_or_else(|| BrokerError::PositionError(format!("MT5 position {symbol} not found")))?;
+        if matches.next().is_some() { return Err(BrokerError::PositionError(format!("Multiple MT5 positions for {symbol}; use the order ID"))); }
+        Ok(position)
     }
 
     pub fn asset(&self, symbol: &str) -> Asset {
@@ -1238,7 +1288,7 @@ impl Mt5Bridge {
             )
             .await?;
         let mut quote = deserialize_payload::<Quote>(payload, "MT5 quote")?;
-        quote.symbol = self.aqe_symbol(&quote.symbol);
+        quote.set_mapped_symbol(self.aqe_symbol(&quote.symbol));
         self.state
             .write()
             .latest_quotes
@@ -1367,6 +1417,14 @@ impl Mt5Bridge {
         payload: Value,
         request_timeout: Duration,
     ) -> Result<Value, BrokerError> {
+        #[cfg(test)]
+        if self.read_only_probe.load(Ordering::SeqCst) {
+            if !matches!(action,Mt5RpcAction::GetAccount|Mt5RpcAction::GetPositions|Mt5RpcAction::GetOrders|Mt5RpcAction::GetAccountCashFlows) {
+                self.probe_denied_count.fetch_add(1,Ordering::SeqCst);
+                return Err(BrokerError::TradeError("Isolated position probe refuses non-read RPCs before queueing".into()));
+            }
+            if matches!(action,Mt5RpcAction::GetPositions) { self.probe_read_count.fetch_add(1,Ordering::SeqCst); }
+        }
         let mut remaining_attempts = 2;
 
         loop {
@@ -1822,7 +1880,8 @@ impl Mt5Bridge {
 
     fn apply_snapshot(&self, _session_id: &str, payload: Mt5SnapshotPayload) {
         let mut state = self.state.write();
-        if let Some(mut account) = payload.account {
+        if let Some(mut account) = payload.account.filter(|account|
+            state.terminal_connected != Some(false) && Self::validate_account_observation(account, None).is_ok()) {
             account.max_total_orders = Some(
                 account
                     .max_total_orders
@@ -1837,10 +1896,12 @@ impl Mt5Bridge {
         for order in payload.orders {
             state.orders.insert(order.order_id.clone(), order);
         }
-        for position in payload.positions {
+        state.positions.clear();
+        for (offset,mut position) in payload.positions.into_iter().enumerate() {
+            self.map_asset_to_aqe(&mut position.asset);
             state
                 .positions
-                .insert(position.asset.symbol.clone(), position);
+                .insert(position.order_id.clone().unwrap_or_else(||format!("legacy:{offset}:{}",position.asset.symbol)), position);
         }
     }
 
@@ -1858,7 +1919,7 @@ impl Mt5Bridge {
             let mut state = self.state.write();
             state.last_market_data = Some(Utc::now());
             for mut quote in quotes {
-                quote.symbol = self.aqe_symbol(&quote.symbol);
+                quote.set_mapped_symbol(self.aqe_symbol(&quote.symbol));
                 let is_new_tick = state
                     .latest_quotes
                     .get(&quote.symbol)
@@ -1871,6 +1932,14 @@ impl Mt5Bridge {
                     })
                     .unwrap_or(true);
                 if !is_new_tick {
+                    // Account FX may change without this instrument ticking.
+                    // Refresh display metadata without emitting an execution
+                    // quote or rerunning strategy logic for the same tick.
+                    if let Some(previous)=state.latest_quotes.get_mut(&quote.symbol) {
+                        if quote.timestamp==previous.timestamp {
+                            previous.profit_model=quote.profit_model;
+                        }
+                    }
                     continue;
                 }
                 state
@@ -2256,21 +2325,25 @@ async fn bridge_v2(
     request: HttpRequest,
     body: web::Payload,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Unauthenticated sockets must not fence the EA or hold unbounded state.
+    let auth_slot = bridge.v2_auth_slots.clone().try_acquire_owned()
+        .map_err(|_| actix_web::error::ErrorTooManyRequests("MT5 authentication capacity reached"))?;
     let (response, mut session, messages) = actix_ws::handle(&request, body)?;
     // The EA fragments large history/account replies into <=32 KiB frames.
     // Keep the 64 KiB frame limit; bound reassembly to the HTTP payload limit.
     let mut messages = messages
         .aggregate_continuations()
-        .max_continuation_size(16 * 1024 * 1024);
+        .max_continuation_size(MT5_V2_MAX_AUTH_BYTES);
     let bridge = bridge.into_inner();
     let nonce = Uuid::new_v4().to_string();
     let bridge_session_id = bridge.session_id();
-    let transport_generation = bridge
-        .active_transport_generation
-        .fetch_add(1, Ordering::SeqCst)
-        .saturating_add(1);
+    // Hello is only a challenge, not ownership of the broker transport. Claim a
+    // new generation only after the nonce and shared secret have been verified.
+    let mut transport_generation = bridge.active_transport_generation.load(Ordering::SeqCst);
+    let auth_deadline = tokio::time::Instant::now() + MT5_V2_AUTH_TIMEOUT;
 
     actix_web::rt::spawn(async move {
+        let mut auth_slot = Some(auth_slot);
         if session
             .text(
                 serde_json::json!({
@@ -2303,6 +2376,10 @@ async fn bridge_v2(
 
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(auth_deadline), if authenticated_session.is_none() => {
+                    let _ = session.clone().close(None).await;
+                    break;
+                }
                 message = messages.recv() => {
                     let Some(message) = message else { break; };
                     let message = match message {
@@ -2322,6 +2399,9 @@ async fn bridge_v2(
                             break;
                         }
                         actix_ws::AggregatedMessage::Text(text) => {
+                            if authenticated_session.is_none() && text.len() > MT5_V2_MAX_AUTH_BYTES {
+                                break;
+                            }
                             let frame = match serde_json::from_str::<Mt5BridgeV2Inbound>(text.as_ref()) {
                                 Ok(frame) => frame,
                                 Err(error) => {
@@ -2340,10 +2420,16 @@ async fn bridge_v2(
                                         token,
                                         session_id,
                                         last_acknowledged_sequence,
-                                    } if supplied_nonce == nonce && token == bridge.config.token => {
+                                    } if supplied_nonce == nonce && !bridge.config.token.trim().is_empty()
+                                        && token == bridge.config.token && !session_id.is_empty()
+                                        && session_id.len() <= 256 => {
+                                        transport_generation = bridge.active_transport_generation
+                                            .fetch_add(1, Ordering::SeqCst).saturating_add(1);
                                         bridge.register_session(&session_id);
                                         bridge.record_rpc_poll(&session_id);
                                         authenticated_session = Some(session_id.clone());
+                                        drop(auth_slot.take());
+                                        messages = messages.max_continuation_size(16 * 1024 * 1024);
                                         let _ = session.text(serde_json::json!({
                                             "type": "Authenticated",
                                             "protocolVersion": 2,
@@ -2499,19 +2585,25 @@ async fn bridge_v2(
     Ok(response)
 }
 
-async fn health(bridge: web::Data<Mt5Bridge>) -> HttpResponse {
-    let diagnostics = bridge.diagnostics();
+async fn health(bridge: web::Data<Mt5Bridge>, request: HttpRequest) -> HttpResponse {
+    // A reachability probe is public, account/session/order diagnostics are not.
+    let mut payload = serde_json::json!({
+        "connected": bridge.is_connected(),
+        "transportConnected": bridge.is_transport_connected(),
+        "brokerConnected": bridge.is_broker_connected(),
+        "datafeedConnected": bridge.is_datafeed_connected(),
+        "protocolVersion": PROTOCOL_VERSION,
+    });
+    if request.headers().contains_key("x-aqe-mt5-token") {
+        if let Err(error) = authorize_token(bridge.get_ref(), request.headers()) {
+            return bridge_error(bridge.get_ref(), Uuid::new_v4().to_string(), StatusCode::UNAUTHORIZED, error);
+        }
+        payload["diagnostics"] = serde_json::to_value(bridge.diagnostics()).expect("MT5 diagnostics serialize");
+    }
     HttpResponse::Ok().json(Mt5BridgeResponse::ok(
         &bridge.session_id(),
         Uuid::new_v4().to_string(),
-        Some(serde_json::json!({
-            "connected": bridge.is_connected(),
-            "transportConnected": bridge.is_transport_connected(),
-            "brokerConnected": bridge.is_broker_connected(),
-            "datafeedConnected": bridge.is_datafeed_connected(),
-            "protocolVersion": PROTOCOL_VERSION,
-            "diagnostics": diagnostics,
-        })),
+        Some(payload),
     ))
 }
 
@@ -2828,7 +2920,7 @@ fn authorize_session_token(
     if session_id.is_empty() || header_session.as_deref() != Some(session_id) {
         return Err("invalid MT5 bridge session".to_string());
     }
-    if header_token.as_deref() != Some(bridge.config.token.as_str()) {
+    if bridge.config.token.trim().is_empty() || header_token.as_deref() != Some(bridge.config.token.as_str()) {
         return Err("invalid MT5 bridge token".to_string());
     }
     Ok(())
@@ -2839,7 +2931,7 @@ fn authorize_token(bridge: &Mt5Bridge, headers: &HeaderMap) -> Result<(), String
     if header_token.is_none() {
         return Err("missing MT5 bridge token".to_string());
     }
-    if header_token.as_deref() != Some(bridge.config.token.as_str()) {
+    if bridge.config.token.trim().is_empty() || header_token.as_deref() != Some(bridge.config.token.as_str()) {
         return Err("invalid MT5 bridge token".to_string());
     }
     Ok(())

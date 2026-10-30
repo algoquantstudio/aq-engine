@@ -40,37 +40,17 @@ impl PositionMarkTransfer {
         })
     }
     pub fn page(&self) -> Result<PositionMarkPage, String> {
-        if self.schema_version != POSITION_MARK_VERSION
-            || self.body.is_empty()
-            || self.body.len() > POSITION_MARK_TRANSFER_BYTES
-            || self.transfer_id
-                != crate::execution_evidence_transfer::checksum(self.body.as_bytes())
-        {
-            return Err("Invalid position mark transfer size/checksum/version".into());
-        }
-        let page: PositionMarkPage = serde_json::from_str(&self.body).map_err(|e| e.to_string())?;
-        page.validate()?;
-        if page.records.is_empty()
-            || (
-                self.schema_version,
-                &self.source_id,
-                &self.strategy_id,
-                &self.account_id,
-                self.after_sequence,
-                self.next_sequence,
-            ) != (
-                page.version,
-                &page.source_id,
-                &page.strategy_id,
-                &page.account_id,
-                page.after_sequence,
-                page.next_sequence,
-            )
-        {
-            return Err("Position mark transfer scope/boundary mismatch".into());
-        }
-        Ok(page)
+        decode_page(self.into())
     }
+
+    /// Validate an event's retained JSON payload without copying its envelope
+    /// strings or encoded body. The decoded, validated page remains owned.
+    pub fn page_from_value(value: &serde_json::Value) -> Result<PositionMarkPage, String> {
+        let envelope = crate::transfer_envelope::Envelope::deserialize(value)
+            .map_err(|_| "invalid position mark payload".to_owned())?;
+        decode_page(envelope)
+    }
+
     pub fn receipt(&self) -> PositionMarkExportReceipt {
         PositionMarkExportReceipt {
             source_id: self.source_id.clone(),
@@ -79,6 +59,39 @@ impl PositionMarkTransfer {
             next_sequence: self.next_sequence,
         }
     }
+}
+
+fn decode_page(envelope: crate::transfer_envelope::Envelope<'_>) -> Result<PositionMarkPage, String> {
+    if envelope.schema_version != POSITION_MARK_VERSION
+        || envelope.body.is_empty()
+        || envelope.body.len() > POSITION_MARK_TRANSFER_BYTES
+        || envelope.transfer_id
+            != crate::execution_evidence_transfer::checksum(envelope.body.as_bytes())
+    {
+        return Err("Invalid position mark transfer size/checksum/version".into());
+    }
+    let page: PositionMarkPage = serde_json::from_str(envelope.body).map_err(|e| e.to_string())?;
+    page.validate()?;
+    if page.records.is_empty()
+        || (
+            envelope.schema_version,
+            envelope.source_id,
+            envelope.strategy_id,
+            envelope.account_id,
+            envelope.after_sequence,
+            envelope.next_sequence,
+        ) != (
+            page.version,
+            page.source_id.as_str(),
+            page.strategy_id.as_str(),
+            page.account_id.as_str(),
+            page.after_sequence,
+            page.next_sequence,
+        )
+    {
+        return Err("Position mark transfer scope/boundary mismatch".into());
+    }
+    Ok(page)
 }
 
 #[cfg(test)]
