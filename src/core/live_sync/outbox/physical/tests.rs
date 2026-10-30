@@ -11,7 +11,7 @@ async fn reconciliation_cleanup_refuses_oversized_legacy_blob_before_materializi
     let start=ReconciliationStart{purpose:aqe_live_protocol::ReconciliationPurpose::Startup,critical_replay_through:None,
         generation:"bounded-new".into(),runtime_id:"runtime".into(),strategy_id:"strategy".into(),live_session_id:"session".into(),
         run_id:Some("run".into()),snapshot_complete:true,broker_features:Vec::new(),critical_cutoff:None,total_chunks:0,total_records:0};
-    assert!(matches!(store.begin_reconciliation_job(&start).await,Err(OutboxStoreError::InvalidRecord(message)) if message.contains("offline legacy-envelope")));
+    assert!(matches!(store.begin_reconciliation_job(&start).await,Err(OutboxStoreError::InvalidRecord(message)) if message.contains("unsupported oversized reconciliation envelope")));
     assert_eq!(scalar(&store,"SELECT count(*) FROM outbox_events WHERE state='pending'").await,1);
     assert_eq!(scalar(&store,"SELECT length(wire_payload) FROM outbox_events").await,bytes);
     let mut rows=store.connection.query("SELECT CASE WHEN length(wire_payload)<=?1 THEN wire_payload END FROM outbox_events",params![LOCAL_EVENT_HARD_LIMIT_BYTES as i64]).await.unwrap();
@@ -475,27 +475,6 @@ async fn independent_writers_serialize_physical_admission_before_acceptance() {
     );
 }
 
-#[tokio::test]
-async fn a_deferred_legacy_identity_upgrade_is_not_a_new_history_gap() {
-    let directory = Directory::new();
-    let mut store = OutboxStore::open_with_physical_capture_budget(directory.path(), budget())
-        .await
-        .unwrap();
-    let mut legacy = event(1);
-    legacy.critical_sequence = Some(1);
-    store.insert_events(&[legacy.clone()]).await.unwrap();
-    pause_for_physical_pressure(&mut store).await;
-    legacy.critical_sequence = None;
-    assert!(
-        matches!(store.reserve_publisher_events(&[legacy],0).await,Err(OutboxStoreError::CapturePaused(capacity)) if capacity.requested_bytes==0)
-    );
-    assert!(store.latest_capture_pause().await.unwrap().is_none());
-    assert_eq!(
-        scalar(&store, "SELECT count(*) FROM publisher_event_reservations").await,
-        0
-    );
-    assert_eq!(store.pending_count().await.unwrap(), 1);
-}
 
 struct Directory(PathBuf);
 impl Directory {

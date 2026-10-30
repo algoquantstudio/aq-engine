@@ -43,11 +43,10 @@ mod execution_recovery;
 mod execution_runtime;
 pub mod hyperparameters;
 mod insight_work;
-mod legacy_metrics_recovery;
 mod lifecycle_reconciliation;
 mod live_capture_recovery;
 mod live_event_projection;
-mod live_evidence_export;
+mod live_analytics_export;
 mod live_execution;
 mod live_fill_history;
 mod live_position_marks;
@@ -202,8 +201,6 @@ where
     live_metrics: LivePerformanceTracker,
     live_metrics_cloud_write_enabled: bool,
     metrics_checkpoint_writer: Option<metrics_checkpoint_writer::MetricsCheckpointWriter>,
-    legacy_metrics_recovery: legacy_metrics_recovery::LegacyMetricsRecovery,
-    legacy_metrics_recovery_needed: bool,
     default_live_auth: Option<AqsAuth>,
     hosted_sync: Option<crate::core::live_sync::HostedSyncConfig>,
     runtime_telemetry: RuntimeTelemetry,
@@ -416,8 +413,6 @@ where
             live_metrics: LivePerformanceTracker::default(),
             live_metrics_cloud_write_enabled: true,
             metrics_checkpoint_writer: None,
-            legacy_metrics_recovery: Default::default(),
-            legacy_metrics_recovery_needed: false,
             default_live_auth: AqsAuth::from_process_args(),
             hosted_sync: None,
             runtime_telemetry: RuntimeTelemetry::default(),

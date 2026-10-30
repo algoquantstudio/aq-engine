@@ -2,7 +2,6 @@
 
 use super::aqs_reader::MetricAccountOrigin;
 use super::aqs_types::{AqsAuth, StrategyLiveMetricsRecord};
-use super::live_metrics::LegacyRiskBaseline;
 use std::future::Future;
 use std::time::Duration;
 use tokio::task::{JoinError, JoinSet};
@@ -11,25 +10,17 @@ pub(super) struct ContinuityLookupResult {
     pub strategy_id: String,
     pub account_id: String,
     pub metrics: Result<Option<StrategyLiveMetricsRecord>, String>,
-    pub legacy: Option<LegacyContinuity>,
     pub baseline: Option<MetricAccountOrigin>,
-}
-
-pub(super) enum LegacyContinuity {
-    AccountChanged(String),
-    Risk(LegacyRiskBaseline),
 }
 
 struct PreparedContinuity {
     metrics: Option<StrategyLiveMetricsRecord>,
-    legacy: Option<LegacyContinuity>,
     baseline: Option<MetricAccountOrigin>,
 }
 
 async fn read_prepared_continuity<C: surrealdb::Connection>(
     client: &surrealdb::Surreal<C>,
     auth: &AqsAuth,
-    expected_account: &str,
 ) -> Result<PreparedContinuity, String> {
     let (metrics, baseline) = tokio::try_join!(
         read_with_deadline(super::aqs_reader::load_latest_live_metrics(client, auth)),
@@ -37,65 +28,21 @@ async fn read_prepared_continuity<C: surrealdb::Connection>(
             client, auth
         )),
     )?;
-    let mut legacy = None;
-    if let Some(record) = metrics
-        .as_ref()
-        .filter(|record| record.tracker_checkpoint.is_none())
-    {
-        legacy = Some(
-            prepare_legacy_continuity(
-                record,
-                expected_account,
-                read_with_deadline(super::aqs_reader::load_latest_metric_account_origin(
-                    client, auth,
-                )),
-                read_with_deadline(super::aqs_reader::load_earliest_metric_account_origin(
-                    client,
-                    auth,
-                    expected_account,
-                )),
-            )
-            .await?,
-        );
+    if let Some(record) = metrics.as_ref() {
+        require_current_checkpoint(record)?;
     }
-    Ok(PreparedContinuity {
-        metrics,
-        legacy,
-        baseline,
-    })
+    Ok(PreparedContinuity { metrics, baseline })
 }
 
-async fn prepare_legacy_continuity(
-    record: &StrategyLiveMetricsRecord,
-    expected_account: &str,
-    latest: impl Future<Output = Result<Option<MetricAccountOrigin>, String>>,
-    earliest: impl Future<Output = Result<Option<MetricAccountOrigin>, String>>,
-) -> Result<LegacyContinuity, String> {
-    let latest = latest
-        .await?
-        .ok_or_else(|| "Legacy metrics account identity is unavailable".to_string())?;
-    let previous_account = latest.account_id.trim();
-    if previous_account.is_empty() || expected_account.trim().is_empty() {
-        return Err("Legacy metrics account identity is empty".into());
-    }
-    if previous_account != expected_account.trim() {
-        return Ok(LegacyContinuity::AccountChanged(
-            previous_account.to_string(),
-        ));
-    }
-    let origin = earliest.await?;
-    if origin
+pub(super) fn require_current_checkpoint(record: &StrategyLiveMetricsRecord) -> Result<(), String> {
+    let checkpoint = record
+        .tracker_checkpoint
         .as_ref()
-        .is_some_and(|origin| origin.account_id.trim() != expected_account.trim())
-    {
-        return Err("Legacy metrics origin belongs to a different broker account".into());
+        .ok_or("unsupported legacy Cloud metrics: a full tracker checkpoint is required")?;
+    if checkpoint.version != super::types::live_metrics::LIVE_METRICS_CHECKPOINT_VERSION {
+        return Err("unsupported Cloud metrics checkpoint version".into());
     }
-    LegacyRiskBaseline::prepare(
-        record.snapshot(),
-        expected_account.trim().to_string(),
-        origin.map(|origin| (origin.equity, origin.captured_at)),
-    )
-    .map(LegacyContinuity::Risk)
+    Ok(())
 }
 
 async fn read_with_deadline<T>(
@@ -124,12 +71,11 @@ impl MetricsContinuityLookup {
         account_id: String,
     ) -> bool {
         let strategy_id = auth.strategy_id.clone();
-        let expected_account = account_id.clone();
         self.start_prepared_read(
             strategy_id,
             account_id,
             Duration::from_secs(30),
-            async move { read_prepared_continuity(&client, &auth, &expected_account).await },
+            async move { read_prepared_continuity(&client, &auth).await },
         )
     }
 
@@ -144,7 +90,6 @@ impl MetricsContinuityLookup {
         self.start_prepared_read(strategy_id, account_id, timeout, async move {
             read.await.map(|metrics| PreparedContinuity {
                 metrics,
-                legacy: None,
                 baseline: None,
             })
         })
@@ -164,15 +109,14 @@ impl MetricsContinuityLookup {
             let prepared = tokio::time::timeout(timeout, read)
                 .await
                 .unwrap_or_else(|_| Err("Cloud metrics continuity lookup timed out".into()));
-            let (metrics, legacy, baseline) = match prepared {
-                Ok(prepared) => (Ok(prepared.metrics), prepared.legacy, prepared.baseline),
-                Err(error) => (Err(error), None, None),
+            let (metrics, baseline) = match prepared {
+                Ok(prepared) => (Ok(prepared.metrics), prepared.baseline),
+                Err(error) => (Err(error), None),
             };
             ContinuityLookupResult {
                 strategy_id,
                 account_id,
                 metrics,
-                legacy,
                 baseline,
             }
         });
@@ -194,151 +138,6 @@ impl MetricsContinuityLookup {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    fn legacy_record() -> StrategyLiveMetricsRecord {
-        let mut tracker = super::super::live_metrics::LivePerformanceTracker::default();
-        tracker.initialize_for_account(
-            Some("account".into()),
-            100.0,
-            110.0,
-            chrono::Utc::now(),
-            [],
-        );
-        StrategyLiveMetricsRecord::from_snapshot(tracker.snapshot().unwrap(), None)
-    }
-
-    fn origin(account: &str) -> MetricAccountOrigin {
-        MetricAccountOrigin {
-            account_id: account.into(),
-            currency: "USD".into(),
-            equity: 100.0,
-            captured_at: chrono::Utc::now() - chrono::TimeDelta::hours(1),
-        }
-    }
-
-    #[tokio::test]
-    async fn continuity_lookup_legacy_account_evidence_is_required_and_checked() {
-        let record = legacy_record();
-        for latest in [Ok(None), Ok(Some(origin("  "))), Err("query failed".into())] {
-            assert!(
-                prepare_legacy_continuity(&record, "account", async { latest }, async {
-                    panic!("origin query must not be polled without identity")
-                })
-                .await
-                .is_err()
-            );
-        }
-        let changed = prepare_legacy_continuity(
-            &record,
-            "account",
-            async { Ok(Some(origin(" other "))) },
-            async { panic!("different account must not rebuild history") },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(changed, LegacyContinuity::AccountChanged(account) if account == "other"));
-        for earliest in [Err("origin query failed".into()), Ok(Some(origin("wrong")))] {
-            assert!(
-                prepare_legacy_continuity(
-                    &record,
-                    "account",
-                    async { Ok(Some(origin("account"))) },
-                    async { earliest }
-                )
-                .await
-                .is_err()
-            );
-        }
-        // A successful absent origin can use the existing snapshot's origin.
-        assert!(matches!(
-            prepare_legacy_continuity(
-                &record,
-                " account ",
-                async { Ok(Some(origin("account"))) },
-                async { Ok(None) }
-            )
-            .await
-            .unwrap(),
-            LegacyContinuity::Risk(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn continuity_lookup_legacy_origin_is_owned_and_timeout_never_means_no_history() {
-        for fail in [false, true] {
-            let record = legacy_record();
-            let (release, wait) = tokio::sync::oneshot::channel();
-            let mut worker = MetricsContinuityLookup::default();
-            worker.start_prepared_read(
-                "strategy".into(),
-                "account".into(),
-                Duration::from_secs(1),
-                async move {
-                    let legacy = prepare_legacy_continuity(
-                        &record,
-                        "account",
-                        async { Ok(Some(origin("account"))) },
-                        async {
-                            wait.await.unwrap();
-                            if fail {
-                                Err("origin unavailable".into())
-                            } else {
-                                Ok(Some(origin("account")))
-                            }
-                        },
-                    )
-                    .await?;
-                    Ok(PreparedContinuity {
-                        metrics: Some(record),
-                        legacy: Some(legacy),
-                        baseline: None,
-                    })
-                },
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(5), worker.next())
-                    .await
-                    .is_err()
-            );
-            assert!(worker.is_running());
-            release.send(()).unwrap();
-            let result = worker.next().await.unwrap().unwrap();
-            assert_eq!(result.strategy_id, "strategy");
-            assert_eq!(result.account_id, "account");
-            if fail {
-                assert!(result.metrics.is_err());
-                assert!(result.legacy.is_none());
-            } else {
-                assert!(result.metrics.unwrap().is_some());
-                assert!(matches!(result.legacy, Some(LegacyContinuity::Risk(_))));
-            }
-        }
-        let mut worker = MetricsContinuityLookup::default();
-        worker.start_prepared_read(
-            "strategy".into(),
-            "account".into(),
-            Duration::from_millis(5),
-            async {
-                let record = legacy_record();
-                let legacy = prepare_legacy_continuity(
-                    &record,
-                    "account",
-                    async { Ok(Some(origin("account"))) },
-                    std::future::pending(),
-                )
-                .await?;
-                Ok(PreparedContinuity {
-                    metrics: Some(record),
-                    legacy: Some(legacy),
-                    baseline: None,
-                })
-            },
-        );
-        let result = worker.next().await.unwrap().unwrap();
-        assert!(result.metrics.is_err());
-        assert!(result.legacy.is_none());
-        assert!(!worker.is_running());
-    }
 
     #[tokio::test]
     async fn continuity_lookup_delayed_checkpoint_preserves_new_trades_and_exposure() {
@@ -556,5 +355,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod current_format_tests {
+    use super::*;
+    #[test]
+    fn aggregate_only_cloud_metrics_are_not_reconstructed_or_promoted() {
+        let mut tracker = super::super::live_metrics::LivePerformanceTracker::default();
+        tracker.initialize_for_account(Some("account".into()), 100., 105., chrono::Utc::now(), []);
+        let old = StrategyLiveMetricsRecord::from_snapshot(tracker.snapshot().unwrap(), None);
+        assert!(
+            require_current_checkpoint(&old)
+                .unwrap_err()
+                .contains("full tracker checkpoint")
+        );
+        let current = StrategyLiveMetricsRecord::from_snapshot(
+            tracker.snapshot().unwrap(),
+            tracker.checkpoint(),
+        );
+        require_current_checkpoint(&current).unwrap();
     }
 }

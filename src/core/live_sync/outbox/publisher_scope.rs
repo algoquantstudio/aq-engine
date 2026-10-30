@@ -78,6 +78,11 @@ impl OutboxStore {
             .await
             .map_err(db)?;
         let connection = database.connect().map_err(db)?;
+        crate::core::utils::storage_format::require_current(
+            &connection, "live outbox", 1095847746, 1,
+        )
+        .await
+        .map_err(OutboxStoreError::InvalidRecord)?;
         connection
             .execute_batch(
                 "PRAGMA cache_size=-2048; PRAGMA busy_timeout=1000; PRAGMA query_only=1;",
@@ -105,7 +110,7 @@ impl OutboxStore {
         {
             return Err(invalid());
         }
-        // Missing optional tables are normal for old outboxes. A missing core
+        // Capacity tables may be absent before capture is enabled. A missing core
         // table is an unrelated SQLite file, never an invitation to initialize it.
         for (table, has_session) in [
             ("outbox_events", true),
@@ -319,6 +324,28 @@ mod tests {
         assert_eq!(store.pending_count().await.unwrap(), 2);
         assert_eq!(store.publisher_retirement_uncommitted().await.unwrap(), 2);
         drop(store);
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_validation_rejects_retired_format_without_reinitializing_it() {
+        let (root, path) = fixture();
+        let lease = CaptureOwnerLease::acquire_for_import(&path).unwrap();
+        let store = OutboxStore::open(&path).await.unwrap();
+        store.connection.execute_batch("PRAGMA user_version=0;").await.unwrap();
+        drop(store);
+        let error = OutboxStore::validate_publisher_file_scope(
+            &path, &lease, "strategy", "session",
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("unsupported live outbox saved-data format"));
+        let database = Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let connection = database.connect().unwrap();
+        let mut rows = connection.query("PRAGMA user_version", ()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 0);
+        drop(rows);
+        drop(connection);
+        drop(database);
         drop(lease);
         std::fs::remove_dir_all(root).unwrap();
     }

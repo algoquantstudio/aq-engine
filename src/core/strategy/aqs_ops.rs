@@ -390,7 +390,6 @@ where
         // Wake any workers created during startup before disconnecting their transports.
         self.shutdown();
 
-        self.stop_legacy_metrics_recovery().await;
 
         if let Err(error) = self.stop_live_execution_worker().await {
             warn!("Failed to release execution worker during startup rollback: {error}");
@@ -1765,7 +1764,6 @@ where
                                     "insights_count": self.insights_state_counts_json(),
                                     "publisher_health": sync.publisher.health(),
                                     "cloud_capture_recovery": sync.capture_recovery.health,
-                                    "execution_evidence_export": sync.evidence_export.health,
                                     "execution_fill_export": sync.fill_export.health,
                                     "position_mark_export": sync.mark_export.health,
                                     "sent_at": chrono::Utc::now(),
@@ -1785,7 +1783,6 @@ where
                     _ = live_sync_reconnect_interval.tick(), if auth.is_some() && (db.is_none() || !self.live_metrics_cloud_write_enabled) => {
                         if !live_sync_reconnect_in_flight
                             && !metrics_continuity_lookup.is_running()
-                            && !self.legacy_metrics_recovery.is_running()
                             && Instant::now() >= next_live_sync_retry_at
                         {
                             let reconnect_auth = auth
@@ -1829,9 +1826,7 @@ where
                                 action_stream = next_action_stream;
                                 if !self.live_metrics_cloud_write_enabled {
                                     if let (Some(client), Some(a)) = (db.as_ref(), auth.as_ref()) {
-                                        if self.legacy_metrics_recovery_needed {
-                                            self.start_legacy_live_trade_metrics(client, a);
-                                        } else if let Ok(account) = self.broker.account_snapshot() {
+                                        if let Ok(account) = self.broker.account_snapshot() {
                                             let account_id = account.account_id.trim().to_string();
                                             if !account_id.is_empty() {
                                                 metrics_continuity_lookup.start(client.clone(), a.clone(), account_id);
@@ -1841,7 +1836,7 @@ where
                                 }
                                 // A pending lookup owns the retry outcome. Do not
                                 // double the backoff at both connection and lookup completion.
-                                if !metrics_continuity_lookup.is_running() && !self.legacy_metrics_recovery.is_running() {
+                                if !metrics_continuity_lookup.is_running() {
                                     live_sync_retry_delay = if self.live_metrics_cloud_write_enabled {
                                         initial_live_sync_retry_delay
                                     } else {
@@ -1873,16 +1868,6 @@ where
                         }
                     }
 
-                    Some(completed) = self.legacy_metrics_recovery.next(), if self.legacy_metrics_recovery.is_running() => {
-                        self.apply_legacy_live_trade_metrics(completed, auth.as_ref());
-                        live_sync_retry_delay = if self.live_metrics_cloud_write_enabled {
-                            initial_live_sync_retry_delay
-                        } else {
-                            next_live_sync_retry_delay(live_sync_retry_delay)
-                        };
-                        next_live_sync_retry_at = Instant::now() + live_sync_retry_delay;
-                    }
-
                     Some(result) = metrics_continuity_lookup.next(), if metrics_continuity_lookup.is_running() => {
                         match result {
                             Ok(result) => {
@@ -1891,7 +1876,7 @@ where
                                         match result.metrics {
                                             Ok(metrics) => {
                                                 self.resolve_deferred_live_metrics_continuity(
-                                                    client, a, &result.account_id, metrics, result.legacy, result.baseline,
+                                                    client, a, &result.account_id, metrics, result.baseline,
                                                 );
                                             }
                                             Err(error) => warn!("AQS live metrics continuity lookup failed for strategy {}; Cloud writes remain deferred: {error}", a.strategy_id),
@@ -1901,19 +1886,17 @@ where
                             }
                             Err(error) => warn!("AQS live metrics continuity lookup task exited unexpectedly; Cloud writes remain deferred: {error}"),
                         }
-                        if !self.legacy_metrics_recovery.is_running() {
-                            live_sync_retry_delay = if self.live_metrics_cloud_write_enabled {
-                                initial_live_sync_retry_delay
-                            } else {
-                                next_live_sync_retry_delay(live_sync_retry_delay)
-                            };
-                        }
+                        live_sync_retry_delay = if self.live_metrics_cloud_write_enabled {
+                            initial_live_sync_retry_delay
+                        } else {
+                            next_live_sync_retry_delay(live_sync_retry_delay)
+                        };
                         next_live_sync_retry_at = Instant::now() + live_sync_retry_delay;
                     }
 
                     _ = live_sync_interval.tick() => {
                         if let (Some(sync), Some(a)) = (local_batch_sync.as_mut(), auth.as_ref()) {
-                            sync.progress_execution_evidence(self.command_driver.as_ref().map(|driver| driver.sender()));
+                            sync.progress_execution_analytics(self.command_driver.as_ref().map(|driver| driver.sender()));
                             self.publish_dirty_insights_to_local_bus(
                                 sync,
                                 a,
@@ -1999,7 +1982,6 @@ where
         // command worker and local terminal-history reader remain alive below
         // to settle mutations even when a manual close callback was missed.
         metrics_continuity_lookup.shutdown().await;
-        self.stop_legacy_metrics_recovery().await;
         live_background_reads.shutdown().await;
         macro_rules! teardown_progress {
             ($phase:expr, $message:expr) => {

@@ -189,7 +189,6 @@ mod tests {
             assert!(state.broker.snapshot_refresh_health().is_none());
             assert!(state.broker.connection_worker_health().is_none());
             assert!(state.metrics_checkpoint_writer.is_none());
-            assert!(!state.legacy_metrics_recovery.is_running());
             let persisted = state
                 .load_local_live_metrics_checkpoint(&strategy_id)
                 .unwrap();

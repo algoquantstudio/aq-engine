@@ -90,12 +90,10 @@ fn disk_snapshot(path: &std::path::Path) -> Vec<Vec<u8>> {
 #[tokio::test]
 async fn real_source_pressure_handoff_survives_restart_without_resuming_or_acknowledging_data() {
     let fixture = Fixture::new();
-    let mut journal = BrokerCommandJournal::open_with_state_history(
+    let mut journal = BrokerCommandJournal::open(
         fixture.journal(),
         "strategy",
-        "account",
-        false,
-    )
+        "account")
     .await
     .unwrap();
     journal
@@ -192,12 +190,10 @@ async fn real_source_pressure_handoff_survives_restart_without_resuming_or_ackno
     drop(owner);
     drop(store);
     drop(journal);
-    let mut journal = BrokerCommandJournal::open_with_state_history(
+    let mut journal = BrokerCommandJournal::open(
         fixture.journal(),
         "strategy",
-        "account",
-        false,
-    )
+        "account")
     .await
     .unwrap()
     .with_analytics_capture_budget(budget)

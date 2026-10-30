@@ -203,7 +203,7 @@ async fn source_witness_crash_child() {
     let path=root.join("publisher.db");let store=OutboxStore::open(&path).await.unwrap();
     let owner=Arc::new(CaptureOwnerLease::acquire(&path,"old-runtime","strategy","session","old-run").unwrap());
     if std::env::var("AQE_DISPOSABLE_SOURCE_CRASH_MODE").as_deref()==Ok("sealed") {
-        let journal=BrokerCommandJournal::open_with_state_history(root.join("final-journal.db"),"strategy","account",false).await.unwrap()
+        let journal=BrokerCommandJournal::open(root.join("final-journal.db"),"strategy","account").await.unwrap()
             .with_analytics_capture_budget(limit()).await.unwrap();
         let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(Arc::new(InProcessEventBus::default()),store.clone(),
             LocalEventPublisherConfig{capture_limit_bytes:Some(100_000),source_journal_limit:Some(limit()),..Default::default()},0,Arc::new(()),owner);
@@ -517,12 +517,10 @@ async fn observation_suspension_is_durable_idempotent_and_allocates_no_event() {
 #[tokio::test]
 async fn public_owner_bridge_hands_off_real_source_status_without_resuming_it() {
     let fixture = Fixture::new().await;
-    let mut journal = BrokerCommandJournal::open_with_state_history(
+    let mut journal = BrokerCommandJournal::open(
         fixture.root.join("journal.db"),
         "strategy",
-        "account",
-        false,
-    )
+        "account")
     .await
     .unwrap();
     let tiny = PhysicalCaptureLimit {
@@ -634,7 +632,7 @@ async fn direct_source_observations_share_the_recovery_operation_lane() {
 async fn final_source_owner_retains_exclusivity_without_inventing_a_gap() {
     let fixture=Fixture::new().await;
     let path=fixture.root.join("final-journal.db");
-    let journal=BrokerCommandJournal::open_with_state_history(&path,"strategy","account",false).await.unwrap()
+    let journal=BrokerCommandJournal::open(&path,"strategy","account").await.unwrap()
         .with_analytics_capture_budget(limit()).await.unwrap();
     let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(
         Arc::new(InProcessEventBus::default()),fixture.store.clone(),
@@ -644,7 +642,7 @@ async fn final_source_owner_retains_exclusivity_without_inventing_a_gap() {
     let final_owner=publisher.seal_final_source_journal(journal).await.unwrap();
     assert!(!publisher.cloud_capture_paused());
     assert!(fixture.store.latest_capture_pause().await.unwrap().is_none());
-    assert!(BrokerCommandJournal::open_with_state_history(&path,"strategy","account",false).await.is_err(),
+    assert!(BrokerCommandJournal::open(&path,"strategy","account").await.is_err(),
         "the returned journal must stay exclusive until final cloud publication ends");
     assert!(publisher.observe_source_journal(report).await.is_err(),"a sealed owner cannot accept a later observer");
     assert!(publisher.observe_source_journal(paused(sample())).await.is_err());
@@ -655,7 +653,7 @@ async fn final_source_owner_retains_exclusivity_without_inventing_a_gap() {
     publisher.shutdown(std::time::Duration::from_secs(1)).await;
     drop(final_owner);
     assert!(publisher.cloud_capture_paused());
-    assert!(BrokerCommandJournal::open_with_state_history(&path,"strategy","account",false).await.is_ok());
+    assert!(BrokerCommandJournal::open(&path,"strategy","account").await.is_ok());
     drop(publisher);
     let restarted=fixture.controller();restarted.observe_source(&fixture.store,sample()).await.unwrap();restarted.refresh(&fixture.store).await.unwrap();
     assert!(!restarted.blocked(false));
@@ -666,7 +664,7 @@ async fn final_source_owner_retains_exclusivity_without_inventing_a_gap() {
 async fn cancelled_final_source_handoff_closes_capture_before_releasing_the_journal() {
     let fixture=Fixture::new().await;
     let path=fixture.root.join("cancel-final.db");
-    let journal=BrokerCommandJournal::open_with_state_history(&path,"strategy","account",false).await.unwrap()
+    let journal=BrokerCommandJournal::open(&path,"strategy","account").await.unwrap()
         .with_analytics_capture_budget(limit()).await.unwrap();
     let publisher=LocalEventPublisher::spawn_owned_with_capture_lease(
         Arc::new(InProcessEventBus::default()),fixture.store.clone(),
@@ -680,7 +678,7 @@ async fn cancelled_final_source_handoff_closes_capture_before_releasing_the_jour
     assert!(!task.is_finished());
     task.abort();let _=task.await;
     assert!(publisher.cloud_capture_paused());
-    assert!(BrokerCommandJournal::open_with_state_history(&path,"strategy","account",false).await.is_ok());
+    assert!(BrokerCommandJournal::open(&path,"strategy","account").await.is_ok());
     drop(operation);
     publisher.shutdown(std::time::Duration::from_secs(1)).await;
 }

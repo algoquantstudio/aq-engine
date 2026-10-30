@@ -1,0 +1,38 @@
+Compatible LRU panic-safety backport — 2026-10-30
+
+Base: lru 0.16.4, MIT, from the crates.io source archive.
+Archive SHA-256: 7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39
+The upstream license, package version, public API and cache format are retained.
+This private compatibility copy is not a new upstream release.
+
+Advisory: RUSTSEC-2026-0253
+Upstream fix: https://github.com/jeromefroe/lru-rs/pull/238
+Applied commit: 2776ded569ee89a99c515bca8194f65639182c96
+Merged as: f9a7f00fcf2d33e00adb03758cb350aaaa52cddb
+Upstream fixed release: 0.18.2
+
+Production change: the exact upstream LruCache::pop reorder detaches the
+intrusive node before freeing its allocation and dropping its key. A panicking
+key destructor therefore cannot leave a dangling node in the live list.
+
+Qualification additions:
+- The upstream panic-on-Drop regression pattern is retained with assertions.
+- A separate before/after probe only compares live-sentinel/pointer identities.
+  On the original source it abandons the corrupt cache before failing, so the
+  negative test does not intentionally traverse or drop dangling nodes.
+- The independent qualification workspace and lockfile pin test dependencies.
+- publish=false prevents accidentally publishing this private patched copy.
+
+Run from a consuming AQS checkout:
+  cargo test --manifest-path aq-engine/vendor/lru/Cargo.toml --offline --locked
+  cargo test --manifest-path aq-engine/vendor/lru/Cargo.toml --no-default-features --offline --locked
+
+The workspace must select this path through [patch.crates-io]. Patches declared
+by a dependency are not inherited by consuming Cargo workspaces. Standalone AQE
+and the parent AQS workspace therefore need matching patch selection.
+
+The observed Tantivy consumer uses usize cache keys, whose Drop does not panic;
+the advisory prerequisite was not demonstrated for that consumer. This patch
+fixes the generic library contract rather than suppressing its advisory.
+Native before/after and full-suite qualification do not replace Miri checking;
+Miri is not installed in the current local toolchain.

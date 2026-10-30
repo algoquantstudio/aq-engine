@@ -119,7 +119,7 @@ mod tests {
         assert!(row.observe_position_accounting(&evidence()));
         assert_ne!(row.snapshot_fingerprint_hash(), before);
         let saved = InsightExecutionCheckpoint::capture(&row, 1, true, None);
-        assert_eq!(saved.version, 4);
+        assert_eq!(saved.version, super::super::execution_checkpoint::EXECUTION_CHECKPOINT_VERSION);
         saved.validate().unwrap();
         let json = serde_json::to_string(&saved).unwrap();
         let restored: InsightExecutionCheckpoint = serde_json::from_str(&json).unwrap();

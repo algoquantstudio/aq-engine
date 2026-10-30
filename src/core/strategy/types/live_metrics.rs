@@ -60,6 +60,7 @@ pub struct LiveMetricsCheckpoint {
     pub updated_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, SurrealValue)]
 pub(crate) struct HistoricalClosedInsightMetric {
     pub insight_id: String,

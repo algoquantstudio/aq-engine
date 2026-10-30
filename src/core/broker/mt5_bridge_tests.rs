@@ -16,6 +16,117 @@ fn test_bridge(token: &str) -> Mt5Bridge {
 }
 
 #[actix_web::test]
+async fn unauthorized_http_json_is_rejected_without_polling_the_payload() {
+    use actix_web::FromRequest;
+    use futures::stream::LocalBoxStream;
+    for token in [None, Some("wrong-token")] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let stream: LocalBoxStream<'static, Result<web::Bytes, actix_web::error::PayloadError>> =
+            Box::pin(futures::stream::poll_fn(move |_| {
+                observed.fetch_add(1, AtomicOrdering::SeqCst);
+                std::task::Poll::Pending
+            }));
+        let mut payload = actix_web::dev::Payload::from(stream);
+        let data = web::Data::new(test_bridge("private-http-token"));
+        let mut request = actix_web::test::TestRequest::post().uri("/v1/snapshot")
+            .app_data(data).insert_header(("content-type", "application/json"));
+        if let Some(token) = token {
+            request = request.insert_header(("x-aqe-mt5-token", token));
+        }
+        let request = request.to_http_request();
+        let result = tokio::time::timeout(Duration::from_millis(100),
+            AuthenticatedJson::<Value>::from_request(&request, &mut payload)).await.unwrap();
+        assert_eq!(result.err().unwrap().as_response_error().status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+    }
+}
+
+#[actix_web::test]
+async fn all_http_producer_routes_authorize_before_json_parsing() {
+    let data = web::Data::new(test_bridge("private-http-token"));
+    let app = actix_web::test::init_service(App::new().app_data(data.clone())
+        .route("/v1/heartbeat", web::post().to(heartbeat))
+        .route("/v1/snapshot", web::post().to(snapshot))
+        .route("/v1/market-data", web::post().to(market_data))
+        .route("/v1/trade-event", web::post().to(trade_event))
+        .route("/v1/trade-events", web::post().to(trade_events))
+        .route("/v1/execution-fill-revisions", web::post().to(fill_revisions))
+        .route("/v1/rpc/poll", web::post().to(poll_rpc))
+        .route("/v1/rpc/response", web::post().to(rpc_response))).await;
+    for path in ["/v1/heartbeat", "/v1/snapshot", "/v1/market-data", "/v1/trade-event",
+        "/v1/trade-events", "/v1/execution-fill-revisions", "/v1/rpc/poll", "/v1/rpc/response"] {
+        for token in [None, Some("wrong-token")] {
+            let mut request = actix_web::test::TestRequest::post().uri(path)
+                .insert_header(("content-type", "application/json")).set_payload("not JSON");
+            if let Some(token) = token {
+                request = request.insert_header(("x-aqe-mt5-token", token));
+            }
+            let response = actix_web::test::call_service(&app, request.to_request()).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            let body: Mt5BridgeResponse<Value> = actix_web::test::read_body_json(response).await;
+            assert!(!body.ok);
+        }
+    }
+    assert!(data.diagnostics().last_poll_attempt_at.is_some());
+    assert!(data.diagnostics().last_poll_auth_error.is_some());
+    // Authorized EAs still reach the existing JSON decoder and its error policy.
+    let request = actix_web::test::TestRequest::post().uri("/v1/heartbeat")
+        .insert_header(("x-aqe-mt5-token", "private-http-token"))
+        .insert_header(("content-type", "application/json")).set_payload("not JSON").to_request();
+    assert_eq!(actix_web::test::call_service(&app, request).await.status(), StatusCode::BAD_REQUEST);
+}
+
+#[actix_web::test]
+async fn unauthorized_http_headers_are_rejected_before_a_stalled_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let data = web::Data::new(test_bridge("private-http-token"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = HttpServer::new(move || App::new().app_data(data.clone())
+        .app_data(web::JsonConfig::default().limit(16 * 1024 * 1024))
+        .route("/v1/snapshot", web::post().to(snapshot)))
+        .workers(1).listen(listener).unwrap().run();
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+    let mut outcomes = Vec::new();
+    for token_header in ["", "x-aqe-mt5-token: wrong-token\r\n"] {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let headers = format!("POST /v1/snapshot HTTP/1.1\r\nHost: {address}\r\n{token_header}Content-Type: application/json\r\nContent-Length: 16777216\r\nConnection: close\r\n\r\n");
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        // Deliberately send no body. Admission cannot wait for any of the
+        // advertised 16 MiB, even when the producer stalls after its headers.
+        let mut response = [0; 1024];
+        outcomes.push(tokio::time::timeout(Duration::from_secs(3), socket.read(&mut response)).await
+            .map(|read| String::from_utf8_lossy(&response[..read.unwrap()]).into_owned()));
+    }
+    handle.stop(false).await;
+    for response in outcomes {
+        assert!(response.expect("authorization waited for the HTTP body").starts_with("HTTP/1.1 401"));
+    }
+}
+
+#[actix_web::test]
+async fn admitted_http_json_retains_body_limits_and_decodes_values() {
+    use actix_web::FromRequest;
+    let data = web::Data::new(test_bridge("private-http-token"));
+    let (request, mut payload) = actix_web::test::TestRequest::post()
+        .app_data(data.clone()).app_data(web::JsonConfig::default().limit(32))
+        .insert_header(("x-aqe-mt5-token", "private-http-token"))
+        .insert_header(("content-type", "application/json"))
+        .set_payload("{\"ok\":true}").to_http_parts();
+    let value = AuthenticatedJson::<Value>::from_request(&request, &mut payload).await.unwrap().into_inner();
+    assert_eq!(value, serde_json::json!({"ok": true}));
+    let (request, mut payload) = actix_web::test::TestRequest::post()
+        .app_data(data).app_data(web::JsonConfig::default().limit(4))
+        .insert_header(("x-aqe-mt5-token", "private-http-token"))
+        .insert_header(("content-type", "application/json"))
+        .set_payload("{\"ok\":true}").to_http_parts();
+    let error = AuthenticatedJson::<Value>::from_request(&request, &mut payload).await.err().unwrap();
+    assert_eq!(error.as_response_error().status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[actix_web::test]
 async fn unauthenticated_v2_connections_cannot_fence_the_active_ea() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

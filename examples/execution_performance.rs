@@ -56,6 +56,7 @@ mod controls {
                 median_ms: duration_ms(elapsed),
                 p95_ms: duration_ms(elapsed),
                 throughput_per_second: 32.0 / elapsed.as_secs_f64(),
+                raw_sample_ms: vec![duration_ms(elapsed)],
             });
         }
         serde_json::to_value(BenchmarkReport {

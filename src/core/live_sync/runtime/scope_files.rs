@@ -43,32 +43,6 @@ pub fn publisher_outbox_path(receiver: &Path, strategy: &str, session: &str) -> 
     PathBuf::from(name)
 }
 
-/// Discovery only, never use this lossy name for new writers. A retained legacy
-/// file must pass leased, whole-file scope validation before recovery can adopt it.
-pub fn legacy_publisher_outbox_path(
-    receiver: &Path,
-    strategy: &str,
-    session: &str,
-) -> Option<PathBuf> {
-    let scope = format!("{strategy}--{session}")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let mut name = receiver.as_os_str().to_os_string();
-    name.push(format!(".publisher-{scope}.db"));
-    let path = PathBuf::from(name);
-    // The old sanitizer produced an ASCII suffix. Oversized components could
-    // never have been written on supported filesystems and must not cause an
-    // endless ENAMETOOLONG recovery loop.
-    (path.file_name()?.as_encoded_bytes().len() <= 255).then_some(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,10 +78,5 @@ mod tests {
             assert!(name.len() < 240 && !name.contains('\0'));
             assert!(portable_names.insert(name.to_ascii_lowercase()));
         }
-        assert_eq!(
-            legacy_publisher_outbox_path(receiver, "a/b", "c"),
-            legacy_publisher_outbox_path(receiver, "a:b", "c")
-        );
-        assert!(legacy_publisher_outbox_path(receiver, &"x".repeat(512), "session").is_none());
     }
 }

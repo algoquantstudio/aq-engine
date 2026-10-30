@@ -160,12 +160,28 @@ impl PaperBroker {
                 source_clock: BrokerClockDomain::RuntimeHost,
                 ..Default::default()
             });
-        self.trade_events.lock().push_back(envelope.clone());
-        // Callbacks may unsubscribe themselves; never invoke one under the
-        // subscriber lock. Queue and stream reuse the same event/fill identity.
-        let subscribers = self.trade_stream_subscribers.lock().clone();
-        for sub in subscribers {
-            sub(envelope.clone());
+        let (mut subscribers, callback_event) = {
+            let mut queue = self.trade_events.lock();
+            queue.push_back(envelope);
+            // Keep the original enqueue-before-snapshot boundary. The only
+            // nested order is queue -> subscribers; unsubscribe detaches user
+            // captures before dropping them, so no destructor can invert it.
+            let subscribers = self.trade_stream_subscribers.lock().clone();
+            let callback_event = if subscribers.is_empty() {
+                None
+            } else {
+                Some(queue.back().expect("event was just queued").clone())
+            };
+            (subscribers, callback_event)
+        };
+        // Both locks are released before any callback or user capture is
+        // destroyed. Every callback receives the same event/fill identity.
+        if let Some(event) = callback_event {
+            let last = subscribers.pop().expect("nonempty subscriber snapshot");
+            for sub in subscribers {
+                sub(event.clone());
+            }
+            last(event);
         }
     }
     pub(super) fn drain_execution_events(&self, max_events: usize) -> Vec<BrokerOrderEvent> {
@@ -262,3 +278,6 @@ impl ExecutionFillHistoryReader for PaperBroker {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod event_delivery_tests;

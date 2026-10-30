@@ -157,12 +157,10 @@ async fn real_paper_history_drives_durable_fills_marks_and_replay_without_state_
     let mut insight = insight(OrderSide::Buy);
     let order = b.submit_order(insight.clone().into()).await.unwrap();
     insight.order_id = Some(order.order_id.clone());
-    let mut journal = BrokerCommandJournal::open_with_state_history(
+    let mut journal = BrokerCommandJournal::open(
         fixture.0.join("journal.db"),
         "standalone-paper",
-        &account,
-        false,
-    )
+        &account)
     .await
     .unwrap();
     journal
@@ -261,25 +259,16 @@ async fn real_paper_history_drives_durable_fills_marks_and_replay_without_state_
         head,
         "fresh timestamps must not append unchanged facts"
     );
-    assert!(
-        journal
-            .prepare_execution_evidence_export()
-            .await
-            .unwrap()
-            .is_none()
-    );
     let frozen = journal
         .prepare_execution_fill_export()
         .await
         .unwrap()
         .unwrap();
     drop(journal);
-    let journal = BrokerCommandJournal::open_with_state_history(
+    let journal = BrokerCommandJournal::open(
         fixture.0.join("journal.db"),
         "standalone-paper",
-        &account,
-        false,
-    )
+        &account)
     .await
     .unwrap();
     assert_eq!(

@@ -9,12 +9,10 @@ impl Fixture {
         Self(std::env::temp_dir().join(format!("aqe-fill-ledger-{}", uuid::Uuid::new_v4())))
     }
     async fn open(&self) -> BrokerCommandJournal {
-        BrokerCommandJournal::open_with_state_history(
+        BrokerCommandJournal::open(
             self.0.join("commands.db"),
             "strategy",
-            "account",
-            false,
-        )
+            "account")
         .await
         .unwrap()
     }
@@ -75,12 +73,6 @@ async fn fill_exports_are_bounded_frozen_across_restart_and_acknowledged_indepen
     assert!(frozen.body.len() <= aqe_live_protocol::EXECUTION_FILL_TRANSFER_BYTES);
     assert!(frozen.page().unwrap().has_more);
     assert!(frozen.page().unwrap().records.len() <= 32);
-    assert!(
-        j.prepare_execution_evidence_export()
-            .await
-            .unwrap()
-            .is_none()
-    );
     save(
         &mut j,
         vec![input("late", ExecutionFillEffect::Exit, 1., 8.)],

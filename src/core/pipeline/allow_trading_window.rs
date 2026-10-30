@@ -29,32 +29,9 @@ pub struct AllowTradingWindowPipe {
     pub allowed_days: String,
 }
 
-/// Compatibility conversion for older AQS graphs that stored weekdays as an array.
-pub trait IntoAllowedDays {
-    fn into_allowed_days(self) -> String;
-}
-
-impl IntoAllowedDays for String {
-    fn into_allowed_days(self) -> String {
-        self
-    }
-}
-
-impl IntoAllowedDays for Vec<String> {
-    fn into_allowed_days(self) -> String {
-        self.join(",")
-    }
-}
-
-impl IntoAllowedDays for &str {
-    fn into_allowed_days(self) -> String {
-        self.to_string()
-    }
-}
-
 impl AllowTradingWindowPipe {
-    pub fn new(start_utc: String, end_utc: String, allowed_days: impl IntoAllowedDays) -> Self {
-        let allowed_days = allowed_days.into_allowed_days();
+    pub fn new(start_utc: String, end_utc: String, allowed_days: impl Into<String>) -> Self {
+        let allowed_days = allowed_days.into();
         Self {
             start_utc: normalize_time(&start_utc, DEFAULT_START_UTC),
             end_utc: normalize_time(&end_utc, DEFAULT_END_UTC),
@@ -176,17 +153,6 @@ mod tests {
         assert_eq!(pipe.start_utc, "06:05");
         assert_eq!(pipe.end_utc, DEFAULT_END_UTC);
         assert_eq!(pipe.allowed_days, "1,4");
-    }
-
-    #[test]
-    fn accepts_legacy_array_day_configuration() {
-        let pipe = AllowTradingWindowPipe::new(
-            "09:30".to_string(),
-            "16:00".to_string(),
-            vec!["0".to_string(), "2".to_string(), "4".to_string()],
-        );
-
-        assert_eq!(pipe.allowed_days, "0,2,4");
     }
 
     #[test]

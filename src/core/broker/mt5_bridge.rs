@@ -29,6 +29,10 @@ use uuid::Uuid;
 mod recovery_task;
 use recovery_task::RecoveryTask;
 
+#[path = "mt5_http_auth.rs"]
+mod http_auth;
+use http_auth::AuthenticatedJson;
+
 use crate::core::broker::DataStreamMode;
 use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
 
@@ -2610,7 +2614,7 @@ async fn health(bridge: web::Data<Mt5Bridge>, request: HttpRequest) -> HttpRespo
 async fn heartbeat(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5HeartbeatPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5HeartbeatPayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     if let Err(message) =
@@ -2649,7 +2653,7 @@ async fn heartbeat(
 async fn snapshot(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5SnapshotPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5SnapshotPayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     if let Err(message) =
@@ -2675,7 +2679,7 @@ async fn snapshot(
 async fn market_data(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5MarketDataPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5MarketDataPayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     if let Err(message) =
@@ -2716,7 +2720,7 @@ async fn market_data(
 async fn trade_event(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5TradeEventPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5TradeEventPayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     if let Err(message) =
@@ -2762,19 +2766,19 @@ async fn trade_event(
 async fn fill_revisions(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5TradeEventsPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5TradeEventsPayload>>,
 ) -> HttpResponse {
     let mut envelope = envelope.into_inner();
     for event in &mut envelope.payload.events {
         event.analytics_only = true;
     }
-    trade_events(bridge, request, web::Json(envelope)).await
+    trade_events(bridge, request, AuthenticatedJson(envelope)).await
 }
 
 async fn trade_events(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5TradeEventsPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5TradeEventsPayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     if let Err(message) =
@@ -2820,7 +2824,7 @@ async fn trade_events(
 async fn poll_rpc(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5RpcPollPayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5RpcPollPayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     bridge.record_rpc_poll_attempt(&envelope.session_id);
@@ -2887,7 +2891,7 @@ async fn poll_rpc(
 async fn rpc_response(
     bridge: web::Data<Mt5Bridge>,
     request: HttpRequest,
-    envelope: web::Json<Mt5BridgeEnvelope<Mt5RpcResponsePayload>>,
+    envelope: AuthenticatedJson<Mt5BridgeEnvelope<Mt5RpcResponsePayload>>,
 ) -> HttpResponse {
     let envelope = envelope.into_inner();
     if let Err(message) =

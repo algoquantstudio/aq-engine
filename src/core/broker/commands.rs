@@ -91,7 +91,22 @@ impl From<&Insight> for BrokerOrderRequest {
 
 impl From<Insight> for BrokerOrderRequest {
     fn from(insight: Insight) -> Self {
-        Self::from(&insight)
+        let insight_id = insight.insight_id.to_string();
+        Self {
+            client_order_id: insight_id.clone(),
+            insight_id,
+            strategy_type: insight.strategy_type.to_string(),
+            symbol: insight.symbol,
+            quantity: insight.quantity,
+            side: insight.side,
+            order_type: insight.order_type,
+            order_class: insight.order_class,
+            limit_price: insight.limit_price,
+            stop_price: insight.stop_price,
+            take_profit_levels: insight.take_profit_levels,
+            stop_loss_levels: insight.stop_loss_levels,
+            trailing_stop_price: insight.trailing_stop_price,
+        }
     }
 }
 
@@ -607,6 +622,88 @@ mod submission_correlation_tests {
         );
         assert!(
             !super::super::types::Mt5RpcAction::SubmitOrder.can_retry_after_transport_failure()
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod owned_request_tests {
+    use super::*;
+    use crate::core::insight::types::StrategyType;
+
+    #[test]
+    fn owned_request_matches_borrowed_conversion_for_all_order_variants() {
+        for side in [OrderSide::Buy, OrderSide::Sell] {
+            for order_type in [
+                OrderType::Market,
+                OrderType::Limit,
+                OrderType::Stop,
+                OrderType::StopLimit,
+                OrderType::TrailingStop,
+            ] {
+                for order_class in [
+                    OrderClass::Simple,
+                    OrderClass::Bracket,
+                    OrderClass::OCO,
+                    OrderClass::OTO,
+                    OrderClass::TRO,
+                ] {
+                    for populated in [false, true] {
+                        let mut insight = Insight::default();
+                        insight.symbol = "BTC-USD".into();
+                        insight.side = side.clone();
+                        insight.order_type = order_type.clone();
+                        insight.order_class = order_class.clone();
+                        if populated {
+                            insight.strategy_type = StrategyType::Custom("Custom strategy".into());
+                            insight.quantity = Some(3.25);
+                            insight.limit_price = Some(100.5);
+                            insight.stop_price = Some(98.75);
+                            insight.take_profit_levels = Some(vec![110.25, 120.75]);
+                            insight.stop_loss_levels = Some(vec![95.25, 90.75]);
+                            insight.trailing_stop_price = Some(97.5);
+                        }
+                        let expected = BrokerOrderRequest::from(&insight);
+                        let actual = BrokerOrderRequest::from(insight);
+                        assert_eq!(actual, expected);
+                        assert_eq!(actual.client_order_id, actual.insight_id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_request_reuses_symbol_and_level_buffers() {
+        let mut symbol = String::with_capacity(512);
+        symbol.push_str("BTC-USD");
+        let mut take_profit_levels = Vec::with_capacity(64);
+        take_profit_levels.extend([110.0, 120.0]);
+        let mut stop_loss_levels = Vec::with_capacity(32);
+        stop_loss_levels.extend([95.0, 90.0]);
+        let symbol_buffer = (symbol.as_ptr(), symbol.capacity());
+        let take_profit_buffer = (take_profit_levels.as_ptr(), take_profit_levels.capacity());
+        let stop_loss_buffer = (stop_loss_levels.as_ptr(), stop_loss_levels.capacity());
+        let mut insight = Insight::default();
+        insight.symbol = symbol;
+        insight.take_profit_levels = Some(take_profit_levels);
+        insight.stop_loss_levels = Some(stop_loss_levels);
+        let expected = BrokerOrderRequest::from(&insight);
+
+        let request = BrokerOrderRequest::from(insight);
+
+        assert_eq!(request, expected);
+        assert_eq!((request.symbol.as_ptr(), request.symbol.capacity()), symbol_buffer);
+        let take_profit_levels = request.take_profit_levels.as_ref().unwrap();
+        assert_eq!(
+            (take_profit_levels.as_ptr(), take_profit_levels.capacity()),
+            take_profit_buffer
+        );
+        let stop_loss_levels = request.stop_loss_levels.as_ref().unwrap();
+        assert_eq!(
+            (stop_loss_levels.as_ptr(), stop_loss_levels.capacity()),
+            stop_loss_buffer
         );
     }
 }

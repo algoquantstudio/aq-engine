@@ -8,14 +8,11 @@ use crate::core::{
         deterministic_event_id,
     },
 };
-use aqe_live_protocol::{
-    ExecutionEvidenceExportReceipt, ExecutionEvidenceFeedPage, execution_evidence_chunks,
-};
 use std::time::{Duration, Instant};
 use tokio::{sync::oneshot, task::JoinHandle};
 mod health;
 mod scheduler;
-pub(super) use health::EvidenceExportHealth;
+pub(super) use health::AnalyticsExportHealth;
 use health::{ExportError, SharedBacklog};
 pub(super) use scheduler::ExecutionExportScheduler;
 
@@ -31,60 +28,50 @@ type ExportTask = (
     JoinHandle<()>,
     oneshot::Receiver<Result<Option<u64>, ExportError>>,
 );
-pub(super) struct ExecutionEvidenceExporter {
-    stream: EvidenceStream,
+pub(super) struct ExecutionAnalyticsExporter {
+    stream: AnalyticsStream,
     active: Option<ExportTask>,
     next_attempt: Instant,
     last_warning_at: Option<Instant>,
     backlog: SharedBacklog,
-    pub health: EvidenceExportHealth,
+    pub health: AnalyticsExportHealth,
 }
 #[derive(Clone, Copy)]
-enum EvidenceStream {
-    State,
+enum AnalyticsStream {
     Fills,
     Marks,
 }
-impl EvidenceStream {
+impl AnalyticsStream {
     fn label(self) -> &'static str {
         match self {
-            Self::State => "state",
             Self::Fills => "fills",
             Self::Marks => "marks",
         }
     }
 }
 
-fn export_enabled(stream: EvidenceStream, value: Option<&str>) -> bool {
-    value.map_or(matches!(stream, EvidenceStream::Marks), |v| {
+fn export_enabled(stream: AnalyticsStream, value: Option<&str>) -> bool {
+    value.map_or(matches!(stream, AnalyticsStream::Marks), |v| {
         matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
     })
 }
 
-impl ExecutionEvidenceExporter {
+impl ExecutionAnalyticsExporter {
     pub(super) fn has_inflight(&self) -> bool {
         self.active.is_some()
     }
 
-    pub fn new() -> Self {
-        Self::for_stream(EvidenceStream::State)
-    }
-
     pub fn new_fills() -> Self {
-        Self::for_stream(EvidenceStream::Fills)
+        Self::for_stream(AnalyticsStream::Fills)
     }
     pub fn new_marks() -> Self {
-        Self::for_stream(EvidenceStream::Marks)
+        Self::for_stream(AnalyticsStream::Marks)
     }
 
-    fn for_stream(stream: EvidenceStream) -> Self {
-        // Fill delivery stays opt-in outside AQS. Marks default on; the legacy
-        // duplicate Insight-state archive remains opt-in for CLI-only users
-        // and is always disabled by protected AQS launch configuration.
+    fn for_stream(stream: AnalyticsStream) -> Self {
         let setting = crate::launch_config::setting(match stream {
-            EvidenceStream::State => "AQE_EXECUTION_EVIDENCE_EXPORT",
-            EvidenceStream::Fills => "AQE_EXECUTION_FILL_EXPORT",
-            EvidenceStream::Marks => "AQE_POSITION_MARK_EXPORT",
+            AnalyticsStream::Fills => "AQE_EXECUTION_FILL_EXPORT",
+            AnalyticsStream::Marks => "AQE_POSITION_MARK_EXPORT",
         })
         .ok()
         .flatten();
@@ -95,7 +82,7 @@ impl ExecutionEvidenceExporter {
             next_attempt: Instant::now(),
             last_warning_at: None,
             backlog: Default::default(),
-            health: EvidenceExportHealth {
+            health: AnalyticsExportHealth {
                 enabled,
                 stream: stream.label(),
                 status: if enabled { "idle" } else { "disabled" },
@@ -238,7 +225,7 @@ impl ExecutionEvidenceExporter {
     }
 }
 
-impl Drop for ExecutionEvidenceExporter {
+impl Drop for ExecutionAnalyticsExporter {
     fn drop(&mut self) {
         if let Some((task, _)) = self.active.take() {
             task.abort();
@@ -246,55 +233,15 @@ impl Drop for ExecutionEvidenceExporter {
     }
 }
 
-async fn export_one(
-    sender: &BrokerCommandSender,
-    publisher: &LocalEventPublisher,
-    identity: &ExportIdentity,
-    backlog: &SharedBacklog,
-) -> Result<Option<u64>, ExportError> {
-    let sampled = chrono::Utc::now().timestamp_micros();
-    let Some(page) = sender
-        .try_prepare_execution_evidence_export()?
-        .wait()
-        .await?
-    else {
-        backlog.lock().empty(sampled);
-        return Ok(None);
-    };
-    backlog.lock().page(
-        page.generated_at_us,
-        page.after_sequence,
-        page.through_sequence,
-        page.observations.len(),
-        page.observations
-            .iter()
-            .map(|o| o.record.recorded_at_us)
-            .min(),
-    );
-    let receipt = publish_page(publisher, identity, &page).await?;
-    let sequence = receipt.next_sequence;
-    acknowledge_when_available(|| {
-        sender
-            .try_acknowledge_execution_evidence_export(receipt.clone())
-            .map(|reply| reply.wait())
-    })
-    .await?;
-    backlog.lock().acknowledged();
-    Ok(Some(sequence))
-}
-
 async fn export_stream(
     sender: &BrokerCommandSender,
     publisher: &LocalEventPublisher,
     identity: &ExportIdentity,
-    stream: EvidenceStream,
+    stream: AnalyticsStream,
     backlog: &SharedBacklog,
 ) -> Result<Option<u64>, ExportError> {
-    if matches!(stream, EvidenceStream::State) {
-        return export_one(sender, publisher, identity, backlog).await;
-    }
     let sampled = chrono::Utc::now().timestamp_micros();
-    if matches!(stream, EvidenceStream::Marks) {
+    if matches!(stream, AnalyticsStream::Marks) {
         let Some(transfer) = sender.try_prepare_position_mark_export()?.wait().await? else {
             backlog.lock().empty(sampled);
             return Ok(None);
@@ -484,70 +431,6 @@ async fn publish_fill_page_observed(
         .map_err(|_| "execution fill receipt channel closed")?
         .map_err(|e| ExportError::admission(publisher, e))?;
     Ok(transfer.receipt())
-}
-
-async fn publish_page(
-    publisher: &LocalEventPublisher,
-    identity: &ExportIdentity,
-    page: &ExecutionEvidenceFeedPage,
-) -> Result<ExecutionEvidenceExportReceipt, ExportError> {
-    if identity.strategy_id.trim_start_matches("strategy:")
-        != page.strategy_id.trim_start_matches("strategy:")
-    {
-        return Err("execution evidence publisher scope mismatch".into());
-    }
-    let chunks = execution_evidence_chunks(page)?;
-    let receipt = ExecutionEvidenceExportReceipt {
-        source_id: page.source_id.clone(),
-        transfer_id: chunks[0].transfer_id.clone(),
-        after_sequence: page.after_sequence,
-        next_sequence: page.next_sequence,
-    };
-    let subject = EventSubject::for_priority(
-        &identity.runtime_id,
-        &identity.strategy_id,
-        EventPriority::Audit,
-    );
-    // A page has at most 37 chunks (~1 MiB). Queue this bounded group before
-    // waiting, so the publisher can persist micro-batches instead of paying a
-    // separate transport fallback delay for every chunk while offline.
-    let mut receipts = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let entity = format!(
-            "execution-evidence:{}:{}:{}",
-            chunk.source_id, chunk.transfer_id, chunk.index
-        );
-        let mut event = CloudEvent::new(
-            &identity.runtime_id,
-            &identity.strategy_id,
-            &identity.session_id,
-            entity.clone(),
-            chunk.next_sequence,
-            EventPriority::Audit,
-            EventKind::ExecutionEvidenceChunk,
-            serde_json::to_value(chunk).map_err(|e| e.to_string())?,
-        );
-        event.run_id = Some(identity.run_id.clone());
-        event.event_id = deterministic_event_id(&format!(
-            "aqs-evidence-v2:{}:{}:{}",
-            identity.run_id, identity.session_id, entity
-        ));
-        // Retries keep the exact envelope identity, including source snapshot
-        // time. Transport receipt clocks are carried separately in LatencyTrace.
-        event.created_at = chrono::DateTime::from_timestamp_micros(page.generated_at_us)
-            .ok_or("invalid evidence snapshot time")?;
-        let durable = publisher
-            .queue_durable(subject.clone(), event)
-            .map_err(|e| ExportError::admission(publisher, e))?;
-        receipts.push(durable);
-    }
-    for durable in receipts {
-        durable
-            .await
-            .map_err(|_| "execution evidence receipt channel closed")?
-            .map_err(|e| ExportError::admission(publisher, e))?;
-    }
-    Ok(receipt)
 }
 
 #[cfg(test)]

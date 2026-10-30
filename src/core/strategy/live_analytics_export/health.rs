@@ -55,7 +55,7 @@ type Backlog = std::sync::Arc<parking_lot::Mutex<ExportBacklogHealth>>;
 pub(super) type SharedBacklog = Backlog;
 
 #[derive(Default, serde::Serialize)]
-pub(crate) struct EvidenceExportHealth {
+pub(crate) struct AnalyticsExportHealth {
     pub enabled: bool,
     pub stream: &'static str,
     pub status: &'static str,
@@ -132,7 +132,7 @@ pub(super) fn retry_delay(error: &ExportError, consecutive: u32) -> Duration {
     Duration::from_millis(base.saturating_mul(1u64 << exponent).min(cap))
 }
 
-impl ExecutionEvidenceExporter {
+impl ExecutionAnalyticsExporter {
     pub(super) fn refresh_health(&mut self) {
         let now = chrono::Utc::now().timestamp_micros();
         if let Some(backlog) = self.backlog.try_lock() {

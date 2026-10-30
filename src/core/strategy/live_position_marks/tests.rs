@@ -49,12 +49,10 @@ impl PositionValuationReader for Reader {
 
 async fn worker_fixture() -> (std::path::PathBuf, BrokerCommandWorker) {
     let dir = std::env::temp_dir().join(format!("aqe-mark-reader-{}", uuid::Uuid::new_v4()));
-    let mut journal = BrokerCommandJournal::open_with_state_history(
+    let mut journal = BrokerCommandJournal::open(
         dir.join("commands.db"),
         "strategy",
-        "account",
-        false,
-    )
+        "account")
     .await
     .unwrap();
     let mut insight = Insight::default();

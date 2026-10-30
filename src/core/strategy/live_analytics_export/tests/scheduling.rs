@@ -167,22 +167,21 @@ async fn fair_export_scheduler_runs_one_page_at_a_time_and_rotates_ready_streams
         Default::default(),
     );
     let mut schedule = ExecutionExportScheduler::default();
-    let mut state = enabled_exporter();
-    let mut fills = ExecutionEvidenceExporter::new_fills();
-    let mut marks = ExecutionEvidenceExporter::new_marks();
+    let mut fills = ExecutionAnalyticsExporter::new_fills();
+    let mut marks = ExecutionAnalyticsExporter::new_marks();
     fills.health.enabled = true;
     marks.health.enabled = true;
-    for expected in ["state", "fills", "marks", "state", "fills", "marks"] {
-        for stream in [&mut state, &mut fills, &mut marks] {
+    for expected in ["fills", "marks", "fills", "marks"] {
+        for stream in [&mut fills, &mut marks] {
             stream.next_attempt = Instant::now();
         }
         schedule.poll(
-            [&mut state, &mut fills, &mut marks],
+            [&mut fills, &mut marks],
             Some(worker.sender.clone()),
             &publisher,
             identity(),
         );
-        let active = [&state, &fills, &marks]
+        let active = [&fills, &marks]
             .into_iter()
             .filter(|s| s.has_inflight())
             .collect::<Vec<_>>();
@@ -190,10 +189,10 @@ async fn fair_export_scheduler_runs_one_page_at_a_time_and_rotates_ready_streams
         assert_eq!(active[0].health.stream, expected);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                for stream in [&mut state, &mut fills, &mut marks] {
+                for stream in [&mut fills, &mut marks] {
                     stream.poll_completion();
                 }
-                if [&state, &fills, &marks].iter().all(|s| !s.has_inflight()) {
+                if [&fills, &marks].iter().all(|s| !s.has_inflight()) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -202,24 +201,24 @@ async fn fair_export_scheduler_runs_one_page_at_a_time_and_rotates_ready_streams
         .await
         .unwrap();
         assert!(
-            [&state, &fills, &marks]
+            [&fills, &marks]
                 .iter()
                 .all(|s| s.health.last_error.is_none())
         );
     }
-    state.health.enabled = false;
-    for stream in [&mut state, &mut fills, &mut marks] {
+    marks.health.enabled = false;
+    for stream in [&mut fills, &mut marks] {
         stream.next_attempt = Instant::now();
     }
     schedule.poll(
-        [&mut state, &mut fills, &mut marks],
+        [&mut fills, &mut marks],
         Some(worker.sender.clone()),
         &publisher,
         identity(),
     );
     assert!(
-        !state.has_inflight(),
-        "the disabled duplicate-state archive stays off"
+        !marks.has_inflight(),
+        "disabled mark delivery stays off"
     );
     assert!(fills.has_inflight());
     fills
@@ -232,7 +231,7 @@ async fn fair_export_scheduler_runs_one_page_at_a_time_and_rotates_ready_streams
         .await
         .unwrap();
     assert!(
-        [&state, &fills, &marks]
+        [&fills, &marks]
             .iter()
             .all(|s| s.health.busy_deferrals == 0)
     );
@@ -244,9 +243,8 @@ async fn fair_export_scheduler_runs_one_page_at_a_time_and_rotates_ready_streams
 #[tokio::test]
 async fn active_export_blocks_other_export_starts_and_drop_cancels_it() {
     let mut schedule = ExecutionExportScheduler::default();
-    let mut state = enabled_exporter();
-    let mut fills = ExecutionEvidenceExporter::new_fills();
-    let mut marks = ExecutionEvidenceExporter::new_marks();
+    let mut fills = ExecutionAnalyticsExporter::new_fills();
+    let mut marks = ExecutionAnalyticsExporter::new_marks();
     fills.health.enabled = true;
     marks.health.enabled = true;
     let (reply, receiver) = oneshot::channel();
@@ -262,12 +260,12 @@ async fn active_export_blocks_other_export_starts_and_drop_cancels_it() {
         Default::default(),
     );
     schedule.poll(
-        [&mut state, &mut fills, &mut marks],
+        [&mut fills, &mut marks],
         None,
         &publisher,
         identity(),
     );
-    assert!(!state.has_inflight() && !fills.has_inflight() && marks.has_inflight());
+    assert!(!fills.has_inflight() && marks.has_inflight());
     drop(marks);
     tokio::time::timeout(Duration::from_secs(1), async {
         while !abort.is_finished() {

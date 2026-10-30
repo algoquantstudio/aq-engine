@@ -554,3 +554,101 @@ fn checkpoint_preserves_pending_effects_flags_history_and_flat_child_identity() 
         matches!(&restored.pending_mutations[0].effect, MutationEffect::TakeProfit(Some(levels)) if *levels == vec![2500.0])
     );
 }
+
+#[tokio::test]
+async fn canonical_setter_history_survives_without_a_duplicate_state_archive() {
+    use crate::core::insight::InsightSnapshot;
+    let fixture = Fixture::new();
+    let mut journal = BrokerCommandJournal::open(
+        fixture.0.join("commands.db"),
+        "strategy",
+        "account")
+    .await
+    .unwrap();
+    let parent = uuid::Uuid::new_v4();
+    let mut row = Insight::default();
+    row.symbol = "GENERIC".into();
+    row.set_quantity(Some(2.))
+        .set_limit_price(Some(100.))
+        .set_stop_price(Some(101.))
+        .set_take_profit_levels(Some(vec![110.]))
+        .set_stop_loss_levels(Some(vec![90.]))
+        .set_trailing_stop_price(Some(5.))
+        .set_parent_id(parent);
+    let history = row.state_history.clone();
+    for prefix in [
+        "Quantity set to",
+        "Limit price set to",
+        "Stop price set to",
+        "Take profit levels set to",
+        "Stop loss levels set to",
+        "Trailing stop set to",
+        "Parent ID set to",
+    ] {
+        assert_eq!(
+            history
+                .iter()
+                .filter(|(_, _, message)| message.as_deref().is_some_and(|m| m.starts_with(prefix)))
+                .count(),
+            1,
+            "{prefix}"
+        );
+    }
+    // Setting the same values is a no-op, not a second analytics event.
+    row.set_quantity(Some(2.))
+        .set_limit_price(Some(100.))
+        .set_parent_id(parent);
+    assert_eq!(row.state_history, history);
+    journal.persist_execution_batch(&ExecutionCheckpointBatch::new(vec![checkpoint(&row, 1)], vec![]).unwrap()).await.unwrap();
+    drop(journal);
+    let journal = BrokerCommandJournal::open(
+        fixture.0.join("commands.db"),
+        "strategy",
+        "account")
+    .await
+    .unwrap();
+    let mut tables = journal.connection.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('broker_execution_evidence','broker_execution_evidence_export')", ()
+    ).await.unwrap();
+    assert!(tables.next().await.unwrap().is_none(), "current journals must not recreate the retired duplicate archive");
+    drop(tables);
+    let saved = journal
+        .execution_checkpoint_page("", 32)
+        .await
+        .unwrap()
+        .rows
+        .remove(0);
+    let (restored, _, _, _) = saved.into_parts();
+    assert_eq!(restored.state_history, history);
+    let snapshot = InsightSnapshot::from_insight(&restored, "strategy");
+    assert_eq!(snapshot.parent_id, Some(parent.to_string()));
+    assert_eq!(snapshot.quantity, Some(2.));
+    assert_eq!(snapshot.limit_price, Some(100.));
+    assert_eq!(snapshot.state_history.len(), history.len());
+    assert_eq!(
+        snapshot
+            .state_history
+            .iter()
+            .map(|h| h.message.clone())
+            .collect::<Vec<_>>(),
+        history
+            .iter()
+            .map(|(_, _, m)| m.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+
+#[test]
+fn only_the_current_checkpoint_format_is_accepted() {
+    let current=checkpoint(&insight(),1);
+    current.validate().unwrap();
+    assert_eq!(current.version,6);
+    for old in 0..6 {
+        let mut row=current.clone();row.version=old;
+        assert!(row.validate().is_err(), "old checkpoint version {old} was accepted");
+    }
+    let mut json=serde_json::to_value(&current).unwrap();
+    json["alpha_node_id"]=serde_json::json!("retired-node-metadata");
+    assert!(serde_json::from_value::<InsightExecutionCheckpoint>(json).is_err());
+}

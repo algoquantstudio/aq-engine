@@ -18,12 +18,10 @@ impl Fixture {
         self.0.join("publisher.db")
     }
     async fn journal(&self) -> BrokerCommandJournal {
-        BrokerCommandJournal::open_with_state_history(
+        BrokerCommandJournal::open(
             self.0.join("commands.db"),
             "strategy",
-            "account",
-            false,
-        )
+            "account")
         .await
         .unwrap()
         .with_analytics_capture_budget(PhysicalCaptureLimit {
@@ -112,6 +110,30 @@ async fn fallback_links_are_bounded_idempotent_and_keep_original_delivery_identi
     assert!(import.retire_empty_journal_recovery().await.unwrap());
     assert!(!CaptureOwnerLease::journal_recovery_path(&fixture.source()).exists());
     drop(journal);
+}
+
+#[tokio::test]
+async fn exited_reader_rejects_retired_journal_formats_without_rewriting_them() {
+    let fixture = Fixture::new();
+    let journal = fixture.journal().await;
+    let owner = fixture.owner("runtime");
+    let link = journal.recovery_link(&owner, 100_000).unwrap();
+    drop(journal);
+    let database = turso::Builder::new_local(link.journal_path.to_str().unwrap())
+        .build().await.unwrap();
+    let connection = database.connect().unwrap();
+    connection.execute_batch("PRAGMA user_version=1;").await.unwrap();
+    assert!(matches!(
+        ExitedAnalyticsCapture::open(&link).await,
+        Err(ExitedAnalyticsCaptureError::Invalid)
+    ));
+    let mut rows = connection.query("PRAGMA user_version", ()).await.unwrap();
+    assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 1);
+    drop(rows);
+    let mut rows = connection.query(
+        "SELECT source_id FROM broker_execution_evidence_source WHERE singleton=1", (),
+    ).await.unwrap();
+    assert_eq!(rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(), link.journal_source_id);
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
 use super::StrategyState;
 use super::aqs_reader::{
-    MetricAccountOrigin, load_closed_insight_metric_page, load_earliest_metric_account_origin,
-    load_latest_live_metrics, load_latest_metric_account_origin, load_strategy_account_baseline,
+    MetricAccountOrigin, load_latest_live_metrics, load_strategy_account_baseline,
 };
 use super::aqs_types::AqsAuth;
 use super::live_metrics::LivePerformanceTracker;
@@ -149,103 +148,6 @@ where
         self.metrics_checkpoint_writer = None;
     }
 
-    pub(super) fn start_legacy_live_trade_metrics<C: surrealdb::Connection>(
-        &mut self,
-        client: &surrealdb::Surreal<C>,
-        auth: &AqsAuth,
-    ) {
-        self.live_metrics_cloud_write_enabled = false;
-        self.legacy_metrics_recovery_needed = true;
-        if self.legacy_metrics_recovery.is_running() {
-            return;
-        }
-        let token = match self.live_metrics.begin_trade_history_recovery() {
-            Ok(token) => token,
-            Err(error) => {
-                warn!(
-                    "Cannot start legacy metrics recovery for strategy {}: {error}",
-                    auth.strategy_id
-                );
-                self.live_metrics_cloud_write_enabled = false;
-                return;
-            }
-        };
-        let client = client.clone();
-        let auth = auth.clone();
-        if let Err(error) = self
-            .legacy_metrics_recovery
-            .start(token.clone(), async move {
-                super::legacy_metrics_recovery::load_trade_history_pages(
-                    &auth.strategy_id,
-                    |offset, limit| {
-                        let client = &client;
-                        let auth = &auth;
-                        async move {
-                            load_closed_insight_metric_page(client, auth, offset, limit)
-                                .await
-                                .map_err(|error| error.to_string())
-                        }
-                    },
-                )
-                .await
-            })
-        {
-            self.live_metrics.cancel_trade_history_recovery(&token);
-            warn!("Cannot queue legacy metrics recovery: {error}");
-        }
-    }
-
-    pub(super) fn apply_legacy_live_trade_metrics(
-        &mut self,
-        completed: super::legacy_metrics_recovery::LegacyMetricsRecoveryResult,
-        auth: Option<&AqsAuth>,
-    ) {
-        if !self
-            .live_metrics
-            .is_trade_history_recovery_current(&completed.token)
-        {
-            warn!("Ignoring obsolete legacy metrics recovery result");
-            return;
-        }
-        let account_matches = self
-            .broker
-            .account_snapshot()
-            .ok()
-            .is_some_and(|account| completed.token.matches_account(&account.account_id));
-        let result = if account_matches {
-            completed.result.and_then(|rebuilt| {
-                self.live_metrics
-                    .try_apply_trade_history_recovery(&completed.token, rebuilt)
-            })
-        } else {
-            Err("Broker account is unavailable or changed during legacy metrics recovery".into())
-        };
-        self.live_metrics
-            .cancel_trade_history_recovery(&completed.token);
-        match result {
-            Ok(()) => {
-                self.legacy_metrics_recovery_needed = false;
-                self.live_metrics_cloud_write_enabled = true;
-                let key = self.live_metrics_strategy_key(auth);
-                self.persist_local_live_metrics_checkpoint(&key);
-                info!("Legacy metrics recovery committed for strategy {key}");
-            }
-            Err(error) => {
-                self.live_metrics.mark_history_recovery_incomplete();
-                self.live_metrics_cloud_write_enabled = false;
-                warn!(
-                    "Legacy metrics recovery not committed; current metrics preserved and Cloud writes deferred: {error}"
-                );
-            }
-        }
-    }
-
-    pub(super) async fn stop_legacy_metrics_recovery(&mut self) {
-        if let Some(token) = self.legacy_metrics_recovery.shutdown().await {
-            self.live_metrics.cancel_trade_history_recovery(&token);
-        }
-    }
-
     pub(super) async fn initialize_live_metrics_continuity<C: surrealdb::Connection>(
         &mut self,
         client: Option<&surrealdb::Surreal<C>>,
@@ -311,7 +213,6 @@ where
         executed_at: chrono::DateTime<chrono::Utc>,
         symbols: Vec<String>,
     ) -> Option<String> {
-        self.legacy_metrics_recovery_needed = false;
         self.live_metrics_cloud_write_enabled = true;
         let strategy_key = self.live_metrics_strategy_key(auth);
         let local_checkpoint = self.load_local_live_metrics_checkpoint(&strategy_key);
@@ -353,7 +254,15 @@ where
             )
             .await
             {
-                Ok(Ok(metrics)) => cloud_metrics = metrics,
+                Ok(Ok(metrics)) => {
+                    if let Some(record)=metrics.as_ref() {
+                        if let Err(error)=super::metrics_continuity_lookup::require_current_checkpoint(record) {
+                            warn!("{error}; Cloud metric writes are deferred, not reconstructed");
+                            self.live_metrics_cloud_write_enabled=false;
+                        }
+                    }
+                    cloud_metrics=metrics;
+                },
                 Ok(Err(error)) => {
                     warn!(
                         "AQS live metrics continuity could not be loaded for strategy {}: {}; cloud metric writes are deferred for this run",
@@ -410,20 +319,7 @@ where
             .filter(|checkpoint| checkpoint.history_recovery_complete)
             .cloned()
             .collect::<Vec<_>>();
-        let checkpoint_candidates = if complete_candidates.is_empty() {
-            // An incomplete local checkpoint created while Cloud continuity was
-            // unavailable must not outrank a legacy Cloud metrics snapshot.
-            if cloud_metrics
-                .as_ref()
-                .is_some_and(|metrics| metrics.tracker_checkpoint.is_none())
-            {
-                Vec::new()
-            } else {
-                candidates
-            }
-        } else {
-            complete_candidates
-        };
+        let checkpoint_candidates = if complete_candidates.is_empty() { candidates } else { complete_candidates };
         let selected_checkpoint = LivePerformanceTracker::newest_compatible_checkpoint(
             &account_id,
             checkpoint_candidates,
@@ -444,9 +340,8 @@ where
                         strategy_key, account_id, checkpoint_time
                     );
                     if !recovery_complete {
-                        if let (Some(client), Some(auth)) = (client, auth) {
-                            self.start_legacy_live_trade_metrics(client, auth);
-                        }
+                        self.live_metrics_cloud_write_enabled=false;
+                        warn!("Incomplete historical metrics checkpoint is unsupported; current statistics are retained without a legacy rebuild");
                     }
                     return None;
                 }
@@ -454,61 +349,6 @@ where
                     "Ignoring invalid live metrics checkpoint for strategy {}: {}",
                     strategy_key, error
                 ),
-            }
-        }
-
-        let mut legacy_account_id = None;
-        if let (Some(client), Some(auth), Some(metrics)) = (client, auth, cloud_metrics.as_ref()) {
-            let latest_origin = match tokio::time::timeout(
-                Duration::from_secs(LIVE_SYNC_QUERY_TIMEOUT_SECS),
-                load_latest_metric_account_origin(client, auth),
-            )
-            .await
-            {
-                Ok(Ok(origin)) => origin,
-                Ok(Err(error)) => {
-                    warn!(
-                        "Could not load broker identity for legacy live metrics on strategy {}: {}",
-                        auth.strategy_id, error
-                    );
-                    None
-                }
-                Err(_) => None,
-            };
-            legacy_account_id = latest_origin
-                .as_ref()
-                .map(|origin| origin.account_id.trim().to_string());
-            if latest_origin
-                .as_ref()
-                .is_some_and(|origin| origin.account_id.trim() == account_id)
-            {
-                if self
-                    .live_metrics
-                    .restore_legacy_snapshot(
-                        metrics.snapshot(),
-                        account_id.clone(),
-                        current_equity,
-                        executed_at,
-                        symbols.clone(),
-                    )
-                    .is_ok()
-                {
-                    if let Ok(Ok(Some(origin))) = tokio::time::timeout(
-                        Duration::from_secs(LIVE_SYNC_QUERY_TIMEOUT_SECS),
-                        load_earliest_metric_account_origin(client, auth, &account_id),
-                    )
-                    .await
-                    {
-                        self.live_metrics
-                            .set_continuity_origin(origin.equity, origin.captured_at);
-                    }
-                    self.start_legacy_live_trade_metrics(client, auth);
-                    info!(
-                        "Recovered legacy live metrics continuity for strategy {} account {}",
-                        auth.strategy_id, account_id
-                    );
-                    return None;
-                }
             }
         }
 
@@ -520,7 +360,6 @@ where
                     .as_ref()
                     .map(|checkpoint| checkpoint.account_id.trim().to_string())
             })
-            .or(legacy_account_id)
             .or_else(|| cloud_metrics.as_ref().map(|_| "unavailable".to_string()));
         self.live_metrics.initialize_for_account(
             Some(account_id.clone()),
@@ -543,7 +382,6 @@ where
         auth: &AqsAuth,
         expected_account_id: &str,
         cloud_metrics: Option<super::aqs_types::StrategyLiveMetricsRecord>,
-        legacy: Option<super::metrics_continuity_lookup::LegacyContinuity>,
         baseline: Option<MetricAccountOrigin>,
     ) -> bool {
         let resolved = self.resolve_deferred_live_metrics_continuity_inner(
@@ -551,7 +389,6 @@ where
             auth,
             expected_account_id,
             cloud_metrics,
-            legacy,
         );
         if resolved {
             if let Some(origin) = baseline {
@@ -577,11 +414,10 @@ where
 
     fn resolve_deferred_live_metrics_continuity_inner<C: surrealdb::Connection>(
         &mut self,
-        client: &surrealdb::Surreal<C>,
+        _client: &surrealdb::Surreal<C>,
         auth: &AqsAuth,
         expected_account_id: &str,
         cloud_metrics: Option<super::aqs_types::StrategyLiveMetricsRecord>,
-        legacy: Option<super::metrics_continuity_lookup::LegacyContinuity>,
     ) -> bool {
         if self.live_metrics_cloud_write_enabled {
             return true;
@@ -621,10 +457,10 @@ where
                         if recovery_complete {
                             self.live_metrics.mark_history_recovery_complete();
                         } else {
-                            // A partial legacy rebuild is not continuity proof.
+                            // An incomplete checkpoint is not continuity proof.
                             // Keep retries enabled and never overwrite Cloud
                             // history with incomplete local accumulators.
-                            self.start_legacy_live_trade_metrics(client, auth);
+                            warn!("Incomplete metrics checkpoint is unsupported; Cloud writes remain deferred");
                             return false;
                         }
                         self.live_metrics_cloud_write_enabled = true;
@@ -653,47 +489,8 @@ where
             return true;
         }
 
-        // Lookup and risk-baseline preparation already finished on the owned
-        // read task. Never rerun startup initialization here: it would overwrite
-        // the trades/equity samples accepted while Cloud was unavailable.
-        use super::live_metrics::LegacyRiskMerge;
-        use super::metrics_continuity_lookup::LegacyContinuity;
-        match legacy {
-            Some(LegacyContinuity::AccountChanged(previous)) => {
-                self.live_metrics.mark_history_recovery_complete();
-                self.live_metrics_cloud_write_enabled = true;
-                warn!(
-                    "Legacy metrics belong to previous broker account '{previous}'; current account metrics remain separate"
-                );
-                true
-            }
-            Some(LegacyContinuity::Risk(baseline)) => {
-                match self.live_metrics.merge_legacy_risk_baseline(baseline) {
-                    Ok(LegacyRiskMerge::CompleteCheckpointPreferred) => {
-                        self.live_metrics_cloud_write_enabled = true;
-                        true
-                    }
-                    Ok(LegacyRiskMerge::NeedsTradeHistory) => {
-                        self.start_legacy_live_trade_metrics(client, auth);
-                        false
-                    }
-                    Err(error) => {
-                        warn!(
-                            "Legacy risk baseline could not be merged for strategy {}; preserving live metrics and deferring Cloud writes: {error}",
-                            auth.strategy_id
-                        );
-                        false
-                    }
-                }
-            }
-            None => {
-                warn!(
-                    "Legacy metrics lookup did not provide account/baseline evidence for strategy {}; Cloud writes remain deferred",
-                    auth.strategy_id
-                );
-                false
-            }
-        }
+        warn!("Cloud metrics lack a current tracker checkpoint; aggregate-snapshot reconstruction was removed and Cloud writes remain deferred");
+        false
     }
 
     pub(super) fn persist_local_live_metrics_if_needed(

@@ -8,12 +8,10 @@ impl Fixture {
         Self(std::env::temp_dir().join(format!("aqe-source-capture-{}", uuid::Uuid::new_v4())))
     }
     async fn open(&self) -> BrokerCommandJournal {
-        BrokerCommandJournal::open_with_state_history(
+        BrokerCommandJournal::open(
             self.0.join("journal.db"),
             "strategy",
-            "account",
-            false,
-        )
+            "account")
         .await
         .unwrap()
     }
@@ -683,7 +681,7 @@ async fn analytics_budget_is_opt_in_and_does_not_install_an_archive_or_a_pause()
     assert!(journal.analytics_capture_usage().await.unwrap().is_some());
     assert_eq!(journal.analytics_capture_pause().await.unwrap(), None);
     assert_eq!(
-        count(&journal, "SELECT count(*) FROM broker_execution_evidence").await,
+        count(&journal, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='broker_execution_evidence'").await,
         0
     );
     assert_eq!(count(&journal, "PRAGMA cache_spill").await, 0);
@@ -842,20 +840,6 @@ async fn a_local_gap_survives_restart_and_requires_exact_generation_and_capacity
 #[tokio::test]
 async fn invalid_budget_or_missing_footprint_never_falls_back_to_acceptance() {
     let fixture = Fixture::new();
-    assert!(
-        BrokerCommandJournal::open_with_state_history(
-            fixture.0.join("journal.db"),
-            "strategy",
-            "account",
-            true
-        )
-        .await
-        .unwrap()
-        .with_analytics_capture_budget(budget())
-        .await
-        .is_err(),
-        "bounded analytics must not silently leave a second uncapped observation archive on"
-    );
     assert!(
         fixture
             .open()

@@ -58,7 +58,7 @@ pub(crate) use publisher::CloudCaptureGate;
 pub(crate) use publisher::FinalSourceJournal;
 pub use runtime::{
     PUBLISHER_IMPORT_BOUND_VERSION,
-    legacy_publisher_outbox_path, publisher_outbox_path,
+    publisher_outbox_path,
     SOURCE_OBSERVATION_LIFECYCLE_VERSION,
     REGISTRATION_AUDIT_DIRECTORY, RegistrationAudit, RegistrationAuditDecision, RuntimeHostHealth,
     RuntimeHostMetadata, RuntimeLogSource, RuntimeStrategyRegistration,

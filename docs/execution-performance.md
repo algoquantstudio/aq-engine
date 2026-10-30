@@ -16,8 +16,8 @@ The default suite reuses `engine_performance.rs`'s exact three control workloads
 250,000 bars through four indicators, 20,000 insights through three configuration/
 validation stages, and 5,000 direct PaperBroker submissions/fills. It adds 5,000
 market insights through the real `StrategyState::run_backtest` execution path.
-There are three warm-ups and fifteen measured samples, with median/p95 elapsed
-time and median-derived throughput in the JSON report.
+There are three warm-ups and fifteen measured samples, with the raw sample
+durations, median/p95 elapsed time and median-derived throughput in the JSON report.
 
 The additional test uses a synthetic minute-bar feed and PaperBroker. It exercises
 submission deferral, bounded command admission, the command worker, durable

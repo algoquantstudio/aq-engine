@@ -134,31 +134,6 @@ enum JournalRequest {
         limit: usize,
         reply: oneshot::Sender<Result<ExecutionCheckpointPage, BrokerCommandError>>,
     },
-    EvidencePage {
-        epoch: u64,
-        after: u64,
-        through: Option<u64>,
-        limit: usize,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-        reply:
-            oneshot::Sender<Result<aqe_live_protocol::ExecutionEvidencePage, BrokerCommandError>>,
-    },
-    EvidenceFeedPage {
-        after: u64,
-        through: Option<u64>,
-        limit: usize,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-        reply: oneshot::Sender<Result<aqe_live_protocol::ExecutionEvidenceFeedPage, BrokerCommandError>>,
-    },
-    PrepareEvidenceExport {
-        _permit: tokio::sync::OwnedSemaphorePermit,
-        reply: oneshot::Sender<Result<Option<aqe_live_protocol::ExecutionEvidenceFeedPage>, BrokerCommandError>>,
-    },
-    AcknowledgeEvidenceExport {
-        receipt: aqe_live_protocol::ExecutionEvidenceExportReceipt,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-        reply: oneshot::Sender<Result<(), BrokerCommandError>>,
-    },
 }
 
 /// A bounded, non-blocking request to the journal owner. Await it only outside
@@ -543,66 +518,6 @@ impl BrokerCommandSender {
         let permit = self.try_analytics_permit()?;
         let (reply, receiver) = oneshot::channel();
         self.try_analytics_request(JournalRequest::AcknowledgeFillExport { receipt, _permit: permit, reply })?;
-        Ok(BrokerJournalReply(receiver))
-    }
-
-    /// Sanitized read-only analytics feed. At most one page may be queued or
-    /// running across all sender clones; analytics cannot flood the journal's
-    /// control lane. Await outside the synchronous strategy/reducer turn.
-    pub fn try_execution_evidence_page(
-        &self,
-        epoch: u64,
-        after: u64,
-        through: Option<u64>,
-        limit: usize,
-    ) -> Result<BrokerJournalReply<aqe_live_protocol::ExecutionEvidencePage>, BrokerCommandError>
-    {
-        let permit = self.try_analytics_permit()?;
-        let (reply, receiver) = oneshot::channel();
-        self.try_analytics_request(JournalRequest::EvidencePage {
-            epoch,
-            after,
-            through,
-            limit: limit.clamp(1, 128),
-            _permit: permit,
-            reply,
-        })?;
-        Ok(BrokerJournalReply(receiver))
-    }
-
-    /// Ordered export across epochs, including corrections to stopped epochs.
-    /// Shares the single read permit with the inspector's epoch-scoped feed.
-    pub fn try_execution_evidence_feed_page(
-        &self,
-        after: u64,
-        through: Option<u64>,
-        limit: usize,
-    ) -> Result<BrokerJournalReply<aqe_live_protocol::ExecutionEvidenceFeedPage>, BrokerCommandError> {
-        let permit = self.try_analytics_permit()?;
-        let (reply, receiver) = oneshot::channel();
-        self.try_analytics_request(JournalRequest::EvidenceFeedPage {
-            after,
-            through,
-            limit: limit.clamp(1, 128),
-            _permit: permit,
-            reply,
-        })?;
-        Ok(BrokerJournalReply(receiver))
-    }
-
-    pub fn try_prepare_execution_evidence_export(&self)
-        -> Result<BrokerJournalReply<Option<aqe_live_protocol::ExecutionEvidenceFeedPage>>, BrokerCommandError> {
-        let permit = self.try_analytics_permit()?;
-        let (reply, receiver) = oneshot::channel();
-        self.try_analytics_request(JournalRequest::PrepareEvidenceExport { _permit: permit, reply })?;
-        Ok(BrokerJournalReply(receiver))
-    }
-
-    pub fn try_acknowledge_execution_evidence_export(&self, receipt: aqe_live_protocol::ExecutionEvidenceExportReceipt)
-        -> Result<BrokerJournalReply<()>, BrokerCommandError> {
-        let permit = self.try_analytics_permit()?;
-        let (reply, receiver) = oneshot::channel();
-        self.try_analytics_request(JournalRequest::AcknowledgeEvidenceExport { receipt, _permit: permit, reply })?;
         Ok(BrokerJournalReply(receiver))
     }
 
@@ -1705,42 +1620,6 @@ async fn handle_journal_request(
             reply,
         } => {
             let _ = reply.send(journal.execution_checkpoint_page(&after, limit).await);
-        }
-        JournalRequest::EvidencePage {
-            epoch,
-            after,
-            through,
-            limit,
-            _permit,
-            reply,
-        } => {
-            // A cancelled inspector/request should not perform unnecessary I/O.
-            if !reply.is_closed() {
-                let result = journal
-                    .execution_evidence_page(epoch, after, through, limit)
-                    .await;
-                let _ = reply.send(result);
-            }
-            drop(_permit);
-        }
-        JournalRequest::EvidenceFeedPage { after, through, limit, _permit, reply } => {
-            if !reply.is_closed() {
-                let result = journal.execution_evidence_feed_page(after, through, limit).await;
-                let _ = reply.send(result);
-            }
-            drop(_permit);
-        }
-        JournalRequest::PrepareEvidenceExport { _permit, reply } => {
-            if !reply.is_closed() {
-                let _ = reply.send(journal.prepare_execution_evidence_export().await);
-            }
-            drop(_permit);
-        }
-        JournalRequest::AcknowledgeEvidenceExport { receipt, _permit, reply } => {
-            if !reply.is_closed() {
-                let _ = reply.send(journal.acknowledge_execution_evidence_export(&receipt).await);
-            }
-            drop(_permit);
         }
     }
     ready.notify_one();

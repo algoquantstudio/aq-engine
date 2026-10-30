@@ -17,99 +17,13 @@ pub(super) const ACTIVE_FILL_OWNER_PREDICATE: &str = "materialized=1 AND executi
     (json_extract(checkpoint_json,'$.state')='Filled' OR
     (json_extract(checkpoint_json,'$.state')='Executed' AND COALESCE(json_extract(checkpoint_json,'$.entry_filled_quantity'),0)>0))";
 
-/// Private journal metadata preserves original execution ownership across
-/// restarts. Existing Insight fields remain the source of order and symbol.
-pub(super) async fn install_owner_epochs(
+/// Indexed private ownership metadata avoids decoding historical checkpoints
+/// during broker-history refreshes.
+pub(super) async fn install_owner_indexes(
     connection: &Connection,
-    current_epoch: u64,
 ) -> Result<(), BrokerCommandError> {
-    let mut columns = connection
-        .query("PRAGMA table_info(broker_insight_checkpoints)", ())
-        .await
-        .map_err(journal_error)?;
-    let mut installed = HashSet::new();
-    while let Some(row) = columns.next().await.map_err(journal_error)? {
-        installed.insert(row.get::<String>(1).map_err(journal_error)?);
-    }
-    drop(columns);
-    let mut version_rows = connection
-        .query("PRAGMA user_version", ())
-        .await
-        .map_err(journal_error)?;
-    let version = version_rows
-        .next()
-        .await
-        .map_err(journal_error)?
-        .ok_or_else(|| journal_error("missing private journal schema version"))?
-        .get::<i64>(0)
-        .map_err(journal_error)?;
-    drop(version_rows);
-    let mut backfill = version < 1;
-    for (name, definition) in [
-        ("execution_epoch", "INTEGER NOT NULL DEFAULT 0"),
-        ("order_id", "TEXT"),
-        ("symbol", "TEXT"),
-        ("materialized", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        if !installed.contains(name) {
-            connection
-                .execute_batch(&format!(
-                    "ALTER TABLE broker_insight_checkpoints ADD COLUMN {name} {definition};"
-                ))
-                .await
-                .map_err(journal_error)?;
-            backfill = true;
-        }
-    }
-    // Scalar lookup columns index the existing checkpoint, rather than copying
-    // its execution state/history. Reads do not parse private JSON per owner.
-    let mut index = connection.query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_fill_history_owned_order'", ())
+    connection.execute_batch("CREATE INDEX IF NOT EXISTS idx_fill_history_owned_order ON broker_insight_checkpoints(order_id); CREATE INDEX IF NOT EXISTS idx_checkpoint_owner_epoch ON broker_insight_checkpoints(execution_epoch);")
         .await.map_err(journal_error)?;
-    let legacy_index = match index.next().await.map_err(journal_error)? {
-        Some(row) => row
-            .get::<String>(0)
-            .map_err(journal_error)?
-            .contains("json_extract"),
-        None => false,
-    };
-    drop(index);
-    if legacy_index {
-        connection
-            .execute_batch("DROP INDEX idx_fill_history_owned_order;")
-            .await
-            .map_err(journal_error)?;
-    }
-    connection.execute_batch("CREATE INDEX IF NOT EXISTS idx_fill_history_owned_order ON broker_insight_checkpoints(order_id);")
-        .await.map_err(journal_error)?;
-    if backfill {
-        connection.execute_batch("UPDATE broker_insight_checkpoints SET
-            order_id=json_extract(checkpoint_json,'$.order_id'),symbol=json_extract(checkpoint_json,'$.symbol'),
-            materialized=COALESCE(json_extract(checkpoint_json,'$.materialized'),0)
-            WHERE json_valid(checkpoint_json);")
-            .await.map_err(journal_error)?;
-    }
-    connection.execute_batch("CREATE INDEX IF NOT EXISTS idx_checkpoint_owner_epoch ON broker_insight_checkpoints(execution_epoch);")
-        .await.map_err(journal_error)?;
-    // Prefer an established archive epoch. Older journals without the archive
-    // use the retained lifecycle epoch; no historical epoch is invented.
-    connection
-        .execute(
-            "UPDATE broker_insight_checkpoints SET execution_epoch=COALESCE(
-        (SELECT execution_epoch FROM broker_execution_evidence e
-            WHERE e.insight_id=broker_insight_checkpoints.insight_id ORDER BY sequence LIMIT 1),
-        ?1)
-        WHERE execution_epoch=0 AND materialized=1",
-            params![i64::try_from(current_epoch).map_err(journal_error)?],
-        )
-        .await
-        .map_err(journal_error)?;
-    if version < 1 {
-        // Written last: an interrupted ALTER/backfill resumes on next open.
-        connection
-            .execute_batch("PRAGMA user_version=1;")
-            .await
-            .map_err(journal_error)?;
-    }
     connection.execute_batch(&format!("CREATE INDEX IF NOT EXISTS idx_fill_history_active_owner ON broker_insight_checkpoints(insight_id) WHERE {ACTIVE_FILL_OWNER_PREDICATE};"))
         .await.map_err(journal_error)?;
     Ok(())
@@ -124,7 +38,6 @@ struct EncodedCheckpoint {
     materialized: bool,
     order_id: Option<String>,
     symbol: String,
-    observed_at_us: i64,
 }
 
 /// Intent and owning Insight state share one commit before broker dispatch.
@@ -276,7 +189,6 @@ impl ExecutionCheckpointBatch {
                 materialized: row.materialized,
                 order_id: row.order_id,
                 symbol: row.symbol,
-                observed_at_us: row.updated_at.timestamp_micros(),
             });
         }
         Ok(Self {
@@ -354,7 +266,6 @@ impl BrokerCommandJournal {
                     .await.map_err(journal_error)?;
             }
         }
-        let mut evidence_remaining = MAX_CHECKPOINT_BYTES;
         for checkpoint in &batch.rows {
             let mut rows = tx.query("SELECT revision,checkpoint_json FROM broker_insight_checkpoints WHERE insight_id=?1",
                 params![checkpoint.id.clone()]).await.map_err(journal_error)?;
@@ -391,39 +302,6 @@ impl BrokerCommandJournal {
                 ON CONFLICT(insight_id) DO UPDATE SET revision=excluded.revision,recovery_seed=excluded.recovery_seed,metadata_json=excluded.metadata_json",
                 params![checkpoint.id.clone(), checkpoint.revision, i64::from(checkpoint.recovery_seed), checkpoint.metadata_json.clone()])
                 .await.map_err(journal_error)?;
-            if self.state_history_enabled && checkpoint.materialized {
-                // This compatibility projection runs on the journal worker,
-                // only when explicitly enabled; never on the decision loop.
-                let row: InsightExecutionCheckpoint =
-                    serde_json::from_str(&checkpoint.json).map_err(journal_error)?;
-                let mut writer = BoundedJson {
-                    bytes: Vec::new(),
-                    limit: evidence_remaining,
-                };
-                serde_json::to_writer(&mut writer, &super::evidence::project(&row))
-                    .map_err(journal_error)?;
-                evidence_remaining -= writer.bytes.len();
-                let evidence = String::from_utf8(writer.bytes).map_err(journal_error)?;
-                let mut origin = tx.query("SELECT execution_epoch FROM broker_insight_checkpoints WHERE insight_id=?1",
-                    params![checkpoint.id.clone()]).await.map_err(journal_error)?;
-                let epoch = origin
-                    .next()
-                    .await
-                    .map_err(journal_error)?
-                    .ok_or_else(|| journal_error("missing checkpoint ownership epoch"))?
-                    .get::<i64>(0)
-                    .map_err(journal_error)?;
-                drop(origin);
-                super::evidence::append(
-                    &tx,
-                    u64::try_from(epoch).map_err(journal_error)?,
-                    &checkpoint.id,
-                    checkpoint.revision,
-                    checkpoint.observed_at_us,
-                    &evidence,
-                )
-                .await?;
-            }
         }
         for receipt in &batch.applied {
             let mut rows = tx.query("SELECT sequence,command_json,state,queued_at_us,dispatched_at_us,completion_json

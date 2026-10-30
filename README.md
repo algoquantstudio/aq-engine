@@ -185,8 +185,8 @@ of complete broker history. Do not delete an outbox with unresolved work.
 The legacy CLI `AqsAuth` arguments and MT5 environment variables still work for
 standalone code; `--access-method` remains an optional override defaulting to
 `aqe_live`. Do not combine cloud credential arguments with a launch file. The new
-AQS files carry one canonical session ID and always disable the obsolete duplicate
-Insight-state archive internally. Fill delivery is enabled by AQS and remains
+AQS files carry one canonical session ID; the duplicate Insight-state archive
+and its export switch have been removed. Fill delivery is enabled by AQS and remains
 opt-in for ordinary standalone AQE. Live position-mark capture and export now
 default to **on** for both MT5 and Paper; standalone callers can opt out with
 `AQE_POSITION_MARK_CAPTURE=false` and `AQE_POSITION_MARK_EXPORT=false`.
@@ -219,8 +219,9 @@ cargo test -p aq-engine --features runtime
 
 When AQE is consumed from another Cargo project (including a Git dependency),
 Cargo does not inherit AQE's `[patch.crates-io]` section. The consuming workspace
-must select the equivalent `zstd` and `quick-xml` security backports itself; see
-`vendor/zstd/AQS-PATCH.txt` and `vendor/quick-xml/AQS-PATCH.txt`. A standalone
+must select the equivalent `zstd`, `quick-xml` and `lru` security backports itself;
+see `vendor/zstd/AQS-PATCH.txt`, `vendor/quick-xml/AQS-PATCH.txt` and
+`vendor/lru/AQS-PATCH.txt`. A standalone
 checkout of AQE selects these patches directly. Do not treat a successful build
 of an unpatched downstream dependency graph as security qualification.
 
@@ -289,3 +290,37 @@ The licence text controls over this summary. It restricts competitive use of
 AQE; it is not a claim over independently written software. It does not license
 the private AQS application, gateway, runtime host, research implementation,
 hosted services or branding. Third-party dependencies retain their own licences.
+
+## Current-format storage baseline (0.2.0 development cutover)
+
+Legacy saved-data converters and the duplicate Insight-state archive have been
+removed. Current execution recovery uses canonical Insight checkpoints; cloud
+analytics delivery contains exact fills and position marks only.
+
+The current private broker-journal format is application ID 1095846482/version 2,
+the live outbox is application ID 1095847746/version 1, execution checkpoints use
+version 6, and generated AQBT backtests use user version 2. Files from before
+this cutover are intentionally unsupported: opening them fails before schema
+initialization instead of altering, resetting or deleting their contents.
+There is no automatic conversion or offline legacy-outbox upgrade command.
+
+This is a breaking development cutover, including files created by older 0.2.0
+development binaries. Keep those binaries and storage together until their
+pending execution/delivery work is settled. Back up retained files and choose
+a fresh storage location for the new build; never discard an unsettled command
+journal merely to make startup succeed. Changing source does not update a
+running strategy or runtime host.
+
+Cloud metrics continuity requires a full current tracker checkpoint. Aggregate
+snapshots are no longer converted into guessed return accumulators or rebuilt
+by paging older Insight rows; unsupported history leaves cloud writes deferred.
+
+`AllowTradingWindowPipe` accepts comma-separated weekday strings (`String` or
+`&str`). The retired array-valued graph adapter is gone; regenerate older source
+that passes a `Vec<String>`.
+
+Native debug tests use the same larger stack as CI:
+
+```sh
+RUST_MIN_STACK=16777216 cargo test --features runtime,node --lib -- --test-threads=1
+```

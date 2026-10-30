@@ -62,12 +62,10 @@ impl Fixture {
         Self(std::env::temp_dir().join(format!("aqe-split-history-{}", uuid::Uuid::new_v4())))
     }
     async fn open(&self) -> BrokerCommandJournal {
-        BrokerCommandJournal::open_with_state_history(
+        BrokerCommandJournal::open(
             self.0.join("commands.db"),
             "strategy",
-            "account",
-            false,
-        )
+            "account")
         .await
         .unwrap()
     }
@@ -272,12 +270,10 @@ async fn missing_split_store_never_falls_back_to_empty_history() {
     drop(j);
     std::fs::rename(&path, path.with_extension("held")).unwrap();
     assert!(
-        BrokerCommandJournal::open_with_state_history(
+        BrokerCommandJournal::open(
             fixture.0.join("commands.db"),
             "strategy",
-            "account",
-            false
-        )
+            "account")
         .await
         .is_err()
     );

@@ -2,9 +2,7 @@
 mod scoped_health;
 use super::{
     CloudEvent, EventEnvelope, EventId, EventKind, EventPriority, FlatbufferEventCodec,
-    LOCAL_EVENT_HARD_LIMIT_BYTES, RECONCILIATION_TARGET_BYTES, ReconciliationChunk,
-    ReconciliationComplete, ReconciliationRecord, ReconciliationSnapshot, ReconciliationStart,
-    deterministic_event_id, now_epoch_micros,
+    LOCAL_EVENT_HARD_LIMIT_BYTES, ReconciliationStart, now_epoch_micros,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +20,6 @@ mod gap_notices;
 mod journal_gaps;
 mod source_suspensions;
 mod source_lifecycle;
-mod legacy;
 mod job_cleanup;
 mod types;
 pub use capture::{CaptureCapacity, CapturePauseRecord};
@@ -123,7 +120,6 @@ pub struct OutboxStore {
     health_cache: Arc<tokio::sync::Mutex<Option<(Instant, OutboxHealth)>>>,
     capture_initialized: Arc<std::sync::atomic::AtomicBool>,
     physical_budget: Option<PhysicalCaptureBudget>,
-    legacy_envelope_limit_bytes: usize,
 }
 
 impl OutboxStore {
@@ -134,18 +130,6 @@ impl OutboxStore {
     pub(super) async fn open_configured(
         path: impl AsRef<Path>,
         physical_budget: Option<PhysicalCaptureBudget>,
-    ) -> Result<Self, OutboxStoreError> {
-        Self::open_configured_for_legacy_upgrade(
-            path,
-            physical_budget,
-            legacy::MAX_LEGACY_ENVELOPE_BYTES,
-        ).await
-    }
-
-    async fn open_configured_for_legacy_upgrade(
-        path: impl AsRef<Path>,
-        physical_budget: Option<PhysicalCaptureBudget>,
-        legacy_envelope_limit_bytes: usize,
     ) -> Result<Self, OutboxStoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -177,8 +161,9 @@ impl OutboxStore {
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             capture_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             physical_budget,
-            legacy_envelope_limit_bytes,
         };
+        crate::core::utils::storage_format::require_current(&store.connection, "live outbox", 1095847746, 1)
+            .await.map_err(OutboxStoreError::InvalidRecord)?;
         if physical_budget.is_some() {
             install_physical_capture_spill_control(&store.connection).await?;
         }
@@ -341,6 +326,7 @@ impl OutboxStore {
         // Startup DDL is transactional and admitted before any WAL commit.
         self.execute_bounded_metadata_batch(
                 r#"
+                PRAGMA application_id = 1095847746; PRAGMA user_version = 1;
                 CREATE TABLE IF NOT EXISTS outbox_events (
                     event_id TEXT PRIMARY KEY,
                     runtime_id TEXT,
@@ -439,6 +425,8 @@ impl OutboxStore {
                     strategy_id TEXT NOT NULL,
                     live_session_id TEXT NOT NULL DEFAULT '',
                     run_id TEXT,
+                    purpose TEXT NOT NULL DEFAULT 'startup',
+                    critical_replay_through INTEGER,
                     status TEXT NOT NULL,
                     uploaded_records INTEGER NOT NULL DEFAULT 0,
                     processed_records INTEGER NOT NULL DEFAULT 0,
@@ -510,9 +498,6 @@ impl OutboxStore {
             .await
             ?;
 
-        self.ensure_runtime_scope_column().await?;
-        self.ensure_sync_cursor_runtime_scope().await?;
-        self.ensure_reconciliation_job_columns().await?;
         self.ensure_safety_headroom_columns().await?;
         self.ensure_gap_notice_schema().await?;
         self.execute_bounded_metadata_batch(
@@ -550,11 +535,10 @@ impl OutboxStore {
         self.requeue_retryable_dead_letters().await?;
         self.reset_pending_contention_backoff().await?;
         if self.physical_budget.is_some() {
-            // Compatibility conversion inserts new bounded envelopes. Install
-            // its aggregate before calling the ordinary capped insertion path.
+            // Install the aggregate before admitting capped data.
             self.ensure_capture_capacity_schema().await?;
         }
-        self.upgrade_legacy_reconciliation_snapshots().await
+        Ok(())
     }
 
     /// Terminal output is a bounded local runtime artifact, not synchronization data. Remove
@@ -647,251 +631,6 @@ impl OutboxStore {
             .await
             ?;
             if changed==0 {break;}
-        }
-        Ok(())
-    }
-
-    /// Converts pending protocol-v1 monolithic reconciliation snapshots into bounded,
-    /// deterministic protocol-v2 messages. The original row is marked committed only after all
-    /// replacement rows are durable, so a process crash cannot lose reconciliation work.
-    async fn upgrade_legacy_reconciliation_snapshots(&self) -> Result<(), OutboxStoreError> {
-        let mut after=None;
-        while let Some((stored_event_id,payload))=self.next_legacy_envelope(
-            "state='pending' AND event_kind='reconciliation_snapshot'",after.as_deref()).await? {
-            after=Some(stored_event_id.clone());
-            let mut event = match FlatbufferEventCodec::decode(&payload) {
-                Ok(event) => event,
-                Err(error) => {
-                    if let Ok(event_id) = EventId::parse_str(&stored_event_id) {
-                        self.move_to_dead_letter(
-                            event_id,
-                            &format!("invalid legacy reconciliation envelope: {error}"),
-                        )
-                        .await?;
-                    }
-                    continue;
-                }
-            };
-            let snapshot =
-                match serde_json::from_value::<ReconciliationSnapshot>(std::mem::take(&mut event.payload)) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        self.move_to_dead_letter(
-                            event.event_id,
-                            &format!("invalid legacy reconciliation snapshot: {error}"),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-            let total_records = snapshot.records.len() as u64;
-            let chunks = bounded_reconciliation_chunks(snapshot.records);
-            let total_chunks = chunks.len() as u32;
-            let mut replacements = Vec::with_capacity(chunks.len() + 2);
-            let start = ReconciliationStart {
-                purpose: aqe_live_protocol::ReconciliationPurpose::Startup,
-                critical_replay_through: None,
-                generation: snapshot.generation.clone(),
-                runtime_id: snapshot.runtime_id.clone(),
-                strategy_id: snapshot.strategy_id.clone(),
-                live_session_id: snapshot.live_session_id.clone(),
-                run_id: event.run_id.clone(),
-                snapshot_complete: snapshot.snapshot_complete,
-                broker_features: Vec::new(),
-                critical_cutoff: snapshot.critical_cutoff,
-                total_chunks,
-                total_records,
-            };
-            replacements.push(upgraded_reconciliation_event(
-                &event,
-                "start",
-                EventKind::ReconciliationStart,
-                serde_json::to_value(start).unwrap_or_default(),
-            ));
-            for (index, records) in chunks.into_iter().enumerate() {
-                replacements.push(upgraded_reconciliation_event(
-                    &event,
-                    &format!("chunk:{index}"),
-                    EventKind::ReconciliationChunk,
-                    serde_json::to_value(ReconciliationChunk {
-                        generation: snapshot.generation.clone(),
-                        chunk_index: index as u32,
-                        records,
-                    })
-                    .unwrap_or_default(),
-                ));
-            }
-            replacements.push(upgraded_reconciliation_event(
-                &event,
-                "complete",
-                EventKind::ReconciliationComplete,
-                serde_json::to_value(ReconciliationComplete {
-                    generation: snapshot.generation,
-                    total_chunks,
-                    total_records,
-                    snapshot_complete: snapshot.snapshot_complete,
-                })
-                .unwrap_or_default(),
-            ));
-
-            let oversized = replacements.iter().find_map(|replacement| {
-                FlatbufferEventCodec::encode(replacement)
-                    .ok()
-                    .filter(|bytes| bytes.len() > LOCAL_EVENT_HARD_LIMIT_BYTES)
-                    .map(|bytes| (replacement.kind.clone(), bytes.len()))
-            });
-            if let Some((kind, bytes)) = oversized {
-                self.move_to_dead_letter(
-                    event.event_id,
-                    &format!(
-                        "legacy reconciliation contains oversized singleton: type={kind} bytes={bytes} max={LOCAL_EVENT_HARD_LIMIT_BYTES}"
-                    ),
-                )
-                .await?;
-                continue;
-            }
-            // Offline allocations can contain more than 256 bounded chunks.
-            // Commit finite pages; deterministic IDs make a crash before the
-            // original-row acknowledgement an exact, resumable retry.
-            for page in replacements.chunks(64) {
-                self.insert_events(page).await?;
-            }
-            self
-                .execute_bounded_metadata(
-                    "UPDATE outbox_events
-                     SET state = 'committed', remote_committed_at_us = ?2,
-                         last_error = 'upgraded to bounded protocol-v2 reconciliation'
-                     WHERE event_id = ?1 AND state = 'pending'",
-                    params![event.event_id.to_string(), now_epoch_micros()],
-                )
-                .await
-                ?;
-        }
-        Ok(())
-    }
-
-    /// Adds and backfills the runtime scope for outboxes created before runtime generations
-    /// became part of the SQLite projection. The immutable wire envelope is authoritative, so
-    /// this migration preserves every pending event instead of guessing from host metadata.
-    async fn ensure_runtime_scope_column(&self) -> Result<(), OutboxStoreError> {
-        let mut columns = self
-            .connection
-            .query("PRAGMA table_info(outbox_events)", ())
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut has_runtime_id = false;
-        while let Some(row) = columns
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let name: String = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            has_runtime_id |= name == "runtime_id";
-        }
-        drop(columns);
-        if !has_runtime_id {
-            self.execute_bounded_metadata("ALTER TABLE outbox_events ADD COLUMN runtime_id TEXT", ())
-                .await
-                ?;
-        }
-
-        self.backfill_legacy_runtime_scope().await
-    }
-
-    /// Migrates the remote persistence cursor from strategy/session scope to the exact runtime
-    /// generation used by the SurrealDB endpoint. A new process must never inherit or overwrite
-    /// another runtime's cursor merely because it reuses the same live session.
-    async fn ensure_sync_cursor_runtime_scope(&self) -> Result<(), OutboxStoreError> {
-        let mut columns = self
-            .connection
-            .query("PRAGMA table_info(sync_cursors)", ())
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut has_runtime_id = false;
-        while let Some(row) = columns
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let name: String = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            has_runtime_id |= name == "runtime_id";
-        }
-        drop(columns);
-        if has_runtime_id {
-            return Ok(());
-        }
-
-        self.execute_bounded_metadata_batch(
-                r#"
-                ALTER TABLE sync_cursors RENAME TO sync_cursors_legacy;
-                CREATE TABLE sync_cursors (
-                    runtime_id TEXT NOT NULL DEFAULT '',
-                    strategy_id TEXT NOT NULL,
-                    live_session_id TEXT NOT NULL,
-                    critical_through INTEGER NOT NULL DEFAULT 0,
-                    updated_at_us INTEGER NOT NULL,
-                    PRIMARY KEY(runtime_id, strategy_id, live_session_id)
-                );
-                INSERT INTO sync_cursors(
-                    runtime_id, strategy_id, live_session_id, critical_through, updated_at_us
-                )
-                SELECT COALESCE((
-                           SELECT runtime_id FROM outbox_events
-                           WHERE outbox_events.strategy_id = legacy.strategy_id
-                             AND outbox_events.live_session_id = legacy.live_session_id
-                             AND runtime_id IS NOT NULL AND runtime_id != ''
-                           ORDER BY created_at_us DESC LIMIT 1
-                       ), ''),
-                       strategy_id, live_session_id, critical_through, updated_at_us
-                FROM sync_cursors_legacy AS legacy;
-                DROP TABLE sync_cursors_legacy;
-                "#,
-            )
-            .await
-    }
-
-    async fn ensure_reconciliation_job_columns(&self) -> Result<(), OutboxStoreError> {
-        let mut rows = self
-            .connection
-            .query("PRAGMA table_info(reconciliation_jobs)", ())
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut columns = std::collections::HashSet::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            let name: String = row
-                .get(1)
-                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-            columns.insert(name);
-        }
-        drop(rows);
-        let additions = [
-            ("live_session_id", "TEXT NOT NULL DEFAULT ''"),
-            ("run_id", "TEXT"),
-            ("purpose", "TEXT NOT NULL DEFAULT 'startup'"),
-            ("critical_replay_through", "INTEGER"),
-            ("candidate_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("classified_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("unresolved_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("current_cursor", "TEXT"),
-            ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
-        ];
-        for (name, definition) in additions {
-            if !columns.contains(name) {
-                self.execute_bounded_metadata(
-                        format!("ALTER TABLE reconciliation_jobs ADD COLUMN {name} {definition}"),
-                        (),
-                    )
-                    .await
-                    ?;
-            }
         }
         Ok(())
     }
@@ -2568,123 +2307,6 @@ impl OutboxStore {
         Ok(runtime_ids)
     }
 
-    /// Repairs outboxes written before the runtime host persisted one complete critical stream
-    /// per runtime generation. Retained committed rows are made replayable (remote application is
-    /// idempotent), while genuinely absent sequence slots become explicit diagnostic checkpoints.
-    /// This is only intended for historical runtime IDs, never the currently executing runtime.
-    pub async fn prepare_legacy_runtime_replay(
-        &self,
-        runtime_id: &str,
-        strategy_id: &str,
-        live_session_id: &str,
-    ) -> Result<usize, OutboxStoreError> {
-        let operation = self.operation_gate.lock().await;
-        // Validate before rewriting committed rows or allocating the retained
-        // sequence set. Oversized legacy journals are operator-repair work,
-        // not a reason to rescan/requeue thousands of rows on every retry.
-        let mut max_rows = self
-            .connection
-            .query(
-                "SELECT COALESCE(MAX(critical_sequence), 0) FROM outbox_events
-             WHERE priority = 'critical' AND runtime_id = ?1
-               AND strategy_id = ?2 AND live_session_id = ?3",
-                params![
-                    runtime_id.to_string(),
-                    strategy_id.to_string(),
-                    live_session_id.to_string()
-                ],
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let max_sequence = max_rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-            .map(|row| row.get::<i64>(0))
-            .transpose()
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-            .unwrap_or(0)
-            .max(0) as u64;
-        drop(max_rows);
-        if max_sequence > 10_000 {
-            return Err(OutboxStoreError::InvalidRecord(format!(
-                "legacy runtime {runtime_id} requires an unsafe number of sequence checkpoints ({max_sequence})"
-            )));
-        }
-        self
-            .execute_bounded_metadata(
-                "UPDATE outbox_events
-                 SET state = 'pending', next_attempt_at_us = 0
-                 WHERE state = 'committed' AND priority = 'critical'
-                   AND runtime_id = ?1 AND strategy_id = ?2 AND live_session_id = ?3",
-                params![
-                    runtime_id.to_string(),
-                    strategy_id.to_string(),
-                    live_session_id.to_string(),
-                ],
-            )
-            .await
-            ?;
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT critical_sequence FROM outbox_events
-                 WHERE priority = 'critical' AND runtime_id = ?1
-                   AND strategy_id = ?2 AND live_session_id = ?3
-                   AND critical_sequence IS NOT NULL
-                 ORDER BY critical_sequence",
-                params![
-                    runtime_id.to_string(),
-                    strategy_id.to_string(),
-                    live_session_id.to_string(),
-                ],
-            )
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
-        let mut sequences = std::collections::BTreeSet::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-        {
-            sequences.insert(
-                row.get::<i64>(0)
-                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?
-                    .max(0) as u64,
-            );
-        }
-        drop(rows);
-        drop(operation);
-
-        let Some(max_sequence) = sequences.last().copied() else {
-            return Ok(0);
-        };
-        let mut checkpoints = Vec::new();
-        for sequence in 1..=max_sequence {
-            if sequences.contains(&sequence) {
-                continue;
-            }
-            let mut event = EventEnvelope::new(
-                runtime_id,
-                strategy_id,
-                live_session_id,
-                format!("legacy-critical-gap:{sequence}"),
-                sequence,
-                EventPriority::Critical,
-                EventKind::ReconciliationProgress,
-                serde_json::json!({
-                    "status": "legacy_sequence_checkpoint",
-                    "missing_critical_sequence": sequence,
-                    "message": "Historical runtime outbox did not retain this pre-migration sequence; checkpoint inserted so later durable events can replay in order"
-                }),
-            );
-            event.critical_sequence = Some(sequence);
-            checkpoints.push(event);
-        }
-        self.insert_events(&checkpoints).await?;
-        Ok(checkpoints.len())
-    }
-
     /// Ensures an unexpectedly exited managed process leaves a durable terminal lifecycle event.
     /// AQE normally emits this during graceful teardown; the runtime host supplies it only when
     /// the process is gone and the publisher outbox has been fully imported.
@@ -2836,57 +2458,6 @@ fn priority_label(priority: EventPriority) -> &'static str {
         EventPriority::Audit => "audit",
         EventPriority::Reconciliation => "reconciliation",
     }
-}
-
-fn bounded_reconciliation_chunks(
-    records: Vec<ReconciliationRecord>,
-) -> Vec<Vec<ReconciliationRecord>> {
-    let target = RECONCILIATION_TARGET_BYTES.saturating_sub(2 * 1024);
-    let mut chunks = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes = 0usize;
-    for record in records {
-        let bytes = serde_json::to_vec(&record)
-            .map(|value| value.len())
-            .unwrap_or(target);
-        if !current.is_empty() && current_bytes.saturating_add(bytes).saturating_add(1) > target {
-            chunks.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes
-            .saturating_add(usize::from(!current.is_empty()))
-            .saturating_add(bytes);
-        current.push(record);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
-fn upgraded_reconciliation_event(
-    source: &CloudEvent,
-    suffix: &str,
-    kind: EventKind,
-    payload: serde_json::Value,
-) -> CloudEvent {
-    let mut event = EventEnvelope::new(
-        source.runtime_id.clone(),
-        source.strategy_id.clone(),
-        source.live_session_id.clone(),
-        format!("{}:{suffix}", source.entity_id),
-        source.entity_revision,
-        EventPriority::Reconciliation,
-        kind,
-        payload,
-    );
-    event.run_id = source.run_id.clone();
-    event.event_id = deterministic_event_id(&format!(
-        "aqs-live-reconciliation-v2:{}:{suffix}",
-        source.event_id
-    ));
-    event.created_at = source.created_at;
-    event
 }
 
 fn latency_stage_durations(trace: &super::LatencyTrace) -> Vec<(&'static str, i64)> {

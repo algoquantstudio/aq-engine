@@ -503,7 +503,7 @@ async fn canonical_checkpoint_owns_history_without_a_second_state_archive() {
     async fn count(j: &BrokerCommandJournal) -> i64 {
         let mut rows = j
             .connection
-            .query("SELECT COUNT(*) FROM broker_execution_evidence", ())
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='broker_execution_evidence'", ())
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
@@ -517,12 +517,6 @@ async fn canonical_checkpoint_owns_history_without_a_second_state_archive() {
     assert!(saved_position_check(&j).await.unwrap().matched);
     let frozen = j.prepare_execution_fill_export().await.unwrap().unwrap();
     assert!(!frozen.page().unwrap().records.is_empty());
-    assert!(
-        j.prepare_execution_evidence_export()
-            .await
-            .unwrap()
-            .is_none()
-    );
     j.request_execution_stop().await.unwrap();
     assert!(j.complete_execution_stop().await.unwrap());
     assert_eq!(j.begin_execution_epoch().await.unwrap().epoch, 2);

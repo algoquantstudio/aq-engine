@@ -8,7 +8,7 @@ use std::{fs::File, path::{Path,PathBuf}};
 use turso::{Connection, params};
 
 mod checkpoints;
-mod evidence;
+mod source_identity;
 mod fills;
 pub(crate) mod marks;
 pub use fills::ExecutionFillBatch;
@@ -74,7 +74,6 @@ pub struct BrokerCommandJournal {
     strategy_id: String,
     account_id: String,
     evidence_source_id: String,
-    state_history_enabled: bool,
     lifecycle: lifecycle::ExecutionLifecycle,
     _process_lock: File,
 }
@@ -85,24 +84,7 @@ impl BrokerCommandJournal {
         strategy_id: &str,
         account_id: &str,
     ) -> Result<Self, BrokerCommandError> {
-        let enabled = crate::launch_config::setting("AQE_EXECUTION_EVIDENCE_EXPORT")
-            .map_err(BrokerCommandError::Invalid)?
-            .is_some_and(|v| {
-                matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-            });
-        Self::open_with_state_history(path, strategy_id, account_id, enabled).await
-    }
-
-    /// Optional compatibility archive for deployments that explicitly consume
-    /// state-evidence pages. Execution, fill ownership and recovery use the
-    /// canonical Insight checkpoint and do not require this second history.
-    pub async fn open_with_state_history(
-        path: impl AsRef<Path>,
-        strategy_id: &str,
-        account_id: &str,
-        state_history_enabled: bool,
-    ) -> Result<Self, BrokerCommandError> {
-        Self::open_configured(path,strategy_id,account_id,state_history_enabled,None).await
+        Self::open_configured(path, strategy_id, account_id, None).await
     }
 
     /// Startup-only capacity selection, including resuming a previously
@@ -113,13 +95,13 @@ impl BrokerCommandJournal {
         limit:crate::core::live_sync::PhysicalCaptureLimit,
     )->Result<Self,BrokerCommandError>{
         let limit=limit.validate().map_err(journal_error)?;
-        let mut journal=Self::open_configured(path,strategy_id,account_id,false,Some(limit)).await?;
+        let mut journal=Self::open_configured(path,strategy_id,account_id,Some(limit)).await?;
         Box::pin(cloud_history::migrate(&mut journal,limit)).await?;
         journal.with_analytics_capture_budget(limit).await
     }
 
     async fn open_configured(
-        path: impl AsRef<Path>,strategy_id:&str,account_id:&str,state_history_enabled:bool,
+        path: impl AsRef<Path>,strategy_id:&str,account_id:&str,
         cloud_capacity:Option<crate::core::live_sync::PhysicalCaptureLimit>,
     )->Result<Self,BrokerCommandError>{
         let strategy_id = strategy_id.trim().to_owned();
@@ -153,6 +135,8 @@ impl BrokerCommandJournal {
             .await
             .map_err(journal_error)?;
         let connection = database.connect().map_err(journal_error)?;
+        crate::core::utils::storage_format::require_current(&connection, "broker journal", 1095846482, 2)
+            .await.map_err(journal_error)?;
         let mut rows = connection
             .query("PRAGMA journal_mode = WAL", ())
             .await
@@ -160,7 +144,8 @@ impl BrokerCommandJournal {
         while rows.next().await.map_err(journal_error)?.is_some() {}
         drop(rows);
         connection.execute_batch(
-            "PRAGMA synchronous = FULL;
+            "PRAGMA application_id = 1095846482; PRAGMA user_version = 2;
+             PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              PRAGMA cache_size = -2048;
              CREATE TABLE IF NOT EXISTS broker_command_scope (
@@ -225,12 +210,12 @@ impl BrokerCommandJournal {
         }
         drop(rows);
         connection
-            .execute_batch(evidence::SCHEMA)
+            .execute_batch(source_identity::SCHEMA)
             .await
             .map_err(journal_error)?;
-        let evidence_source_id = evidence::install_source(&connection).await?;
+        let evidence_source_id = source_identity::install_source(&connection).await?;
         let lifecycle = lifecycle::ExecutionLifecycle::install(&connection).await?;
-        checkpoints::install_owner_epochs(&connection, lifecycle.epoch).await?;
+        checkpoints::install_owner_indexes(&connection).await?;
         if !cloud_history::has_location(&connection).await? {
             connection.execute_batch(fills::SCHEMA).await.map_err(journal_error)?;
             connection.execute_batch(marks::SCHEMA).await.map_err(journal_error)?;
@@ -243,7 +228,6 @@ impl BrokerCommandJournal {
             strategy_id,
             account_id,
             evidence_source_id,
-            state_history_enabled,
             lifecycle,
             _process_lock: process_lock,
         };

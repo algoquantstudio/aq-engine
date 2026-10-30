@@ -11,29 +11,6 @@ fn db(error: impl std::fmt::Display) -> OutboxStoreError {
 
 impl OutboxStore {
     pub(super) async fn ensure_safety_headroom_columns(&self) -> Result<(), OutboxStoreError> {
-        let mut rows = self
-            .connection
-            .query("PRAGMA table_info(safety_observations)", ())
-            .await
-            .map_err(db)?;
-        let mut columns = HashSet::new();
-        while let Some(row) = rows.next().await.map_err(db)? {
-            columns.insert(row.get::<String>(1).map_err(db)?);
-        }
-        drop(rows);
-        for (name, definition) in [
-            ("full_evidence_required", "INTEGER NOT NULL DEFAULT 1"),
-            ("updated_at_us", "INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            if !columns.contains(name) {
-                self.execute_bounded_metadata(
-                        format!("ALTER TABLE safety_observations ADD COLUMN {name} {definition}"),
-                        (),
-                    )
-                    .await
-                    ?;
-            }
-        }
         self.execute_bounded_metadata_batch(
             "CREATE INDEX IF NOT EXISTS idx_safety_scope ON safety_observations(strategy_id,live_session_id,delivered);
              CREATE INDEX IF NOT EXISTS idx_safety_transport ON safety_observations(delivered,next_attempt_at_us);

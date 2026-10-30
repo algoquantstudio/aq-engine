@@ -272,7 +272,7 @@ fn newest_checkpoint_is_selected_without_adding_accumulators() {
 }
 
 #[test]
-fn legacy_trade_rebuild_is_deterministic_and_idempotent() {
+fn closed_trade_history_fixture_is_deterministic_and_idempotent() {
     let now = Utc::now();
     let mut records = vec![
         HistoricalClosedInsightMetric {

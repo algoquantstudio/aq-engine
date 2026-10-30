@@ -82,11 +82,6 @@ impl BrokerCommandJournal {
         mut self,
         limit: PhysicalCaptureLimit,
     ) -> Result<Self, BrokerCommandError> {
-        if self.state_history_enabled {
-            return Err(journal_error(
-                "bounded analytics capture requires the duplicate state archive to be disabled",
-            ));
-        }
         if [
             &self.evidence_source_id,
             &self.strategy_id,

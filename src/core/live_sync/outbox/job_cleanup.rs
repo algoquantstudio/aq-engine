@@ -45,7 +45,7 @@ impl OutboxStore {
                     cursor = row.get(0).map_err(db)?;
                     if row.get::<i64>(3).map_err(db)? > LOCAL_EVENT_HARD_LIMIT_BYTES as i64 {
                         return Err(OutboxStoreError::InvalidRecord(
-                            "reconciliation cleanup requires offline legacy-envelope upgrade"
+                            "unsupported oversized reconciliation envelope; legacy upgrades are not supported"
                                 .into(),
                         ));
                     }

@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_dependencies_round_trip_version_three_and_reject_invalid_updates() {
+    fn recovery_dependencies_round_trip_current_checkpoint_and_reject_invalid_updates() {
         let mut consumer = row();
         let id = Uuid::new_v4();
         consumer.set_recovery_dependencies(&[id, id]).unwrap();
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(consumer.snapshot_fingerprint_hash(), before);
         let checkpoint = InsightExecutionCheckpoint::capture(&consumer, 1, true, None);
         let mut encoded = serde_json::to_value(checkpoint).unwrap();
-        assert_eq!(encoded["version"], 3);
+        assert_eq!(encoded["version"], super::super::execution_checkpoint::EXECUTION_CHECKPOINT_VERSION);
         let decoded: InsightExecutionCheckpoint = serde_json::from_value(encoded.clone()).unwrap();
         decoded.validate().unwrap();
         let (restored, _, _, _) = decoded.into_parts();
@@ -355,7 +355,7 @@ mod tests {
             vec![id]
         );
         assert_eq!(restored.snapshot_fingerprint_hash(), before);
-        for version in [1, 2] {
+        for version in 0..super::super::execution_checkpoint::EXECUTION_CHECKPOINT_VERSION {
             encoded["version"] = serde_json::json!(version);
             assert!(
                 serde_json::from_value::<InsightExecutionCheckpoint>(encoded.clone())

@@ -333,6 +333,7 @@ impl HttpBatchSink {
         let gateway = super::gateway::GatewayConnection::new(gateway_url, config.clone())?;
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| RemoteSyncError {
                 kind: RemoteSyncErrorKind::Terminal,
@@ -682,7 +683,6 @@ impl RemoteBatchSink for HttpBatchSink {
                 message: format!("failed to refresh AQS live-sync authentication: {error}"),
             })?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(RemoteSyncError {
                 kind: if status.is_server_error() || status.as_u16() == 429 {
@@ -690,9 +690,12 @@ impl RemoteBatchSink for HttpBatchSink {
                 } else {
                     RemoteSyncErrorKind::Authentication
                 },
-                message: format!("AQS live-sync sign-in returned {status}: {body}"),
+                // Upstream errors can echo credentials. Status is sufficient
+                // for diagnostics and the existing retry classification.
+                message: format!("AQS live-sync sign-in returned {status}"),
             });
         }
+        let body = response.text().await.unwrap_or_default();
         let value: serde_json::Value =
             serde_json::from_str(&body).map_err(|error| RemoteSyncError {
                 kind: RemoteSyncErrorKind::Authentication,

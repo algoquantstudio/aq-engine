@@ -168,9 +168,6 @@ impl LaunchConfig {
     pub fn setting(&self, name: &str) -> Option<String> {
         match name {
             "AQE_RUN_ID" => return Some(self.run_id.clone()),
-            // Canonical Insight/history already exists. New launch files never
-            // enable the obsolete duplicate state archive, including by inheritance.
-            "AQE_EXECUTION_EVIDENCE_EXPORT" => return Some("false".into()),
             "AQE_EXECUTION_FILL_EXPORT" => return Some(self.fill_export.to_string()),
             _ => {}
         }

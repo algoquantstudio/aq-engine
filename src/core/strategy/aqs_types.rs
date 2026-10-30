@@ -74,6 +74,8 @@ pub enum StrategyEventType {
     InsightState,
     TradeEvent,
     Action,
+    AccountCashFlowGap,
+    AccountCashFlow,
 }
 
 impl StrategyEventType {
@@ -86,6 +88,8 @@ impl StrategyEventType {
             Self::InsightState => "insight_state",
             Self::TradeEvent => "trade_event",
             Self::Action => "action",
+            Self::AccountCashFlowGap => "account_cash_flow_gap",
+            Self::AccountCashFlow => "account_cash_flow",
         }
     }
 }
@@ -190,6 +194,12 @@ pub enum StrategyEventTitle {
     #[serde(rename = "Insight reconciliation completed")]
     #[surreal(rename = "Insight reconciliation completed")]
     InsightReconciliationCompleted,
+    #[serde(rename = "Account money-operation history is partial")]
+    #[surreal(rename = "Account money-operation history is partial")]
+    AccountMoneyHistoryPartial,
+    #[serde(rename = "Account money operation observed")]
+    #[surreal(rename = "Account money operation observed")]
+    AccountMoneyOperationObserved,
 }
 
 impl StrategyEventTitle {
@@ -216,6 +226,8 @@ impl StrategyEventTitle {
             Self::InsightCancelled => "Insight Cancelled",
             Self::InsightRejected => "Insight Rejected",
             Self::InsightReconciliationCompleted => "Insight reconciliation completed",
+            Self::AccountMoneyHistoryPartial => "Account money-operation history is partial",
+            Self::AccountMoneyOperationObserved => "Account money operation observed",
         }
     }
 
@@ -674,47 +686,6 @@ impl StrategyLiveMetricsRecord {
         }
     }
 
-    pub fn snapshot(&self) -> LiveMetricsSnapshot {
-        LiveMetricsSnapshot {
-            starting_cash: self.starting_cash,
-            final_equity: self.final_equity,
-            total_return: self.total_return,
-            total_return_pct: self.total_return_pct,
-            total_trades: self.total_trades,
-            winning_trades: self.winning_trades,
-            losing_trades: self.losing_trades,
-            win_rate: self.win_rate,
-            max_drawdown: self.max_drawdown,
-            cagr: self.cagr,
-            annualized_volatility: self.annualized_volatility,
-            sharpe_ratio: self.sharpe_ratio,
-            sortino_ratio: self.sortino_ratio,
-            calmar_ratio: self.calmar_ratio,
-            max_drawdown_duration_days: self.max_drawdown_duration_days,
-            expectancy: self.expectancy,
-            profit_factor: self.profit_factor,
-            payoff_ratio: self.payoff_ratio,
-            avg_winner: self.avg_winner,
-            avg_loser: self.avg_loser,
-            avg_winner_pct: self.avg_winner_pct,
-            avg_loser_pct: self.avg_loser_pct,
-            best_trade: self.best_trade,
-            worst_trade: self.worst_trade,
-            consistency_score: self.consistency_score,
-            longest_winning_trade_held_secs: self.longest_winning_trade_held_secs,
-            longest_losing_trade_held_secs: self.longest_losing_trade_held_secs,
-            average_trade_held_secs: self.average_trade_held_secs,
-            open_positions_count: self.open_positions_count,
-            open_insights_count: self.open_insights_count,
-            open_positions_unrealized_pnl: self.open_positions_unrealized_pnl,
-            open_positions_profitable_count: self.open_positions_profitable_count,
-            open_positions_losing_count: self.open_positions_losing_count,
-            symbols: self.symbols.clone(),
-            executed_at: self.executed_at,
-            finished_at: self.finished_at,
-            updated_at: self.updated_at,
-        }
-    }
 }
 
 pub fn live_session_key(value: &str) -> String {
@@ -840,6 +811,96 @@ mod tests {
         );
     }
     use super::*;
+
+    fn assert_strategy_metadata_round_trip<T>(value: T, expected: &str)
+    where
+        T: Copy
+            + std::fmt::Debug
+            + std::fmt::Display
+            + PartialEq
+            + Serialize
+            + serde::de::DeserializeOwned
+            + SurrealValue,
+    {
+        let json = serde_json::json!(expected);
+        assert_eq!(value.to_string(), expected);
+        assert_eq!(serde_json::to_value(value).unwrap(), json);
+        assert_eq!(serde_json::from_value::<T>(json).unwrap(), value);
+        let database = surrealdb::types::Value::String(expected.into());
+        assert_eq!(value.into_value(), database);
+        assert_eq!(T::from_value(database).unwrap(), value);
+    }
+
+    #[test]
+    fn account_cash_flow_event_metadata_round_trips() {
+        // These exact tuples are already emitted by publish_account_cash_flows.
+        // Extending the typed reader must not rename or reclassify that evidence.
+        for (event_type, wire_type, level, wire_level, title, wire_title) in [
+            (
+                StrategyEventType::AccountCashFlowGap,
+                "account_cash_flow_gap",
+                StrategyEventLevel::Warn,
+                "warn",
+                StrategyEventTitle::AccountMoneyHistoryPartial,
+                "Account money-operation history is partial",
+            ),
+            (
+                StrategyEventType::AccountCashFlow,
+                "account_cash_flow",
+                StrategyEventLevel::Info,
+                "info",
+                StrategyEventTitle::AccountMoneyOperationObserved,
+                "Account money operation observed",
+            ),
+        ] {
+            assert_eq!(event_type.as_str(), wire_type);
+            assert_eq!(level.as_str(), wire_level);
+            assert_eq!(title.as_str(), wire_title);
+            assert_strategy_metadata_round_trip(event_type, wire_type);
+            assert_strategy_metadata_round_trip(level, wire_level);
+            assert_strategy_metadata_round_trip(title, wire_title);
+            let record = serde_json::to_value(StrategyEventRecord {
+                event_type,
+                level,
+                title,
+                message: "Broker account evidence".into(),
+                payload: None,
+                created_at: None,
+            })
+            .unwrap();
+            assert_eq!(record["event_type"], wire_type);
+            assert_eq!(record["level"], wire_level);
+            assert_eq!(record["title"], wire_title);
+        }
+    }
+
+    #[test]
+    fn strategy_event_metadata_rejects_unknown_values() {
+        for value in ["deployment_check", "account_cash_flow_future"] {
+            assert!(serde_json::from_value::<StrategyEventType>(serde_json::json!(value)).is_err());
+            assert!(
+                StrategyEventType::from_value(surrealdb::types::Value::String(value.into()))
+                    .is_err()
+            );
+        }
+        for value in [
+            "AQS owned deployment canary",
+            "Account money operation imported",
+        ] {
+            assert!(
+                serde_json::from_value::<StrategyEventTitle>(serde_json::json!(value)).is_err()
+            );
+            assert!(
+                StrategyEventTitle::from_value(surrealdb::types::Value::String(value.into()))
+                    .is_err()
+            );
+        }
+        assert!(serde_json::from_value::<StrategyEventLevel>(serde_json::json!("fatal")).is_err());
+        assert!(
+            StrategyEventLevel::from_value(surrealdb::types::Value::String("fatal".into()))
+                .is_err()
+        );
+    }
 
     #[test]
     fn strategy_action_enums_use_database_values() {

@@ -1058,20 +1058,12 @@ async fn analytics_page_admission_is_bounded_across_sender_clones_and_read_only(
     ).unwrap();
     let sender = worker.sender.clone();
     let permit = worker.sender.evidence_capacity.clone().try_acquire_owned().unwrap();
-    assert!(matches!(sender.try_execution_evidence_page(1, 0, None, 128), Err(BrokerCommandError::AnalyticsBusy)));
-    assert!(matches!(sender.try_execution_evidence_feed_page(0, None, 128), Err(BrokerCommandError::AnalyticsBusy)));
     assert!(matches!(sender.try_execution_fill_page(0, None, 128), Err(BrokerCommandError::AnalyticsBusy)));
-    assert!(matches!(sender.try_prepare_execution_evidence_export(), Err(BrokerCommandError::AnalyticsBusy)));
+    assert!(matches!(sender.try_prepare_execution_fill_export(), Err(BrokerCommandError::AnalyticsBusy)));
     drop(permit);
-    let page = sender.try_execution_evidence_page(1, 0, None, 128).unwrap().wait().await.unwrap();
-    assert!(page.records.is_empty());
-    assert_eq!(page.through_sequence, 0);
-    let feed = sender.try_execution_evidence_feed_page(0, None, 128).unwrap().wait().await.unwrap();
-    assert!(feed.observations.is_empty());
-    assert_eq!(feed.source_id, page.source_id);
     let fills=sender.try_execution_fill_page(0,None,128).unwrap().wait().await.unwrap();
-    assert!(fills.records.is_empty());assert_eq!(fills.source_id,page.source_id);
-    assert!(sender.try_prepare_execution_evidence_export().unwrap().wait().await.unwrap().is_none());
+    assert!(fills.records.is_empty());assert!(!fills.source_id.is_empty());
+    assert!(sender.try_prepare_execution_fill_export().unwrap().wait().await.unwrap().is_none());
     assert!(probe.calls.lock().is_empty(), "analytics must not invoke a broker mutation");
     drop(sender);
     drop(finish(worker).await);
@@ -1103,9 +1095,8 @@ async fn analytics_permit_busy_is_not_actual_journal_queue_saturation() {
 async fn checkpoint_and_recovery_remain_available_during_a_slow_broker_call() {
     let fixture = Fixture::new();
     let probe = Arc::new(Probe::new(true));
-    let journal = BrokerCommandJournal::open_with_state_history(
-        fixture.0.join("commands.db"), "strategy", "account", true,
-    ).await.unwrap();
+    let journal = BrokerCommandJournal::open(
+        fixture.0.join("commands.db"), "strategy", "account").await.unwrap();
     let mut worker = BrokerCommandWorker::start_executor(
         probe.clone(),
         journal,
@@ -1138,13 +1129,6 @@ async fn checkpoint_and_recovery_remain_available_during_a_slow_broker_call() {
     .unwrap()
     .unwrap();
     assert_eq!(page.rows.len(), 1);
-    let evidence = tokio::time::timeout(
-        Duration::from_secs(1),
-        worker.sender.try_execution_evidence_page(1, 0, None, 128).unwrap().wait(),
-    ).await.unwrap().unwrap();
-    assert_eq!(evidence.records.len(), 1);
-    assert_eq!(evidence.records[0].state.insight_id, insight.insight_id.to_string());
-    assert!(evidence.records[0].state.entry_price.is_none());
     assert_eq!(probe.active.load(Ordering::SeqCst), 1);
     assert_eq!(probe.calls.lock().len(), 1);
     let recovery = worker

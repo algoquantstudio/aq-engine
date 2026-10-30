@@ -4,7 +4,6 @@
 //! no database writes; the runtime host and event gateway own projection persistence.
 
 use super::aqs_types::{AqsAuth, StrategyLiveMetricsRecord};
-use super::types::live_metrics::HistoricalClosedInsightMetric;
 use chrono::{DateTime, Utc};
 use surrealdb::IndexedResults;
 use surrealdb::types::SurrealValue;
@@ -51,75 +50,6 @@ pub(crate) async fn load_latest_live_metrics<C: surrealdb::Connection>(
         )
         .bind(("user_id", auth.user_id.clone()))
         .bind(("strategy_id", auth.strategy_id.clone()))
-        .await?
-        .check()?;
-    result.take(0)
-}
-
-pub(crate) async fn load_latest_metric_account_origin<C: surrealdb::Connection>(
-    client: &surrealdb::Surreal<C>,
-    auth: &AqsAuth,
-) -> Result<Option<MetricAccountOrigin>, surrealdb::Error> {
-    let mut result: IndexedResults = client
-        .query(
-            "SELECT account_id, currency, equity, captured_at
-             FROM strategy_accounts
-             WHERE user_id = <record<users>> $user_id
-               AND strategy_id = type::record('strategy', $strategy_id)
-             ORDER BY captured_at DESC
-             LIMIT 1",
-        )
-        .bind(("user_id", auth.user_id.clone()))
-        .bind(("strategy_id", auth.strategy_id.clone()))
-        .await?
-        .check()?;
-    result.take(0)
-}
-
-pub(crate) async fn load_earliest_metric_account_origin<C: surrealdb::Connection>(
-    client: &surrealdb::Surreal<C>,
-    auth: &AqsAuth,
-    account_id: &str,
-) -> Result<Option<MetricAccountOrigin>, surrealdb::Error> {
-    let mut result: IndexedResults = client
-        .query(
-            "SELECT account_id, currency, equity, timestamp AS captured_at
-             FROM strategy_equity_points
-             WHERE user_id = <record<users>> $user_id
-               AND strategy_id = type::record('strategy', $strategy_id)
-               AND string::trim(account_id) = $account_id
-               AND equity > 0 AND equity < math::inf
-             ORDER BY captured_at ASC
-             LIMIT 1",
-        )
-        .bind(("user_id", auth.user_id.clone()))
-        .bind(("strategy_id", auth.strategy_id.clone()))
-        .bind(("account_id", account_id.trim().to_string()))
-        .await?
-        .check()?;
-    result.take(0)
-}
-
-pub(crate) async fn load_closed_insight_metric_page<C: surrealdb::Connection>(
-    client: &surrealdb::Surreal<C>,
-    auth: &AqsAuth,
-    start: usize,
-    limit: usize,
-) -> Result<Vec<HistoricalClosedInsightMetric>, surrealdb::Error> {
-    let mut result: IndexedResults = client
-        .query(
-            "SELECT insight_id, side, quantity, limit_price, stop_price, filled_price, close_price,
-                    broker_realized_pnl, commission, swap, created_at, updated_at,
-                    filled_at, closed_at
-             FROM insights
-             WHERE strategy_id = type::record('strategy', $strategy_id)
-               AND state = 'Closed'
-             ORDER BY closed_at ASC, created_at ASC, insight_id ASC
-             LIMIT $limit START $start",
-        )
-        .bind(("strategy_id", auth.strategy_id.clone()))
-        .bind(("limit", limit))
-        .bind(("start", start))
         .await?
         .check()?;
     result.take(0)

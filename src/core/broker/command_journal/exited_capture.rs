@@ -90,6 +90,11 @@ impl ExitedAnalyticsCapture {
             .await
             .map_err(db)?;
         let connection = database.connect().map_err(db)?;
+        crate::core::utils::storage_format::require_current(
+            &connection, "broker journal", 1095846482, 2,
+        )
+        .await
+        .map_err(|_| Invalid)?;
         connection
             .execute_batch(
                 "PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000; PRAGMA cache_size=-256;",

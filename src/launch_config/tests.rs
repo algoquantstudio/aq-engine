@@ -114,11 +114,11 @@ fn protected_capture_private_file_roundtrip_preserves_exact_allocation(){
 }
 
 #[test]
-fn aqs_policy_disables_state_archive_without_a_generated_environment_flag() {
+fn launch_settings_have_no_retired_state_archive_switch() {
     let config = fixture();
     assert_eq!(
         config.setting("AQE_EXECUTION_EVIDENCE_EXPORT").as_deref(),
-        Some("false")
+        None
     );
     assert_eq!(
         config.setting("AQE_EXECUTION_FILL_EXPORT").as_deref(),

@@ -1447,7 +1447,7 @@ impl OrderManagementProvider for PaperBroker {
             )));
         }
 
-        let order_id = insight.client_order_id.clone();
+        let order_id = insight.client_order_id;
         let now_ts = self.current_time_ts();
 
         let asset = self
@@ -1547,8 +1547,8 @@ impl OrderManagementProvider for PaperBroker {
 
         let order = Order {
             order_id: order_id.clone(),
-            insight_id: Some(insight.insight_id.to_string()),
-            strategy_type: Some(insight.strategy_type.to_string()),
+            insight_id: Some(insight.insight_id),
+            strategy_type: Some(insight.strategy_type),
             asset,
             qty,
             filled_qty: 0.0,
@@ -2037,8 +2037,16 @@ impl OrderManagementProvider for PaperBroker {
     }
 
     async fn unsubscribe_from_trade_stream(&self) -> Result<(), BrokerError> {
-        let mut subscribers = self.trade_stream_subscribers.lock();
-        subscribers.clear();
+        let subscribers = {
+            let mut registered = self.trade_stream_subscribers.lock();
+            std::mem::take(&mut *registered)
+        };
+        // Captures belong to callers and may run arbitrary Drop code, including
+        // draining broker events. Never destroy them under the registry lock.
+        drop(subscribers);
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod submission_identity_tests;

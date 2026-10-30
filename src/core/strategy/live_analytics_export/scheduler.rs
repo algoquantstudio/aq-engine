@@ -9,7 +9,7 @@ pub(crate) struct ExecutionExportScheduler {
 impl ExecutionExportScheduler {
     pub(in crate::core::strategy) fn poll(
         &mut self,
-        mut streams: [&mut ExecutionEvidenceExporter; 3],
+        mut streams: [&mut ExecutionAnalyticsExporter; 2],
         sender: Option<BrokerCommandSender>,
         publisher: &LocalEventPublisher,
         identity: ExportIdentity,

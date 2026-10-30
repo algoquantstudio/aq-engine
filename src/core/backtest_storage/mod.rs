@@ -17,7 +17,7 @@ pub use types::BacktestTradeLogRow;
 
 pub const BACKTEST_DB_FILE: &str = "backtest.db";
 pub const BACKTEST_DB_APPLICATION_ID: u32 = 0x4151_4254; // "AQBT"
-pub const BACKTEST_DB_USER_VERSION: u32 = 1;
+pub const BACKTEST_DB_USER_VERSION: u32 = 2;
 
 fn to_storage_err<E: std::fmt::Display>(value: E) -> String {
     value.to_string()
@@ -33,10 +33,11 @@ async fn connect_database(dir_path: &Path) -> Result<Connection, String> {
 }
 
 async fn init_schema(conn: &Connection) -> Result<(), String> {
+    crate::core::utils::storage_format::require_current(conn, "backtest", i64::from(BACKTEST_DB_APPLICATION_ID), i64::from(BACKTEST_DB_USER_VERSION)).await?;
     conn.execute_batch(
         r#"
         PRAGMA application_id = 1095844436;
-        PRAGMA user_version = 1;
+        PRAGMA user_version = 2;
         CREATE TABLE IF NOT EXISTS trade_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_at TEXT NOT NULL,
@@ -281,40 +282,6 @@ async fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .await
     .map_err(to_storage_err)?;
-    // Saving into an existing artifact is additive; historical readers use a
-    // NULL fallback when this column predates cumulative entry-fill tracking.
-    let mut columns = conn
-        .query("PRAGMA table_info(insights)", ())
-        .await
-        .map_err(to_storage_err)?;
-    let mut has_entry_quantity = false;
-    while let Some(column) = columns.next().await.map_err(to_storage_err)? {
-        if column.get::<String>(1).map_err(to_storage_err)? == "entry_filled_quantity" {
-            has_entry_quantity = true;
-            break;
-        }
-    }
-    drop(columns);
-    if !has_entry_quantity {
-        conn.execute(
-            "ALTER TABLE insights ADD COLUMN entry_filled_quantity REAL",
-            (),
-        )
-        .await
-        .map_err(to_storage_err)?;
-    }
-    let mut columns = conn.query("PRAGMA table_info(trade_log)", ()).await.map_err(to_storage_err)?;
-    let mut existing = std::collections::HashSet::new();
-    while let Some(column) = columns.next().await.map_err(to_storage_err)? {
-        existing.insert(column.get::<String>(1).map_err(to_storage_err)?);
-    }
-    drop(columns);
-    // NULL is intentional: an old execution is not evidence of zero cash/cost.
-    for (name, kind) in [("execution_cash_json", "TEXT"), ("account_notional", "REAL"), ("valuation_basis", "TEXT")] {
-        if !existing.contains(name) {
-            conn.execute(format!("ALTER TABLE trade_log ADD COLUMN {name} {kind}"), ()).await.map_err(to_storage_err)?;
-        }
-    }
     Ok(())
 }
 

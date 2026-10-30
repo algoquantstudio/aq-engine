@@ -142,11 +142,6 @@ pub(super) async fn reopen(journal: &mut BrokerCommandJournal,capacity:Option<Ph
     .validate()
     .map_err(journal_error)?;
     drop(rows);
-    if journal.state_history_enabled {
-        return Err(journal_error(
-            "split cloud history requires the duplicate state archive to remain disabled",
-        ));
-    }
     if state == "copying" {
         return Box::pin(migrate(journal, limit)).await;
     }
@@ -596,11 +591,6 @@ impl BrokerCommandJournal {
         mut self,
         limit: PhysicalCaptureLimit,
     ) -> Result<Self, BrokerCommandError> {
-        if self.state_history_enabled {
-            return Err(journal_error(
-                "split cloud history requires the duplicate state archive to be disabled",
-            ));
-        }
         Box::pin(migrate(&mut self, limit)).await?;
         self.with_analytics_capture_budget(limit).await
     }

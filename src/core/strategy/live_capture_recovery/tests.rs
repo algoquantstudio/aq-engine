@@ -349,7 +349,7 @@ async fn sealed_owner_replay_coordinates_the_running_journal_without_broker_muta
     };
     let directory=std::env::temp_dir().join(format!("joint-owner-recovery-{}",Uuid::new_v4()));std::fs::create_dir_all(&directory).unwrap();
     let policy=PhysicalCaptureLimit{physical_limit_bytes:32*1024*1024,operational_headroom_bytes:MIN_OPERATIONAL_HEADROOM_BYTES};
-    let mut journal=BrokerCommandJournal::open_with_state_history(directory.join("journal.db"),"strategy","account",false).await.unwrap()
+    let mut journal=BrokerCommandJournal::open(directory.join("journal.db"),"strategy","account").await.unwrap()
         .with_analytics_capture_budget(PhysicalCaptureLimit{physical_limit_bytes:MIN_OPERATIONAL_HEADROOM_BYTES+1,..policy}).await.unwrap();
     let input=serde_json::from_value(serde_json::json!({"insight_id":null,"fill":{
         "version":1,"provider":"fixture","fill_id":"refused","order_id":"order","position_id":null,"symbol":"ANY",

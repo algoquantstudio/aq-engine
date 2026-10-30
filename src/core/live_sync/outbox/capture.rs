@@ -119,6 +119,9 @@ impl OutboxStore {
                     blocked_attempts INTEGER NOT NULL, resumed_at_us INTEGER,
                     retained_bytes INTEGER NOT NULL, requested_bytes INTEGER NOT NULL,
                     limit_bytes INTEGER NOT NULL,
+                    origin_runtime_id TEXT, origin_run_id TEXT, last_blocked_run_id TEXT, owner_run_id TEXT,
+                    handoff_count INTEGER NOT NULL DEFAULT 0, notice_handoff_generation INTEGER,
+                    origin_runtime_unknown INTEGER NOT NULL DEFAULT 0, source_observation_pause_id TEXT,
                     PRIMARY KEY(runtime_id,strategy_id,live_session_id));
                  CREATE INDEX IF NOT EXISTS capture_pauses_open
                     ON capture_pauses(resumed_at_us,last_blocked_at_us DESC);
@@ -127,24 +130,6 @@ impl OutboxStore {
                  CREATE INDEX IF NOT EXISTS capture_pauses_scope_latest
                     ON capture_pauses(strategy_id,live_session_id,resumed_at_us,last_blocked_at_us DESC);"
             ).await.map_err(db)?;
-            let mut columns = self.connection.query("PRAGMA table_info(capture_pauses)", ()).await.map_err(db)?;
-            let mut known = HashSet::new();
-            while let Some(row) = columns.next().await.map_err(db)? {
-                known.insert(row.get::<String>(1).map_err(db)?);
-            }
-            drop(columns);
-            for (name, definition) in [
-                ("origin_runtime_id", "TEXT"), ("origin_run_id", "TEXT"),
-                ("last_blocked_run_id", "TEXT"), ("owner_run_id", "TEXT"),
-                ("handoff_count", "INTEGER NOT NULL DEFAULT 0"),
-                ("notice_handoff_generation", "INTEGER"),
-                ("origin_runtime_unknown", "INTEGER NOT NULL DEFAULT 0"),
-                ("source_observation_pause_id", "TEXT"),
-            ] {
-                if !known.contains(name) {
-                    self.connection.execute_batch(&format!("ALTER TABLE capture_pauses ADD COLUMN {name} {definition};")).await.map_err(db)?;
-                }
-            }
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS capture_source_observation (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL CHECK(version=1),

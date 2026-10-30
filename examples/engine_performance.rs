@@ -71,6 +71,7 @@ struct BenchmarkResult {
     median_ms: f64,
     p95_ms: f64,
     throughput_per_second: f64,
+    raw_sample_ms: Vec<f64>,
 }
 
 struct MockTools;
@@ -308,6 +309,7 @@ where
     }
 
     let mut durations = (0..SAMPLE_RUNS).map(|_| sample()).collect::<Vec<_>>();
+    let raw_sample_ms = durations.iter().copied().map(duration_ms).collect();
     durations.sort_unstable();
 
     let median = percentile(&durations, 0.50);
@@ -321,6 +323,7 @@ where
         median_ms: duration_ms(median),
         p95_ms: duration_ms(p95),
         throughput_per_second: operations_per_sample as f64 / median.as_secs_f64(),
+        raw_sample_ms,
     }
 }
 

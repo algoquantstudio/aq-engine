@@ -38,7 +38,7 @@ impl Fixture {
     fn path(&self) -> PathBuf { self.root.join("commands.db") }
     fn cloud_path(&self) -> PathBuf { self.root.join("commands.db.cloud-history.db") }
     async fn journal(&self) -> BrokerCommandJournal {
-        BrokerCommandJournal::open_with_state_history(self.path(),"strategy","account",false)
+        BrokerCommandJournal::open(self.path(),"strategy","account")
             .await.unwrap().with_separate_analytics_capture_budget(limit()).await.unwrap()
     }
     async fn finish(self) {
@@ -223,7 +223,7 @@ async fn pre_first_witness_process_exit_retains_journal_quality_without_fabricat
         })).env("AQE_DISPOSABLE_PREARM_ROOT",&root);
     let output=child.output().unwrap();
     assert_eq!(output.status.code(),Some(88),"{}",String::from_utf8_lossy(&output.stderr));
-    let journal=BrokerCommandJournal::open_with_state_history(root.join("commands.db"),"strategy","account",false)
+    let journal=BrokerCommandJournal::open(root.join("commands.db"),"strategy","account")
         .await.unwrap().with_analytics_capture_budget(limit()).await.unwrap();
     let pause=journal.analytics_capture_pause().await.unwrap().unwrap();
     assert_eq!(pause.generation,1);

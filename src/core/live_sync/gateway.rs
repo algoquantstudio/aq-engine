@@ -231,6 +231,9 @@ impl GatewayConnection {
             config,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                // Registration POSTs contain a session secret. Redirects must
+                // not move that body outside the configured gateway origin.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| error(RemoteSyncErrorKind::Terminal, &e.to_string()))?,
             access: Arc::new(tokio::sync::Mutex::new(None)),

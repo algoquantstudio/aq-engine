@@ -5,6 +5,23 @@ on:
   pull_request:
 
 jobs:
+  lru-panic-safety:
+    name: LRU panic safety (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the exact compatible panic-safety backport
+        run: |
+          cargo test --manifest-path vendor/lru/Cargo.toml --locked
+          cargo test --manifest-path vendor/lru/Cargo.toml --locked --no-default-features
+
   check:
     name: Check AQE
     runs-on: ubuntu-latest

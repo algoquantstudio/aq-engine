@@ -113,7 +113,7 @@ impl<S: Strategy, E: Broker + OrderManagementProvider, D: DataFeed + DataProvide
         // Analytics deferral must never invalidate broker settlement or submit
         // any order; unfinished pages remain durable for a later launch.
         if let (Some(sync), Some(driver)) = (analytics, self.command_driver.as_ref()) {
-            if let Err(error) = sync.finish_execution_evidence(&driver.sender()).await {
+            if let Err(error) = sync.finish_execution_analytics(&driver.sender()).await {
                 log::warn!("Final execution analytics delivery deferred: {error}");
             }
         }

@@ -1,16 +1,13 @@
 use super::types::live_metrics::{
-    EquityRiskReconciliation, HistoricalClosedInsightMetric, LIVE_METRICS_CHECKPOINT_VERSION,
+    EquityRiskReconciliation, LIVE_METRICS_CHECKPOINT_VERSION,
     LiveMetricsCheckpoint, LiveMetricsSnapshot,
 };
+#[cfg(test)]
+use super::types::live_metrics::HistoricalClosedInsightMetric;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
 use crate::core::insight::InsightSnapshot;
-mod legacy_baseline;
-mod trade_history;
-pub(crate) use legacy_baseline::{LegacyRiskBaseline, LegacyRiskMerge};
-pub(crate) use trade_history::TradeHistoryRebuild;
-pub(crate) use trade_history::TradeRecoveryToken;
 #[derive(Clone, Debug, Default)]
 pub struct LivePerformanceTracker {
     account_id: Option<String>,
@@ -22,7 +19,6 @@ pub struct LivePerformanceTracker {
     max_drawdown: f64,
     total_trades: usize,
     recorded_closed_insight_ids: HashSet<String>,
-    trade_recovery: Option<trade_history::TradeRecoveryCapture>,
     winning_trades: usize,
     losing_trades: usize,
     gross_profit: f64,
@@ -137,7 +133,6 @@ impl LivePerformanceTracker {
         executed_at: DateTime<Utc>,
         symbols: impl IntoIterator<Item = String>,
     ) {
-        self.trade_recovery = None;
         self.account_id = account_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -201,7 +196,6 @@ impl LivePerformanceTracker {
             return Err("live metrics checkpoint is missing its broker account id".to_string());
         }
 
-        self.trade_recovery = None;
         self.account_id = Some(account_id.to_string());
         self.equity_risk_reconciliation = checkpoint.equity_risk_reconciliation;
         self.history_recovery_complete = checkpoint.history_recovery_complete;
@@ -265,72 +259,6 @@ impl LivePerformanceTracker {
         Ok(())
     }
 
-    pub fn restore_legacy_snapshot(
-        &mut self,
-        snapshot: LiveMetricsSnapshot,
-        account_id: String,
-        current_equity: f64,
-        at: DateTime<Utc>,
-        current_symbols: impl IntoIterator<Item = String>,
-    ) -> Result<(), String> {
-        let annualizer = (252.0f64).sqrt();
-        let sample_std_dev = (snapshot.annualized_volatility / annualizer).abs();
-        let return_count = u64::from(sample_std_dev > f64::EPSILON) * 2;
-        let return_mean = if sample_std_dev > f64::EPSILON {
-            snapshot.sharpe_ratio * sample_std_dev / annualizer
-        } else {
-            0.0
-        };
-        let downside_deviation = if snapshot.sortino_ratio.abs() > f64::EPSILON {
-            (return_mean * annualizer / snapshot.sortino_ratio).abs()
-        } else {
-            0.0
-        };
-        let checkpoint = LiveMetricsCheckpoint {
-            version: LIVE_METRICS_CHECKPOINT_VERSION,
-            account_id,
-            equity_risk_reconciliation: None,
-            history_recovery_complete: false,
-            starting_cash: snapshot.starting_cash,
-            current_equity: snapshot.final_equity,
-            peak_equity: snapshot.final_equity.max(snapshot.starting_cash),
-            max_drawdown: snapshot.max_drawdown,
-            total_trades: snapshot.total_trades,
-            recorded_closed_insight_ids: Vec::new(),
-            winning_trades: snapshot.winning_trades,
-            losing_trades: snapshot.losing_trades,
-            gross_profit: snapshot.avg_winner.max(0.0) * snapshot.winning_trades as f64,
-            gross_loss_abs: snapshot.avg_loser.abs() * snapshot.losing_trades as f64,
-            sum_winner: snapshot.avg_winner.max(0.0) * snapshot.winning_trades as f64,
-            sum_loser_abs: snapshot.avg_loser.abs() * snapshot.losing_trades as f64,
-            sum_winner_pct: snapshot.avg_winner_pct.max(0.0) * snapshot.winning_trades as f64,
-            sum_loser_pct_abs: snapshot.avg_loser_pct.abs() * snapshot.losing_trades as f64,
-            best_trade: snapshot.best_trade,
-            worst_trade: snapshot.worst_trade,
-            sum_hold_secs: snapshot.average_trade_held_secs * snapshot.total_trades as i64,
-            longest_winning_trade_held_secs: snapshot.longest_winning_trade_held_secs,
-            longest_losing_trade_held_secs: snapshot.longest_losing_trade_held_secs,
-            open_positions_count: snapshot.open_positions_count,
-            open_insights_count: snapshot.open_insights_count,
-            open_positions_unrealized_pnl: snapshot.open_positions_unrealized_pnl,
-            open_positions_profitable_count: snapshot.open_positions_profitable_count,
-            open_positions_losing_count: snapshot.open_positions_losing_count,
-            symbols: snapshot.symbols,
-            return_count,
-            return_mean,
-            return_m2: sample_std_dev.powi(2),
-            downside_return_count: u64::from(downside_deviation > f64::EPSILON),
-            downside_return_sum_sq: downside_deviation.powi(2),
-            previous_equity: Some(snapshot.final_equity),
-            underwater_start: None,
-            max_drawdown_duration_secs: (snapshot.max_drawdown_duration_days * 86_400.0).round()
-                as i64,
-            executed_at: snapshot.executed_at,
-            updated_at: snapshot.updated_at,
-        };
-        self.restore(checkpoint, current_equity, at, current_symbols)
-    }
-
     pub fn checkpoint(&self) -> Option<LiveMetricsCheckpoint> {
         let mut recorded_closed_insight_ids = self
             .recorded_closed_insight_ids
@@ -387,7 +315,6 @@ impl LivePerformanceTracker {
     }
 
     pub fn mark_history_recovery_complete(&mut self) {
-        self.trade_recovery = None;
         self.history_recovery_complete = true;
         self.last_persisted_checkpoint = None;
     }
@@ -596,9 +523,33 @@ impl LivePerformanceTracker {
         &mut self,
         records: impl IntoIterator<Item = HistoricalClosedInsightMetric>,
     ) {
-        let mut rebuild = TradeHistoryRebuild::default();
-        rebuild.push_page(records);
-        self.apply_trade_history_rebuild(rebuild);
+        let mut staged=LivePerformanceTracker::default();
+        for record in records {
+            let pnl=historical_trade_pnl(&record);
+            let return_pct=historical_trade_return_pct(&record);
+            let held=historical_trade_hold_secs(&record);
+            let at=record.closed_at.unwrap_or(record.updated_at);
+            if staged.recorded_closed_insight_ids.insert(record.insight_id) { staged.record_closed_values(pnl,return_pct,held,at); }
+        }
+        self.total_trades = staged.total_trades;
+        self.recorded_closed_insight_ids = staged.recorded_closed_insight_ids;
+        self.winning_trades = staged.winning_trades;
+        self.losing_trades = staged.losing_trades;
+        self.gross_profit = staged.gross_profit;
+        self.gross_loss_abs = staged.gross_loss_abs;
+        self.sum_winner = staged.sum_winner;
+        self.sum_loser_abs = staged.sum_loser_abs;
+        self.sum_winner_pct = staged.sum_winner_pct;
+        self.sum_loser_pct_abs = staged.sum_loser_pct_abs;
+        self.best_trade = staged.best_trade;
+        self.worst_trade = staged.worst_trade;
+        self.sum_hold_secs = staged.sum_hold_secs;
+        self.longest_winning_trade_held_secs = staged.longest_winning_trade_held_secs;
+        self.longest_losing_trade_held_secs = staged.longest_losing_trade_held_secs;
+        self.updated_at = self.updated_at.max(staged.updated_at);
+        self.history_recovery_complete = true;
+        self.last_persisted = None;
+        self.last_persisted_checkpoint = None;
     }
 
     pub fn update_equity(&mut self, equity: f64, at: DateTime<Utc>) {
@@ -667,7 +618,6 @@ impl LivePerformanceTracker {
         let hold_secs = trade_hold_secs(snapshot);
 
         let at = Utc::now();
-        self.capture_recovery_trade(&snapshot.insight_id, pnl, return_pct, hold_secs, at);
         self.record_closed_values(pnl, return_pct, hold_secs, at);
     }
 
@@ -1016,6 +966,7 @@ fn trade_hold_secs(snapshot: &InsightSnapshot) -> i64 {
     }
 }
 
+#[cfg(test)]
 fn historical_trade_entry(record: &HistoricalClosedInsightMetric) -> Option<f64> {
     record
         .filled_price
@@ -1023,6 +974,7 @@ fn historical_trade_entry(record: &HistoricalClosedInsightMetric) -> Option<f64>
         .or(record.stop_price)
 }
 
+#[cfg(test)]
 fn historical_trade_return_pct(record: &HistoricalClosedInsightMetric) -> f64 {
     let Some(entry_price) = historical_trade_entry(record) else {
         return 0.0;
@@ -1044,6 +996,7 @@ fn historical_trade_return_pct(record: &HistoricalClosedInsightMetric) -> f64 {
         * 100.0
 }
 
+#[cfg(test)]
 fn historical_trade_pnl(record: &HistoricalClosedInsightMetric) -> f64 {
     if let Some(realized_pnl) = record.broker_realized_pnl {
         return realized_pnl;
@@ -1063,6 +1016,7 @@ fn historical_trade_pnl(record: &HistoricalClosedInsightMetric) -> f64 {
     gross_pnl + record.swap.unwrap_or_default() - record.commission.unwrap_or_default()
 }
 
+#[cfg(test)]
 fn historical_trade_hold_secs(record: &HistoricalClosedInsightMetric) -> i64 {
     let start = record.filled_at.unwrap_or(record.created_at);
     let end = record.closed_at.unwrap_or(record.updated_at);

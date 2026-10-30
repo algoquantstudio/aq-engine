@@ -79,6 +79,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publisher_rejects_unreserved_payloads_without_adopting_or_deleting_them() {
+        let path = std::env::temp_dir().join(format!(
+            "publisher-current-format-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = OutboxStore::open(&path).await.unwrap();
+        let mut retained = event(1);
+        retained.critical_sequence = Some(12);
+        store.insert_events(&[retained.clone()]).await.unwrap();
+        let saved_cursor = cursor(&store).await;
+        assert_eq!(saved_cursor, 12);
+        let mut retry = retained.clone();
+        retry.critical_sequence = None;
+        assert!(matches!(
+            store.reserve_publisher_events(&[retry], 0).await,
+            Err(OutboxStoreError::InvalidRecord(message))
+                if message.contains("unreserved publisher payload")
+        ));
+        assert_eq!(store.pending_count().await.unwrap(), 1);
+        assert_eq!(cursor(&store).await, saved_cursor);
+        let mut gap = event(2);
+        gap.critical_sequence = Some(14);
+        assert!(matches!(
+            store.reserve_publisher_events(&[gap], 0).await,
+            Err(OutboxStoreError::InvalidRecord(_))
+        ));
+        assert_eq!(store.pending_count().await.unwrap(), 1);
+        assert_eq!(cursor(&store).await, saved_cursor);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn publisher_conflict_rolls_back_payload_identity_and_cursor() {
         let path =
             std::env::temp_dir().join(format!("publisher-conflict-{}.db", uuid::Uuid::new_v4()));
@@ -121,54 +154,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn publisher_reservations_upgrade_legacy_payloads_and_reject_sequence_gaps() {
-        let path =
-            std::env::temp_dir().join(format!("publisher-legacy-{}.db", uuid::Uuid::new_v4()));
-        let store = OutboxStore::open(&path).await.unwrap();
-        let mut legacy = event(1);
-        legacy.critical_sequence = Some(12);
-        store.insert_events(&[legacy.clone()]).await.unwrap();
-        let mut retry = legacy.clone();
-        retry.critical_sequence = None;
-        assert!(
-            store
-                .reserve_publisher_events(&[retry.clone()], 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(cursor(&store).await, 12);
-        store
-            .mark_remote_committed(&[legacy.event_id], Some(12))
-            .await
-            .unwrap();
-        store.prune_committed(0).await.unwrap();
-        assert!(
-            store
-                .reserve_publisher_events(&[retry], 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let mut gap = event(2);
-        gap.critical_sequence = Some(14);
-        assert!(matches!(
-            store.reserve_publisher_events(&[gap.clone()], 0).await,
-            Err(OutboxStoreError::InvalidRecord(_))
-        ));
-        gap.critical_sequence = None;
-        assert_eq!(
-            store.reserve_publisher_events(&[gap], 0).await.unwrap()[0].critical_sequence,
-            Some(13)
-        );
-        let mut other = event(3);
-        other.runtime_id = "different-runtime".into();
-        assert_eq!(
-            store.reserve_publisher_events(&[other], 0).await.unwrap()[0].critical_sequence,
-            Some(1)
-        );
-    }
 }
 
 fn fingerprint(event: &CloudEvent) -> Result<Vec<u8>, OutboxStoreError> {
@@ -301,8 +286,7 @@ impl OutboxStore {
             Err(OutboxStoreError::CapturePaused(capacity)) => {
                 transaction.rollback().await.map_err(db)?;
                 let capacity=self.normalize_physical_refusal(capacity).await?;
-                // Legacy identity upgrade is already accepted evidence. A
-                // metadata-only refusal must not fabricate missing history.
+                // A metadata-only refusal must not fabricate missing history.
                 if capacity.requested_bytes>0 || capacity.physical.is_none() {
                     self.record_capture_pause_locked(events, capacity).await?;
                     self.safety_notify.notify_waiters();
@@ -323,7 +307,6 @@ impl OutboxStore {
         capacity: Option<u64>,
     ) -> Result<Vec<CloudEvent>, OutboxStoreError> {
         let mut fresh = Vec::with_capacity(events.len());
-        let mut upgraded_legacy=false;
         for event in events {
             if event.priority != EventPriority::Critical || event.kind == EventKind::Log {
                 return Err(OutboxStoreError::InvalidRecord(
@@ -357,36 +340,13 @@ impl OutboxStore {
             }
             drop(rows);
 
-            // Upgrade lazily from a legacy pending/committed payload. Existing
-            // payloads already have a sequence and must not receive a new one.
-            let mut rows = self
-                .connection
-                .query(
-                    "SELECT wire_payload FROM outbox_events WHERE event_id = ?1",
-                    params![event.event_id.to_string()],
-                )
-                .await
-                .map_err(db)?;
-            let legacy = if let Some(row) = rows.next().await.map_err(db)? {
-                let payload: Vec<u8> = row.get(0).map_err(db)?;
-                let existing = FlatbufferEventCodec::decode(&payload)?;
-                if fingerprint(&existing)? != digest {
-                    return Err(OutboxStoreError::InvalidRecord(format!(
-                        "publisher event {} conflicts with its existing outbox payload",
-                        event.event_id
-                    )));
-                }
-                if existing.critical_sequence.is_none_or(|s| s == 0) {
-                    return Err(OutboxStoreError::InvalidRecord(
-                        "legacy publisher payload has no valid critical sequence".into(),
-                    ));
-                }
-                Some(existing)
-            } else {
-                None
-            };
-            drop(rows);
-
+            // Current publishers reserve identity and sequence before capture.
+            // An unreserved retained payload is not silently adopted or relabeled.
+            let mut saved=self.connection.query("SELECT 1 FROM outbox_events WHERE event_id=?1",params![event.event_id.to_string()]).await.map_err(db)?;
+            if saved.next().await.map_err(db)?.is_some() {
+                return Err(OutboxStoreError::InvalidRecord("unsupported unreserved publisher payload; source retained".into()));
+            }
+            drop(saved);
             let mut rows = self.connection.query(
                 "SELECT MAX(value) FROM (
                     SELECT COALESCE(MAX(critical_through), 0) AS value FROM publisher_sequence_cursors
@@ -415,12 +375,7 @@ impl OutboxStore {
                 .ok_or_else(|| {
                     OutboxStoreError::InvalidRecord("publisher sequence exhausted".into())
                 })?;
-            let sequence = match legacy.as_ref().and_then(|e| e.critical_sequence) {
-                Some(sequence) => i64::try_from(sequence).map_err(|_| {
-                    OutboxStoreError::InvalidRecord("invalid legacy sequence".into())
-                })?,
-                None => next,
-            };
+            let sequence = next;
             if event
                 .critical_sequence
                 .is_some_and(|s| s != sequence as u64)
@@ -447,22 +402,15 @@ impl OutboxStore {
                 params![event.runtime_id.clone(), event.strategy_id.clone(), event.live_session_id.clone(),
                     sequence, now_epoch_micros()],
             ).await.map_err(db)?;
-            if legacy.is_none() {
-                let mut event = event.clone();
-                event.critical_sequence = Some(sequence as u64);
-                fresh.push(event);
-            } else {
-                upgraded_legacy=true;
-            }
+            let mut event = event.clone();
+            event.critical_sequence = Some(sequence as u64);
+            fresh.push(event);
         }
         if let Some(limit) = capacity {
             self.check_capture_capacity_in_transaction(&fresh, limit)
                 .await?;
         }
         self.insert_events_in_transaction(&fresh).await?;
-        if fresh.is_empty() && upgraded_legacy {
-            self.check_physical_capture_in_transaction().await?;
-        }
         Ok(fresh)
     }
 }

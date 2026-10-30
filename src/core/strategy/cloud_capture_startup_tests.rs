@@ -160,13 +160,13 @@ mod cloud_capture_startup_regressions {
         let account_id=state.broker.execution.get_account().await.unwrap().account_id;
         let journal_path=state.live_execution_journal_path("strategy",&account_id);
         if recovering_stop {
-            let mut journal=crate::core::broker::command_journal::BrokerCommandJournal::open_with_state_history(&journal_path,"strategy",&account_id,false).await.unwrap()
+            let mut journal=crate::core::broker::command_journal::BrokerCommandJournal::open(&journal_path,"strategy",&account_id).await.unwrap()
                 .with_analytics_capture_budget(source_limit.unwrap()).await.unwrap();
             journal.request_execution_stop().await.unwrap();
         }
         if source==Some(true){
             use crate::core::broker::{command_journal::{BrokerCommandJournal,ExecutionFillBatch},commands::BrokerCommandError};
-            let mut journal=BrokerCommandJournal::open_with_state_history(&journal_path,"strategy",&account_id,false).await.unwrap()
+            let mut journal=BrokerCommandJournal::open(&journal_path,"strategy",&account_id).await.unwrap()
                 .with_analytics_capture_budget(source_limit.unwrap()).await.unwrap();
             journal.begin_execution_epoch().await.unwrap();
             let input=serde_json::from_value(json!({"insight_id":"fixture","fill":{

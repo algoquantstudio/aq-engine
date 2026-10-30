@@ -14,10 +14,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub(crate) const EXECUTION_CHECKPOINT_VERSION: u16 = 1;
-const EXECUTION_CHECKPOINT_WITH_DATA_VERSION: u16 = 2;
-const EXECUTION_CHECKPOINT_WITH_DEPENDENCIES_VERSION: u16 = 3;
-const EXECUTION_CHECKPOINT_WITH_ACCOUNTING_VERSION: u16 = 4;
+
+pub(crate) const EXECUTION_CHECKPOINT_VERSION: u16 = 6;
 
 impl Insight {
     /// Embedded links to materialized children retain configuration/quantity
@@ -83,6 +81,7 @@ impl Insight {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InsightExecutionCheckpoint {
     pub version: u16,
     /// Monotonic per-row revision. Zero is reserved for "no previous row".
@@ -158,15 +157,7 @@ impl InsightExecutionCheckpoint {
         pipeline: Option<InsightPipelineCheckpoint>,
     ) -> Self {
         Self {
-            version: if insight.position_accounting.is_some() {
-                EXECUTION_CHECKPOINT_WITH_ACCOUNTING_VERSION
-            } else if insight.execution_data.has_recovery_dependencies() {
-                EXECUTION_CHECKPOINT_WITH_DEPENDENCIES_VERSION
-            } else if insight.execution_data.is_empty() {
-                EXECUTION_CHECKPOINT_VERSION
-            } else {
-                EXECUTION_CHECKPOINT_WITH_DATA_VERSION
-            },
+            version: EXECUTION_CHECKPOINT_VERSION,
             revision,
             materialized,
             owner_receipts: Vec::new(),
@@ -229,19 +220,7 @@ impl InsightExecutionCheckpoint {
 
     pub fn validate(&self) -> Result<(), BrokerCommandError> {
         let invalid = |message: &str| BrokerCommandError::Invalid(message.to_owned());
-        if !matches!(
-            self.version,
-            EXECUTION_CHECKPOINT_VERSION
-                | EXECUTION_CHECKPOINT_WITH_DATA_VERSION
-                | EXECUTION_CHECKPOINT_WITH_DEPENDENCIES_VERSION
-                | EXECUTION_CHECKPOINT_WITH_ACCOUNTING_VERSION
-                // Version 5 only added optional metadata, now ignored by serde.
-                | 5
-        ) || (self.version == EXECUTION_CHECKPOINT_VERSION && !self.execution_data.is_empty())
-            || (self.version < EXECUTION_CHECKPOINT_WITH_DEPENDENCIES_VERSION
-                && self.execution_data.has_recovery_dependencies())
-            || (self.version < EXECUTION_CHECKPOINT_WITH_ACCOUNTING_VERSION
-                && self.position_accounting.is_some())
+        if self.version != EXECUTION_CHECKPOINT_VERSION
             || self.revision == 0
             || self.revision > i64::MAX as u64
         {

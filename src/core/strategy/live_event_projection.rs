@@ -33,10 +33,9 @@ pub(super) struct LocalBatchSyncState {
     source_monitor:Option<crate::core::live_sync::SourceJournalMonitor>,
     final_source_journal:Option<crate::core::live_sync::FinalSourceJournal>,
     pub(super) capture_recovery: super::live_capture_recovery::CaptureRecovery,
-    pub(super) evidence_export: super::live_evidence_export::ExecutionEvidenceExporter,
-    pub(super) fill_export: super::live_evidence_export::ExecutionEvidenceExporter,
-    pub(super) mark_export: super::live_evidence_export::ExecutionEvidenceExporter,
-    export_schedule: super::live_evidence_export::ExecutionExportScheduler,
+    pub(super) fill_export: super::live_analytics_export::ExecutionAnalyticsExporter,
+    pub(super) mark_export: super::live_analytics_export::ExecutionAnalyticsExporter,
+    export_schedule: super::live_analytics_export::ExecutionExportScheduler,
     control_receipts: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pending_publications: parking_lot::Mutex<PendingPublications>,
     pub(super) publisher: LocalEventPublisher,
@@ -78,9 +77,8 @@ impl LocalBatchSyncState {
             source_monitor:None,
             final_source_journal:None,
             capture_recovery: Default::default(),
-            evidence_export: super::live_evidence_export::ExecutionEvidenceExporter::new(),
-            fill_export: super::live_evidence_export::ExecutionEvidenceExporter::new_fills(),
-            mark_export: super::live_evidence_export::ExecutionEvidenceExporter::new_marks(),
+            fill_export: super::live_analytics_export::ExecutionAnalyticsExporter::new_fills(),
+            mark_export: super::live_analytics_export::ExecutionAnalyticsExporter::new_marks(),
             export_schedule: Default::default(),
             control_receipts: Default::default(),
             pending_publications: Default::default(),
@@ -213,15 +211,15 @@ impl LocalBatchSyncState {
         }
     }
 
-    pub(super) fn progress_execution_evidence(
+    pub(super) fn progress_execution_analytics(
         &mut self,
         sender: Option<crate::core::broker::command_worker::BrokerCommandSender>,
     ) {
         self.export_schedule.poll(
-            [&mut self.evidence_export, &mut self.fill_export, &mut self.mark_export],
+            [&mut self.fill_export, &mut self.mark_export],
             sender,
             &self.publisher,
-            super::live_evidence_export::ExportIdentity {
+            super::live_analytics_export::ExportIdentity {
                 runtime_id: self.runtime_id.clone(),
                 strategy_id: self.strategy_id.clone(),
                 session_id: self.live_session_id.clone(),
@@ -230,37 +228,34 @@ impl LocalBatchSyncState {
         );
     }
 
-    pub(super) async fn finish_execution_evidence(
+    pub(super) async fn finish_execution_analytics(
         &mut self,
         sender: &crate::core::broker::command_worker::BrokerCommandSender,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<(), String> {
         let started = Instant::now();
-        let identity = super::live_evidence_export::ExportIdentity {
+        let identity = super::live_analytics_export::ExportIdentity {
             runtime_id: self.runtime_id.clone(),
             strategy_id: self.strategy_id.clone(),
             session_id: self.live_session_id.clone(),
             run_id: self.run_id.clone(),
         };
         let mut streams = [
-            ("state", &mut self.evidence_export),
             ("fills", &mut self.fill_export),
             ("marks", &mut self.mark_export),
         ];
         // Settle the scheduler's sole in-flight page before another stream
         // prepares a page. Preserve the existing shared ten-second stop budget.
         streams.sort_by_key(|(_, exporter)| !exporter.has_inflight());
-        let mut result = None;
         let mut errors = Vec::new();
         for (kind, exporter) in streams {
             let delivered = exporter.finish(sender, &self.publisher, &identity,
                 Duration::from_secs(10).saturating_sub(started.elapsed())).await;
             match delivered {
-                Ok(sequence) if kind == "state" => result = sequence,
                 Ok(_) => {},
                 Err(error) => errors.push(format!("{kind}: {error}")),
             }
         }
-        if errors.is_empty() { Ok(result) } else { Err(errors.join("; ")) }
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
     /// Advance an entity cursor while preserving a source-provided ordering floor.

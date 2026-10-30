@@ -136,40 +136,6 @@ fn old_trade_log_rows_default_parent_child_fields() {
     assert_eq!(row.base_strategy_type, None);
 }
 
-#[tokio::test]
-async fn fill_cash_storage_upgrades_legacy_without_inventing_evidence() {
-    let dir = std::env::temp_dir().join(format!("aqe-fill-cash-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut conn = connect_database(&dir).await.unwrap();
-    conn.execute_batch("CREATE TABLE trade_log(id INTEGER PRIMARY KEY,event_at TEXT,symbol TEXT,side TEXT,qty REAL,price REAL,order_id TEXT,insight_id TEXT,strategy_type TEXT,commission REAL,swap REAL,trade_type TEXT);
-        INSERT INTO trade_log VALUES(1,'2026-01-01T00:00:00Z','CUSTOM','Buy',2,100,'legacy',NULL,NULL,0,0,'Entry');").await.unwrap();
-    init_schema(&conn).await.unwrap();
-    init_schema(&conn).await.unwrap();
-    let mut legacy = conn.query("SELECT execution_cash_json,account_notional,valuation_basis FROM trade_log WHERE id=1", ()).await.unwrap();
-    let row = legacy.next().await.unwrap().unwrap();
-    assert_eq!(row.get::<Option<String>>(0).unwrap(),None);
-    assert_eq!(row.get::<Option<f64>>(1).unwrap(),None);
-    assert_eq!(row.get::<Option<String>>(2).unwrap(),None);
-    drop(legacy);
-    let mut record: TradeRecord = serde_json::from_value(serde_json::json!({
-        "date":"2026-01-01T00:05:00Z","symbol":"CUSTOM","side":"Buy","qty":2.,"price":100.,"order_id":"new","commission":-1.,"swap":0.,"trade_type":"Entry"
-    })).unwrap();
-    assert!(record.execution_cash.is_none());
-    assert!(!serde_json::to_string(&record).unwrap().contains("execution_cash"));
-    record.execution_cash=Some(aqe_live_protocol::ExecutionFillCash {currency:"EUR".into(),gross_pnl:Some(0.),commission:Some(-1.),carry:Some(0.)});
-    record.account_notional=Some(200.);
-    record.valuation_basis=Some("paper_price_units".into());
-    let tx=conn.transaction().await.unwrap();
-    insert_trade_log(&tx,&[record.clone()]).await.unwrap();
-    tx.commit().await.unwrap();
-    let mut rows=conn.query("SELECT execution_cash_json,account_notional,valuation_basis FROM trade_log WHERE id=2",()).await.unwrap();
-    let row=rows.next().await.unwrap().unwrap();
-    let cash:aqe_live_protocol::ExecutionFillCash=serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
-    assert_eq!(Some(cash),record.execution_cash);
-    assert_eq!(row.get::<f64>(1).unwrap(),200.);
-    assert_eq!(row.get::<String>(2).unwrap(),"paper_price_units");
-    drop(rows);drop(conn);std::fs::remove_dir_all(dir).unwrap();
-}
 
 #[test]
 fn child_trade_log_rows_include_parent_and_base_strategy_type() {
@@ -320,28 +286,6 @@ async fn entry_fill_quantity_persists_without_changing_partial_close_quantity() 
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[tokio::test]
-async fn entry_fill_quantity_schema_upgrade_preserves_legacy_rows() {
-    let dir = std::env::temp_dir().join(format!("aqe-entry-fill-upgrade-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let conn = connect_database(&dir).await.unwrap();
-    conn.execute_batch("CREATE TABLE insights(insight_id TEXT PRIMARY KEY, retained TEXT); INSERT INTO insights VALUES('old', 'unchanged');").await.unwrap();
-    init_schema(&conn).await.unwrap();
-    init_schema(&conn).await.unwrap();
-    let mut rows = conn
-        .query(
-            "SELECT retained, entry_filled_quantity FROM insights WHERE insight_id = 'old'",
-            (),
-        )
-        .await
-        .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    assert_eq!(row.get::<String>(0).unwrap(), "unchanged");
-    assert_eq!(row.get::<Option<f64>>(1).unwrap(), None);
-    drop(rows);
-    drop(conn);
-    std::fs::remove_dir_all(dir).unwrap();
-}
 
 #[tokio::test]
 async fn account_history_batches_rows_and_rebuilds_indexes() {
@@ -483,4 +427,16 @@ fn drawdown_series_contains_portfolio_and_realized_strategy_rows() {
         rows.iter()
             .any(|row| row.series_type == "strategy_realized")
     );
+}
+
+#[tokio::test]
+async fn old_backtest_schema_is_rejected_without_altering_saved_evidence() {
+    let root=std::env::temp_dir().join(format!("aqe-old-backtest-{}",uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let connection=connect_database(&root).await.unwrap();
+    connection.execute_batch("PRAGMA application_id=1095844436; PRAGMA user_version=1; CREATE TABLE retained_evidence(value TEXT); INSERT INTO retained_evidence VALUES('saved');").await.unwrap();
+    assert!(init_schema(&connection).await.unwrap_err().contains("unsupported backtest saved-data format"));
+    let mut rows=connection.query("SELECT value FROM retained_evidence",()).await.unwrap();
+    assert_eq!(rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(),"saved");
+    drop(rows);drop(connection);std::fs::remove_dir_all(root).unwrap();
 }

@@ -30,9 +30,6 @@ impl ExecutionData {
             .transpose()
     }
 
-    pub(super) fn has_recovery_dependencies(&self) -> bool {
-        self.0.contains_key(RECOVERY_DEPENDENCIES)
-    }
 
     pub(crate) fn recovery_dependencies(&self) -> Result<Vec<Uuid>, BrokerCommandError> {
         self.0
@@ -184,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_data_restores_exactly_and_keeps_legacy_empty_checkpoints_readable() {
+    fn execution_data_restores_exactly_and_rejects_old_checkpoint_formats() {
         let mut row = Insight::default();
         row.symbol = "ETHUSD".into();
         row.set_execution_data(
@@ -194,7 +191,7 @@ mod tests {
         .unwrap();
         let checkpoint = InsightExecutionCheckpoint::capture(&row, 1, true, None);
         let encoded = serde_json::to_value(&checkpoint).unwrap();
-        assert_eq!(encoded["version"], 2);
+        assert_eq!(encoded["version"], super::super::execution_checkpoint::EXECUTION_CHECKPOINT_VERSION);
         let decoded: InsightExecutionCheckpoint = serde_json::from_value(encoded.clone()).unwrap();
         decoded.validate().unwrap();
         let (restored, _, _, _) = decoded.into_parts();
@@ -211,9 +208,6 @@ mod tests {
                 .is_err()
         );
         legacy.as_object_mut().unwrap().remove("execution_data");
-        serde_json::from_value::<InsightExecutionCheckpoint>(legacy)
-            .unwrap()
-            .validate()
-            .unwrap();
+        assert!(serde_json::from_value::<InsightExecutionCheckpoint>(legacy).unwrap().validate().is_err());
     }
 }

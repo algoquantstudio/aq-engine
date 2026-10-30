@@ -17,12 +17,10 @@ impl Fixture {
         Self(std::env::temp_dir().join(format!("aqe-marks-{}", uuid::Uuid::new_v4())))
     }
     async fn open(&self) -> BrokerCommandJournal {
-        BrokerCommandJournal::open_with_state_history(
+        BrokerCommandJournal::open(
             self.0.join("journal.db"),
             "generic",
-            "account",
-            false,
-        )
+            "account")
         .await
         .unwrap()
     }
@@ -154,7 +152,7 @@ async fn scheduled_marks_are_owned_minute_bounded_and_survive_without_state_arch
     assert_eq!(record.records[0].observation.values.as_of_us, slot + 100);
     let mut archive = j
         .connection
-        .query("SELECT COUNT(*) FROM broker_execution_evidence", ())
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='broker_execution_evidence'", ())
         .await
         .unwrap();
     assert_eq!(
@@ -477,12 +475,6 @@ async fn mark_export_freezes_restart_bytes_and_only_acks_the_exact_pending_page(
         .unwrap();
     assert!(j.prepare_position_mark_export().await.unwrap().is_none());
     // State and fill cursors were not advanced by mark receipts.
-    assert!(
-        j.prepare_execution_evidence_export()
-            .await
-            .unwrap()
-            .is_none()
-    );
     assert!(j.prepare_execution_fill_export().await.unwrap().is_some());
 }
 

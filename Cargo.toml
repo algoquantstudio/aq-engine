@@ -82,3 +82,4 @@ env_logger = "0.11.11"
 [patch.crates-io]
 zstd = { path = "vendor/zstd" }
 quick-xml = { path = "vendor/quick-xml" }
+lru = { path = "vendor/lru" }

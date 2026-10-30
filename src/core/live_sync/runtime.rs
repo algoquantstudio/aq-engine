@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub const SOURCE_OBSERVATION_LIFECYCLE_VERSION: u16 = 1;
-pub const PUBLISHER_IMPORT_BOUND_VERSION: u16 = 2;
+pub const PUBLISHER_IMPORT_BOUND_VERSION: u16 = 3;
 mod registration_audit;
 mod scope_files;
-pub use scope_files::{legacy_publisher_outbox_path, publisher_outbox_path};
+pub use scope_files::publisher_outbox_path;
 pub use registration_audit::{
     REGISTRATION_AUDIT_DIRECTORY, RegistrationAudit, RegistrationAuditDecision,
 };
@@ -187,7 +187,8 @@ pub struct RuntimeHostHealth {
     #[serde(default, skip_serializing_if = "is_zero_version")]
     pub outbox_metadata_bound_version: u16,
     /// V1 bounds exited publisher imports. V2 also verifies whole-file scope
-    /// and discovers both collision-resistant names and retained legacy files.
+    /// and discovers collision-resistant names. V3 requires the current saved
+    /// format and no longer adopts lossy legacy filenames.
     #[serde(default, skip_serializing_if = "is_zero_version")]
     pub publisher_import_bound_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
