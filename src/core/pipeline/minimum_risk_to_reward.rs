@@ -53,7 +53,7 @@ impl InsightPipe for MinimumRiskToRewardPipe {
         if !entry.is_finite()
             || entry <= 0.0
             || insight.stop_loss().is_none()
-            || insight.take_profit_levels().is_none()
+            || insight.take_profit_levels.is_none()
         {
             return InsightPipeResult::new(
                 false,
@@ -101,7 +101,7 @@ impl InsightPipe for MinimumRiskToRewardPipe {
         }
         let take_profit = insight
             .take_profit_levels
-            .clone()
+            .as_ref()
             .and_then(|levels| levels.last().copied())
             .unwrap_or(entry);
         let risk = (entry - stop_loss).abs();

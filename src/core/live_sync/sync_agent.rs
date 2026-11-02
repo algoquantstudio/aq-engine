@@ -17,6 +17,7 @@ use surrealdb::{Notification, Surreal, engine::any};
 use tokio::sync::{mpsc, watch};
 mod periodic;
 mod telemetry_ingest;
+mod recovery;
 pub(crate) mod safety;
 pub(crate) mod gaps;
 
@@ -58,6 +59,11 @@ impl std::error::Error for RemoteSyncError {}
 
 #[async_trait]
 pub trait RemoteBatchSink: Send + Sync {
+    /// Opt in only when a successful heartbeat actually contacts the delivery
+    /// service. The default heartbeat is a no-op for standalone/custom sinks.
+    fn heartbeat_can_wake_delivery(&self) -> bool {
+        false
+    }
     async fn persist_capture_gap(&self,_notice:&aqe_live_protocol::CaptureGapNotice)
         -> Result<Option<aqe_live_protocol::CaptureGapReceipt>,RemoteSyncError> {Ok(None)}
     /// Optional generic operational channel. No billing/subscription concepts.
@@ -635,6 +641,9 @@ fn database_websocket_url(batch_url: &str) -> Result<String, RemoteSyncError> {
 
 #[async_trait]
 impl RemoteBatchSink for HttpBatchSink {
+    fn heartbeat_can_wake_delivery(&self) -> bool {
+        true
+    }
     async fn persist_capture_gap(&self,notice:&aqe_live_protocol::CaptureGapNotice)
         -> Result<Option<aqe_live_protocol::CaptureGapReceipt>,RemoteSyncError> {
         self.gateway.publish_capture_gap(notice).await.map(Some)
@@ -924,6 +933,7 @@ pub struct SyncAgent {
     outbox: OutboxStore,
     sink: Arc<dyn RemoteBatchSink>,
     health_state: Arc<Mutex<AgentHealthState>>,
+    delivery_recovery: Arc<recovery::Recovery>,
 }
 
 impl SyncAgent {
@@ -942,6 +952,7 @@ impl SyncAgent {
             outbox,
             sink,
             health_state: Arc::new(Mutex::new(AgentHealthState::default())),
+            delivery_recovery: Arc::new(recovery::Recovery::default()),
         }
     }
 
@@ -949,6 +960,7 @@ impl SyncAgent {
         if *shutdown.borrow() {
             return Ok(());
         }
+        self.restore_delivery_recovery().await?;
         let critical_subject = EventSubject::for_priority(
             &self.config.runtime_id,
             &self.config.strategy_id,
@@ -1889,6 +1901,7 @@ impl SyncAgent {
                         },
                         None,
                     );
+                    self.wake_delivery_retries().await;
                 }
                 Err(error)
                     if error.kind == RemoteSyncErrorKind::Authentication
@@ -1991,6 +2004,9 @@ impl SyncAgent {
         records: &[OutboxEventRecord],
         error: &RemoteSyncError,
     ) -> Result<(), SyncAgentError> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let attempt = records
             .iter()
             .map(|record| record.attempt_count)
@@ -2012,6 +2028,14 @@ impl SyncAgent {
         self.outbox
             .schedule_retry(&ids, delay, &error.message)
             .await?;
+        if error.kind == RemoteSyncErrorKind::Transient {
+            self.delivery_recovery.remember(
+                records[0].event.priority,
+                &ids,
+                &error.message,
+                now_epoch_micros().saturating_add((delay as i64).saturating_mul(1_000_000)),
+            );
+        }
         Ok(())
     }
 }

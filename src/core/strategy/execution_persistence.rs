@@ -120,6 +120,7 @@ where
     E: Broker + OrderManagementProvider,
     D: DataFeed + DataProvider,
 {
+    #[cfg(test)]
     pub(super) fn advance_execution_persistence(&mut self) -> Result<(), BrokerCommandError> {
         self.advance_execution_persistence_with_budget(256, Duration::from_millis(5))
             .map(|_| ())

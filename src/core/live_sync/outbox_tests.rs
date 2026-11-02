@@ -98,6 +98,16 @@ async fn supervisor_and_backpressure_queries_use_scope_indexes() {
             "idx_outbox_scope_state",
         ),
         (
+            PENDING_SCOPE_EXISTS_QUERY,
+            vec!["strategy".into(), "session".into()],
+            "idx_outbox_scope_state",
+        ),
+        (
+            PENDING_RUNTIME_ID_AFTER_QUERY,
+            vec!["strategy".into(), "session".into(), "runtime-one".into()],
+            "idx_outbox_scope_state",
+        ),
+        (
             CRITICAL_BACKLOG_EXCEEDS_QUERY,
             vec![
                 "runtime".into(),
@@ -127,6 +137,101 @@ async fn supervisor_and_backpressure_queries_use_scope_indexes() {
     }
     drop(store);
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn supervisor_pending_probes_preserve_scope_state_and_generation_order() {
+    let path = temp_database();
+    let store = OutboxStore::open(&path).await.unwrap();
+    assert!(!store.has_pending_for_scope("strategy", "session").await.unwrap());
+    let mut events = Vec::new();
+    for (index, runtime) in ["z", "a", "Ω", "middle", "a", "", "legacy"].iter().enumerate() {
+        events.push(event_for_runtime(EventPriority::Audit, index as u64 + 1, runtime));
+    }
+    let mut unrelated = event_for_runtime(EventPriority::Critical, 100, "first");
+    unrelated.strategy_id = "other".into();
+    events.push(unrelated);
+    events.push(event_for_session(EventPriority::Audit, 101, "other"));
+    store.insert_events(&events).await.unwrap();
+    store.connection.execute(
+        "UPDATE outbox_events SET runtime_id = NULL WHERE runtime_id = 'legacy'", (),
+    ).await.unwrap();
+    assert!(store.has_pending_for_scope("strategy", "session").await.unwrap());
+    assert!(!store.has_pending_for_scope("missing", "session").await.unwrap());
+    assert!(!store.has_pending_for_scope("strategy", "missing").await.unwrap());
+    let full = store.pending_runtime_ids_for_scope("strategy", "session").await.unwrap();
+    assert_eq!(full, ["a", "middle", "z", "Ω"]);
+    for limit in [0, 1, 2, 3, 4, 20] {
+        assert_eq!(
+            store.pending_runtime_ids_for_scope_limited("strategy", "session", limit).await.unwrap(),
+            full.iter().take(limit).cloned().collect::<Vec<_>>()
+        );
+    }
+    assert!(store.pending_runtime_ids_for_scope_limited("strategy", "missing", 3).await.unwrap().is_empty());
+
+    // Null/empty legacy generations still block cleanup even though no worker ID can be derived.
+    store.connection.execute(
+        "UPDATE outbox_events SET state = 'committed' WHERE runtime_id IS NOT NULL AND runtime_id != ''", (),
+    ).await.unwrap();
+    assert!(store.has_pending_for_scope("strategy", "session").await.unwrap());
+    assert!(store.pending_runtime_ids_for_scope_limited("strategy", "session", 3).await.unwrap().is_empty());
+    // Non-pending rows use the independent, stronger retirement proof.
+    store.connection.execute("UPDATE outbox_events SET state = 'dead_letter' WHERE state = 'pending'", ()).await.unwrap();
+    assert!(!store.has_pending_for_scope("strategy", "session").await.unwrap());
+    assert_eq!(store.retirement_uncommitted_for_scope("strategy", "session").await.unwrap(), 2);
+    store.connection.execute("DROP TABLE outbox_events", ()).await.unwrap();
+    assert!(store.has_pending_for_scope("strategy", "session").await.is_err());
+    assert!(store.pending_runtime_ids_for_scope_limited("strategy", "session", 3).await.is_err());
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+#[ignore = "isolated paired supervisor backlog benchmark"]
+async fn benchmark_supervisor_pending_probes() {
+    async fn sample(store: &OutboxStore, bounded: bool, expected_ids: &[String]) -> f64 {
+        let started = Instant::now();
+        if bounded {
+            assert!(store.has_pending_for_scope("strategy", "session").await.unwrap());
+            assert_eq!(store.pending_runtime_ids_for_scope_limited("strategy", "session", 3).await.unwrap(),
+                expected_ids.iter().take(3).cloned().collect::<Vec<_>>());
+        } else {
+            assert_eq!(store.pending_count_for_scope("strategy", "session").await.unwrap(), 30000);
+            assert_eq!(store.pending_runtime_ids_for_scope("strategy", "session").await.unwrap(), expected_ids);
+        }
+        started.elapsed().as_secs_f64() * 1000.0
+    }
+    for generations in [1, 60] {
+        let path = temp_database();
+        let store = OutboxStore::open(&path).await.unwrap();
+        let events: Vec<_> = (0..30000).map(|index| {
+            event_for_runtime(EventPriority::Audit, index + 1, &format!("runtime-{:03}", index % generations))
+        }).collect();
+        store.insert_events(&events).await.unwrap();
+        drop(events);
+        let expected_ids = store.pending_runtime_ids_for_scope("strategy", "session").await.unwrap();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for pair in 0..34 {
+            for bounded in if pair % 2 == 0 { [false, true] } else { [true, false] } {
+                let elapsed = sample(&store, bounded, &expected_ids).await;
+                if pair >= 3 {
+                    if bounded { after.push(elapsed); } else { before.push(elapsed); }
+                }
+            }
+        }
+        let stats = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            serde_json::json!({"median_ms": sorted[15], "p95_ms": sorted[29], "samples_ms": values})
+        };
+        eprintln!("supervisor-probes {}", serde_json::json!({
+            "backlog": 30000, "generations": generations, "pairs":31,
+            "before":stats(&before), "after":stats(&after),
+        }));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[tokio::test]

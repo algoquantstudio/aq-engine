@@ -178,6 +178,15 @@ each protected copied launch is single-use. Stop/recover the previous run in AQS
 and copy a fresh command for a new run. The outbox/runtime identity is retained.
 Initial copied startup requires gateway admission before the broker connects;
 ordinary cloud outages after admission are handled by the background outbox.
+Retry backoff remains protective during an outage. Once an existing gateway
+heartbeat or successful batch establishes connectivity, the sender can wake a
+bounded page of matching transient retries instead of waiting out a stale
+five-minute timer. Recovery bursts are limited to once per 30 seconds per sync
+agent; no extra heartbeat polling is added. Authentication, explicit cloud
+pauses, rate limits and critical sequence ordering are not bypassed. Only local
+retry deadlines change, never event identities, payloads, attempts or receipts.
+Connectivity only changes retry eligibility: every event still needs its own
+durable acknowledgement, and this does not prove downstream SQL has caught up.
 Standalone explicit hosted-sync APIs still support their existing restart flow.
 Gateway acknowledgement is not a claim
 of complete broker history. Do not delete an outbox with unresolved work.

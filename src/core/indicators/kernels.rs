@@ -37,6 +37,7 @@ impl Sum {
 pub(super) struct Average {
     period: usize,
     mode: Smoothing,
+    alpha: f64,
     queue: VecDeque<Option<f64>>,
     sum: Sum,
     count: usize,
@@ -47,6 +48,11 @@ impl Average {
         Self {
             period,
             mode,
+            alpha: if mode == Smoothing::Wilder {
+                1.0 / period as f64
+            } else {
+                2.0 / (period as f64 + 1.0)
+            },
             queue: VecDeque::new(),
             sum: Sum::default(),
             count: 0,
@@ -75,11 +81,7 @@ impl Average {
                     return self.previous;
                 };
                 if let Some(previous) = self.previous {
-                    let alpha = if self.mode == Smoothing::Wilder {
-                        1.0 / self.period as f64
-                    } else {
-                        2.0 / (self.period as f64 + 1.0)
-                    };
+                    let alpha = self.alpha;
                     self.previous = Some(previous * (1.0 - alpha) + value * alpha);
                 } else {
                     self.sum.add(value);

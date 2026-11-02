@@ -21,7 +21,9 @@ pub use analytics_capture::{AnalyticsCapturePause,AnalyticsCaptureHandoffReceipt
 mod exited_capture;
 pub use exited_capture::{ExitedAnalyticsCapture,ExitedAnalyticsCaptureError};
 pub(crate) mod recovery;
-pub(crate) use checkpoints::{ExecutionCheckpointBatch, ExecutionCheckpointPage, ExecutionIntent};
+pub(crate) use checkpoints::{ExecutionCheckpointBatch, ExecutionIntent};
+#[cfg(test)]
+pub(crate) use checkpoints::ExecutionCheckpointPage;
 
 const RECOVERY_PAGE_LIMIT: usize = 256;
 

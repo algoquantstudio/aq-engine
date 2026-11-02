@@ -1917,9 +1917,10 @@ where
         }
     }
 
+    #[cfg(test)]
     async fn drain_ready_broker_events(&mut self) {
-        // Backtests must apply every ready event before simulated time advances.
-        // Yield between bounded turns so stop/timers and transport tasks run.
+        // Fixtures drain all ready evidence between assertions. Yield between
+        // bounded turns so stop/timers and transport tasks run.
         while self.has_pending_broker_events() {
             self.on_trade_update();
             tokio::task::yield_now().await;

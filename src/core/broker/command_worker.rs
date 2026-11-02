@@ -3,7 +3,7 @@
 //! completions into insight state; this task owns transport and journal I/O only.
 use super::{
     command_journal::{
-        BrokerCommandJournal, ExecutionCheckpointBatch, ExecutionCheckpointPage,
+        BrokerCommandJournal, ExecutionCheckpointBatch,
         ExecutionFillBatch,
         JournalCommandRecord, JournalCommandState,
     },
@@ -16,6 +16,8 @@ use super::{
     traits::OrderManagementProvider,
 };
 use crate::core::live_sync::CloudCaptureGate;
+#[cfg(test)]
+use super::command_journal::ExecutionCheckpointPage;
 use std::{collections::VecDeque, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 mod account_lane;
@@ -129,6 +131,7 @@ enum JournalRequest {
         _permit: tokio::sync::OwnedSemaphorePermit,
         reply: oneshot::Sender<Result<(), BrokerCommandError>>,
     },
+    #[cfg(test)]
     CheckpointPage {
         after: String,
         limit: usize,
@@ -391,6 +394,7 @@ impl BrokerCommandSender {
         Ok(BrokerJournalReply(receiver))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_execution_checkpoint_page(
         &self,
         after: String,
@@ -1614,6 +1618,7 @@ async fn handle_journal_request(
             drop(_permit);
             let _ = reply.send(result);
         }
+        #[cfg(test)]
         JournalRequest::CheckpointPage {
             after,
             limit,

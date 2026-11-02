@@ -82,6 +82,7 @@ impl Write for BoundedJson {
 }
 
 impl ExecutionCheckpointBatch {
+    #[cfg(test)]
     pub fn new(
         rows: Vec<InsightExecutionCheckpoint>,
         applied: Vec<BrokerCommandReceipt>,
@@ -199,6 +200,8 @@ impl ExecutionCheckpointBatch {
     }
 }
 
+/// Readback helper for checkpoint assertions; production recovery uses its scoped graph loader.
+#[cfg(test)]
 pub(crate) struct ExecutionCheckpointPage {
     pub rows: Vec<InsightExecutionCheckpoint>,
     pub next_cursor: Option<String>,
@@ -353,6 +356,7 @@ impl BrokerCommandJournal {
 
     /// Primary-key pagination with both a row and byte ceiling. No full table
     /// materialization, and no history/decode allocation beyond one bounded page.
+    #[cfg(test)]
     pub(crate) async fn execution_checkpoint_page(
         &self,
         after: &str,

@@ -5,7 +5,7 @@
 //! strategy reducer is allowed to apply the returned evidence to Insights.
 use crate::core::broker::{
     command_journal::{
-        BrokerCommandJournal, ExecutionCheckpointBatch, ExecutionCheckpointPage, ExecutionIntent,
+        BrokerCommandJournal, ExecutionCheckpointBatch, ExecutionIntent,
         JournalCommandRecord,
     },
     command_worker::{
@@ -24,6 +24,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use crate::core::broker::command_journal::ExecutionCheckpointPage;
 mod source_observation;
 pub(crate) use source_observation::SourceObservationPreparation;
 
@@ -162,6 +164,7 @@ impl StrategyCommandDriver {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_recovering<E: OrderManagementProvider + 'static>(
         broker: Arc<E>,
         path: impl AsRef<Path>,
@@ -175,15 +178,10 @@ impl StrategyCommandDriver {
         ),
         BrokerCommandError,
     > {
-        Self::start_recovering_with_capture(broker,path,strategy_id,account_id,config,None).await
-    }
-
-    pub(crate) async fn start_recovering_with_capture<E: OrderManagementProvider + 'static>(
-        broker: Arc<E>,path:impl AsRef<Path>,strategy_id:&str,account_id:&str,
-        config:BrokerCommandWorkerConfig,
-        capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
-    )->Result<(Self,crate::core::broker::command_journal::recovery::ExecutionRecovery),BrokerCommandError>{
-        Self::start_recovering_with_source_observation(broker,path,strategy_id,account_id,config,capture,None).await
+        Self::start_recovering_with_source_observation(
+            broker, path, strategy_id, account_id, config, None, None,
+        )
+        .await
     }
 
     pub(crate) async fn start_recovering_with_source_observation<E: OrderManagementProvider + 'static>(
@@ -363,6 +361,7 @@ impl StrategyCommandDriver {
             || !self.worker.events.is_empty()
             || self.next_dispatch_id(allow_entries).is_some()
     }
+    #[cfg(test)]
     pub(crate) fn has_completion_events(&self) -> bool {
         !self.worker.events.is_empty()
     }
@@ -631,6 +630,7 @@ impl StrategyCommandDriver {
         self.saved_rows.get(id).map_or(0, |row| row.revision)
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint_matches(&self, id: &uuid::Uuid, fingerprint: u64) -> bool {
         self.saved_rows
             .get(id)
@@ -1037,6 +1037,7 @@ impl StrategyCommandDriver {
         Ok(dispatched)
     }
 
+    #[cfg(test)]
     pub(crate) async fn execution_checkpoint_page(
         &self,
         after: String,

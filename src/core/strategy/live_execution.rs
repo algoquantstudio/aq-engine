@@ -133,17 +133,13 @@ impl<
     D: DataFeed + DataProvider + 'static,
 > StrategyState<S, E, D>
 {
+    #[cfg(test)]
     pub(super) async fn start_live_execution(
         &mut self,
         auth: Option<&AqsAuth>,
     ) -> Result<(), BrokerError> {
-        self.start_live_execution_with_capture(auth,None).await
-    }
-
-    pub(super) async fn start_live_execution_with_capture(
-        &mut self,auth:Option<&AqsAuth>,capture:Option<crate::core::live_sync::PhysicalCaptureLimit>,
-    )->Result<(),BrokerError>{
-        self.start_live_execution_with_source_observation(auth,capture,None).await
+        self.start_live_execution_with_source_observation(auth, None, None)
+            .await
     }
 
     pub(super) async fn start_live_execution_with_source_observation(

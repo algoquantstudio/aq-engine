@@ -92,17 +92,6 @@ impl ExecutionAnalyticsExporter {
         }
     }
 
-    #[cfg(test)]
-    pub fn poll(
-        &mut self,
-        sender: Option<BrokerCommandSender>,
-        publisher: &LocalEventPublisher,
-        identity: ExportIdentity,
-    ) {
-        self.poll_completion();
-        self.try_start(sender, publisher, &identity);
-    }
-
     /// Constant-time completion polling. No I/O or historical scan on the owner.
     fn poll_completion(&mut self) {
         if let Some((_, reply)) = self.active.as_mut() {

@@ -86,13 +86,15 @@ impl Calculator {
         height: usize,
         count: usize,
         collect: bool,
-    ) -> (Vec<Vec<Option<f64>>>, Values) {
+    ) -> (Vec<Float64Chunked>, Values) {
         let mut iterators: Vec<_> = inputs
             .iter()
             .map(|c| c.f64().expect("cast Float64").iter())
             .collect();
+        // Build Arrow output buffers directly; an intermediate Vec<Option<f64>>
+        // doubles value storage and requires another pass to create each column.
         let mut output: Vec<_> = (0..if collect { count } else { 0 })
-            .map(|_| Vec::with_capacity(height))
+            .map(|_| PrimitiveChunkedBuilder::<Float64Type>::new(PlSmallStr::EMPTY, height))
             .collect();
         let mut row = [None; 4];
         let mut latest = [None; 4];
@@ -102,14 +104,17 @@ impl Calculator {
             }
             latest = kernel.next(&row[..inputs.len()]);
             for (column, value) in output.iter_mut().zip(latest) {
-                column.push(value);
+                column.append_option(value);
             }
         }
-        (output, latest)
+        (
+            output.into_iter().map(|column| column.finish()).collect(),
+            latest,
+        )
     }
-    fn write(&self, df: &mut DataFrame, values: Vec<Vec<Option<f64>>>) -> Result<(), String> {
+    fn write(&self, df: &mut DataFrame, values: Vec<Float64Chunked>) -> Result<(), String> {
         for (name, values) in self.outputs.iter().zip(values) {
-            upsert_column(df, Column::new(name.clone().into(), values))
+            upsert_column(df, values.into_column().with_name(name.clone().into()))
                 .map_err(|e| e.to_string())?;
         }
         Ok(())

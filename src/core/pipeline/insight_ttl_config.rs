@@ -21,13 +21,19 @@ use super::InsightPipe;
 pub struct InsightTtlConfigPipe {
     period_unfilled: Option<u32>,
     period_till_tp: Option<u32>,
+    message: String,
 }
 
 impl InsightTtlConfigPipe {
     pub fn new(period_unfilled: i64, period_till_tp: i64) -> Self {
+        let period_unfilled = Self::normalise_period(period_unfilled);
+        let period_till_tp = Self::normalise_period(period_till_tp);
         Self {
-            period_unfilled: Self::normalise_period(period_unfilled),
-            period_till_tp: Self::normalise_period(period_till_tp),
+            period_unfilled,
+            period_till_tp,
+            message: format!(
+                "Insight TTL configured: period_unfilled={period_unfilled:?}, period_till_tp={period_till_tp:?}"
+            ),
         }
     }
 
@@ -49,10 +55,7 @@ impl InsightPipe for InsightTtlConfigPipe {
         InsightPipeResult::new(
             true,
             true,
-            Some(format!(
-                "Insight TTL configured: period_unfilled={:?}, period_till_tp={:?}",
-                self.period_unfilled, self.period_till_tp
-            )),
+            Some(self.message.clone()),
             self.name().to_string(),
         )
     }

@@ -162,6 +162,9 @@ impl SyncAgent {
                             self.pause_cloud_delivery(error.message)
                         }
                         Ok(()) => {
+                            if self.sink.heartbeat_can_wake_delivery() {
+                                self.wake_delivery_retries().await;
+                            }
                             if self.health_state.lock().sync_state == "cloud_paused" {
                                 self.set_health_state("recovering", None);
                             }

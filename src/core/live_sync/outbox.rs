@@ -21,6 +21,7 @@ mod journal_gaps;
 mod source_suspensions;
 mod source_lifecycle;
 mod job_cleanup;
+mod recovery;
 mod types;
 pub use capture::{CaptureCapacity, CapturePauseRecord};
 pub use physical::{PhysicalCaptureBudget,PhysicalCaptureLimit,PhysicalCaptureUsage,MIN_OPERATIONAL_HEADROOM_BYTES};
@@ -39,10 +40,17 @@ const AUXILIARY_RETENTION_US: i64 = 7 * 24 * 60 * 60 * 1_000_000;
 const PENDING_SCOPE_COUNT_QUERY: &str =
     "SELECT COUNT(*) FROM outbox_events INDEXED BY idx_outbox_scope_state
      WHERE state = 'pending' AND strategy_id = ?1 AND live_session_id = ?2";
+const PENDING_SCOPE_EXISTS_QUERY: &str =
+    "SELECT EXISTS(SELECT 1 FROM outbox_events INDEXED BY idx_outbox_scope_state
+     WHERE state = 'pending' AND strategy_id = ?1 AND live_session_id = ?2)";
 const PENDING_RUNTIME_IDS_QUERY: &str =
     "SELECT DISTINCT runtime_id FROM outbox_events INDEXED BY idx_outbox_scope_state
      WHERE state = 'pending' AND strategy_id = ?1 AND live_session_id = ?2
        AND runtime_id IS NOT NULL AND runtime_id != '' ORDER BY runtime_id";
+const PENDING_RUNTIME_ID_AFTER_QUERY: &str =
+    "SELECT runtime_id FROM outbox_events INDEXED BY idx_outbox_scope_state
+     WHERE strategy_id = ?1 AND live_session_id = ?2 AND state = 'pending'
+       AND runtime_id > ?3 ORDER BY runtime_id LIMIT 1";
 const CRITICAL_BACKLOG_EXCEEDS_QUERY: &str =
     "SELECT EXISTS(SELECT 1 FROM outbox_events INDEXED BY idx_outbox_runtime_pending
      WHERE runtime_id = ?1 AND strategy_id = ?2 AND live_session_id = ?3
@@ -2082,9 +2090,37 @@ impl OutboxStore {
         })
     }
 
-    /// Pending durable work for exactly one strategy session. Runtime-host process cleanup uses
-    /// this count to keep the sync agent and its credentials alive after the strategy process
-    /// exits, until the final lifecycle events have reached the remote cursor or the DLQ.
+    /// Whether a strategy session has pending work in any runtime generation or priority.
+    /// Supervisors only need a yes/no answer: an indexed existence probe stops at the first
+    /// pending row instead of counting an arbitrarily large recovery backlog.
+    /// This is not a retirement proof; failed work and operational evidence are checked by
+    /// `retirement_uncommitted_for_scope` separately.
+    pub async fn has_pending_for_scope(
+        &self,
+        strategy_id: &str,
+        live_session_id: &str,
+    ) -> Result<bool, OutboxStoreError> {
+        let _operation = self.operation_gate.lock().await;
+        let mut rows = self
+            .connection
+            .query(
+                PENDING_SCOPE_EXISTS_QUERY,
+                params![strategy_id.to_string(), live_session_id.to_string()],
+            )
+            .await
+            .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
+            .ok_or_else(|| OutboxStoreError::InvalidRecord("missing scoped existence row".into()))?;
+        Ok(row
+            .get::<i64>(0)
+            .map_err(|error| OutboxStoreError::Database(error.to_string()))?
+            != 0)
+    }
+
+    /// Exact pending durable work count for one strategy session.
     pub async fn pending_count_for_scope(
         &self,
         strategy_id: &str,
@@ -2299,6 +2335,42 @@ impl OutboxStore {
             .await
             .map_err(|error| OutboxStoreError::Database(error.to_string()))?
         {
+            runtime_ids.push(
+                row.get(0)
+                    .map_err(|error| OutboxStoreError::Database(error.to_string()))?,
+            );
+        }
+        Ok(runtime_ids)
+    }
+
+    /// First `limit` runtime generations with pending work, in the same order as the full
+    /// lookup. Each index seek jumps past the preceding generation's entire backlog.
+    /// This is a bounded worker-scheduling hint, not a proof that a scope is drained.
+    pub async fn pending_runtime_ids_for_scope_limited(
+        &self,
+        strategy_id: &str,
+        live_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, OutboxStoreError> {
+        let _operation = self.operation_gate.lock().await;
+        let mut runtime_ids: Vec<String> = Vec::new();
+        while runtime_ids.len() < limit {
+            let after = runtime_ids.last().map(String::as_str).unwrap_or("");
+            let mut rows = self
+                .connection
+                .query(
+                    PENDING_RUNTIME_ID_AFTER_QUERY,
+                    params![strategy_id.to_string(), live_session_id.to_string(), after.to_string()],
+                )
+                .await
+                .map_err(|error| OutboxStoreError::Database(error.to_string()))?;
+            let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| OutboxStoreError::Database(error.to_string()))?
+            else {
+                break;
+            };
             runtime_ids.push(
                 row.get(0)
                     .map_err(|error| OutboxStoreError::Database(error.to_string()))?,

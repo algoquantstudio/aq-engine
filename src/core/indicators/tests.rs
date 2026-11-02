@@ -440,6 +440,11 @@ fn chunked_frames_and_repeated_runs_preserve_schema_and_do_not_look_ahead() {
         let mut indicator = builtin(index);
         let mut full = chunked.clone();
         indicator.run(&mut full).unwrap();
+        let mut contiguous = source.clone();
+        indicator.run(&mut contiguous).unwrap();
+        for name in indicator.output_columns() {
+            assert_eq!(values(&full, &name), values(&contiguous, &name));
+        }
         let latest = indicator.run_bar(&chunked).unwrap();
         for name in indicator.output_columns() {
             near(latest.get(&name).copied(), values(&full, &name)[99]);
