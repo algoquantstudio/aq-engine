@@ -2,6 +2,8 @@
 
 AlgoQuant Engine (AQE) is a modular Rust framework for algorithmic trading. Build reusable strategy components and run them across backtesting and live execution, with control over your data, brokers and infrastructure.
 
+Website: [algoquantstudio.com](https://algoquantstudio.com).
+
 Use AQE independently or connect it to AlgoQuant Studio, the desktop workspace for research, visual strategy composition, backtest review and live monitoring. AQE provides the strategy lifecycle, insight state machine, broker and datafeed traits, backtest runner, live runner and optional AQS Cloud synchronisation.
 
 AQE is independently buildable: no AlgoQuant Studio checkout, private research
