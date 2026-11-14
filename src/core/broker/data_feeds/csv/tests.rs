@@ -176,7 +176,7 @@ fn csv_validates_headers_and_handles_quoting_bom_reordering() {
     let data = "\u{feff}VOLUME,CLOSE,LOW,HIGH,OPEN,TIMESTAMP,TIMEFRAME,SYMBOL\r\n1,101,99,102,100,2026-10-01T07:00:00Z,1m,\"BTC,USD\"\r\n";
     let parsed = CsvDataset::read(data.as_bytes()).unwrap();
     assert_eq!(parsed.streams.len(), 1);
-    assert_eq!(parsed.streams.values().next().unwrap()[0].symbol, "BTC,USD");
+    assert_eq!(parsed.streams.values().next().unwrap().column("symbol").unwrap().str().unwrap().get(0), Some("BTC,USD"));
     for data in [
         "symbol,timeframe\n",
         "symbol,timeframe,timestamp,open,high,low,close,volume,open\n",
@@ -271,6 +271,45 @@ async fn csv_missing_symbols_are_untradable_and_missing_timeframes_are_skipped()
     assert!(feed.get_latest_bar("BTCUSD").await.is_err());
     assert!(feed.get_latest_quote("BTCUSD").await.is_err());
     assert!(feed.configure_live_session("test").is_err());
+}
+
+#[tokio::test]
+async fn csv_history_shares_column_buffers_and_preserves_submillisecond_bounds() {
+    use polars::prelude::*;
+    let feed = feed("BTCUSD,1m,2026-10-01T07:00:00Z,100,102,99,101,1\nBTCUSD,1m,2026-10-01T07:01:00Z,101,103,100,102,1\n").await;
+    let start = parse_timestamp("2026-10-01T07:00:00Z").unwrap();
+    let end = start + chrono::Duration::minutes(2);
+    let snapshot = feed.snapshot().await.unwrap();
+    let original = &snapshot.streams[&("BTCUSD".into(), TimeFrame::default())];
+    let mut frame = feed.get_history("BTCUSD", start, end, TimeFrame::default()).await.unwrap();
+    assert_eq!(
+        frame.column("close").unwrap().f64().unwrap().cont_slice().unwrap().as_ptr(),
+        original.column("close").unwrap().f64().unwrap().cont_slice().unwrap().as_ptr()
+    );
+    frame.with_column(Column::new("close".into(), [999.0, 999.0])).unwrap();
+    let next = feed.get_history("BTCUSD", start + chrono::Duration::nanoseconds(1), end, TimeFrame::default()).await.unwrap();
+    assert_eq!(next.height(), 1);
+    assert_eq!(next.column("close").unwrap().f64().unwrap().get(0), Some(102.0));
+    let early_end = feed.get_history("BTCUSD", start, start + chrono::Duration::nanoseconds(1), TimeFrame::default()).await.unwrap();
+    assert_eq!(early_end.height(), 1);
+    assert_eq!(early_end.column("close").unwrap().f64().unwrap().get(0), Some(101.0));
+}
+
+#[tokio::test]
+async fn csv_columnar_history_preserves_accepted_leap_second_selection_and_summary() {
+    let feed = feed("BTCUSD,1m,2016-12-31T23:59:60Z,100,102,99,101,1\nBTCUSD,1m,2017-01-01T00:00:00Z,101,103,100,102,1\n").await;
+    let start = parse_timestamp("2016-12-31T23:59:59Z").unwrap();
+    let midnight = parse_timestamp("2017-01-01T00:00:00Z").unwrap();
+    let leap = parse_timestamp("2016-12-31T23:59:60Z").unwrap();
+    let selected = feed.get_history("BTCUSD", start, midnight, TimeFrame::default()).await.unwrap();
+    assert_eq!(selected.height(), 1);
+    assert_eq!(selected.column("close").unwrap().f64().unwrap().get(0), Some(101.0));
+    let summary = feed.summary().await.unwrap();
+    assert_eq!(summary[0].start, leap);
+    assert_eq!(summary[0].end, midnight);
+    let following = feed.get_history("BTCUSD", midnight, midnight + chrono::Duration::minutes(1), TimeFrame::default()).await.unwrap();
+    assert_eq!(following.height(), 1);
+    assert_eq!(following.column("close").unwrap().f64().unwrap().get(0), Some(102.0));
 }
 
 #[tokio::test]

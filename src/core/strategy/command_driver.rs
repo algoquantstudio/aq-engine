@@ -102,6 +102,8 @@ pub struct StrategyCommandDriver {
     pending: HashMap<BrokerCommandId, PendingCommand>,
     persisting: Option<PersistingExecution>,
     by_insight: HashMap<uuid::Uuid, Vec<BrokerCommandId>>,
+    // Exact group identity -> (retained receipts, receipts awaiting completion).
+    operation_groups: HashMap<(String, u64), (usize, usize)>,
     entry_admission: VecDeque<BrokerCommandId>,
     control_admission: VecDeque<BrokerCommandId>,
     saved_rows: HashMap<uuid::Uuid, SavedExecutionRow>,
@@ -113,6 +115,8 @@ pub struct StrategyCommandDriver {
     last_admission_order: u64,
     restoring: bool,
     source_observation_preparation: Option<SourceObservationPreparation>,
+    #[cfg(test)]
+    prepared_dispatch_attempts: usize,
 }
 
 impl StrategyCommandDriver {
@@ -150,6 +154,7 @@ impl StrategyCommandDriver {
             pending: HashMap::new(),
             persisting: None,
             by_insight: HashMap::new(),
+            operation_groups: HashMap::new(),
             entry_admission: VecDeque::new(),
             control_admission: VecDeque::new(),
             saved_rows: HashMap::new(),
@@ -161,6 +166,8 @@ impl StrategyCommandDriver {
             last_admission_order,
             restoring: false,
             source_observation_preparation: None,
+            #[cfg(test)]
+            prepared_dispatch_attempts: 0,
         })
     }
 
@@ -240,6 +247,14 @@ impl StrategyCommandDriver {
             // Every recovered command is delivered through the existing worker
             // and reducer. Completed/Dispatching rows replay evidence only; the
             // worker cannot perform another broker mutation for those states.
+            if let Some(group) = &record.command.group {
+                let counts = driver
+                    .operation_groups
+                    .entry((group.id.clone(), group.version))
+                    .or_default();
+                counts.0 += 1;
+                counts.1 += 1;
+            }
             driver.pending.insert(
                 id.clone(),
                 PendingCommand {
@@ -304,18 +319,9 @@ impl StrategyCommandDriver {
     }
 
     pub(super) fn operation_group_ready(&self, group: &BrokerOperationGroup) -> bool {
-        let mut found = false;
-        for pending in self
-            .pending
-            .values()
-            .filter(|pending| pending.command.group.as_ref() == Some(group))
-        {
-            found = true;
-            if matches!(pending.progress, BrokerCommandProgress::Queued) {
-                return false;
-            }
-        }
-        found
+        self.operation_groups
+            .get(&(group.id.clone(), group.version))
+            .is_some_and(|&(retained, queued)| retained != 0 && queued == 0)
     }
 
     pub(super) fn unresolved_execution_error(&self) -> Option<BrokerCommandError> {
@@ -359,7 +365,9 @@ impl StrategyCommandDriver {
     pub(super) fn has_ready_events_with_admission(&self, allow_entries: bool) -> bool {
         self.worker.sender.execution_stop_error().is_some()
             || !self.worker.events.is_empty()
-            || self.next_dispatch_id(allow_entries).is_some()
+            || self.next_dispatch_id(allow_entries).is_some_and(|id| {
+                self.worker.sender.command_lane_ready(&self.pending[id].command.action)
+            })
     }
     #[cfg(test)]
     pub(crate) fn has_completion_events(&self) -> bool {
@@ -511,6 +519,14 @@ impl StrategyCommandDriver {
         } else {
             self.entry_admission.push_back(command.id.clone());
         }
+        if let Some(group) = &command.group {
+            let counts = self
+                .operation_groups
+                .entry((group.id.clone(), group.version))
+                .or_default();
+            counts.0 += 1;
+            counts.1 += 1;
+        }
         self.pending.insert(
             command.id.clone(),
             PendingCommand {
@@ -599,6 +615,12 @@ impl StrategyCommandDriver {
         }
         if matches!(pending.progress, BrokerCommandProgress::Queued) {
             self.awaiting_completion -= 1;
+            if let Some(group) = &pending.command.group {
+                self.operation_groups
+                    .get_mut(&(group.id.clone(), group.version))
+                    .expect("pending group indexed")
+                    .1 -= 1;
+            }
         }
         pending.progress = progress.clone();
         self.progress_revision = self.progress_revision.wrapping_add(1);
@@ -898,6 +920,17 @@ impl StrategyCommandDriver {
                 .pending
                 .remove(&id)
                 .expect("persisting receipt remains owned");
+            if let Some(group) = &pending.command.group {
+                let key = (group.id.clone(), group.version);
+                let counts = self
+                    .operation_groups
+                    .get_mut(&key)
+                    .expect("retained group indexed");
+                counts.0 -= 1;
+                if counts.0 == 0 {
+                    self.operation_groups.remove(&key);
+                }
+            }
             if !pending.command.action.is_teardown() {
                 self.ordinary_pending -= 1;
             }
@@ -992,9 +1025,16 @@ impl StrategyCommandDriver {
     ) -> Result<usize, BrokerCommandError> {
         let mut dispatched = 0;
         while dispatched < max_events.min(256) {
-            let Some(id) = self.next_dispatch_id(allow_entries).cloned() else {
+            let Some(id) = self.next_dispatch_id(allow_entries) else {
                 break;
             };
+            // Full transport lanes are not ready work. Avoid cloning, setting
+            // deadlines and re-encoding the same command on every owner turn.
+            // Keep the selected control/entry priority and authoritative try_send.
+            if !self.worker.sender.command_lane_ready(&self.pending[id].command.action) {
+                break;
+            }
+            let id = id.clone();
             let pending = self
                 .pending
                 .get_mut(&id)
@@ -1012,6 +1052,10 @@ impl StrategyCommandDriver {
                         .get(&pending.owner_id)
                         .and_then(|row| row.entry_deadline),
                 );
+            }
+            #[cfg(test)]
+            {
+                self.prepared_dispatch_attempts += 1;
             }
             match self
                 .worker
@@ -1243,6 +1287,14 @@ where
                 break;
             };
             count += 1;
+            let receipt = evidence.command.receipt();
+            let group_ready = receipt
+                .group
+                .as_ref()
+                .is_some_and(|group| driver.operation_group_ready(group));
+            self.insight_pipeline
+                .command_dependencies
+                .completed(&receipt, group_ready);
             if let Ok(id) = uuid::Uuid::parse_str(&evidence.command.insight_id) {
                 self.insight_work.wake(id);
             }

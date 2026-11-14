@@ -89,6 +89,7 @@ pub struct InsightPipeline {
     pub pipeline: HashMap<InsightState, VecDeque<WrappedInsightPipe>>,
     pub(crate) deferred: std::collections::BTreeMap<uuid::Uuid, DeferredPipeResume>,
     pub(super) snapshot_dependencies: super::snapshot_dependencies::SnapshotDependencies,
+    pub(super) command_dependencies: super::command_dependencies::CommandDependencies,
 }
 
 pub(crate) struct DeferredPipeResume {
@@ -110,6 +111,7 @@ pub(crate) struct InsightPipelineCheckpoint {
 impl InsightPipeline {
     pub(crate) fn forget_continuation(&mut self, id: &uuid::Uuid) -> bool {
         self.snapshot_dependencies.remove(id);
+        self.command_dependencies.remove(id);
         let Some(resume) = self.deferred.remove(id) else {
             return false;
         };
@@ -174,6 +176,8 @@ impl InsightPipeline {
         );
         self.snapshot_dependencies
             .update(id, self.deferred.get(&id).map(|resume| &resume.dependency));
+        self.command_dependencies
+            .update(id, self.deferred.get(&id).map(|resume| &resume.dependency));
         Ok(())
     }
 
@@ -228,6 +232,7 @@ impl Default for InsightPipeline {
             pipeline,
             deferred: Default::default(),
             snapshot_dependencies: Default::default(),
+            command_dependencies: Default::default(),
         }
     }
 }

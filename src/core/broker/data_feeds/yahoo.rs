@@ -6,7 +6,7 @@ use crate::core::broker::types::{
 use crate::core::broker::{DataFeedFeature, DataStreamMode};
 use crate::core::utils::timeframe::{TimeFrame, TimeFrameUnit};
 use chrono::{DateTime, TimeZone, Utc};
-use dashmap::DashMap;
+use super::frame_cache::FrameCache;
 use log::{info, warn};
 use polars::prelude::*;
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
@@ -43,10 +43,10 @@ enum YahooRetryDecision {
 
 /// Immutable, process-local normalized bar snapshots. Hyperparameter seeds deliberately create
 /// fresh brokers/strategies, but must not redownload or renormalize an identical market window.
-static HISTORICAL_BAR_CACHE: OnceLock<DashMap<String, Vec<Bar>>> = OnceLock::new();
+static HISTORICAL_BAR_CACHE: OnceLock<Mutex<FrameCache>> = OnceLock::new();
 
-fn historical_bar_cache() -> &'static DashMap<String, Vec<Bar>> {
-    HISTORICAL_BAR_CACHE.get_or_init(DashMap::new)
+fn historical_bar_cache() -> &'static Mutex<FrameCache> {
+    HISTORICAL_BAR_CACHE.get_or_init(|| Mutex::new(FrameCache::new(256 * 1024 * 1024, 32)))
 }
 
 impl YahooFinanceDataFeed {
@@ -473,14 +473,14 @@ impl YahooFinanceDataFeed {
         // Live rolling windows are mutable and have a new key on every poll. Never
         // retain them indefinitely in the immutable backtest history cache.
         let cacheable = end < Utc::now() - chrono::Duration::days(2);
-        if let Some(bars) = cacheable
-            .then(|| historical_bar_cache().get(&cache_key))
+        if let Some(frame) = cacheable
+            .then(|| historical_bar_cache().lock().unwrap().get(&cache_key))
             .flatten()
         {
             info!(
                 "Reusing immutable Yahoo bar snapshot for {symbol} {interval} ({start_ts}..{end_ts})"
             );
-            return Ok(BarData::Bars(bars.clone()));
+            return Ok(BarData::Frame(frame));
         }
         let json = self
             .request_chart_json(symbol, start_ts, end_ts, &interval)
@@ -561,7 +561,10 @@ impl YahooFinanceDataFeed {
         }
 
         if cacheable {
-            historical_bar_cache().insert(cache_key, bars.clone());
+            let frame = self.format_on_bar(BarData::Bars(bars))
+                .map_err(BrokerError::DataFeedError)?;
+            historical_bar_cache().lock().unwrap().insert(cache_key, frame.clone());
+            return Ok(BarData::Frame(frame));
         }
         Ok(BarData::Bars(bars))
     }
@@ -888,6 +891,27 @@ impl DataProvider for YahooFinanceDataFeed {
 mod tests {
     use super::*;
     use tokio;
+
+    #[tokio::test]
+    async fn yahoo_history_cache_reuses_columnar_snapshots_without_network() {
+        let feed = YahooFinanceDataFeed::new();
+        let symbol = format!("cache-test-{}", Uuid::new_v4());
+        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let end = start + chrono::Duration::days(1);
+        let timeframe = TimeFrame::new(1, TimeFrameUnit::Day);
+        let key = format!("{symbol}|{}|{}|{}", start.timestamp(), end.timestamp(), YahooFinanceDataFeed::chart_interval(timeframe));
+        let original = crate::core::broker::bar_frame::from_bars(&[Bar {
+            symbol: symbol.clone(), timestamp: start,
+            open: 10.0, high: 12.0, low: 9.0, close: 11.0, volume: 4.0,
+        }]).unwrap();
+        let pointer = original.column("close").unwrap().f64().unwrap().cont_slice().unwrap().as_ptr();
+        historical_bar_cache().lock().unwrap().insert(key, original);
+        let mut first = feed.get_history(&symbol, start, end, timeframe).await.unwrap();
+        assert_eq!(pointer, first.column("close").unwrap().f64().unwrap().cont_slice().unwrap().as_ptr());
+        first.with_column(Column::new("close".into(), [99.0])).unwrap();
+        let second = feed.get_history(&symbol, start, end, timeframe).await.unwrap();
+        assert_eq!(second.column("close").unwrap().f64().unwrap().get(0), Some(11.0));
+    }
 
     #[test]
     fn yahoo_retry_policy_only_refreshes_explicit_cookie_or_crumb_failures() {

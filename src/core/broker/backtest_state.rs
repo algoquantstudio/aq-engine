@@ -45,8 +45,9 @@ impl PartialOrd for ScheduledMarketStream {
 /// Shared state for backtesting. Held behind `Arc<parking_lot::RwLock<BacktestState>>`
 /// by both the `PaperBroker` (execution) and `UnifiedBroker` (orchestrator).
 ///
-/// Historical bars are stored per-symbol as `Vec<Bar>` for O(1) indexed access.
-/// A Polars `DataFrame` copy is kept for the strategy layer via `historical_dataframes`.
+/// Provider history and strategy calculations use Polars DataFrames. These
+/// public mutable execution views retain `Vec<Bar>` for API compatibility and
+/// O(1) row access; provider caches share column buffers before this boundary.
 #[derive(Debug)]
 pub struct BacktestState {
     /// Raw bar data per symbol — used by PaperBroker for fast order fill lookups
@@ -449,6 +450,10 @@ impl BacktestState {
 }
 // ─────────────────────── Backtest Results ───────────────────────
 
+#[path = "backtest_analysis.rs"]
+mod analysis;
+pub(crate) use analysis::PreparedBacktestAnalysis;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BacktestResults {
     pub starting_cash: f64,
@@ -522,6 +527,10 @@ pub struct AccountHistoryItem {
 }
 
 impl BacktestResults {
+    pub(crate) fn prepare_analysis(&self) -> PreparedBacktestAnalysis<'_> {
+        PreparedBacktestAnalysis::new(self)
+    }
+
     // ─────────────── Internal: pair entries with exits ───────────────
 
     /// Build round-trip trades from the trade log by pairing Entry ↔ Exit
@@ -969,15 +978,6 @@ impl BacktestResults {
         }
     }
 
-    // ──────────────── Convenience: count long/short ──────────────
-
-    fn count_long_short(&self) -> (usize, usize) {
-        let trips = self.round_trip_trades();
-        let longs = trips.iter().filter(|t| t.side == OrderSide::Buy).count();
-        let shorts = trips.iter().filter(|t| t.side == OrderSide::Sell).count();
-        (longs, shorts)
-    }
-
     // ──────────────── Pretty-Print All Metrics ──────────────────
 
     fn format_duration_seconds(secs: i64) -> String {
@@ -998,6 +998,22 @@ impl BacktestResults {
     }
 
     pub fn metric_summary_lines(&self) -> Vec<String> {
+        self.prepare_analysis().metric_summary_lines()
+    }
+
+    /// Print a comprehensive, formatted summary of all backtest metrics.
+    pub fn print_metrics(&self) {
+        if crate::core::tui::terminal_output_suspended() {
+            return;
+        }
+        for line in self.metric_summary_lines() {
+            println!("{line}");
+        }
+    }
+}
+
+impl PreparedBacktestAnalysis<'_> {
+    pub(crate) fn metric_summary_lines(&self) -> Vec<String> {
         let (n_long, n_short) = self.count_long_short();
         vec![
             "═══════════════════════════════════════════════".to_string(),
@@ -1030,15 +1046,15 @@ impl BacktestResults {
             ),
             format!(
                 "  Longest Win Held:  {}",
-                Self::format_duration_seconds(self.longest_winning_trade_held_secs())
+                BacktestResults::format_duration_seconds(self.longest_winning_trade_held_secs())
             ),
             format!(
                 "  Longest Loss Held: {}",
-                Self::format_duration_seconds(self.longest_losing_trade_held_secs())
+                BacktestResults::format_duration_seconds(self.longest_losing_trade_held_secs())
             ),
             format!(
                 "  Average Trade Held: {}",
-                Self::format_duration_seconds(self.average_trade_held_secs())
+                BacktestResults::format_duration_seconds(self.average_trade_held_secs())
             ),
             "  ─────────────────────────────────────────────".to_string(),
             format!("  Long Trades:       {}", n_long),
@@ -1058,7 +1074,7 @@ impl BacktestResults {
             format!("  Finished At:       {:?}", self.finished_at),
             format!(
                 "  Duration:          {}",
-                Self::format_duration_seconds(
+                BacktestResults::format_duration_seconds(
                     self.finished_at.timestamp() - self.executed_at.timestamp()
                 )
             ),
@@ -1068,15 +1084,6 @@ impl BacktestResults {
         ]
     }
 
-    /// Print a comprehensive, formatted summary of all backtest metrics.
-    pub fn print_metrics(&self) {
-        if crate::core::tui::terminal_output_suspended() {
-            return;
-        }
-        for line in self.metric_summary_lines() {
-            println!("{line}");
-        }
-    }
 }
 
 /// A completed entry→exit round-trip trade used for metric calculations.
@@ -1482,6 +1489,19 @@ impl BacktestResults {
         dir_path: &Path,
         state: &BacktestState,
     ) -> Result<(), String> {
+        self.prepare_analysis()
+            .save_to_disk_async(dir_path, state)
+            .await
+    }
+}
+
+impl PreparedBacktestAnalysis<'_> {
+    #[cfg(feature = "runtime")]
+    pub(crate) async fn save_to_disk_async(
+        &self,
+        dir_path: &Path,
+        state: &BacktestState,
+    ) -> Result<(), String> {
         std::fs::create_dir_all(dir_path).map_err(|e| e.to_string())?;
 
         let mut symbols: Vec<String> = state.historical_bars.keys().cloned().collect();
@@ -1489,7 +1509,7 @@ impl BacktestResults {
             symbols.push("Unknown".to_string());
         }
 
-        let trips = self.round_trip_trades();
+        let trips = &self.trips;
         let best_trade = trips
             .iter()
             .map(|t| t.pnl)
@@ -1610,7 +1630,13 @@ impl BacktestResults {
 
         // Persist the database first. The metrics include its fingerprint, so this must
         // happen only after the database transaction has committed and the file is closed.
-        crate::core::backtest_storage::write_backtest_db(dir_path, self, state).await?;
+        crate::core::backtest_storage::write_prepared_backtest_db(
+            dir_path,
+            self.results,
+            state,
+            &self.trips,
+        )
+        .await?;
 
         // Save metrics to JSON. If the project has an `.aqmeta` file, attach the AQS
         // run metadata and copy the snapshot without requiring generated main.rs code.

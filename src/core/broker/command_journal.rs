@@ -290,6 +290,24 @@ impl BrokerCommandJournal {
         Ok(page)
     }
 
+    async fn prepare_command_statement(
+        &self,
+        sql: &'static str,
+    ) -> Result<turso::Statement, BrokerCommandError> {
+        // Turso 0.7's prepare_cached skips the deferred transaction cleanup that
+        // query/execute perform. An empty batch invokes that public cleanup hook
+        // without compiling/executing SQL, including after a failed checkpoint.
+        // Cache only the four fixed command queries; each gets fresh VM state.
+        self.connection
+            .execute_batch("")
+            .await
+            .map_err(journal_error)?;
+        self.connection
+            .prepare_cached(sql)
+            .await
+            .map_err(journal_error)
+    }
+
     /// An identical retry returns the durable disposition. In particular, a
     /// Dispatching record must be reconciled; this API never resets it to Queued.
     pub async fn prepare(
@@ -301,10 +319,20 @@ impl BrokerCommandJournal {
             return Err(journal_error("command does not match journal scope"));
         }
         let encoded = command.encode()?;
-        let inserted = self.connection.execute(
+        // Checkpointed intents are already durable. An AUTOINCREMENT INSERT
+        // still writes sqlite_sequence on conflict, so replay must read first.
+        // Keep validation above and compare the full immutable command before
+        // returning its existing disposition without another journal write.
+        if let Some(record) = self.get(&command.id).await? {
+            if record.command != *command {
+                return Err(BrokerCommandError::IdentityConflict);
+            }
+            return Ok(record);
+        }
+        let inserted = self.prepare_command_statement(
             "INSERT INTO broker_commands(command_id,command_json,state,queued_at_us) VALUES(?1,?2,'queued',?3) ON CONFLICT(command_id) DO NOTHING",
-            params![command.id.0.clone(), encoded, queued_at_us],
-        ).await.map_err(journal_error)?;
+        ).await?.execute(params![command.id.0.clone(), encoded, queued_at_us])
+            .await.map_err(journal_error)?;
         if inserted == 1 {
             // The journal has one owner; no other statement can race this rowid.
             // Avoid rereading and decoding every newly accepted immutable request.
@@ -331,10 +359,9 @@ impl BrokerCommandJournal {
         &self,
         id: &BrokerCommandId,
     ) -> Result<Option<JournalCommandRecord>, BrokerCommandError> {
-        let mut rows = self.connection.query(
+        let mut rows = self.prepare_command_statement(
             "SELECT sequence,command_json,state,queued_at_us,dispatched_at_us,completion_json FROM broker_commands WHERE command_id=?1",
-            params![id.0.clone()],
-        ).await.map_err(journal_error)?;
+        ).await?.query(params![id.0.clone()]).await.map_err(journal_error)?;
         rows.next()
             .await
             .map_err(journal_error)?
@@ -347,10 +374,9 @@ impl BrokerCommandJournal {
         id: &BrokerCommandId,
         at_us: i64,
     ) -> Result<(), BrokerCommandError> {
-        let changed = self.connection.execute(
+        let changed = self.prepare_command_statement(
             "UPDATE broker_commands SET state='dispatching',dispatched_at_us=?2 WHERE command_id=?1 AND state='queued'",
-            params![id.0.clone(), at_us],
-        ).await.map_err(journal_error)?;
+        ).await?.execute(params![id.0.clone(), at_us]).await.map_err(journal_error)?;
         if changed != 1 {
             return Err(journal_error("dispatch requires a queued durable intent"));
         }
@@ -404,10 +430,10 @@ impl BrokerCommandJournal {
             }
             return Err(BrokerCommandError::IdentityConflict);
         }
-        let changed = self.connection.execute(
+        let changed = self.prepare_command_statement(
             "UPDATE broker_commands SET state='completed',completion_json=?2,dispatched_at_us=?3 WHERE command_id=?1 AND state IN ('queued','dispatching')",
-            params![id.0.clone(), json, completion.dispatched_at_us],
-        ).await.map_err(journal_error)?;
+        ).await?.execute(params![id.0.clone(), json, completion.dispatched_at_us])
+            .await.map_err(journal_error)?;
         if changed != 1 {
             return Err(journal_error("completion lost journal ownership"));
         }
@@ -464,3 +490,6 @@ impl BrokerCommandJournal {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

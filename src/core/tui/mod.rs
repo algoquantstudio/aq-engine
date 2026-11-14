@@ -210,6 +210,7 @@ impl Default for RuntimeSnapshot {
 pub struct RuntimeTelemetry {
     snapshot: Arc<RwLock<RuntimeSnapshot>>,
     events: VecDeque<RuntimeEventSnapshot>,
+    events_changed: bool,
     event_capacity: usize,
     dropped_events: Arc<AtomicU64>,
     strategy_stop_requested: Arc<AtomicBool>,
@@ -222,6 +223,7 @@ impl Default for RuntimeTelemetry {
         Self {
             snapshot: Arc::new(RwLock::new(RuntimeSnapshot::default())),
             events: VecDeque::with_capacity(DEFAULT_EVENT_CAPACITY),
+            events_changed: false,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             dropped_events: Arc::new(AtomicU64::new(0)),
             strategy_stop_requested: Arc::new(AtomicBool::new(false)),
@@ -236,6 +238,12 @@ impl RuntimeTelemetry {
         self.snapshot.clone()
     }
 
+    /// TUI threads and external readers own snapshot handles. Weak handles also
+    /// count: a reader can upgrade one concurrently with the next publication.
+    pub fn has_snapshot_consumers(&self) -> bool {
+        Arc::strong_count(&self.snapshot) > 1 || Arc::weak_count(&self.snapshot) > 0
+    }
+
     fn push_event_snapshot(&mut self, mut event: RuntimeEventSnapshot) {
         event.message = bounded_text(&event.message);
         if self.events.len() >= self.event_capacity {
@@ -243,6 +251,7 @@ impl RuntimeTelemetry {
             self.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
         self.events.push_back(event);
+        self.events_changed = true;
     }
 
     fn drain_global_log_events(&mut self) {
@@ -256,11 +265,13 @@ impl RuntimeTelemetry {
         F: FnOnce(&mut RuntimeSnapshot),
     {
         self.drain_global_log_events();
-        let events = self.events.iter().cloned().collect::<Vec<_>>();
         let dropped_events = self.dropped_events.load(Ordering::Relaxed);
         if let Ok(mut snapshot) = self.snapshot.write() {
             update(&mut snapshot);
-            snapshot.events = events;
+            if self.events_changed {
+                snapshot.events = self.events.iter().cloned().collect();
+                self.events_changed = false;
+            }
             snapshot.dropped_events = dropped_events;
             snapshot.updated_at = Utc::now();
         }
@@ -1637,6 +1648,36 @@ mod tests {
         assert_eq!(snapshot.events.len(), 2);
         assert_eq!(snapshot.dropped_events, 1);
         assert_eq!(snapshot.events[0].message, "two");
+    }
+
+    #[test]
+    fn runtime_telemetry_detects_strong_and_weak_consumers() {
+        let telemetry = RuntimeTelemetry::default();
+        assert!(!telemetry.has_snapshot_consumers());
+        let reader = telemetry.snapshot_handle();
+        assert!(telemetry.has_snapshot_consumers());
+        let weak = Arc::downgrade(&reader);
+        drop(reader);
+        assert!(telemetry.has_snapshot_consumers());
+        drop(weak);
+        assert!(!telemetry.has_snapshot_consumers());
+    }
+
+    #[test]
+    fn runtime_telemetry_reuses_events_until_the_queue_changes() {
+        let mut telemetry = RuntimeTelemetry::default();
+        telemetry.event_capacity = 1;
+        telemetry.push_event("info", "first");
+        telemetry.update_snapshot(|_| {});
+        let allocation = telemetry.snapshot.read().unwrap().events[0].message.as_ptr();
+        telemetry.update_snapshot(|snapshot| snapshot.status = "Running".into());
+        assert_eq!(telemetry.snapshot.read().unwrap().events[0].message.as_ptr(), allocation);
+        telemetry.push_event("info", "second");
+        telemetry.update_snapshot(|_| {});
+        let snapshot = telemetry.snapshot.read().unwrap();
+        assert_eq!(snapshot.events[0].message, "second");
+        assert_eq!(snapshot.dropped_events, 1);
+        assert_eq!(snapshot.status, "Running");
     }
 
     #[test]

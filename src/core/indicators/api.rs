@@ -74,6 +74,9 @@ macro_rules! indicator {
             fn output_columns(&self) -> Vec<String> {
                 self.inner.outputs.clone()
             }
+            fn borrowed_output_columns(&self) -> Option<&[String]> {
+                Some(&self.inner.outputs)
+            }
             fn window_size(&self) -> usize {
                 self.inner.kind.window()
             }

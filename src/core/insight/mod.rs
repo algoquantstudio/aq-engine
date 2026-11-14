@@ -47,6 +47,8 @@ use uuid::Uuid;
 pub struct InsightCollection {
     insights: FxHashMap<Uuid, Insight>,
     dirty_insight_ids: std::collections::BTreeSet<Uuid>,
+    pipeline_state_changes: std::collections::BTreeSet<Uuid>,
+    pipeline_continuations: FxHashSet<Uuid>,
     active_insight_ids: FxHashSet<Uuid>,
     // Ordered IDs permit bounded live cursor reads without collecting/sorting
     // the entire active set. Keep existing iteration order for backtests.
@@ -74,6 +76,8 @@ impl InsightCollection {
         Self {
             insights: FxHashMap::default(),
             dirty_insight_ids: Default::default(),
+            pipeline_state_changes: Default::default(),
+            pipeline_continuations: FxHashSet::default(),
             active_insight_ids: FxHashSet::default(),
             ordered_active_insight_ids: Default::default(),
             active_by_symbol: HashMap::new(),
@@ -179,6 +183,9 @@ impl InsightCollection {
             .insert(*insight_id, current_state.clone())
         {
             Some(previous_state) if previous_state != current_state => {
+                if self.pipeline_continuations.contains(insight_id) {
+                    self.pipeline_state_changes.insert(*insight_id);
+                }
                 self.decrement_state_count(&previous_state);
                 *self.lifetime_state_counts.entry(current_state).or_insert(0) += 1;
             }
@@ -262,6 +269,9 @@ impl InsightCollection {
     }
 
     fn remove_tracking(&mut self, insight_id: &Uuid) {
+        if self.pipeline_continuations.contains(insight_id) {
+            self.pipeline_state_changes.insert(*insight_id);
+        }
         self.recovery_views.remove_owner(insight_id);
         self.remove_symbol_tracking(insight_id);
         self.dirty_insight_ids.remove(insight_id);
@@ -578,6 +588,9 @@ impl InsightCollection {
     }
 
     pub fn get_insight_mut(&mut self, id: &Uuid) -> Option<&mut Insight> {
+        if self.pipeline_continuations.contains(id) {
+            self.pipeline_state_changes.insert(*id);
+        }
         self.insights.get_mut(id)
     }
 
@@ -657,10 +670,35 @@ impl InsightCollection {
     }
 
     pub fn get_mut(&mut self, id: &Uuid) -> Option<&mut Insight> {
+        // Public mutable access may change state without refreshing tracking.
+        if self.pipeline_continuations.contains(id) {
+            self.pipeline_state_changes.insert(*id);
+        }
         if self.execution_persistence_enabled && self.insights.contains_key(id) {
             self.execution_dirty.insert(*id);
         }
         self.insights.get_mut(id)
+    }
+
+    pub(crate) fn track_pipeline_continuation(&mut self, id: Uuid, tracked: bool) {
+        if tracked {
+            self.pipeline_continuations.insert(id);
+        } else {
+            self.pipeline_continuations.remove(&id);
+            self.pipeline_state_changes.remove(&id);
+        }
+    }
+
+    pub(crate) fn first_pipeline_state_change(&self) -> Option<Uuid> {
+        self.pipeline_state_changes.first().copied()
+    }
+
+    pub(crate) fn pop_pipeline_state_change(&mut self) -> Option<Uuid> {
+        self.pipeline_state_changes.pop_first()
+    }
+
+    pub(crate) fn has_pipeline_state_changes(&self) -> bool {
+        !self.pipeline_state_changes.is_empty()
     }
 
     pub(crate) fn enable_execution_persistence(&mut self) {

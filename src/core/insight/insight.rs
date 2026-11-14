@@ -1028,6 +1028,33 @@ impl Insight {
         self.limit_price
     }
     pub fn set_limit_price(&mut self, limit_price: Option<f64>) -> &mut Self {
+        self.set_limit_price_with_message(limit_price, || {
+            format!("Limit price set to {}", limit_price.unwrap_or(0.0))
+        })
+    }
+
+    /// Retain both entry messages while rendering the shared price only once.
+    pub(crate) fn set_limit_price_from_close(&mut self, price: f64) -> String {
+        const CONFIRMATION_PREFIX: &str = "Limit price set to close: ";
+        const HISTORY_PREFIX: &str = "Limit price set to ";
+
+        // Keep the prefix literal so formatting can reserve its output buffer up front.
+        let confirmation = format!("Limit price set to close: {price}");
+        self.set_limit_price_with_message(Some(price), || {
+            let rendered_price = &confirmation[CONFIRMATION_PREFIX.len()..];
+            let mut message = String::with_capacity(HISTORY_PREFIX.len() + rendered_price.len());
+            message.push_str(HISTORY_PREFIX);
+            message.push_str(rendered_price);
+            message
+        });
+        confirmation
+    }
+
+    fn set_limit_price_with_message(
+        &mut self,
+        limit_price: Option<f64>,
+        message: impl FnOnce() -> String,
+    ) -> &mut Self {
         if self.state == InsightState::Filled || self.state.is_inactive() {
             self.state_log(Some("Cannot set entry limit price: order has already filled or is inactive".into()));
             return self;
@@ -1037,10 +1064,7 @@ impl Insight {
         }
         self.limit_price = limit_price;
         self.update_order_type();
-        self.update_state(
-            self.state.clone(),
-            Some(format!("Limit price set to {}", limit_price.unwrap_or(0.0))),
-        );
+        self.update_state(self.state.clone(), Some(message()));
         self
     }
     pub fn stop_price(&self) -> Option<f64> {
@@ -1266,12 +1290,10 @@ impl Insight {
         self.period_unfilled = period_unfilled;
         self.update_state(
             self.state.clone(),
-            Some(format!(
-                "Unfilled TTL set to {}",
-                period_unfilled
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            )),
+            Some(match period_unfilled {
+                Some(value) => format!("Unfilled TTL set to {value}"),
+                None => "Unfilled TTL set to -".to_string(),
+            }),
         );
         self
     }
@@ -1285,12 +1307,10 @@ impl Insight {
         self.period_till_tp = period_till_tp;
         self.update_state(
             self.state.clone(),
-            Some(format!(
-                "Take-profit TTL set to {}",
-                period_till_tp
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            )),
+            Some(match period_till_tp {
+                Some(value) => format!("Take-profit TTL set to {value}"),
+                None => "Take-profit TTL set to -".to_string(),
+            }),
         );
         self
     }

@@ -1,104 +1,140 @@
 use crate::node::{Connection, Node, NodeType};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-/// Find all nodes reachable from the Strategy root node.
-pub(super) fn get_reachable_nodes(
-    nodes: &[Node],
-    connections: &[Connection],
-) -> std::collections::HashSet<String> {
-    let mut reachable = std::collections::HashSet::new();
-    let mut queue = std::collections::VecDeque::new();
-
-    // Find strategy root
-    if let Some(root) = nodes.iter().find(|n| n.node_type == NodeType::Strategy) {
-        reachable.insert(root.id.clone());
-        queue.push_back(root.id.clone());
-    }
-
-    // Normal outward adjacency list.
-    let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    // Reverse adjacency for nested pipe composition (`child_pipe -> parent_pipe.insights_pipes`).
-    let mut reverse_pipe_children: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for conn in connections {
-        adj.entry(conn.from.node_id.clone())
-            .or_default()
-            .push(conn.to.node_id.clone());
-
-        if conn.to.port == "insights_pipes" {
-            reverse_pipe_children
-                .entry(conn.to.node_id.clone())
-                .or_default()
-                .push(conn.from.node_id.clone());
-        }
-    }
-
-    while let Some(curr) = queue.pop_front() {
-        if let Some(neighbors) = adj.get(&curr) {
-            for next in neighbors {
-                if reachable.insert(next.clone()) {
-                    queue.push_back(next.clone());
-                }
-            }
-        }
-
-        if let Some(children) = reverse_pipe_children.get(&curr) {
-            for child in children {
-                if reachable.insert(child.clone()) {
-                    queue.push_back(child.clone());
-                }
-            }
-        }
-    }
-
-    reachable
+/// Borrow the reachable graph and index node IDs once for all code generation passes.
+/// Node/connection order is significant for registration and composed pipe arguments.
+pub(super) struct ReachableGraph<'a> {
+    pub nodes: Vec<&'a Node>,
+    pub connections: Vec<&'a Connection>,
+    pub by_id: HashMap<&'a str, &'a Node>,
 }
 
-/// Topological sort of the node graph. Returns node IDs in execution order.
-pub(super) fn toposort(nodes: &[Node], connections: &[Connection]) -> Result<Vec<String>, String> {
-    let mut in_degrees: HashMap<String, usize> = HashMap::new();
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-
-    for node in nodes {
-        in_degrees.insert(node.id.clone(), 0);
-        adj.insert(node.id.clone(), vec![]);
-    }
-
-    for conn in connections {
-        if !in_degrees.contains_key(&conn.to.node_id) {
-            continue;
+impl<'a> ReachableGraph<'a> {
+    pub fn new(nodes: &'a [Node], connections: &'a [Connection]) -> Self {
+        let reachable = get_reachable_nodes(nodes, connections);
+        let nodes: Vec<_> = nodes
+            .iter()
+            .filter(|node| reachable.contains(node.id.as_str()))
+            .collect();
+        let connections = connections
+            .iter()
+            .filter(|conn| {
+                reachable.contains(conn.from.node_id.as_str())
+                    && reachable.contains(conn.to.node_id.as_str())
+            })
+            .collect();
+        let mut by_id = HashMap::with_capacity(nodes.len());
+        for node in &nodes {
+            // Match the previous linear lookup's first occurrence for duplicate IDs.
+            by_id.entry(node.id.as_str()).or_insert(*node);
         }
-        *in_degrees.entry(conn.to.node_id.clone()).or_insert(0) += 1;
-        adj.entry(conn.from.node_id.clone())
-            .or_default()
-            .push(conn.to.node_id.clone());
-    }
-
-    let mut queue = VecDeque::new();
-    for node in nodes {
-        if in_degrees.get(&node.id).copied().unwrap_or_default() == 0 {
-            queue.push_back(node.id.clone());
+        Self {
+            nodes,
+            connections,
+            by_id,
         }
     }
 
-    let mut sorted = Vec::new();
-    while let Some(curr) = queue.pop_front() {
-        sorted.push(curr.clone());
-        if let Some(neighbors) = adj.get(&curr) {
-            for next in neighbors {
-                if let Some(deg) = in_degrees.get_mut(next) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(next.clone());
+    /// Stable Kahn traversal: roots follow saved node order, successors follow edge order.
+    pub fn toposort(&self) -> Result<Vec<&'a Node>, String> {
+        let mut in_degrees: HashMap<&str, usize> = self
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), 0))
+            .collect();
+        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+        for conn in &self.connections {
+            let Some(degree) = in_degrees.get_mut(conn.to.node_id.as_str()) else {
+                continue;
+            };
+            *degree += 1;
+            adj.entry(conn.from.node_id.as_str())
+                .or_default()
+                .push(conn.to.node_id.as_str());
+        }
+
+        let mut queue = VecDeque::new();
+        for node in &self.nodes {
+            if in_degrees[node.id.as_str()] == 0 {
+                queue.push_back(node.id.as_str());
+            }
+        }
+        let mut sorted = Vec::with_capacity(self.nodes.len());
+        while let Some(curr) = queue.pop_front() {
+            sorted.push(self.by_id[curr]);
+            if let Some(neighbors) = adj.get(curr) {
+                for next in neighbors {
+                    let degree = in_degrees.get_mut(next).expect("indexed edge target");
+                    *degree -= 1;
+                    if *degree == 0 {
+                        queue.push_back(*next);
                     }
                 }
             }
         }
+        if sorted.len() != self.nodes.len() {
+            return Err("Cycle detected in strategy graph".to_string());
+        }
+        Ok(sorted)
     }
+}
 
-    if sorted.len() != nodes.len() {
-        return Err("Cycle detected in strategy graph".to_string());
+/// Include outward paths and reverse composition edges, even through dangling endpoints,
+/// preserving the existing reachability and malformed-graph error behavior.
+fn get_reachable_nodes<'a>(nodes: &'a [Node], connections: &'a [Connection]) -> HashSet<&'a str> {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(root) = nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Strategy)
+    {
+        reachable.insert(root.id.as_str());
+        queue.push_back(root.id.as_str());
     }
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for conn in connections {
+        adj.entry(conn.from.node_id.as_str())
+            .or_default()
+            .push(conn.to.node_id.as_str());
+        if conn.to.port == "insights_pipes" {
+            adj.entry(conn.to.node_id.as_str())
+                .or_default()
+                .push(conn.from.node_id.as_str());
+        }
+    }
+    while let Some(curr) = queue.pop_front() {
+        if let Some(neighbors) = adj.get(curr) {
+            for next in neighbors {
+                if reachable.insert(*next) {
+                    queue.push_back(*next);
+                }
+            }
+        }
+    }
+    reachable
+}
 
-    Ok(sorted)
+/// Propagate each new (pipe, alpha) pair once, including cycles induced by reversed
+/// composition edges. Sorted sets make source independent of hash iteration order.
+pub(super) fn inherit_alpha_scopes<'a>(
+    direct: impl IntoIterator<Item = (&'a str, &'a str)>,
+    successors: &HashMap<&'a str, Vec<&'a str>>,
+) -> HashMap<&'a str, BTreeSet<&'a str>> {
+    let mut allowed: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let mut queue = VecDeque::new();
+    for (pipe, alpha) in direct {
+        if allowed.entry(pipe).or_default().insert(alpha) {
+            queue.push_back((pipe, alpha));
+        }
+    }
+    while let Some((pipe, alpha)) = queue.pop_front() {
+        if let Some(next_pipes) = successors.get(pipe) {
+            for next in next_pipes {
+                if allowed.entry(*next).or_default().insert(alpha) {
+                    queue.push_back((*next, alpha));
+                }
+            }
+        }
+    }
+    allowed
 }

@@ -47,6 +47,7 @@ mod tests {
     include!("lifecycle_reconciliation_tests.rs");
     include!("exit_level_regression_tests.rs");
     include!("indicator_runtime_tests.rs");
+    include!("runtime_snapshot_tests.rs");
 
     struct LiveCommandLifecycleFixture {
         teardown_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -6127,9 +6128,46 @@ mod tests {
             fn on_teardown(&mut self, _ctx: &mut dyn StrategyContext) {}
         }
 
+        // Four flat bars allow submission and fill at 100. The final bar
+        // crosses the 99.90 stop while staying below the 150 take-profit.
+        // This verifies execution against known prices, independent of Yahoo
+        // history or whether the market happened to fall over the last 90 days.
+        let start = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+        let end = start + chrono::Duration::days(4);
+        let history = DataFrame::new(
+            5,
+            vec![
+                Column::new("symbol".into(), vec!["AAPL"; 5]),
+                Column::new("open".into(), vec![100.0; 5]),
+                Column::new("high".into(), vec![101.0; 5]),
+                Column::new("low".into(), vec![100.0, 100.0, 100.0, 100.0, 98.0]),
+                Column::new("close".into(), vec![100.0, 100.0, 100.0, 100.0, 99.0]),
+                Column::new("volume".into(), vec![1_000_000.0; 5]),
+                Column::new(
+                    "timestamp".into(),
+                    (0..5).map(|day| (start + chrono::Duration::days(day)).timestamp_millis())
+                        .collect::<Vec<_>>(),
+                ),
+            ],
+        ).unwrap();
+        let data = FixedScaleOutDataFeed {
+            connected: Arc::new(Mutex::new(false)),
+            history,
+        };
         let execution = PaperBroker::new(AccountType::Paper, 100_000.0, 1);
-        let data = YahooFinanceDataFeed::new();
         let broker = UnifiedBroker::new(execution, data);
+        struct BracketFixtureDirectory(std::path::PathBuf);
+        impl Drop for BracketFixtureDirectory {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let fixture_root = if cfg!(target_os = "macos") {
+            std::path::PathBuf::from("/private/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let directory = BracketFixtureDirectory(
+            fixture_root.join(format!("aqe-bracket-close-{}", uuid::Uuid::new_v4())),
+        );
 
         let mut state = StrategyState::new(
             "BracketTest".to_string(),
@@ -6140,17 +6178,9 @@ mod tests {
             TimeFrame::new(1, TimeFrameUnit::Day),
         );
         state.set_warm_up_bars(1);
-
-        // Use 90 days to give the tight SL time to trigger
-        let end = chrono::Utc::now();
-        let start = end - chrono::Duration::days(90);
-
-        let result = state.run_backtest(start, end, state.timeframe()).await;
-        if assert_backtest_or_skip(result, "Trade event bracket close backtest should complete")
-            .is_none()
-        {
-            return;
-        }
+        state.set_artifact_root(&directory.0);
+        state.run_backtest(start, end, state.timeframe()).await
+            .expect("Trade event bracket close backtest with fixed history should complete");
 
         // Check that at least one insight reached CLOSED state
         let insight_ids = state.insights.ids();
@@ -6169,6 +6199,10 @@ mod tests {
                         "Closed insight should have close_price"
                     );
                     assert!(
+                        (insight.close_price.unwrap() - 99.9).abs() < 1e-9,
+                        "The fixture must close at its 99.90 stop-loss"
+                    );
+                    assert!(
                         insight.closed_at.is_some(),
                         "Closed insight should have closed_at timestamp"
                     );
@@ -6177,7 +6211,7 @@ mod tests {
         }
         assert!(
             found_closed,
-            "With a 0.1% SL over 90 days, the bracket should have triggered CLOSED"
+            "The final fixture bar must trigger the stop-loss and transition to CLOSED"
         );
         println!("  ✓ Trade event bracket close test passed!");
     }

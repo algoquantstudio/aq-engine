@@ -1057,8 +1057,8 @@ where
             .command_driver
             .as_ref()
             .map(|driver| driver.completion_notifier());
-        let mut command_attempted = HashMap::new();
         let snapshot_ready = self.broker.snapshot_notifier();
+        let mut prefer_command_continuations = false;
         let mut live_pipeline_sweep = super::pipeline_sweep::LivePipelineSweep::default();
         let mut lifecycle_reads = tokio::task::JoinSet::new();
         let mut lifecycle_check = self.broker.lifecycle_reconciler().map(|reader| {
@@ -1427,7 +1427,7 @@ where
                     self.on_trade_update();
                     // Resume receipt-dependent stages promptly, not on the next
                     // market bar. This is owner work, never broker transport I/O.
-                    if !recovering_previous_stop && self.resume_live_command_pipes(&mut command_attempted) {
+                    if !recovering_previous_stop && self.resume_live_command_pipes() {
                         if let Some(ready) = command_ready.as_ref() { ready.notify_one(); }
                     }
                     if let (Some(sync), Some(a)) = (local_batch_sync.as_mut(), auth.as_ref()) {
@@ -1948,8 +1948,22 @@ where
                 // Notifications may have already been consumed while a reducer
                 // turn hit its budget. Do not wait for another tick/trade to
                 // finish that page, and do not advance/replay market events.
-                _ = tokio::task::yield_now(), if self.has_pending_broker_events() => {
-                    self.on_trade_update();
+                _ = tokio::task::yield_now(), if self.has_pending_broker_events()
+                    || (!recovering_previous_stop && self.has_pending_command_continuations()) => {
+                    // Membership may change after the last worker notification,
+                    // and a trade can change a suspended insight's state without
+                    // completing its receipt. Keep that work level-triggered.
+                    // Alternate bounded pages when both owners have work so the
+                    // biased select cannot starve reduction or continuation.
+                    if !recovering_previous_stop && self.has_pending_command_continuations()
+                        && (prefer_command_continuations || !self.has_pending_broker_events())
+                    {
+                        self.resume_live_command_pipes();
+                        prefer_command_continuations = false;
+                    } else {
+                        self.on_trade_update();
+                        prefer_command_continuations = true;
+                    }
                     if let (Some(sync), Some(a)) = (local_batch_sync.as_mut(), auth.as_ref()) {
                         self.publish_dirty_insights_to_local_bus(
                             sync, a, Some(LIVE_SYNC_MAX_INSIGHTS_PER_FLUSH), event_gateway_primary,
@@ -2049,7 +2063,7 @@ where
                 }
             }
             self.on_trade_update();
-            if self.resume_live_command_pipes(&mut command_attempted) {
+            if self.resume_live_command_pipes() {
                 if let Some(ready) = command_ready.as_ref() {
                     ready.notify_one();
                 }
