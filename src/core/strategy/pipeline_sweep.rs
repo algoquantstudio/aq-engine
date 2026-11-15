@@ -93,6 +93,7 @@ where
                             })
                         });
                     if stale && self.insight_pipeline.forget_continuation(&id) {
+                        self.insights.track_pipeline_continuation(id, false);
                         self.insights.mark_execution_dirty(id);
                     }
                     sweep.after = Some(id);

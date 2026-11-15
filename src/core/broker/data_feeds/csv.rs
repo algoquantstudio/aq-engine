@@ -39,7 +39,21 @@ pub struct CsvStreamSummary {
 
 #[derive(Debug)]
 struct CsvDataset {
-    streams: HashMap<(String, TimeFrame), Vec<Bar>>,
+    // Frames own the history; range reads share their immutable column buffers.
+    streams: HashMap<(String, TimeFrame), CsvHistory>,
+}
+
+#[derive(Debug)]
+struct CsvHistory {
+    frame: DataFrame,
+    // Epoch milliseconds cannot distinguish a Chrono leap second from midnight.
+    // Only exceptional streams retain the exact accepted source instants.
+    exact_times: Option<Vec<DateTime<Utc>>>,
+}
+
+impl std::ops::Deref for CsvHistory {
+    type Target = DataFrame;
+    fn deref(&self) -> &Self::Target { &self.frame }
 }
 
 fn error(message: impl Into<String>) -> BrokerError {
@@ -90,12 +104,12 @@ impl CsvDataFeed {
         let mut summaries: Vec<_> = data
             .streams
             .iter()
-            .map(|((symbol, tf), bars)| CsvStreamSummary {
+            .map(|((symbol, tf), frame)| CsvStreamSummary {
                 symbol: symbol.clone(),
                 timeframe: tf.compact_label(),
-                bars: bars.len(),
-                start: bars[0].timestamp,
-                end: bars[bars.len() - 1].timestamp,
+                bars: frame.height(),
+                start: frame_time(frame, 0),
+                end: frame_time(frame, frame.height() - 1),
             })
             .collect();
         summaries.sort_by(|a, b| (&a.symbol, &a.timeframe).cmp(&(&b.symbol, &b.timeframe)));
@@ -181,17 +195,16 @@ impl DataProvider for CsvDataFeed {
             return Err(error("CSV history start must be before end"));
         }
         let data = self.snapshot().await?;
-        let Some(bars) = data.streams.get(&(symbol.to_string(), timeframe)) else {
+        let Some(frame) = data.streams.get(&(symbol.to_string(), timeframe)) else {
             log::warn!(
                 "Skipping CSV stream {symbol} {}: no exact timeframe data; no substitution or resampling",
                 timeframe.compact_label()
             );
             return self.format_on_bar(BarData::Bars(Vec::new())).map_err(error);
         };
-        let first = bars.partition_point(|bar| bar.timestamp < start);
-        let last = bars.partition_point(|bar| bar.timestamp < end);
-        self.format_on_bar(BarData::Bars(bars[first..last].to_vec()))
-            .map_err(error)
+        let first = frame_partition_point(frame, start);
+        let last = frame_partition_point(frame, end);
+        Ok(frame.slice(first as i64, last - first))
     }
 
     async fn get_latest_quote(&self, _symbol: &str) -> Result<Quote, BrokerError> {
@@ -322,8 +335,35 @@ impl CsvDataset {
         for bars in streams.values_mut() {
             bars.sort_unstable_by_key(|bar| bar.timestamp);
         }
+        let streams = streams.into_iter().map(|(key, bars)| {
+            let exact_times = bars.iter().any(|bar| bar.timestamp.timestamp_subsec_nanos() >= 1_000_000_000)
+                .then(|| bars.iter().map(|bar| bar.timestamp).collect());
+            crate::core::broker::bar_frame::from_bars(&bars)
+                .map(|frame| (key, CsvHistory { frame, exact_times }))
+                .map_err(|e| error(e.to_string()))
+        }).collect::<Result<_, _>>()?;
         Ok(Self { streams })
     }
+}
+
+fn frame_time(frame: &CsvHistory, index: usize) -> DateTime<Utc> {
+    if let Some(times) = &frame.exact_times { return times[index]; }
+    let millis = frame.column("timestamp").unwrap().i64().unwrap().get(index).unwrap();
+    DateTime::from_timestamp_millis(millis).expect("CSV timestamps were validated")
+}
+
+fn frame_partition_point(frame: &CsvHistory, timestamp: DateTime<Utc>) -> usize {
+    let mut first = 0;
+    let mut last = frame.height();
+    while first < last {
+        let middle = first + (last - first) / 2;
+        if frame_time(frame, middle) < timestamp {
+            first = middle + 1;
+        } else {
+            last = middle;
+        }
+    }
+    first
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, String> {

@@ -55,11 +55,11 @@ impl InsightPipe for MarketOrderEntryPipe {
                             .get(df.height() - 1)
                             .filter(|price| price.is_finite() && *price > 0.0)
                         {
-                            insight.set_limit_price(Some(price));
+                            let message = insight.set_limit_price_from_close(price);
                             return InsightPipeResult::new(
                                 true,
                                 true,
-                                Some(format!("Limit price set to close: {}", price)),
+                                Some(message),
                                 self.name().to_string(),
                             );
                         }

@@ -1,4 +1,6 @@
-use crate::node::{Connection, LifecyclePhase, Node, NodeType, StrategyMeta};
+use crate::node::{LifecyclePhase, NodeType, StrategyMeta};
+#[cfg(test)]
+use crate::node::{Connection, Node};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -16,7 +18,7 @@ mod indicators;
 #[path = "codegen/indicator_tests.rs"]
 mod indicator_tests;
 
-use graph::{get_reachable_nodes, toposort};
+use graph::{inherit_alpha_scopes, ReachableGraph};
 use source::{
     get_builtin_lifecycle_info, get_builtin_pipe_info, push_custom_module_decl,
     source_file_to_mod_name, to_pascal_case,
@@ -36,24 +38,9 @@ use support::{
 /// This is a pure function — no filesystem or Tauri dependency.
 pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
     meta.validate_hyper_parameters()?;
-    // ── 0. Filter reachable nodes ──
-    let reachable_ids = get_reachable_nodes(&meta.nodes, &meta.connections);
-    let reachable_nodes: Vec<Node> = meta
-        .nodes
-        .iter()
-        .filter(|n| reachable_ids.contains(&n.id))
-        .cloned()
-        .collect();
-    let reachable_connections: Vec<Connection> = meta
-        .connections
-        .iter()
-        .filter(|c| {
-            reachable_ids.contains(&c.from.node_id) && reachable_ids.contains(&c.to.node_id)
-        })
-        .cloned()
-        .collect();
-    // ── 1. Toposort the reachable node graph ──
-    let sorted = toposort(&reachable_nodes, &reachable_connections)?;
+    // ── 0–1. Borrow, index and topologically order the reachable graph ──
+    let graph = ReachableGraph::new(&meta.nodes, &meta.connections);
+    let sorted = graph.toposort()?;
 
     // ── 2. Collect alpha and pipe nodes ──
     let mut custom_alphas = Vec::new(); // (mod_name, struct_name, args_string, source_file)
@@ -70,107 +57,61 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
 
     let mut universe_symbols: Vec<String> = Vec::new();
 
-    // Mapping: Insight Pipe Node ID -> Vec<Alpha Name>
-    let mut pipe_allow_alphas: HashMap<String, Vec<String>> = HashMap::new();
-    // Mapping: Parent Pipe Node ID -> Vec<Child Variable Name>
-    let mut pipe_children: HashMap<String, Vec<String>> = HashMap::new();
-    let mut pipe_child_ids: HashMap<String, Vec<String>> = HashMap::new();
-    let mut is_child_pipe: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut downstream_pipe_ids: HashMap<String, Vec<String>> = HashMap::new();
+    // Resolve each alpha name once; scopes borrow these names throughout generation.
+    let alpha_names: HashMap<&str, String> = graph
+        .by_id
+        .iter()
+        .filter(|(_, node)| node.node_type == NodeType::Alpha)
+        .map(|(id, node)| {
+            let name = node
+                .source_file
+                .as_deref()
+                .and_then(crate::node::builtins::alpha_options::model_name)
+                .map(str::to_string)
+                .unwrap_or_else(|| to_pascal_case(&node.label));
+            (*id, name)
+        })
+        .collect();
+    let mut direct_allow_alphas = Vec::new();
+    let mut pipe_children: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut is_child_pipe = std::collections::HashSet::new();
+    let mut scope_successors: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut on_start_nodes = std::collections::HashSet::new();
 
-    // Pre-calculate mappings from Alpha -> Insight Pipe
-    for conn in &reachable_connections {
-        let from_node = reachable_nodes.iter().find(|n| n.id == conn.from.node_id);
-        let to_node = reachable_nodes.iter().find(|n| n.id == conn.to.node_id);
-
+    for conn in &graph.connections {
+        if conn.to.port == "on_start" {
+            on_start_nodes.insert(conn.to.node_id.as_str());
+        }
+        let from_node = graph.by_id.get(conn.from.node_id.as_str());
+        let to_node = graph.by_id.get(conn.to.node_id.as_str());
         if let (Some(from), Some(to)) = (from_node, to_node) {
             if from.node_type == NodeType::Alpha && to.node_type == NodeType::Pipe {
-                let alpha_struct = from.source_file.as_deref()
-                    .and_then(crate::node::builtins::alpha_options::model_name)
-                    .map(str::to_string).unwrap_or_else(|| to_pascal_case(&from.label));
-                pipe_allow_alphas
-                    .entry(to.id.clone())
-                    .or_default()
-                    .push(alpha_struct);
+                direct_allow_alphas.push((to.id.as_str(), alpha_names[from.id.as_str()].as_str()));
             }
-            if from.node_type == NodeType::Pipe
-                && to.node_type == NodeType::Pipe
-                && conn.to.port != "insights_pipes"
-            {
-                downstream_pipe_ids
-                    .entry(from.id.clone())
-                    .or_default()
-                    .push(to.id.clone());
-            }
-            if from.node_type == NodeType::Pipe
-                && to.node_type == NodeType::Pipe
-                && conn.to.port == "insights_pipes"
-            {
-                let child_var_name = format!("pipe_{}", from.id.replace("-", "_"));
-                pipe_children
-                    .entry(to.id.clone())
-                    .or_default()
-                    .push(child_var_name);
-                pipe_child_ids
-                    .entry(to.id.clone())
-                    .or_default()
-                    .push(from.id.clone());
-                is_child_pipe.insert(from.id.clone());
-            }
-        }
-    }
-
-    // Pipe allow-lists should flow across the full downstream pipe chain and through nested
-    // `insights_pipes` compositions so every descendant pipe keeps the originating alpha scope.
-    let mut inherited_allow_alphas = pipe_allow_alphas.clone();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let pipe_ids: std::collections::HashSet<String> = inherited_allow_alphas
-            .keys()
-            .cloned()
-            .chain(downstream_pipe_ids.keys().cloned())
-            .chain(pipe_child_ids.keys().cloned())
-            .collect();
-
-        for pipe_id in pipe_ids {
-            let Some(parent_allowed) = inherited_allow_alphas.get(&pipe_id).cloned() else {
-                continue;
-            };
-
-            for child_id in pipe_child_ids.get(&pipe_id).into_iter().flatten() {
-                let entry = inherited_allow_alphas.entry(child_id.clone()).or_default();
-                let initial_len = entry.len();
-                for alpha in &parent_allowed {
-                    if !entry.contains(alpha) {
-                        entry.push(alpha.clone());
-                    }
-                }
-                if entry.len() != initial_len {
-                    changed = true;
-                }
-            }
-
-            for downstream_id in downstream_pipe_ids.get(&pipe_id).into_iter().flatten() {
-                let entry = inherited_allow_alphas
-                    .entry(downstream_id.clone())
-                    .or_default();
-                let initial_len = entry.len();
-                for alpha in &parent_allowed {
-                    if !entry.contains(alpha) {
-                        entry.push(alpha.clone());
-                    }
-                }
-                if entry.len() != initial_len {
-                    changed = true;
+            if from.node_type == NodeType::Pipe && to.node_type == NodeType::Pipe {
+                if conn.to.port == "insights_pipes" {
+                    pipe_children
+                        .entry(to.id.as_str())
+                        .or_default()
+                        .push(format!("pipe_{}", from.id.replace("-", "_")));
+                    is_child_pipe.insert(from.id.as_str());
+                    // Construction goes child -> parent; alpha scope goes parent -> child.
+                    scope_successors
+                        .entry(to.id.as_str())
+                        .or_default()
+                        .push(from.id.as_str());
+                } else {
+                    scope_successors
+                        .entry(from.id.as_str())
+                        .or_default()
+                        .push(to.id.as_str());
                 }
             }
         }
     }
+    let inherited_allow_alphas = inherit_alpha_scopes(direct_allow_alphas, &scope_successors);
 
-    for node_id in &sorted {
-        let node = reachable_nodes.iter().find(|n| n.id == *node_id).unwrap();
-
+    for node in sorted {
         if let Some(registration) = indicators::registration(node)? {
             indicator_registrations.push(registration);
             continue;
@@ -220,7 +161,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                 let struct_name = to_pascal_case(&node.label);
                 // Attach the allowed_alphas constraint if this pipe was mapped
                 let allowed_alphas_constraint =
-                    if let Some(alphas) = inherited_allow_alphas.get(&node.id) {
+                    if let Some(alphas) = inherited_allow_alphas.get(node.id.as_str()) {
                         let mut alpha_strings = Vec::new();
                         for a in alphas {
                             alpha_strings.push(format!("\"{}\".to_string()", a));
@@ -247,7 +188,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                 if let Some(ref src) = node.source_file {
                     let child_var_name = format!("pipe_{}", node.id.replace("-", "_"));
                     let mut final_args = args_str.clone();
-                    if let Some(children) = pipe_children.get(&node.id) {
+                    if let Some(children) = pipe_children.get(node.id.as_str()) {
                         if final_args.is_empty() {
                             final_args = format!("vec![{}]", children.join(", "));
                         } else {
@@ -298,7 +239,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                         "        let {} = {};\n",
                         child_var_name, builder_expr
                     ));
-                    if !is_child_pipe.contains(&node.id) {
+                    if !is_child_pipe.contains(node.id.as_str()) {
                         ordered_pipes.push(format!("        ctx.add_pipe({});\n", child_var_name));
                     }
                 }
@@ -357,10 +298,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
                 }
             }
             NodeType::Trigger => {
-                let is_on_start_event = reachable_connections
-                    .iter()
-                    .any(|conn| conn.to.node_id == node.id && conn.to.port == "on_start");
-                if is_on_start_event {
+                if on_start_nodes.contains(node.id.as_str()) {
                     event_registrations.push(event_registration_from_node(node));
                 }
             }
@@ -765,3 +703,7 @@ pub fn generate_main_rs(meta: &StrategyMeta) -> Result<String, String> {
 #[cfg(test)]
 #[path = "codegen/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codegen/optimization_tests.rs"]
+mod optimization_tests;

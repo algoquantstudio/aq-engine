@@ -134,14 +134,16 @@ where
             ));
         }
         let context = self.broker.insight_context();
-        let restored = rebuild_insights(recovery, context)?;
+        let mut restored = rebuild_insights(recovery, context)?;
         for (id, cursor) in restored.pipeline {
+            restored.collection.track_pipeline_continuation(id, true);
             if let Err(error) = self
                 .insight_pipeline
                 .restore_execution_checkpoint(id, cursor)
             {
                 self.insight_pipeline.deferred.clear();
                 self.insight_pipeline.snapshot_dependencies = Default::default();
+                self.insight_pipeline.command_dependencies = Default::default();
                 let empty = FxHashSet::default();
                 for pipes in self.insight_pipeline.pipeline.values_mut() {
                     for pipe in pipes {

@@ -254,6 +254,7 @@ impl<
         self.insight_work = Default::default();
         self.insight_pipeline.deferred.clear();
         self.insight_pipeline.snapshot_dependencies = Default::default();
+        self.insight_pipeline.command_dependencies = Default::default();
         let empty = Default::default();
         for pipes in self.insight_pipeline.pipeline.values_mut() {
             for pipe in pipes {

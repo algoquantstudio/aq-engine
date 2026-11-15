@@ -34,6 +34,14 @@ pub trait Indicator: Send + Sync {
     /// Returns the names of columns this indicator will output/append to the DataFrame.
     fn output_columns(&self) -> Vec<String>;
 
+    /// Borrow the current output layout when the implementation stores its names.
+    /// The runtime reads this on every batch; replacements and dynamic layouts are
+    /// never inferred from an indicator's identity. Custom implementations can keep
+    /// the default and their existing `output_columns` behavior.
+    fn borrowed_output_columns(&self) -> Option<&[String]> {
+        None
+    }
+
     /// The number of previous data points needed to compute the current value.
     fn window_size(&self) -> usize;
 

@@ -37,6 +37,8 @@ mod aqs_connection;
 mod aqs_ops;
 mod aqs_reader;
 mod aqs_types;
+mod bar_history_layout;
+mod command_dependencies;
 pub mod command_driver;
 mod execution_persistence;
 mod execution_recovery;
@@ -61,6 +63,7 @@ mod metrics_continuity_lookup;
 mod order_reducer;
 mod pipeline_sweep;
 mod snapshot_dependencies;
+mod runtime_snapshot;
 use order_reducer::{OrderEvidenceSource, OrderReduction};
 mod types;
 use types::HyperparameterSelection;
@@ -188,6 +191,7 @@ where
     // Indicators
     pub indicators: HashMap<String, Box<dyn Indicator>>,
     indicator_order: Vec<String>,
+    bar_history_layout: bar_history_layout::BarHistoryLayout,
 
     // Risk Management Parameters
     warm_up_bars: i32,
@@ -204,6 +208,7 @@ where
     default_live_auth: Option<AqsAuth>,
     hosted_sync: Option<crate::core::live_sync::HostedSyncConfig>,
     runtime_telemetry: RuntimeTelemetry,
+    runtime_snapshot_cache: runtime_snapshot::RuntimeSnapshotCache,
     artifact_root: Option<PathBuf>,
     backtest_result_dir: Option<PathBuf>,
     last_backtest_result_path: Option<PathBuf>,
@@ -402,6 +407,7 @@ where
             execution_quotes: Default::default(),
             indicators: HashMap::new(),
             indicator_order: Vec::new(),
+            bar_history_layout: Default::default(),
             warm_up_bars: 0,
             warm_up_progress: HashMap::new(),
             execution_risk: 0.02,
@@ -416,6 +422,7 @@ where
             default_live_auth: AqsAuth::from_process_args(),
             hosted_sync: None,
             runtime_telemetry: RuntimeTelemetry::default(),
+            runtime_snapshot_cache: Default::default(),
             artifact_root: None,
             backtest_result_dir: None,
             last_backtest_result_path: None,
@@ -1021,31 +1028,11 @@ where
             .collect()
     }
 
-    fn runtime_insight_counts(&self) -> HashMap<String, usize> {
-        self.insights
-            .get_state_count()
-            .into_iter()
-            .map(|(state, count)| (format!("{:?}", state), count))
-            .collect()
-    }
-
     fn runtime_active_insights(&self) -> Vec<RuntimeInsightSnapshot> {
-        // Bound expensive detail/history cloning, not just the final displayed vector.
-        let mut candidates = self
-            .insights
-            .active_insight_ids_unsorted()
+        // Public insight fields have no reliable revision. Read them each time,
+        // but bound selection storage and expensive detail/history cloning.
+        runtime_snapshot::top_active_insights(&self.insights)
             .into_iter()
-            .filter_map(|id| self.insights.get(&id))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then(left.insight_id.cmp(&right.insight_id))
-        });
-        candidates
-            .into_iter()
-            .take(crate::core::tui::INSIGHT_PREVIEW_LIMIT)
             .map(|insight| RuntimeInsightSnapshot {
                 insight_id: insight.insight_id.to_string(),
                 parent_id: insight.parent_id.map(|id| id.to_string()),
@@ -1149,11 +1136,14 @@ where
         let strategy_id = self.strategy_id.to_string();
         let status = self.status.to_string();
         let current_time = Some(self.broker.get_current_time());
-        let mut universe = self.universe.keys().cloned().collect::<Vec<_>>();
-        universe.sort();
-        let variables = self.runtime_variable_snapshot();
-        let insight_counts = self.runtime_insight_counts();
-        let active_insights = self.runtime_active_insights();
+        // Metrics/progress/control/events remain current even with no UI. Hosted
+        // exports read their dedicated metrics/capture sources, not this preview.
+        let details = self.runtime_telemetry.has_snapshot_consumers();
+        let variables = details.then(|| self.runtime_variable_snapshot());
+        let insight_counts = self
+            .runtime_snapshot_cache
+            .counts(self.insights.lifetime_state_counts());
+        let active_insights = details.then(|| self.runtime_active_insights());
         let metrics = self.runtime_live_metrics();
         let backtest_progress = self.runtime_backtest_progress();
         let broker_status = if self.broker.is_broker_connected() {
@@ -1169,16 +1159,15 @@ where
         }
         .to_string();
         let aqs_sync_status = aqs_sync_status.into();
-        let mut provider_capabilities =
-            crate::core::broker::traits::Broker::get_features(&self.broker)
-                .iter()
-                .map(|feature| format!("Broker: {feature:?}"))
-                .collect::<Vec<_>>();
-        provider_capabilities.extend(
-            crate::core::broker::traits::DataFeed::get_features(&self.broker)
-                .iter()
-                .map(|feature| format!("Feed: {feature:?}")),
-        );
+        let provider_capabilities = if details {
+            self.runtime_snapshot_cache.capabilities(
+                crate::core::broker::traits::Broker::get_features(&self.broker),
+                crate::core::broker::traits::DataFeed::get_features(&self.broker),
+            )
+        } else {
+            None
+        };
+        let universe = &self.universe;
 
         self.runtime_telemetry.update_snapshot(|snapshot| {
             snapshot.mode = mode;
@@ -1186,10 +1175,22 @@ where
             snapshot.strategy_id = strategy_id;
             snapshot.status = status;
             snapshot.current_time = current_time;
-            snapshot.universe = universe;
-            snapshot.variables = variables;
-            snapshot.insight_counts = insight_counts;
-            snapshot.active_insights = active_insights;
+            if details
+                && (snapshot.universe.len() != universe.len()
+                    || snapshot.universe.iter().any(|symbol| !universe.contains_key(symbol)))
+            {
+                snapshot.universe = universe.keys().cloned().collect();
+                snapshot.universe.sort();
+            }
+            if let Some(variables) = variables {
+                snapshot.variables = variables;
+            }
+            if let Some(insight_counts) = insight_counts {
+                snapshot.insight_counts = insight_counts;
+            }
+            if let Some(active_insights) = active_insights {
+                snapshot.active_insights = active_insights;
+            }
             if metrics.is_some() {
                 snapshot.metrics = metrics;
             }
@@ -1197,7 +1198,9 @@ where
             snapshot.aqs_sync_status = aqs_sync_status;
             snapshot.broker_status = broker_status;
             snapshot.datafeed_status = datafeed_status;
-            snapshot.provider_capabilities = provider_capabilities;
+            if let Some(provider_capabilities) = provider_capabilities {
+                snapshot.provider_capabilities = provider_capabilities;
+            }
             if saved_result_path.is_some() {
                 snapshot.saved_result_path = saved_result_path;
             }
@@ -1438,17 +1441,13 @@ where
             let bar_df_res = self.broker.data.format_on_bar(bar.clone());
 
             if let Ok(mut bar_df) = bar_df_res {
-                let appended_rows = bar_df.height();
                 // Materialize every declared output, including multi-output MACD/bands/profile.
                 // Built-ins update bounded, per-history-key state once per incoming batch.
-                for name in &self.indicator_order {
-                    if let Some(indicator) = self.indicators.get(name) {
-                        for output in indicator.output_columns() {
-                            let null_series = Series::full_null(output.into(), appended_rows, &DataType::Float64);
-                            let _ = bar_df.with_column(null_series.into());
-                        }
-                    }
-                }
+                self.bar_history_layout.materialize_outputs(
+                    &self.indicators,
+                    &self.indicator_order,
+                    &mut bar_df,
+                );
                 let current_time = self.broker.get_current_time();
                 for name in &self.indicator_order {
                     let Some(indicator) = self.indicators.get_mut(name) else { continue; };
@@ -1463,8 +1462,7 @@ where
                 } else {
                     // Registration/dependency order can differ from physical backfill order.
                     // Align by name; Polars vstack requires identical physical column order.
-                    let appended = bar_df.select(history_df.get_column_names().into_iter().map(|s| s.as_str()))
-                        .and_then(|aligned| history_df.vstack_mut(&aligned).map(|_| ()));
+                    let appended = self.bar_history_layout.append(history_df, &bar_df);
                     if let Err(error) = appended {
                         warn!("Cannot append indicator history for {}: {}", history_key, error);
                         self.event_context_stack.pop();
@@ -1474,6 +1472,7 @@ where
                 if history_df.height() > max_history_rows {
                     *history_df = history_df.tail(Some(max_history_rows));
                 }
+                self.bar_history_layout.compact_history_chunks(history_df);
             }
         }
 
@@ -1586,6 +1585,25 @@ where
         selected: Option<Vec<Uuid>>,
         budget: Option<std::time::Duration>,
     ) -> (Option<Uuid>, usize) {
+        self.run_insight_pipeline_turn(selected, budget, false)
+    }
+
+    fn run_insight_pipeline_turn(
+        &mut self,
+        selected: Option<Vec<Uuid>>,
+        budget: Option<std::time::Duration>,
+        allow_shutdown: bool,
+    ) -> (Option<Uuid>, usize) {
+        self.run_insight_pipeline_turn_with_capacity_recheck(selected, budget, allow_shutdown, false)
+    }
+
+    fn run_insight_pipeline_turn_with_capacity_recheck(
+        &mut self,
+        selected: Option<Vec<Uuid>>,
+        budget: Option<std::time::Duration>,
+        allow_shutdown: bool,
+        recheck_capacity: bool,
+    ) -> (Option<Uuid>, usize) {
         let started = std::time::Instant::now();
         let mut last_processed = None;
         let mut processed = 0;
@@ -1611,6 +1629,7 @@ where
                 .collect::<Vec<_>>();
             for id in stale {
                 pipeline.forget_continuation(&id);
+                self.insights.track_pipeline_continuation(id, false);
                 self.insights.mark_execution_dirty(id);
             }
             for pipes in pipeline.pipeline.values_mut() {
@@ -1622,7 +1641,7 @@ where
 
         for id in insight_ids {
             if budget.is_some_and(|budget| processed > 0 && started.elapsed() >= budget)
-                || (budget.is_some()
+                || (budget.is_some() && !allow_shutdown
                     && (*self.shutdown_tx.borrow() || self.runtime_telemetry.shutdown_requested()))
             {
                 break;
@@ -1635,6 +1654,7 @@ where
                 .is_some_and(|row| !row.state.is_inactive())
             {
                 if pipeline.forget_continuation(&id) {
+                    self.insights.track_pipeline_continuation(id, false);
                     self.insights.mark_execution_dirty(id);
                 }
                 continue;
@@ -1645,8 +1665,36 @@ where
                     .is_some_and(|row| row.state != resume.state)
             }) {
                 if pipeline.forget_continuation(&id) {
+                    self.insights.track_pipeline_continuation(id, false);
                     self.insights.mark_execution_dirty(id);
                 }
+            }
+            // A ready batch can contain many capacity waiters although only one
+            // slot was released. Earlier IDs may consume that slot. Retain the
+            // dependency instead of rebuilding commands that cannot be admitted.
+            // This ID still consumes a page slot; durable retirement advances
+            // the driver revision and wakes its retained capacity route again.
+            // State changes/inactive rows were handled above, and shutdown or
+            // explicit cleanup must still be allowed to consume broker evidence.
+            if recheck_capacity
+                && !*self.shutdown_tx.borrow()
+                && !self.runtime_telemetry.shutdown_requested()
+                && self
+                    .insights
+                    .get(&id)
+                    .is_some_and(|row| !row.closing && !row.cancelling)
+                && pipeline.deferred.get(&id).is_some_and(|resume| {
+                    matches!(
+                        resume.dependency,
+                        crate::core::pipeline::InsightPipeDeferral::BrokerQueueCapacity
+                    )
+                })
+                && self
+                    .command_driver
+                    .as_ref()
+                    .is_some_and(|driver| !driver.has_admission_capacity())
+            {
+                continue;
             }
             let before_continuation = pipeline.execution_checkpoint(&id);
             let mut insight = match self.insights.take_for_update(&id) {
@@ -1813,6 +1861,11 @@ where
                 id,
                 pipeline.deferred.get(&id).map(|resume| &resume.dependency),
             );
+            pipeline.command_dependencies.update(
+                id,
+                pipeline.deferred.get(&id).map(|resume| &resume.dependency),
+            );
+            self.insights.track_pipeline_continuation(id, pipeline.deferred.contains_key(&id));
             self.schedule_insight_children(id);
         }
 
@@ -2344,11 +2397,17 @@ where
     S: Strategy,
     D: DataFeed + DataProvider,
 {
-    async fn finalize_backtest_results(&mut self, results: &BacktestResults) -> Option<String> {
+    async fn finalize_backtest_results(
+        &mut self,
+        analysis: &crate::core::broker::backtest_state::PreparedBacktestAnalysis<'_>,
+        summary_lines: &[String],
+    ) -> Option<String> {
         info!("═══════════════════ Backtest Results ═══════════════════");
         let terminal_output_suspended = crate::core::tui::terminal_output_suspended();
         if !terminal_output_suspended {
-            results.print_metrics();
+            for line in summary_lines {
+                println!("{line}");
+            }
         }
         info!("Insights generated: {}", self.insights.len());
         info!("Insights: {:#?}", self.insights.get_state_count());
@@ -2367,7 +2426,7 @@ where
         let state = backtest_state.read();
         let persistence_started = std::time::Instant::now();
         info!("Persisting backtest artifacts to {}", out_dir.display());
-        if let Err(error) = results.save_to_disk_async(&out_dir, &*state).await {
+        if let Err(error) = analysis.save_to_disk_async(&out_dir, &*state).await {
             error!("Failed to save results to disk: {}", error);
             if !terminal_output_suspended {
                 eprintln!("Failed to save results to disk: {}", error);
@@ -2691,10 +2750,14 @@ where
 
         // ── 9. Results ──
         let results = self.broker.get_results();
-        let saved_result_path = self.finalize_backtest_results(&results).await;
+        let analysis = results.prepare_analysis();
+        let mut summary_lines = analysis.metric_summary_lines();
+        let saved_result_path = self
+            .finalize_backtest_results(&analysis, &summary_lines)
+            .await;
+        drop(analysis);
         self.status = StrategyStatus::Completed;
         let open_insights_count = self.insights.active_insight_ids_unsorted().len();
-        let mut summary_lines = results.metric_summary_lines();
         summary_lines.push(format!("Insights generated: {}", self.insights.len()));
         summary_lines.extend(
             format!("Insights: {:#?}", self.insights.get_state_count())

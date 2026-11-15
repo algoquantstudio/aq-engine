@@ -3,6 +3,8 @@ use crate::core::broker::types::{AccountType, OrderSide, TradeRecordType};
 use crate::core::insight::snapshot::InsightLegsSnapshot;
 use chrono::TimeZone;
 
+include!("bulk_tests.rs");
+
 fn test_account(equity: f64) -> Account {
     Account {
         account_id: "test".to_string(),
@@ -134,6 +136,113 @@ fn old_trade_log_rows_default_parent_child_fields() {
     assert_eq!(row.parent_id, None);
     assert!(!row.is_child);
     assert_eq!(row.base_strategy_type, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_artifact_indexes_parent_frontiers_and_preserves_family_rows_on_rewrite() {
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let fixture = Fixture(std::env::temp_dir().join(format!(
+        "aqe-backtest-parent-index-{}",
+        uuid::Uuid::new_v4()
+    )));
+    let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let end = start + chrono::Duration::days(1);
+    let mut state = BacktestState::new();
+    for (id, parent) in [
+        ("root", None),
+        ("child", Some("root")),
+        ("grandchild", Some("child")),
+        ("unrelated", None),
+        ("unrelated-child", Some("unrelated")),
+    ] {
+        state.insight_snapshots.insert(
+            id.to_owned(),
+            test_snapshot(id, parent, "ParentIndexRegression"),
+        );
+    }
+    let results = BacktestResults {
+        starting_cash: 10_000.0,
+        final_equity: 10_000.0,
+        total_return_pct: 0.0,
+        total_trades: 0,
+        winning_trades: 0,
+        losing_trades: 0,
+        win_rate: 0.0,
+        max_drawdown: 0.0,
+        trade_log: Vec::new(),
+        account_history: vec![
+            (start, test_account(10_000.0)),
+            (end, test_account(10_000.0)),
+        ],
+        executed_at: start,
+        finished_at: end,
+        backtest_start: Some(start),
+        backtest_end: Some(end),
+    };
+
+    // Exercise the public artifact writer, including index recreation on a
+    // second save of this disposable fixture. Never open a historical result.
+    for _ in 0..2 {
+        write_backtest_db(&fixture.0, &results, &state).await.unwrap();
+        let conn = connect_database(&fixture.0).await.unwrap();
+        let mut columns = conn
+            .query("PRAGMA index_info('idx_insights_parent_id')", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            columns
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(2)
+                .unwrap(),
+            "parent_id"
+        );
+        assert!(columns.next().await.unwrap().is_none());
+        drop(columns);
+
+        // This matches the Inspector's batched breadth-frontier access pattern.
+        let query = "SELECT insight_id, parent_id FROM insights WHERE parent_id IN (?1, ?2) ORDER BY insight_id LIMIT 129";
+        let mut plan_rows = conn
+            .query(
+                format!("EXPLAIN QUERY PLAN {query}"),
+                params!["root", "child"],
+            )
+            .await
+            .unwrap();
+        let mut plan = String::new();
+        while let Some(row) = plan_rows.next().await.unwrap() {
+            plan.push_str(&row.get::<String>(3).unwrap());
+            plan.push('\n');
+        }
+        assert!(plan.contains("idx_insights_parent_id"), "{plan}");
+        assert!(!plan.contains("SCAN insights"), "{plan}");
+        drop(plan_rows);
+
+        let mut rows = conn.query(query, params!["root", "child"]).await.unwrap();
+        let mut family = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            family.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
+        assert_eq!(
+            family,
+            vec![
+                ("child".into(), "root".into()),
+                ("grandchild".into(), "child".into())
+            ]
+        );
+        drop(rows);
+        let mut count = conn.query("SELECT COUNT(*) FROM insights", ()).await.unwrap();
+        assert_eq!(count.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 5);
+        drop(count);
+        drop(conn);
+    }
 }
 
 

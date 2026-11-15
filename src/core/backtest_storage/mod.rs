@@ -7,6 +7,8 @@ use polars::prelude::*;
 use turso::{Builder, Connection, Value, params, transaction::Transaction};
 
 mod types;
+mod insert_batch;
+use insert_batch::InsertBatch;
 
 use crate::core::broker::backtest_state::BacktestState;
 use crate::core::broker::backtest_state::{BacktestResults, RoundTripTrade};
@@ -315,6 +317,7 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
     ),
     ("idx_round_trips_insight_id", "round_trips(insight_id)"),
     ("idx_account_history_event_at", "account_history(event_at)"),
+    ("idx_insights_parent_id", "insights(parent_id)"),
     (
         "idx_insights_symbol_created_at",
         "insights(symbol, created_at)",
@@ -479,7 +482,7 @@ struct TradeRowMetadata {
 fn trade_row_metadata(
     insight_id: Option<&str>,
     strategy_type: Option<&str>,
-    insight_lookup: &HashMap<String, &InsightSnapshot>,
+    insight_lookup: &HashMap<&str, &InsightSnapshot>,
 ) -> TradeRowMetadata {
     let insight = insight_id.and_then(|id| insight_lookup.get(id).copied());
     let effective_strategy_type = strategy_type
@@ -501,16 +504,16 @@ fn trade_row_metadata(
     }
 }
 
-fn build_trade_log_rows(
+fn build_trade_log_rows<'a>(
     trade_events: &[TradeRecord],
-    insights: &[InsightSnapshot],
+    insights: impl IntoIterator<Item = &'a InsightSnapshot>,
 ) -> Vec<BacktestTradeLogRow> {
     let mut rows = Vec::new();
     let mut entry_remaining_by_order: std::collections::HashMap<String, (TradeRecord, f64)> =
         std::collections::HashMap::new();
-    let insight_lookup: HashMap<String, &InsightSnapshot> = insights
-        .iter()
-        .map(|insight| (insight.insight_id.clone(), insight))
+    let insight_lookup: HashMap<&str, &InsightSnapshot> = insights
+        .into_iter()
+        .map(|insight| (insight.insight_id.as_str(), insight))
         .collect();
 
     for trade in trade_events {
@@ -662,75 +665,81 @@ fn build_trade_log_rows(
     rows
 }
 
-async fn insert_trade_log_rows(
+const TRADE_LOG_ROWS_INSERT: &str = "INSERT INTO trade_log_rows (symbol, side, strategy_type, parent_id, is_child, base_strategy_type, entry_time, exit_time, insight_id, qty, entry_price, exit_price, return_pct, pnl, commission, swap, status)
+             VALUES";
+
+fn row_insert_values(row: BacktestTradeLogRow) -> Result<Vec<Value>, String> {
+    params![
+        row.symbol,
+        row.side,
+        row.strategy_type,
+        row.parent_id,
+        if row.is_child { 1_i64 } else { 0_i64 },
+        row.base_strategy_type,
+        row.entry_time,
+        row.exit_time,
+        row.insight_id,
+        row.qty,
+        row.entry_price,
+        row.exit_price,
+        row.return_pct,
+        row.pnl,
+        row.commission.unwrap_or(0.0),
+        row.swap.unwrap_or(0.0),
+        row.status
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(to_storage_err)
+}
+
+async fn insert_trade_log_rows<'a>(
     tx: &Transaction<'_>,
     trade_events: &[TradeRecord],
-    insights: &[InsightSnapshot],
+    insights: impl IntoIterator<Item = &'a InsightSnapshot>,
 ) -> Result<(), String> {
     let rows = build_trade_log_rows(trade_events, insights);
-    let mut stmt = tx
-        .prepare(
-            "INSERT INTO trade_log_rows (symbol, side, strategy_type, parent_id, is_child, base_strategy_type, entry_time, exit_time, insight_id, qty, entry_price, exit_price, return_pct, pnl, commission, swap, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-        )
-        .await
-        .map_err(to_storage_err)?;
+    let mut batch = InsertBatch::new(TRADE_LOG_ROWS_INSERT, 17);
     for row in rows {
-        stmt.execute(params![
-            row.symbol.clone(),
-            row.side.clone(),
-            row.strategy_type.clone(),
-            row.parent_id.clone(),
-            if row.is_child { 1_i64 } else { 0_i64 },
-            row.base_strategy_type.clone(),
-            row.entry_time.clone(),
-            row.exit_time.clone(),
-            row.insight_id.clone(),
-            row.qty,
-            row.entry_price,
-            row.exit_price,
-            row.return_pct,
-            row.pnl,
-            row.commission.unwrap_or(0.0),
-            row.swap.unwrap_or(0.0),
-            row.status.clone()
-        ])
-        .await
-        .map_err(to_storage_err)?;
+        let row = row_insert_values(row)?;
+        batch.push(tx, row).await?;
     }
-    Ok(())
+    batch.flush(tx).await
+}
+
+const ROUND_TRIPS_INSERT: &str = "INSERT INTO round_trips (order_id, symbol, side, insight_id, strategy_type, entry_time, exit_time, entry_price, exit_price, qty, pnl, commission, swap, return_pct, hold_secs)
+             VALUES";
+
+fn trip_insert_values(trip: &RoundTripTrade) -> Result<Vec<Value>, String> {
+    params![
+        trip.order_id.clone(),
+        trip.symbol.clone(),
+        format!("{:?}", trip.side),
+        trip.insight_id.clone(),
+        trip.strategy_type.clone(),
+        trip.entry_time.to_rfc3339(),
+        trip.exit_time.to_rfc3339(),
+        trip.entry_price,
+        trip.exit_price,
+        trip.qty,
+        trip.pnl,
+        trip.commission,
+        trip.swap,
+        trip.return_pct,
+        trip.hold_secs
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(to_storage_err)
 }
 
 async fn insert_round_trips(tx: &Transaction<'_>, trips: &[RoundTripTrade]) -> Result<(), String> {
-    let mut stmt = tx
-        .prepare(
-            "INSERT INTO round_trips (order_id, symbol, side, insight_id, strategy_type, entry_time, exit_time, entry_price, exit_price, qty, pnl, commission, swap, return_pct, hold_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        )
-        .await
-        .map_err(to_storage_err)?;
+    let mut batch = InsertBatch::new(ROUND_TRIPS_INSERT, 15);
     for trip in trips {
-        stmt.execute(params![
-            trip.order_id.clone(),
-            trip.symbol.clone(),
-            format!("{:?}", trip.side),
-            trip.insight_id.clone(),
-            trip.strategy_type.clone(),
-            trip.entry_time.to_rfc3339(),
-            trip.exit_time.to_rfc3339(),
-            trip.entry_price,
-            trip.exit_price,
-            trip.qty,
-            trip.pnl,
-            trip.commission,
-            trip.swap,
-            trip.return_pct,
-            trip.hold_secs
-        ])
-        .await
-        .map_err(to_storage_err)?;
+        let row = trip_insert_values(trip)?;
+        batch.push(tx, row).await?;
     }
-    Ok(())
+    batch.flush(tx).await
 }
 
 async fn insert_account_history(
@@ -766,67 +775,73 @@ async fn insert_account_history(
     .await
 }
 
-async fn insert_insights(tx: &Transaction<'_>, insights: &[InsightSnapshot]) -> Result<(), String> {
-    let mut stmt = tx
-        .prepare(
-            "INSERT OR REPLACE INTO insights (insight_id, parent_id, is_split_insight, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json, entry_filled_quantity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
-        )
-        .await
-        .map_err(to_storage_err)?;
+const INSIGHTS_INSERT: &str = "INSERT OR REPLACE INTO insights (insight_id, parent_id, is_split_insight, order_id, side, symbol, quantity, contracts, order_type, order_class, limit_price, stop_price, take_profit_levels_json, stop_loss_levels_json, trailing_stop_price, strategy_type, confidence, timeframe_json, period_unfilled, period_till_tp, execution_depends_json, filled_price, close_order_id, close_price, broker_realized_pnl, commission, swap, partial_closes_json, state, created_at, updated_at, filled_at, closed_at, legs_json, market_changed, submitted, cancelling, closing, first_on_fill, partial_filled_quantity, state_history_json, entry_filled_quantity)
+             VALUES";
+
+fn insight_insert_values(insight: &InsightSnapshot) -> Result<Vec<Value>, String> {
+    params![
+        insight.insight_id.clone(),
+        insight.parent_id.clone(),
+        if insight.is_split_insight {
+            1_i64
+        } else {
+            0_i64
+        },
+        insight.order_id.clone(),
+        insight.side.clone(),
+        insight.symbol.clone(),
+        insight.quantity,
+        insight.contracts,
+        insight.order_type.clone(),
+        insight.order_class.clone(),
+        insight.limit_price,
+        insight.stop_price,
+        serde_json::to_string(&insight.take_profit_levels).map_err(to_storage_err)?,
+        serde_json::to_string(&insight.stop_loss_levels).map_err(to_storage_err)?,
+        insight.trailing_stop_price,
+        insight.strategy_type.clone(),
+        insight.confidence as i64,
+        serde_json::to_string(&insight.timeframe).map_err(to_storage_err)?,
+        insight.period_unfilled.map(|value| value as i64),
+        insight.period_till_tp.map(|value| value as i64),
+        serde_json::to_string(&insight.execution_depends).map_err(to_storage_err)?,
+        insight.filled_price,
+        insight.close_order_id.clone(),
+        insight.close_price,
+        insight.broker_realized_pnl,
+        insight.commission,
+        insight.swap,
+        serde_json::to_string(&insight.partial_closes).map_err(to_storage_err)?,
+        insight.state.clone(),
+        insight.created_at.to_rfc3339(),
+        insight.updated_at.to_rfc3339(),
+        insight.filled_at.map(|value| value.to_rfc3339()),
+        insight.closed_at.map(|value| value.to_rfc3339()),
+        serde_json::to_string(&insight.legs).map_err(to_storage_err)?,
+        if insight.market_changed { 1_i64 } else { 0_i64 },
+        if insight.submitted { 1_i64 } else { 0_i64 },
+        if insight.cancelling { 1_i64 } else { 0_i64 },
+        if insight.closing { 1_i64 } else { 0_i64 },
+        if insight.first_on_fill { 1_i64 } else { 0_i64 },
+        insight.partial_filled_quantity,
+        serde_json::to_string(&insight.state_history).map_err(to_storage_err)?,
+        insight.entry_filled_quantity,
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(to_storage_err)
+}
+
+async fn insert_insights<'a>(
+    tx: &Transaction<'_>,
+    insights: impl IntoIterator<Item = &'a InsightSnapshot>,
+) -> Result<(), String> {
+    let mut batch = InsertBatch::new(INSIGHTS_INSERT, 42);
     for insight in insights {
-        stmt.execute(params![
-            insight.insight_id.clone(),
-            insight.parent_id.clone(),
-            if insight.is_split_insight {
-                1_i64
-            } else {
-                0_i64
-            },
-            insight.order_id.clone(),
-            insight.side.clone(),
-            insight.symbol.clone(),
-            insight.quantity,
-            insight.contracts,
-            insight.order_type.clone(),
-            insight.order_class.clone(),
-            insight.limit_price,
-            insight.stop_price,
-            serde_json::to_string(&insight.take_profit_levels).map_err(to_storage_err)?,
-            serde_json::to_string(&insight.stop_loss_levels).map_err(to_storage_err)?,
-            insight.trailing_stop_price,
-            insight.strategy_type.clone(),
-            insight.confidence as i64,
-            serde_json::to_string(&insight.timeframe).map_err(to_storage_err)?,
-            insight.period_unfilled.map(|value| value as i64),
-            insight.period_till_tp.map(|value| value as i64),
-            serde_json::to_string(&insight.execution_depends).map_err(to_storage_err)?,
-            insight.filled_price,
-            insight.close_order_id.clone(),
-            insight.close_price,
-            insight.broker_realized_pnl,
-            insight.commission,
-            insight.swap,
-            serde_json::to_string(&insight.partial_closes).map_err(to_storage_err)?,
-            insight.state.clone(),
-            insight.created_at.to_rfc3339(),
-            insight.updated_at.to_rfc3339(),
-            insight.filled_at.map(|value| value.to_rfc3339()),
-            insight.closed_at.map(|value| value.to_rfc3339()),
-            serde_json::to_string(&insight.legs).map_err(to_storage_err)?,
-            if insight.market_changed { 1_i64 } else { 0_i64 },
-            if insight.submitted { 1_i64 } else { 0_i64 },
-            if insight.cancelling { 1_i64 } else { 0_i64 },
-            if insight.closing { 1_i64 } else { 0_i64 },
-            if insight.first_on_fill { 1_i64 } else { 0_i64 },
-            insight.partial_filled_quantity,
-            serde_json::to_string(&insight.state_history).map_err(to_storage_err)?,
-            insight.entry_filled_quantity,
-        ])
-        .await
-        .map_err(to_storage_err)?;
+        let row = insight_insert_values(insight)?;
+        batch.push(tx, row).await?;
     }
-    Ok(())
+    batch.flush(tx).await
 }
 
 async fn insert_bars(tx: &Transaction<'_>, state: &BacktestState) -> Result<(), String> {
@@ -2832,20 +2847,28 @@ pub async fn write_backtest_db(
     results: &BacktestResults,
     state: &BacktestState,
 ) -> Result<(), String> {
+    let round_trips = results.round_trip_trades();
+    write_prepared_backtest_db(dir_path, results, state, &round_trips).await
+}
+
+pub(crate) async fn write_prepared_backtest_db(
+    dir_path: &Path,
+    results: &BacktestResults,
+    state: &BacktestState,
+    round_trips: &[RoundTripTrade],
+) -> Result<(), String> {
     std::fs::create_dir_all(dir_path).map_err(to_storage_err)?;
     let mut conn = connect_database(dir_path).await?;
     init_schema(&conn).await?;
     let tx = conn.transaction().await.map_err(to_storage_err)?;
     drop_secondary_indexes(&tx).await?;
-    let insights: Vec<InsightSnapshot> = state.insight_snapshots.values().cloned().collect();
     insert_trade_log(&tx, &results.trade_log).await?;
-    let round_trips = results.round_trip_trades();
-    insert_round_trips(&tx, &round_trips).await?;
-    insert_trade_log_rows(&tx, &results.trade_log, &insights).await?;
+    insert_round_trips(&tx, round_trips).await?;
+    insert_trade_log_rows(&tx, &results.trade_log, state.insight_snapshots.values()).await?;
     insert_account_history(&tx, &results.account_history).await?;
-    insert_insights(&tx, &insights).await?;
+    insert_insights(&tx, state.insight_snapshots.values()).await?;
     insert_bars(&tx, state).await?;
-    insert_analysis_tables(&tx, results, state, &round_trips).await?;
+    insert_analysis_tables(&tx, results, state, round_trips).await?;
     create_secondary_indexes(&tx).await?;
     tx.commit().await.map_err(to_storage_err)?;
     checkpoint_database(&conn).await?;

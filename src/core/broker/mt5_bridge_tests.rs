@@ -127,6 +127,32 @@ async fn admitted_http_json_retains_body_limits_and_decodes_values() {
 }
 
 #[actix_web::test]
+async fn admitted_http_gzip_json_enforces_decoded_budget() {
+    use actix_web::FromRequest;
+    // gzip(" ".repeat(n - 2) + "{}"), n = 32 and 4096. Fixed fixtures avoid
+    // introducing a compression dependency just for this boundary test.
+    let exact: &[u8] = &[31,139,8,0,0,0,0,0,0,19,83,80,192,7,170,107,1,18,132,31,50,32,0,0,0];
+    let oversized: &[u8] = &[31,139,8,0,0,0,0,0,0,19,237,193,1,13,0,0,12,2,160,42,246,116,118,127,143,15,72,0,0,0,128,223,186,3,244,65,182,233,0,16,0,0];
+    for (encoded, allowed) in [(exact, true), (oversized, false)] {
+        let request = actix_web::test::TestRequest::post()
+            .app_data(web::Data::new(test_bridge("private-http-token")))
+            .app_data(web::JsonConfig::default().limit(32))
+            .insert_header(("x-aqe-mt5-token", "private-http-token"))
+            .insert_header(("content-type", "application/json"))
+            .insert_header(("content-encoding", "gzip"))
+            .to_http_request();
+        // No Content-Length shortcut: exercise the decoder's expanded limit.
+        let mut payload = actix_web::dev::Payload::from(encoded.to_vec());
+        let result = AuthenticatedJson::<Value>::from_request(&request, &mut payload).await;
+        if allowed {
+            assert_eq!(result.unwrap().into_inner(), serde_json::json!({}));
+        } else {
+            assert_eq!(result.err().unwrap().as_response_error().status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+}
+
+#[actix_web::test]
 async fn unauthenticated_v2_connections_cannot_fence_the_active_ea() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

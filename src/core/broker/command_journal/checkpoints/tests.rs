@@ -82,6 +82,32 @@ async fn pending_state_and_intent_are_atomic_and_replay_does_not_reset_dispatch(
             .len(),
         1
     );
+    // Repeat the failure with warm statement programs, then retry directly:
+    // starting the next transaction must discard the failed intent/admission.
+    assert!(journal.persist_execution_batch(&conflict).await.is_err());
+    let retry = ExecutionCheckpointBatch::with_intents(
+        vec![checkpoint(&row, 2)],
+        vec![],
+        vec![ExecutionIntent {
+            command: second.clone(),
+            queued_at_us: 126,
+            admission_order: 3,
+        }],
+    )
+    .unwrap();
+    journal.persist_execution_batch(&retry).await.unwrap();
+    journal.persist_execution_batch(&retry).await.unwrap();
+    let record = journal.get(&second.id).await.unwrap().unwrap();
+    assert_eq!(record.command, second);
+    assert_eq!(record.queued_at_us, 126);
+    assert_eq!(record.state, JournalCommandState::Queued);
+    assert_eq!(
+        journal.get(&command.id).await.unwrap().unwrap().state,
+        JournalCommandState::Dispatching
+    );
+    let saved = journal.execution_checkpoint_page("", 32).await.unwrap();
+    assert_eq!(saved.rows[0].revision, 2);
+    assert_eq!(saved.rows[0].pending_mutations.len(), 2);
 }
 
 #[tokio::test]
@@ -269,7 +295,7 @@ async fn failed_second_receipt_rolls_back_prior_rows_and_applied_markers() {
         JournalCommandState::Completed
     );
     drop(journal);
-    let journal = fixture.open().await;
+    let mut journal = fixture.open().await;
     assert!(
         journal
             .execution_checkpoint_page("", 32)
@@ -279,6 +305,100 @@ async fn failed_second_receipt_rolls_back_prior_rows_and_applied_markers() {
             .is_empty()
     );
     assert_eq!(journal.recovery_page(0, 256).await.unwrap().len(), 2);
+    // Leave a failed transaction pending and enter the next checkpoint write
+    // directly. Reusing its programs must not preserve rows or applied markers.
+    assert!(journal.persist_execution_batch(&batch).await.is_err());
+    let retry =
+        ExecutionCheckpointBatch::new(vec![checkpoint(&first, 1)], vec![good.clone()]).unwrap();
+    journal.persist_execution_batch(&retry).await.unwrap();
+    journal.persist_execution_batch(&retry).await.unwrap();
+    assert_eq!(
+        journal.get(&good.id).await.unwrap().unwrap().state,
+        JournalCommandState::Applied
+    );
+    assert_eq!(
+        journal.get(&ambiguous.id).await.unwrap().unwrap().state,
+        JournalCommandState::Completed
+    );
+    drop(journal);
+    let journal = fixture.open().await;
+    let page = journal.execution_checkpoint_page("", 32).await.unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].insight_id, first.insight_id);
+    assert_eq!(journal.recovery_page(0, 256).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn checkpoint_statement_reuse_keeps_row_bindings_and_recovery_metadata_separate() {
+    use super::super::recovery::InsightRecoveryMetadata;
+
+    let fixture = Fixture::new();
+    let mut journal = fixture.open().await;
+    let mut first = insight();
+    first.order_id = Some("first-ticket".into());
+    let mut second = insight();
+    second.symbol = "BTCUSD".into();
+    let initial = vec![
+        InsightExecutionCheckpoint::capture(&first, 1, true, None),
+        InsightExecutionCheckpoint::capture(&second, 1, false, None),
+    ];
+    first.order_id = None;
+    first.symbol = "ETHUSDT".into();
+    second.order_id = Some("second-ticket".into());
+    // Reverse row order and nullable/materialized values on the cached UPSERTs.
+    let updated = vec![
+        InsightExecutionCheckpoint::capture(&second, 2, true, None),
+        InsightExecutionCheckpoint::capture(&first, 2, false, None),
+    ];
+    for expected in [initial, updated] {
+        let batch = ExecutionCheckpointBatch::new(expected.clone(), vec![]).unwrap();
+        journal.persist_execution_batch(&batch).await.unwrap();
+        journal.persist_execution_batch(&batch).await.unwrap();
+        for checkpoint in expected {
+            let mut rows = journal
+                .connection
+                .query(
+                    "SELECT c.revision,c.checkpoint_json,c.execution_epoch,c.order_id,c.symbol,c.materialized,
+                        g.revision,g.recovery_seed,g.metadata_json
+                     FROM broker_insight_checkpoints c JOIN broker_execution_graph g USING(insight_id)
+                     WHERE c.insight_id=?1",
+                    params![checkpoint.insight_id.to_string()],
+                )
+                .await
+                .unwrap();
+            let saved = rows.next().await.unwrap().unwrap();
+            assert_eq!(saved.get::<i64>(0).unwrap(), checkpoint.revision as i64);
+            assert_eq!(
+                saved.get::<String>(1).unwrap(),
+                serde_json::to_string(&checkpoint).unwrap()
+            );
+            let expected_epoch =
+                if checkpoint.insight_id == second.insight_id && checkpoint.revision == 1 {
+                    0
+                } else {
+                    journal.lifecycle.epoch as i64
+                };
+            assert_eq!(saved.get::<i64>(2).unwrap(), expected_epoch);
+            assert_eq!(saved.get::<Option<String>>(3).unwrap(), checkpoint.order_id);
+            assert_eq!(saved.get::<String>(4).unwrap(), checkpoint.symbol);
+            assert_eq!(
+                saved.get::<i64>(5).unwrap(),
+                i64::from(checkpoint.materialized)
+            );
+            let metadata = InsightRecoveryMetadata::from_row(&checkpoint);
+            assert_eq!(saved.get::<i64>(6).unwrap(), metadata.revision as i64);
+            assert_eq!(
+                saved.get::<i64>(7).unwrap(),
+                i64::from(metadata.recovery_seed)
+            );
+            assert_eq!(
+                serde_json::from_str::<InsightRecoveryMetadata>(&saved.get::<String>(8).unwrap())
+                    .unwrap(),
+                metadata
+            );
+            assert!(rows.next().await.unwrap().is_none());
+        }
+    }
 }
 
 #[tokio::test]

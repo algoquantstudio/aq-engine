@@ -1,6 +1,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod backtest_state;
+mod bar_frame;
 pub mod account_cash_flow;
 pub mod command_journal;
 pub mod command_worker;
@@ -1074,7 +1075,7 @@ pub mod traits {
     };
     use crate::core::utils::timeframe::TimeFrame;
     use chrono::DateTime;
-    use polars::prelude::{Column, DataFrame};
+    use polars::prelude::DataFrame;
     use std::sync::Arc;
 
     #[async_trait::async_trait]
@@ -1513,31 +1514,7 @@ pub mod traits {
                     Ok(df)
                 }
                 BarData::Bars(bars) => {
-                    // Default: convert Vec<Bar> into a DataFrame
-                    let symbols: Vec<&str> = bars.iter().map(|b| b.symbol.as_str()).collect();
-                    let opens: Vec<f64> = bars.iter().map(|b| b.open).collect();
-                    let highs: Vec<f64> = bars.iter().map(|b| b.high).collect();
-                    let lows: Vec<f64> = bars.iter().map(|b| b.low).collect();
-                    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-                    let volumes: Vec<f64> = bars.iter().map(|b| b.volume).collect();
-                    let timestamps: Vec<i64> = bars
-                        .iter()
-                        .map(|b| b.timestamp.timestamp_millis())
-                        .collect();
-
-                    DataFrame::new(
-                        bars.len(),
-                        vec![
-                            Column::new("symbol".into(), &symbols),
-                            Column::new("open".into(), &opens),
-                            Column::new("high".into(), &highs),
-                            Column::new("low".into(), &lows),
-                            Column::new("close".into(), &closes),
-                            Column::new("volume".into(), &volumes),
-                            Column::new("timestamp".into(), &timestamps),
-                        ],
-                    )
-                    .map_err(|e| e.to_string())
+                    super::bar_frame::from_bars(&bars).map_err(|e| e.to_string())
                 }
             }
         }

@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 mod execution;
 mod valuation;
+mod symbol_routes;
+use symbol_routes::{ActiveRoutes, PendingOrders, PositionTotals, SymbolOrders};
 
 fn is_terminal_leg_status(status: &TradeUpdateEvent) -> bool {
     matches!(
@@ -77,8 +79,13 @@ pub struct PaperBroker {
     /// Per-symbol, per-order positions: symbol → { order_id → Position }
     positions: Arc<DashMap<String, DashMap<String, Position>>>,
 
-    pending_orders: Arc<Mutex<VecDeque<String>>>,
-    active_orders: Arc<DashMap<String, String>>, // order_id → order_id (bracket legs being tracked)
+    pending_orders: Arc<Mutex<PendingOrders>>,
+    active_orders: Arc<DashMap<String, String>>, // order ID -> symbol; canonical iteration order
+    active_routes: Arc<Mutex<ActiveRoutes>>,
+    position_totals: Arc<Mutex<std::collections::BTreeMap<String, PositionTotals>>>,
+    valuation_dirty_symbols: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    work_counts: Arc<symbol_routes::WorkCounts>,
     terminal_orders_pending_release: Arc<Mutex<VecDeque<String>>>,
 
     // Queues for deferred processing within a step
@@ -129,8 +136,13 @@ impl PaperBroker {
             })),
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
-            pending_orders: Arc::new(Mutex::new(VecDeque::new())),
+            pending_orders: Arc::new(Mutex::new(PendingOrders::default())),
             active_orders: Arc::new(DashMap::new()),
+            active_routes: Arc::new(Mutex::new(ActiveRoutes::default())),
+            position_totals: Arc::new(Mutex::new(Default::default())),
+            valuation_dirty_symbols: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            work_counts: Arc::new(Default::default()),
             terminal_orders_pending_release: Arc::new(Mutex::new(VecDeque::new())),
             update_orders_queue: Arc::new(Mutex::new(VecDeque::new())),
             close_orders_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -240,18 +252,15 @@ impl PaperBroker {
         now_ts: u64,
     ) {
         let mut pending = self.pending_orders.lock();
-        let mut remaining = VecDeque::new();
-
-        while let Some(order_id) = pending.pop_front() {
-            if let Some(mut order) = self.orders.get_mut(&order_id) {
+        let visited = pending.retain_for_symbols(bars.keys(), |order_id| {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 // Skip cancelled orders
                 if order.status == TradeUpdateEvent::Cancelled {
-                    continue;
+                    return false;
                 }
 
                 let Some(bar) = bars.get(&order.asset.symbol) else {
-                    remaining.push_back(order_id);
-                    continue;
+                    return true;
                 };
 
                 let fill_result = self.try_fill_order(&order, bar);
@@ -267,8 +276,8 @@ impl PaperBroker {
                         order.rejection_reason = Some(reason);
                         order.updated_at = now_ts;
                         self.emit_trade_event(&order, TradeUpdateEvent::Rejected);
-                        self.mark_order_terminal_for_release(&order_id);
-                        continue;
+                        self.mark_order_terminal_for_release(order_id);
+                        return false;
                     }
 
                     // Fill the order
@@ -301,16 +310,21 @@ impl PaperBroker {
 
                     // Move to active (for bracket leg tracking) or closed
                     if order.legs.is_some() {
-                        self.active_orders
-                            .insert(order_id.clone(), order_id.clone());
+                        self.add_active_order(order_id, &order.asset.symbol);
                     }
-                } else {
-                    remaining.push_back(order_id);
+                    return false;
                 }
+                true
+            } else {
+                false
             }
-        }
-
-        *pending = remaining;
+        });
+        #[cfg(test)]
+        self.work_counts
+            .pending
+            .fetch_add(visited, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = visited;
     }
 
     /// Try to fill an order against a bar. Returns the fill price if filled.
@@ -440,6 +454,38 @@ impl PaperBroker {
 
     // ─────────────────────── Active Orders (Bracket Legs) ───────────────────────
 
+    fn add_active_order(&self, id: &str, symbol: &str) {
+        let mut routes = self.active_routes.lock();
+        self.active_orders.insert(id.to_owned(), symbol.to_owned());
+        routes.dirty = true;
+    }
+
+    fn remove_active_order(&self, id: &str) {
+        let mut routes = self.active_routes.lock();
+        if self.active_orders.remove(id).is_some() {
+            routes.orders.remove(id);
+            routes.dirty = true;
+        }
+    }
+
+    fn active_orders_for_bars(&self, bars: &HashMap<String, Bar>) -> Vec<(u64, Arc<str>)> {
+        let mut routes = self.active_routes.lock();
+        if routes.dirty {
+            // Hash-map iteration is not FIFO. Retain its canonical order so
+            // simultaneous closes keep their existing cash/buying-power order.
+            // Rebuild only on membership changes, never on a steady sparse bar.
+            let mut orders = SymbolOrders::default();
+            for (ordinal, entry) in self.active_orders.iter().enumerate() {
+                #[cfg(test)]
+                self.work_counts.active_reindex.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                orders.insert_at(entry.value(), entry.key().clone().into(), ordinal as u64);
+            }
+            routes.orders = orders;
+            routes.dirty = false;
+        }
+        routes.orders.select(bars.keys())
+    }
+
     /// Check active orders' bracket legs (TP/SL) against the current bar.
     fn process_active_orders(
         &self,
@@ -449,10 +495,12 @@ impl PaperBroker {
     ) {
         let mut to_remove = Vec::new();
 
-        for entry in self.active_orders.iter() {
-            let order_id = entry.key();
+        let selected = self.active_orders_for_bars(bars);
+        #[cfg(test)]
+        self.work_counts.active.fetch_add(selected.len(), std::sync::atomic::Ordering::Relaxed);
+        for (_, order_id) in &selected {
 
-            if let Some(mut order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id.as_ref()) {
                 let Some(bar) = bars.get(&order.asset.symbol) else {
                     continue;
                 };
@@ -565,12 +613,12 @@ impl PaperBroker {
         }
 
         for id in to_remove {
-            if let Some(mut order) = self.orders.get_mut(&id) {
+            if let Some(mut order) = self.orders.get_mut(id.as_ref()) {
                 order.status = TradeUpdateEvent::Closed;
                 order.qty = 0.0;
                 self.cancel_remaining_legs(&mut order);
             }
-            self.active_orders.remove(&id);
+            self.remove_active_order(&id);
         }
     }
 
@@ -608,6 +656,8 @@ impl PaperBroker {
         };
 
         symbol_positions.insert(order_id.clone(), position);
+        // Entries are opened only for a symbol in process_step's current bars.
+        // Its final balance update visits that symbol once for the whole batch.
 
         // Deduct from buying power
         let cost = fill_price * order.filled_qty;
@@ -745,6 +795,10 @@ impl PaperBroker {
                 self.positions.remove(symbol);
                 self.valuation_mark_times.remove(symbol);
             }
+            let mut dirty = self.valuation_dirty_symbols.lock();
+            if !dirty.contains(symbol) {
+                dirty.insert(symbol.clone());
+            }
             return Some(fully_closed);
         }
         None
@@ -754,22 +808,30 @@ impl PaperBroker {
 
     /// Update account equity and unrealized P&L based on current prices.
     fn update_account_balance(&self, bars: &HashMap<String, Bar>) {
-        let mut total_unrealized_pnl = 0.0;
-        let mut total_margin_held = 0.0;
         let mut mae_updates = Vec::new();
         let observed_at = *self.current_time.read();
 
-        for entry in self.positions.iter() {
-            let bar = bars.get(entry.key());
+        let mut symbols = std::mem::take(&mut *self.valuation_dirty_symbols.lock());
+        symbols.extend(bars.keys().cloned());
+        let mut totals = self.position_totals.lock();
+        for symbol in symbols {
+            let Some(positions) = self.positions.get(&symbol) else {
+                totals.remove(&symbol);
+                continue;
+            };
+            let bar = bars.get(&symbol);
             if let Some(bar) = bar {
                 if bar.close.is_finite() && bar.timestamp <= observed_at {
                     self.valuation_mark_times
-                        .insert(entry.key().clone(), bar.timestamp.timestamp_micros());
+                        .insert(symbol.clone(), bar.timestamp.timestamp_micros());
                 } else {
-                    self.valuation_mark_times.remove(entry.key());
+                    self.valuation_mark_times.remove(&symbol);
                 }
             }
-            for mut pos in entry.value().iter_mut() {
+            let mut symbol_total = PositionTotals::default();
+            for mut pos in positions.iter_mut() {
+                #[cfg(test)]
+                self.work_counts.positions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(bar) = bar {
                     pos.current_price = bar.close;
                     pos.market_value = bar.close * pos.qty;
@@ -795,10 +857,17 @@ impl PaperBroker {
                 }
                 // A sparse live update for one symbol must not drop the open
                 // P&L of every other symbol from account equity.
-                total_unrealized_pnl += pos.unrealized_pnl;
-                total_margin_held += pos.margin_required.unwrap_or(pos.cost_basis);
+                symbol_total.pnl += pos.unrealized_pnl;
+                symbol_total.margin += pos.margin_required.unwrap_or(pos.cost_basis);
             }
+            totals.insert(symbol, symbol_total);
         }
+
+        // Re-sum cached symbol subtotals instead of accumulating deltas: this
+        // avoids drift across repeated sparse marks and retains untouched P&L.
+        let total_unrealized_pnl: f64 = totals.values().map(|value| value.pnl).sum();
+        let total_margin_held: f64 = totals.values().map(|value| value.margin).sum();
+        drop(totals);
 
         if !mae_updates.is_empty()
             && let Some(ref state) = self.backtest_state
@@ -922,7 +991,7 @@ impl PaperBroker {
                     }
 
                     if terminal_close {
-                        self.active_orders.remove(&order_id);
+                        self.remove_active_order(&order_id);
                     }
                 }
             }
@@ -1139,7 +1208,7 @@ impl PaperBroker {
 
         {
             let mut pending_orders = self.pending_orders.lock();
-            pending_orders.retain(|order_id| !release_set.contains(order_id));
+            pending_orders.remove_many(&release_set);
         }
         {
             let mut close_queue = self.close_orders_queue.lock();
@@ -1151,7 +1220,7 @@ impl PaperBroker {
         }
 
         for order_id in release_ids {
-            self.active_orders.remove(&order_id);
+            self.remove_active_order(&order_id);
             self.orders.remove(&order_id);
         }
     }
@@ -1597,26 +1666,24 @@ impl OrderManagementProvider for PaperBroker {
             }
         }
 
-        match self.orders.entry(order_id.clone()) {
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(order);
+        // Use the same pending -> orders lock order as processing. Publishing
+        // canonical storage and its queue membership together also lets us move
+        // the existing ID into the FIFO and borrow the order's symbol directly.
+        let created_order = {
+            let mut pending = self.pending_orders.lock();
+            match self.orders.entry(order_id.clone()) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    pending.insert(&order.asset.symbol, order_id);
+                    entry.insert(order).clone()
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    return Err(BrokerError::OrderError(
+                        "Client order identity already exists; reconcile instead of resubmitting"
+                            .into(),
+                    ));
+                }
             }
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(BrokerError::OrderError(
-                    "Client order identity already exists; reconcile instead of resubmitting"
-                        .into(),
-                ));
-            }
-        }
-        self.pending_orders.lock().push_back(order_id.clone());
-
-        let created_order =
-            self.orders
-                .get(&order_id)
-                .map(|o| o.clone())
-                .ok_or(BrokerError::OrderError(
-                    "Failed to retrieve created order".into(),
-                ))?;
+        };
 
         // Emit PendingNew trade event
         self.emit_trade_event(&created_order, TradeUpdateEvent::PendingNew);
@@ -2050,3 +2117,6 @@ impl OrderManagementProvider for PaperBroker {
 
 #[cfg(test)]
 mod submission_identity_tests;
+
+#[cfg(test)]
+mod symbol_routing_tests;

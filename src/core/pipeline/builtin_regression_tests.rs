@@ -103,6 +103,40 @@ fn builtin_market_entry_does_not_replace_stop_entry() {
 }
 
 #[test]
+fn builtin_market_entry_reads_each_current_close_and_preserves_both_messages() {
+    let mut ctx = fractional_context();
+    let mut pipe = market_order_entry::MarketOrderEntryPipe::new();
+
+    for price in [100.125, 84_065.0823, 1.0] {
+        let mut insight = sample_insight();
+        insight.set_limit_price(None);
+        let history_len = insight.state_history.len();
+        ctx.history
+            .insert("BTCUSD".into(), df!("close" => [100.0, price]).unwrap());
+
+        let result = pipe.run(&mut ctx, &mut insight);
+
+        assert!(result.success && result.passed);
+        assert_eq!(result.pipe_name, "MarketOrderEntryPipe");
+        assert_eq!(result.message, Some(format!("Limit price set to close: {price}")));
+        assert_eq!(insight.limit_price, Some(price));
+        assert_eq!(insight.state_history.len(), history_len + 2);
+        assert_eq!(
+            insight.state_history[history_len].2.as_deref(),
+            Some("Order type set to Limit"),
+        );
+        assert_eq!(
+            insight.state_history.last().unwrap().2,
+            Some(format!("Limit price set to {price}")),
+        );
+        assert_eq!(
+            insight.state_history_kinds.last(),
+            Some(&crate::core::insight::InsightHistoryKind::Diagnostic),
+        );
+    }
+}
+
+#[test]
 fn builtin_market_entry_rejects_non_finite_close() {
     let mut ctx = fractional_context();
     let mut insight = sample_insight();

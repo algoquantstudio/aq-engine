@@ -192,6 +192,91 @@ async fn staged_admission_order_survives_out_of_order_checkpoint_commits() {
 }
 
 #[tokio::test]
+async fn full_dispatch_lane_is_not_ready_and_does_not_retry_command_serialization() {
+    let fixture = Fixture::new();
+    let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+    let mut driver = fixture.driver(broker.clone(), BrokerCommandWorkerConfig {
+        entry_capacity: 1,
+        completion_capacity: 4,
+        ..Default::default()
+    }).await;
+    let first = driver.enqueue_command(entry()).unwrap();
+    let second = driver.enqueue_command(entry()).unwrap();
+    let rows = vec![checkpoint(&driver, &first), checkpoint(&driver, &second)];
+    commit_rows(&mut driver, rows).await;
+    // No await in this section: on the current-thread runtime, the worker cannot
+    // consume the one queued command until all repeated readiness checks finish.
+    assert_eq!(driver.dispatch_prepared(1).unwrap(), 1);
+    for _ in 0..256 {
+        assert!(!driver.has_ready_events());
+        assert_eq!(driver.dispatch_prepared(256).unwrap(), 0);
+        assert!(driver.drain_ready(256, Duration::from_millis(5)).unwrap().is_empty());
+    }
+    assert_eq!(driver.prepared_dispatch_attempts, 1);
+    assert!(!driver.pending[&second.id].dispatch_queued);
+    complete(&mut driver, &first).await;
+    complete(&mut driver, &second).await;
+    assert_eq!(driver.prepared_dispatch_attempts, 2);
+    assert_eq!(broker.get_orders().await.unwrap().len(), 2);
+    drop(driver.stop().await.unwrap());
+}
+
+#[tokio::test]
+async fn full_control_lane_keeps_control_priority_without_retrying_entries() {
+    let fixture = Fixture::new();
+    let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+    let mut driver = fixture.driver(broker, BrokerCommandWorkerConfig {
+        entry_capacity: 1,
+        control_capacity: 1,
+        completion_capacity: 4,
+        ..Default::default()
+    }).await;
+    let entry = driver.enqueue_command(entry()).unwrap();
+    let first = driver.enqueue(&uuid::Uuid::new_v4().to_string(), BrokerCommandAction::Cancel {
+        order_id: "missing-first".into(),
+    }, None).unwrap();
+    let second = driver.enqueue(&uuid::Uuid::new_v4().to_string(), BrokerCommandAction::Cancel {
+        order_id: "missing-second".into(),
+    }, None).unwrap();
+    let rows = vec![checkpoint(&driver, &entry), checkpoint(&driver, &first), checkpoint(&driver, &second)];
+    commit_rows(&mut driver, rows).await;
+    assert_eq!(driver.dispatch_prepared(1).unwrap(), 1);
+    assert!(driver.pending[&first.id].dispatch_queued);
+    assert!(!driver.pending[&entry.id].dispatch_queued);
+    for _ in 0..128 {
+        assert!(!driver.has_ready_events());
+        assert_eq!(driver.dispatch_prepared(256).unwrap(), 0);
+    }
+    assert_eq!(driver.prepared_dispatch_attempts, 1);
+    assert!(!driver.pending[&second.id].dispatch_queued);
+    assert!(!driver.pending[&entry.id].dispatch_queued);
+    complete(&mut driver, &first).await;
+    complete(&mut driver, &second).await;
+    complete(&mut driver, &entry).await;
+    drop(driver.stop().await.unwrap());
+}
+
+#[tokio::test]
+async fn closed_dispatch_lane_remains_error_ready() {
+    let fixture = Fixture::new();
+    let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+    let mut driver = fixture.driver(broker, Default::default()).await;
+    let receipt = driver.enqueue_command(entry()).unwrap();
+    let row = checkpoint(&driver, &receipt);
+    commit_rows(&mut driver, vec![row]).await;
+    driver.worker.events.close();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !driver.is_worker_finished() {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(driver.has_ready_events());
+    assert_eq!(driver.dispatch_prepared(1).unwrap_err(), BrokerCommandError::Closed);
+    assert!(!driver.pending[&receipt.id].dispatch_queued);
+    drop(driver.stop().await.unwrap());
+}
+
+#[tokio::test]
 async fn staged_child_waits_for_durable_ancestor_chain() {
     let fixture = Fixture::new();
     let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
@@ -533,6 +618,104 @@ async fn acknowledge(driver: &mut StrategyCommandDriver, receipt: &BrokerCommand
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn command_group_index_tracks_completion_versions_and_durable_retirement() {
+    let fixture = Fixture::new();
+    let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+    let mut driver = fixture.driver(broker, Default::default()).await;
+    let group = BrokerOperationGroup {
+        id: "batch".into(),
+        version: 1,
+    };
+    let newer = BrokerOperationGroup {
+        id: "batch".into(),
+        version: 2,
+    };
+    let make = |group: &BrokerOperationGroup| {
+        let command = entry();
+        BrokerCommand::new(
+            "strategy",
+            "account",
+            &command.insight_id,
+            command.action,
+            Some(group.clone()),
+        )
+    };
+    let command = make(&group);
+    let a = driver.enqueue_command(command.clone()).unwrap();
+    assert_eq!(driver.enqueue_command(command).unwrap(), a);
+    let b = driver.enqueue_command(make(&group)).unwrap();
+    let c = driver.enqueue_command(make(&newer)).unwrap();
+    assert_eq!(
+        driver.operation_groups[&(group.id.clone(), group.version)],
+        (2, 2)
+    );
+    assert!(!driver.operation_group_ready(&group));
+    complete(&mut driver, &a).await;
+    assert!(!driver.operation_group_ready(&group));
+    assert_eq!(
+        driver.operation_groups[&(group.id.clone(), group.version)],
+        (2, 1)
+    );
+    complete(&mut driver, &b).await;
+    assert!(driver.operation_group_ready(&group));
+    assert!(!driver.operation_group_ready(&newer));
+    acknowledge(&mut driver, &a).await;
+    assert!(driver.operation_group_ready(&group));
+    acknowledge(&mut driver, &b).await;
+    assert!(!driver.operation_group_ready(&group));
+    assert_eq!(driver.operation_groups.len(), 1);
+    complete(&mut driver, &c).await;
+    assert!(driver.operation_group_ready(&newer));
+    acknowledge(&mut driver, &c).await;
+    assert!(driver.operation_groups.is_empty());
+    drop(driver.stop().await.unwrap());
+}
+
+#[tokio::test]
+async fn command_group_index_rebuilds_recovered_completion_ownership() {
+    let fixture = Fixture::new();
+    let broker = Arc::new(PaperBroker::new(AccountType::Paper, 100_000.0, 1));
+    let mut driver = fixture.driver(broker.clone(), Default::default()).await;
+    let group = BrokerOperationGroup {
+        id: "recovered".into(),
+        version: 4,
+    };
+    let command = entry();
+    let receipt = driver
+        .enqueue_command(BrokerCommand::new(
+            "strategy",
+            "account",
+            &command.insight_id,
+            command.action,
+            Some(group.clone()),
+        ))
+        .unwrap();
+    complete(&mut driver, &receipt).await;
+    assert!(driver.operation_group_ready(&group));
+    drop(driver.stop().await.unwrap());
+    let (mut recovered, _) = StrategyCommandDriver::start_recovering(
+        broker,
+        fixture.path(),
+        "strategy",
+        "account",
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered.operation_groups[&(group.id.clone(), group.version)],
+        (1, 1)
+    );
+    assert!(!recovered.operation_group_ready(&group));
+    recovered.finish_recovery();
+    complete(&mut recovered, &receipt).await;
+    assert!(recovered.operation_group_ready(&group));
+    acknowledge(&mut recovered, &receipt).await;
+    assert!(recovered.operation_groups.is_empty());
+    drop(recovered.stop().await.unwrap());
 }
 
 #[tokio::test]

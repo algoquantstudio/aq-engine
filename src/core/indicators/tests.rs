@@ -464,6 +464,108 @@ fn chunked_frames_and_repeated_runs_preserve_schema_and_do_not_look_ahead() {
     }
 }
 
+fn assert_input_layout_parity(frames: &[DataFrame]) {
+    for index in 0..12 {
+        let mut indicator = builtin(index);
+        let names = indicator.output_columns();
+        let mut expected = frames[0].clone();
+        indicator.run(&mut expected).unwrap();
+        let expected_latest = indicator.run_bar(&frames[0]).unwrap();
+        for frame in &frames[1..] {
+            let mut actual = frame.clone();
+            indicator.run(&mut actual).unwrap();
+            let latest = indicator.run_bar(frame).unwrap();
+            for name in &names {
+                let bits = |frame: &DataFrame| {
+                    values(frame, name)
+                        .into_iter()
+                        .map(|value| value.map(f64::to_bits))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&actual), bits(&expected), "indicator {index}: {name}");
+                assert_eq!(
+                    latest.get(name).copied().map(f64::to_bits),
+                    expected_latest.get(name).copied().map(f64::to_bits),
+                    "latest indicator {index}: {name}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dense_sliced_buffers_match_nullable_and_chunked_inputs_exactly() {
+    let nullable = fixture(131, true);
+    let mut dense = nullable.clone();
+    for name in ["open", "high", "low", "close", "volume"] {
+        let input = nullable
+            .column(name)
+            .unwrap()
+            .cast(&DataType::Float64)
+            .unwrap();
+        let values = input
+            .f64()
+            .unwrap()
+            .iter()
+            .map(|value| value.unwrap_or(f64::NAN))
+            .collect::<Vec<_>>();
+        dense.with_column(Column::new(name.into(), values)).unwrap();
+    }
+    // Both physical representations mean missing input to every kernel. Keep a
+    // nonzero Arrow slice offset and chunk boundary in the compared frames.
+    let dense = dense.slice(3, 119);
+    let nullable = nullable.slice(3, 119);
+    let mut chunked = dense.head(Some(43));
+    chunked.vstack_mut(&dense.slice(43, 76)).unwrap();
+    assert!(
+        dense
+            .column("close")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .cont_slice()
+            .is_ok()
+    );
+    assert!(nullable.column("close").unwrap().null_count() > 0);
+    assert!(
+        chunked
+            .column("close")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .chunks()
+            .len()
+            > 1
+    );
+    assert_input_layout_parity(&[dense, nullable, chunked]);
+}
+
+#[test]
+fn numeric_casts_match_float_buffers_with_and_without_nulls() {
+    for gaps in [false, true] {
+        let close: Vec<_> = (0..83i64)
+            .map(|i| (!(gaps && i % 17 == 7)).then_some(100 + (i * 7) % 19))
+            .collect();
+        let integer = df!(
+            "open" => close.iter().map(|v| v.map(|v| v - 1)).collect::<Vec<_>>(),
+            "high" => close.iter().map(|v| v.map(|v| v + 2)).collect::<Vec<_>>(),
+            "low" => close.iter().map(|v| v.map(|v| v - 2)).collect::<Vec<_>>(),
+            "close" => close,
+            "volume" => (0..83i64).map(|i| i % 11 + 1).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut float = integer.clone();
+        for column in integer.columns() {
+            float
+                .with_column(column.cast(&DataType::Float64).unwrap())
+                .unwrap();
+        }
+        let mut chunked = integer.head(Some(31));
+        chunked.vstack_mut(&integer.slice(31, 52)).unwrap();
+        assert_input_layout_parity(&[float, integer, chunked]);
+    }
+}
+
 #[test]
 fn rolling_bands_remain_accurate_for_large_prices_with_small_spread() {
     let prices: Vec<_> = (0..5000).map(|i| 1e9 + (i % 13) as f64 * 0.25).collect();

@@ -19,6 +19,7 @@ use crate::core::live_sync::CloudCaptureGate;
 #[cfg(test)]
 use super::command_journal::ExecutionCheckpointPage;
 use std::{collections::VecDeque, future::Future, sync::Arc, time::Duration};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 mod account_lane;
 mod host_account_lock;
@@ -302,6 +303,7 @@ pub struct BrokerCommandSender {
     scope: Arc<(String, String)>,
     checkpoint_capacity: Arc<tokio::sync::Semaphore>,
     evidence_capacity: Arc<tokio::sync::Semaphore>,
+    terminal: Arc<AtomicBool>,
 }
 
 impl BrokerCommandSender {
@@ -565,6 +567,18 @@ impl BrokerCommandSender {
         self.try_enqueue_inner(command, true)
     }
 
+    /// A readiness hint only: the final try_send still arbitrates sender races.
+    /// Closed lanes stay ready so the owner observes the error instead of waiting
+    /// forever. Capacity includes reservations held by other sender clones.
+    pub(crate) fn command_lane_ready(&self, action: &BrokerCommandAction) -> bool {
+        let sender = if action.is_teardown() {
+            &self.controls
+        } else {
+            &self.entries
+        };
+        self.terminal.load(Ordering::Acquire) || sender.is_closed() || sender.capacity() != 0
+    }
+
     fn try_enqueue_inner(
         &self,
         command: BrokerCommand,
@@ -673,6 +687,7 @@ impl BrokerCommandWorker {
         let (control_tx, control_rx) = mpsc::channel(config.control_capacity);
         let (event_tx, events) = mpsc::channel(config.completion_capacity);
         let ready = Arc::new(tokio::sync::Notify::new());
+        let terminal = Arc::new(AtomicBool::new(false));
         let (journal_tx, journal_rx) = mpsc::channel(config.completion_capacity);
         let phase = journal.execution_lifecycle().phase;
         let stop = Arc::new(StopFence::new(phase));
@@ -690,6 +705,7 @@ impl BrokerCommandWorker {
             scope: Arc::new((strategy_id.to_owned(), account_id.to_owned())),
             checkpoint_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
             evidence_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            terminal: Arc::clone(&terminal),
         };
         let task = tokio::spawn(run(
             executor,
@@ -702,6 +718,7 @@ impl BrokerCommandWorker {
                 events: event_tx,
                 ready: Arc::clone(&ready),
                 stop,
+                terminal,
             },
             gate,
             lane,
@@ -717,12 +734,14 @@ impl BrokerCommandWorker {
 }
 
 /// Readiness is a single coalesced permit, not a second event backlog. Publish
-/// the event before waking its owner; a notification remains observable even
-/// when it arrives between the owner's readiness check and select registration.
+/// completion evidence before its wake; released transport capacity can wake the
+/// owner independently. A notification remains observable when it arrives between
+/// the owner's readiness check and select registration.
 struct CompletionSender {
     events: mpsc::Sender<BrokerCommandWorkerEvent>,
     ready: Arc<tokio::sync::Notify>,
     stop: Arc<StopFence>,
+    terminal: Arc<AtomicBool>,
 }
 
 impl CompletionSender {
@@ -741,6 +760,10 @@ impl CompletionSender {
 
 impl Drop for CompletionSender {
     fn drop(&mut self) {
+        // Drop runs before this sender's fields and the worker's lane receivers
+        // necessarily disappear. Publish terminal readiness first so an owner
+        // cannot consume the final wake while a full lane still appears open.
+        self.terminal.store(true, Ordering::Release);
         self.ready.notify_one();
     }
 }
@@ -1048,6 +1071,9 @@ async fn run<E: CommandExecutor>(
         else {
             continue;
         };
+        // Receiving releases a transport slot before broker/journal completion.
+        // Wake capacity waiters even if this command will be parked or gated.
+        events.ready.notify_one();
         let receipt = command.receipt();
         let record = match journal.prepare(&command, queued_at_us).await {
             Ok(record) => record,

@@ -1624,6 +1624,113 @@ impl Probe {
 }
 
 #[tokio::test]
+async fn dispatch_lane_readiness_respects_shared_reservations_and_lane_isolation() {
+    let fixture = Fixture::new();
+    let mut worker = BrokerCommandWorker::start_executor(
+        Arc::new(Probe::new(false)),
+        fixture.journal().await,
+        BrokerCommandWorkerConfig { entry_capacity: 1, control_capacity: 1, ..Default::default() },
+    ).unwrap();
+    let sender = worker.sender.clone();
+    let entry_action = entry("reserved-entry").action;
+    let control_action = cancel("reserved-control").action;
+    let reserved_entry = sender.entries.clone().try_reserve_owned().unwrap();
+    for _ in 0..256 {
+        assert!(!worker.sender.command_lane_ready(&entry_action));
+        assert!(worker.sender.command_lane_ready(&control_action));
+    }
+    // The full entry lane cannot consume the independent cleanup slot.
+    let control = cancel("cleanup-with-full-entry");
+    sender.try_enqueue(control).unwrap();
+    assert!(!sender.command_lane_ready(&control_action));
+    assert_eq!(next(&mut worker).await.receipt.insight_id, "cleanup-with-full-entry");
+    assert!(!sender.command_lane_ready(&entry_action));
+    assert!(sender.command_lane_ready(&control_action));
+    drop(reserved_entry);
+    assert!(sender.command_lane_ready(&entry_action));
+    drop(finish(worker).await);
+    assert!(sender.command_lane_ready(&entry_action));
+    assert!(sender.command_lane_ready(&control_action));
+    assert_eq!(sender.try_enqueue_prepared(entry("closed-lane")).unwrap_err(), BrokerCommandError::Closed);
+}
+
+#[tokio::test]
+async fn dispatch_lane_reopening_wakes_owner_before_broker_completion() {
+    let fixture = Fixture::new();
+    let probe = Arc::new(Probe::new(true));
+    let mut worker = BrokerCommandWorker::start_executor(
+        probe.clone(),
+        fixture.journal().await,
+        BrokerCommandWorkerConfig { entry_capacity: 1, ..Default::default() },
+    ).unwrap();
+    let command = entry("dequeue-wake");
+    let action = command.action.clone();
+    worker.sender.try_enqueue(command).unwrap();
+    assert!(!worker.sender.command_lane_ready(&action));
+    tokio::time::timeout(Duration::from_secs(2), worker.ready.notified()).await.unwrap();
+    assert!(worker.sender.command_lane_ready(&action));
+    tokio::time::timeout(Duration::from_secs(2), probe.started.notified()).await.unwrap();
+    assert!(worker.events.is_empty(), "capacity notification is not completion evidence");
+    probe.release.add_permits(1);
+    assert!(matches!(next(&mut worker).await.outcome, BrokerCommandOutcome::Acknowledged));
+    drop(finish(worker).await);
+}
+
+#[tokio::test]
+async fn dispatch_lane_terminal_state_precedes_final_wake_while_receivers_remain_open() {
+    let (entries, entry_receiver) = mpsc::channel(1);
+    let (controls, control_receiver) = mpsc::channel(1);
+    let (journal_requests, _journal_receiver) = mpsc::channel(1);
+    let (events, event_receiver) = mpsc::channel(1);
+    let keep_event_sender_open = events.clone();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let terminal = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(StopFence::new(
+        super::super::command_journal::lifecycle::ExecutionPhase::Running,
+    ));
+    let sender = BrokerCommandSender {
+        entries,
+        controls,
+        journal_requests,
+        gate: Arc::new(parking_lot::Mutex::new(EntryGate::default())),
+        stop: stop.clone(),
+        scope: Arc::new(("strategy".into(), "account".into())),
+        checkpoint_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+        evidence_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+        terminal: terminal.clone(),
+    };
+    let completion = CompletionSender { events, ready: ready.clone(), stop, terminal };
+    let entry_action = entry("full-entry").action;
+    let control_action = cancel("full-control").action;
+    sender.try_enqueue(entry("full-entry")).unwrap();
+    sender.try_enqueue(cancel("full-control")).unwrap();
+    assert!(!sender.command_lane_ready(&entry_action));
+    assert!(!sender.command_lane_ready(&control_action));
+
+    // Keep both full receivers and an empty/open completion channel alive after
+    // Drop to deterministically exercise the destructor ordering window.
+    drop(completion);
+    tokio::time::timeout(Duration::from_secs(1), ready.notified()).await.unwrap();
+    assert!(event_receiver.is_empty());
+    assert!(!sender.entries.is_closed());
+    assert!(!sender.controls.is_closed());
+    assert!(sender.command_lane_ready(&entry_action));
+    assert!(sender.command_lane_ready(&control_action));
+    assert_eq!(
+        sender.try_enqueue_prepared(entry("still-full")).unwrap_err(),
+        BrokerCommandError::QueueFull,
+        "terminal readiness must not bypass authoritative channel admission"
+    );
+    drop(entry_receiver);
+    drop(control_receiver);
+    assert_eq!(
+        sender.try_enqueue_prepared(entry("now-closed")).unwrap_err(),
+        BrokerCommandError::Closed
+    );
+    drop(keep_event_sender_open);
+}
+
+#[tokio::test]
 async fn shared_account_wait_preserves_journal_stop_and_other_account_progress() {
     let first_fixture = Fixture::new();
     let second_fixture = Fixture::new();

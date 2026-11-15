@@ -827,6 +827,118 @@ fn no_op_insight_setters_do_not_append_history_entries() {
 }
 
 #[test]
+fn close_entry_messages_and_mutations_match_the_public_limit_setter() {
+    let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+    let log_time = created_at + Duration::minutes(1);
+
+    for price in [
+        f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        f64::EPSILON,
+        1.0,
+        100.0,
+        100.125,
+        84_065.0823,
+        f64::from_bits(1.0_f64.to_bits() + 1),
+        f64::MAX,
+    ] {
+        for state in [
+            InsightState::New,
+            InsightState::Executed,
+            InsightState::Filled,
+            InsightState::Closed,
+            InsightState::Cancelled,
+            InsightState::Rejected,
+        ] {
+            for previous_price in [None, Some(price)] {
+                for stop_price in [None, Some(101.0)] {
+                    let mut expected = sample_insight(created_at);
+                    expected.state = state.clone();
+                    expected.limit_price = previous_price;
+                    expected.stop_price = stop_price;
+                    expected.bind_context(InsightStrategyContext::new(move || log_time));
+                    let mut actual = expected.clone();
+
+                    expected.set_limit_price(Some(price));
+                    let confirmation = actual.set_limit_price_from_close(price);
+
+                    assert_eq!(confirmation, format!("Limit price set to close: {price}"));
+                    assert_eq!(actual.limit_price, expected.limit_price);
+                    assert_eq!(actual.stop_price, expected.stop_price);
+                    assert_eq!(actual.order_type, expected.order_type);
+                    assert_eq!(actual.order_class, expected.order_class);
+                    assert_eq!(actual.state, expected.state);
+                    assert_eq!(actual.updated_at, expected.updated_at);
+                    assert_eq!(actual.state_history, expected.state_history);
+                    assert_eq!(actual.state_history_kinds, expected.state_history_kinds);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ttl_setters_preserve_history_messages_timestamps_and_no_op_behavior() {
+    let created_at = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
+    let mut insight = sample_insight(created_at);
+
+    for (index, (period, text)) in [
+        (Some(0), "0"),
+        (Some(5), "5"),
+        (Some(u32::MAX), "4294967295"),
+        (None, "-"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let log_time = created_at + Duration::minutes(index as i64 + 1);
+        insight.bind_context(InsightStrategyContext::new(move || log_time));
+        let history_len = insight.state_history.len();
+        let kinds_len = insight.state_history_kinds.len();
+
+        insight
+            .set_period_unfilled(period)
+            .set_period_till_tp(period);
+
+        assert_eq!(insight.period_unfilled(), period);
+        assert_eq!(insight.period_till_tp(), period);
+        assert_eq!(insight.updated_at, log_time);
+        assert_eq!(insight.state, InsightState::New);
+        assert_eq!(
+            &insight.state_history[history_len..],
+            &[
+                (
+                    log_time,
+                    InsightState::New,
+                    Some(format!("Unfilled TTL set to {text}")),
+                ),
+                (
+                    log_time,
+                    InsightState::New,
+                    Some(format!("Take-profit TTL set to {text}")),
+                ),
+            ],
+        );
+        assert_eq!(
+            &insight.state_history_kinds[kinds_len..],
+            &[InsightHistoryKind::Diagnostic, InsightHistoryKind::Diagnostic],
+        );
+
+        let next_time = log_time + Duration::seconds(1);
+        insight.bind_context(InsightStrategyContext::new(move || next_time));
+        let updated_at_before_no_op = insight.updated_at;
+        let history_before_no_op = insight.state_history.clone();
+        let kinds_before_no_op = insight.state_history_kinds.clone();
+        insight
+            .set_period_unfilled(period)
+            .set_period_till_tp(period);
+        assert_eq!(insight.updated_at, updated_at_before_no_op);
+        assert_eq!(insight.state_history, history_before_no_op);
+        assert_eq!(insight.state_history_kinds, kinds_before_no_op);
+    }
+}
+
+#[test]
 fn filled_insight_cannot_be_rejected_or_cancelled() {
     let now = Utc.with_ymd_and_hms(2026, 3, 23, 10, 0, 0).unwrap();
     let mut insight = sample_insight(now);

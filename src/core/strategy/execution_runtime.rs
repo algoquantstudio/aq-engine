@@ -14,13 +14,32 @@ where
     /// The caller yields/rechecks shutdown between pages; custom pipes that remain
     /// deferred on unchanged data cannot create an immediate notification loop.
     pub(super) fn resume_snapshot_pipes(&mut self) -> bool {
+        self.snapshot_continuation_turn(256, std::time::Duration::from_millis(5))
+            .1
+    }
+
+    fn snapshot_continuation_turn(
+        &mut self,
+        limit: usize,
+        budget: std::time::Duration,
+    ) -> (usize, bool) {
         use crate::core::broker::snapshots::SnapshotKind;
         let turn = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(5);
         let mut examined = 0;
-        // Enumerate dependency topics, not every deferred broker command/insight.
-        // Cache availability is checked once per topic and again by each pipe.
-        for kind in self.insight_pipeline.snapshot_dependencies.topics() {
+        self.insight_pipeline.snapshot_dependencies.begin_topics(
+            self.broker.snapshot_revision(),
+            self.broker
+                .snapshot_dependency_revision(&SnapshotKind::Account),
+        );
+        while examined < limit.min(256) && turn.elapsed() < budget {
+            if self.runtime_telemetry.shutdown_requested() || *self.shutdown_tx.borrow() {
+                self.shutdown();
+                return (examined, false);
+            }
+            let Some(kind) = self.insight_pipeline.snapshot_dependencies.next_topic() else {
+                break;
+            };
+            examined += 1;
             let Some(revision) = self.broker.snapshot_dependency_revision(&kind) else {
                 continue;
             };
@@ -32,22 +51,32 @@ where
             if !available {
                 continue;
             }
-            while let Some(id) = self
-                .insight_pipeline
-                .snapshot_dependencies
-                .next(&kind, revision)
-            {
+            loop {
+                if examined == limit.min(256) || turn.elapsed() >= budget {
+                    self.insight_pipeline
+                        .snapshot_dependencies
+                        .requeue_topic(kind);
+                    break;
+                }
+                let Some(id) = self
+                    .insight_pipeline
+                    .snapshot_dependencies
+                    .next(&kind, revision)
+                else {
+                    break;
+                };
+                examined += 1;
                 if self.runtime_telemetry.shutdown_requested() || *self.shutdown_tx.borrow() {
                     self.shutdown();
-                    return false;
+                    return (examined, false);
                 }
-                examined += 1;
                 if !self
                     .insights
                     .get(&id)
                     .is_some_and(|row| !row.state.is_inactive())
                 {
                     if self.insight_pipeline.forget_continuation(&id) {
+                        self.insights.track_pipeline_continuation(id, false);
                         self.insights.mark_execution_dirty(id);
                     }
                 } else if let Some(resume) = self.insight_pipeline.deferred.get_mut(&id) {
@@ -64,47 +93,99 @@ where
                         );
                     }
                 }
-                if examined >= 256 || turn.elapsed() >= budget {
-                    return true;
-                }
             }
         }
-        false
+        (
+            examined,
+            self.insight_pipeline.snapshot_dependencies.has_topic_work(),
+        )
     }
 
-    /// Never replay an entire active pipeline to poll a single broker receipt.
-    /// Snapshot dependencies belong to their cache-refresh path, not to broker
-    /// completion wakes. A repeated unchanged deferral is tried once per driver
-    /// progress revision, preventing custom pipes from creating a busy loop.
-    fn ready_execution_continuations(
-        &self,
-        attempted: &HashMap<Uuid, (InsightPipeDeferral, u64)>,
+    /// Discovery and execution share one bounded turn. Each cursor step counts,
+    /// including an unchanged deferral or a state change with no continuation.
+    /// No deferred-map or attempted-map sweep sits outside the time budget.
+    fn resume_execution_continuations(&mut self, include_snapshots: bool) -> bool {
+        self.execution_continuation_turn(
+            include_snapshots,
+            256,
+            std::time::Duration::from_millis(5),
+        )
+        .1
+    }
+
+    fn execution_continuation_turn(
+        &mut self,
         include_snapshots: bool,
-    ) -> Vec<Uuid> {
+        limit: usize,
+        budget: std::time::Duration,
+    ) -> (usize, bool) {
+        let turn = std::time::Instant::now();
         let Some(driver) = &self.command_driver else {
-            return Vec::new();
+            return (0, false);
         };
         let revision = driver.progress_revision();
-        let mut ready = Vec::new();
-        for (id, resume) in &self.insight_pipeline.deferred {
-            if attempted.get(id).is_some_and(|(dependency, previous)| {
-                *previous == revision && *dependency == resume.dependency
-            }) {
+        self.insight_pipeline
+            .command_dependencies
+            .begin_revision(revision, include_snapshots);
+        let mut examined = 0;
+        let mut resumed = false;
+        // Only the deterministic backtest barrier includes snapshot waiters.
+        // Its ready page can share one pipeline setup, as it did before indexed
+        // discovery. Both modes retain a shared discovery/execution deadline;
+        // live turns still interleave them one complete insight at a time.
+        let mut backtest_ready = Vec::new();
+        let mut backtest_selected = FxHashSet::default();
+        while examined < limit.min(256) && turn.elapsed() < budget {
+            // Merge state changes with dependency cursor heads by UUID. Discovery
+            // pages preserve deterministic ordering even when no candidate is ready.
+            let candidate = self.insight_pipeline.command_dependencies.peek();
+            if self
+                .insights
+                .first_pipeline_state_change()
+                .is_some_and(|id| candidate.is_none_or(|candidate| id <= candidate))
+            {
+                let id = self
+                    .insights
+                    .pop_pipeline_state_change()
+                    .expect("observed change");
+                examined += 1;
+                self.insight_pipeline.command_dependencies.wake(id);
                 continue;
             }
+            let Some(id) = self.insight_pipeline.command_dependencies.next() else {
+                if self.insights.has_pipeline_state_changes() {
+                    continue;
+                }
+                break;
+            };
+            examined += 1;
+            if self.runtime_telemetry.shutdown_requested() || *self.shutdown_tx.borrow() {
+                self.shutdown();
+            }
+            let Some(resume) = self.insight_pipeline.deferred.get(&id) else {
+                continue;
+            };
             let state_changed = self
                 .insights
-                .get(id)
-                .is_some_and(|row| row.state != resume.state);
+                .get(&id)
+                .is_none_or(|row| row.state != resume.state);
+            if !state_changed
+                && self
+                    .insight_pipeline
+                    .command_dependencies
+                    .attempted(&id, revision)
+            {
+                continue;
+            }
+            let driver = self
+                .command_driver
+                .as_ref()
+                .expect("execution owner retained");
             let completed = match &resume.dependency {
-                InsightPipeDeferral::BrokerCommand(receipt) => {
-                    matches!(
-                        driver.progress(receipt),
-                        Some(
-                            BrokerCommandProgress::Completed(_) | BrokerCommandProgress::Failed(_)
-                        )
-                    )
-                }
+                InsightPipeDeferral::BrokerCommand(receipt) => matches!(
+                    driver.progress(receipt),
+                    Some(BrokerCommandProgress::Completed(_) | BrokerCommandProgress::Failed(_))
+                ),
                 InsightPipeDeferral::BrokerQueueCapacity => driver.has_admission_capacity(),
                 InsightPipeDeferral::BrokerOperationGroup(group) => {
                     driver.operation_group_ready(group)
@@ -120,42 +201,88 @@ where
                 }
             };
             if state_changed || completed {
-                ready.push(*id);
-                if ready.len() == 256 {
-                    break;
+                // State-change wakes, receipt cursors and a cursor's pending
+                // rerun can select the same owner before the batch executes.
+                // Duplicate selections consume discovery work but cannot replay
+                // an insight in this batch.
+                if include_snapshots && !backtest_selected.insert(id) {
+                    continue;
+                }
+                resumed = true;
+                self.insight_pipeline
+                    .command_dependencies
+                    .mark_attempted(id, revision);
+                if include_snapshots {
+                    backtest_ready.push(id);
+                } else {
+                    // Teardown must still consume broker evidence after cancellation.
+                    // A supplied budget also prevents the pipeline from hiding a
+                    // second reducer drain at the end of each selected insight.
+                    self.run_insight_pipeline_turn(
+                        Some(vec![id]),
+                        Some(budget.saturating_sub(turn.elapsed())),
+                        true,
+                    );
                 }
             }
         }
-        ready.sort_unstable();
-        ready
+        if !backtest_ready.is_empty() {
+            self.run_backtest_continuation_page(
+                backtest_ready,
+                budget.saturating_sub(turn.elapsed()),
+            );
+        }
+        (
+            examined,
+            resumed
+                || self.insight_pipeline.command_dependencies.has_work()
+                || self.insights.has_pipeline_state_changes(),
+        )
     }
 
-    pub(super) fn resume_live_command_pipes(
+    fn run_backtest_continuation_page(
         &mut self,
-        attempted: &mut HashMap<Uuid, (InsightPipeDeferral, u64)>,
-    ) -> bool {
-        attempted.retain(|id, _| self.insight_pipeline.deferred.contains_key(id));
-        let ready = self.ready_execution_continuations(attempted, false);
-        let count = ready.len();
-        let revision = self
-            .command_driver
-            .as_ref()
-            .map_or(0, |driver| driver.progress_revision());
-        let turn = std::time::Instant::now();
-        for (index, id) in ready.into_iter().enumerate() {
-            if let Some(resume) = self.insight_pipeline.deferred.get(&id) {
-                attempted.insert(id, (resume.dependency.clone(), revision));
-            }
-            self.run_insight_pipeline_selected(Some(vec![id]));
-            if turn.elapsed() >= std::time::Duration::from_millis(5) {
-                return index + 1 < count || count == 256;
-            }
+        mut ready: Vec<Uuid>,
+        budget: std::time::Duration,
+    ) -> usize {
+        let started = std::time::Instant::now();
+        // A cursor rerun may wrap to a smaller UUID during discovery. Match the
+        // established ready-batch ordering before processing or requeuing a suffix.
+        ready.sort_unstable();
+        // One shared setup avoids constructing/dropping the default six-state
+        // pipeline map for every receipt. The owner still yields at the same
+        // deadline without a hidden reducer drain. A selected suffix that did
+        // not run must remain immediately eligible at this driver revision.
+        let selected = ready.clone();
+        let (_, processed) = self.run_insight_pipeline_turn_with_capacity_recheck(
+            Some(selected),
+            Some(budget.saturating_sub(started.elapsed())),
+            true,
+            true,
+        );
+        for id in ready.into_iter().skip(processed) {
+            self.insight_pipeline
+                .command_dependencies
+                .requeue_unattempted(id);
         }
-        count == 256
+        processed
+    }
+
+    pub(super) fn has_pending_command_continuations(&self) -> bool {
+        self.command_driver.as_ref().is_some_and(|driver| {
+            self.insight_pipeline
+                .command_dependencies
+                .has_work_at_revision(driver.progress_revision())
+                || self.insights.has_pipeline_state_changes()
+        })
+    }
+
+    pub(super) fn resume_live_command_pipes(&mut self) -> bool {
+        self.resume_execution_continuations(false)
     }
 
     pub(super) async fn drain_backtest_execution(&mut self) -> Result<(), BrokerError> {
-        let mut attempted = HashMap::new();
+        self.insight_pipeline.command_dependencies.begin_barrier();
         let mut shutdown = self.shutdown_tx.subscribe();
         loop {
             if self.runtime_telemetry.shutdown_requested() || *shutdown.borrow() {
@@ -193,18 +320,7 @@ where
                 )));
             }
 
-            let ready = self.ready_execution_continuations(&attempted, true);
-            if !ready.is_empty() {
-                let revision = self
-                    .command_driver
-                    .as_ref()
-                    .map_or(0, |driver| driver.progress_revision());
-                for id in &ready {
-                    if let Some(resume) = self.insight_pipeline.deferred.get(id) {
-                        attempted.insert(*id, (resume.dependency.clone(), revision));
-                    }
-                }
-                self.run_insight_pipeline_selected(Some(ready));
+            if self.resume_execution_continuations(true) {
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -220,14 +336,11 @@ where
                 // Remaining broker deferrals without in-flight work cannot be
                 // satisfied by advancing market time. Expose a broken custom
                 // continuation instead of silently changing its execution bar.
-                if self.insight_pipeline.deferred.values().any(|resume| {
-                    matches!(
-                        resume.dependency,
-                        InsightPipeDeferral::BrokerCommand(_)
-                            | InsightPipeDeferral::BrokerQueueCapacity
-                            | InsightPipeDeferral::BrokerOperationGroup(_)
-                    )
-                }) {
+                if self
+                    .insight_pipeline
+                    .command_dependencies
+                    .has_broker_waiters()
+                {
                     return Err(BrokerError::OrderError(
                         "execution continuation made no progress after broker completion".into(),
                     ));
@@ -264,3 +377,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -228,12 +228,17 @@ impl BrokerCommandJournal {
             .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
             .await
             .map_err(journal_error)?;
+        // These nine fixed SQL statements reuse compiled programs, with fresh
+        // bindings/cursors on each prepare. The transaction and FULL-synchronous
+        // commit still cover every intent, checkpoint, and applied receipt.
         for intent in &batch.intents {
             let mut admission = tx
-                .query(
+                .prepare_cached(
                     "SELECT admission_order FROM broker_command_admission WHERE command_id=?1",
-                    params![intent.command.id.0.clone()],
                 )
+                .await
+                .map_err(journal_error)?
+                .query(params![intent.command.id.0.clone()])
                 .await
                 .map_err(journal_error)?;
             let existing = admission.next().await.map_err(journal_error)?;
@@ -244,14 +249,18 @@ impl BrokerCommandJournal {
                 drop(admission);
             } else {
                 drop(admission);
-                tx.execute("INSERT INTO broker_command_admission(command_id,admission_order) VALUES(?1,?2)",
-                    params![intent.command.id.0.clone(), intent.admission_order]).await.map_err(journal_error)?;
+                tx.prepare_cached("INSERT INTO broker_command_admission(command_id,admission_order) VALUES(?1,?2)")
+                    .await.map_err(journal_error)?
+                    .execute(params![intent.command.id.0.clone(), intent.admission_order])
+                    .await.map_err(journal_error)?;
             }
             let mut rows = tx
-                .query(
+                .prepare_cached(
                     "SELECT command_json FROM broker_commands WHERE command_id=?1",
-                    params![intent.command.id.0.clone()],
                 )
+                .await
+                .map_err(journal_error)?
+                .query(params![intent.command.id.0.clone()])
                 .await
                 .map_err(journal_error)?;
             if let Some(row) = rows.next().await.map_err(journal_error)? {
@@ -264,14 +273,16 @@ impl BrokerCommandJournal {
                 // Identical replay must never reset Dispatching/Completed/Applied.
             } else {
                 drop(rows);
-                tx.execute("INSERT INTO broker_commands(command_id,command_json,state,queued_at_us) VALUES(?1,?2,'queued',?3)",
-                    params![intent.command.id.0.clone(), intent.json.clone(), intent.queued_at_us])
+                tx.prepare_cached("INSERT INTO broker_commands(command_id,command_json,state,queued_at_us) VALUES(?1,?2,'queued',?3)")
+                    .await.map_err(journal_error)?
+                    .execute(params![intent.command.id.0.clone(), intent.json.clone(), intent.queued_at_us])
                     .await.map_err(journal_error)?;
             }
         }
         for checkpoint in &batch.rows {
-            let mut rows = tx.query("SELECT revision,checkpoint_json FROM broker_insight_checkpoints WHERE insight_id=?1",
-                params![checkpoint.id.clone()]).await.map_err(journal_error)?;
+            let mut rows = tx.prepare_cached("SELECT revision,checkpoint_json FROM broker_insight_checkpoints WHERE insight_id=?1")
+                .await.map_err(journal_error)?
+                .query(params![checkpoint.id.clone()]).await.map_err(journal_error)?;
             let existing = rows.next().await.map_err(journal_error)?;
             let (previous, unchanged) = if let Some(row) = existing {
                 let previous: i64 = row.get(0).map_err(journal_error)?;
@@ -295,20 +306,24 @@ impl BrokerCommandJournal {
             } else {
                 0
             };
-            tx.execute("INSERT INTO broker_insight_checkpoints(insight_id,revision,checkpoint_json,execution_epoch,order_id,symbol,materialized) VALUES(?1,?2,?3,?4,?5,?6,?7)
+            tx.prepare_cached("INSERT INTO broker_insight_checkpoints(insight_id,revision,checkpoint_json,execution_epoch,order_id,symbol,materialized) VALUES(?1,?2,?3,?4,?5,?6,?7)
                 ON CONFLICT(insight_id) DO UPDATE SET revision=excluded.revision,checkpoint_json=excluded.checkpoint_json,
                     order_id=excluded.order_id,symbol=excluded.symbol,materialized=excluded.materialized,
-                    execution_epoch=CASE WHEN broker_insight_checkpoints.execution_epoch>0 THEN broker_insight_checkpoints.execution_epoch ELSE excluded.execution_epoch END",
-                params![checkpoint.id.clone(), checkpoint.revision, checkpoint.json.clone(), epoch, checkpoint.order_id.clone(), checkpoint.symbol.clone(), i64::from(checkpoint.materialized)])
+                    execution_epoch=CASE WHEN broker_insight_checkpoints.execution_epoch>0 THEN broker_insight_checkpoints.execution_epoch ELSE excluded.execution_epoch END")
+                .await.map_err(journal_error)?
+                .execute(params![checkpoint.id.clone(), checkpoint.revision, checkpoint.json.clone(), epoch, checkpoint.order_id.clone(), checkpoint.symbol.clone(), i64::from(checkpoint.materialized)])
                 .await.map_err(journal_error)?;
-            tx.execute("INSERT INTO broker_execution_graph(insight_id,revision,recovery_seed,metadata_json) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(insight_id) DO UPDATE SET revision=excluded.revision,recovery_seed=excluded.recovery_seed,metadata_json=excluded.metadata_json",
-                params![checkpoint.id.clone(), checkpoint.revision, i64::from(checkpoint.recovery_seed), checkpoint.metadata_json.clone()])
+            tx.prepare_cached("INSERT INTO broker_execution_graph(insight_id,revision,recovery_seed,metadata_json) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(insight_id) DO UPDATE SET revision=excluded.revision,recovery_seed=excluded.recovery_seed,metadata_json=excluded.metadata_json")
+                .await.map_err(journal_error)?
+                .execute(params![checkpoint.id.clone(), checkpoint.revision, i64::from(checkpoint.recovery_seed), checkpoint.metadata_json.clone()])
                 .await.map_err(journal_error)?;
         }
         for receipt in &batch.applied {
-            let mut rows = tx.query("SELECT sequence,command_json,state,queued_at_us,dispatched_at_us,completion_json
-                FROM broker_commands WHERE command_id=?1", params![receipt.id.0.clone()])
+            let mut rows = tx.prepare_cached("SELECT sequence,command_json,state,queued_at_us,dispatched_at_us,completion_json
+                FROM broker_commands WHERE command_id=?1")
+                .await.map_err(journal_error)?
+                .query(params![receipt.id.0.clone()])
                 .await.map_err(journal_error)?;
             let row = rows
                 .next()
@@ -348,8 +363,9 @@ impl BrokerCommandJournal {
                     "unresolved broker command cannot be marked applied",
                 ));
             }
-            tx.execute("UPDATE broker_commands SET state='applied' WHERE command_id=?1 AND state='completed'",
-                params![receipt.id.0.clone()]).await.map_err(journal_error)?;
+            tx.prepare_cached("UPDATE broker_commands SET state='applied' WHERE command_id=?1 AND state='completed'")
+                .await.map_err(journal_error)?
+                .execute(params![receipt.id.0.clone()]).await.map_err(journal_error)?;
         }
         tx.commit().await.map_err(journal_error)
     }
