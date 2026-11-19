@@ -474,6 +474,9 @@ impl OrderManagementProvider for Mt5Broker {
             "submissionKey": correlation.key, "submissionFingerprint": correlation.fingerprint,
             "submissionAccount": correlation.account_id,
         })).await?;
+        if self.bridge.account()?.account_id.trim() != correlation.account_id {
+            return Err(BrokerError::TradeError("MT5 account changed during submission recovery".into()));
+        }
         let Some(value) = response.get("order").filter(|value| !value.is_null()) else {
             return Ok(SubmissionResolution::Unknown);
         };

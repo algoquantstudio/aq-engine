@@ -1378,6 +1378,7 @@ impl Mt5Bridge {
         order: Option<Order>,
         payload: Value,
     ) -> Result<Order, BrokerError> {
+        let expected_account = payload.get("submissionAccount").and_then(Value::as_str).map(str::to_owned);
         let response = self
             .request_rpc_with_timeout(
                 action,
@@ -1388,6 +1389,19 @@ impl Mt5Bridge {
             )
             .await?;
         let mut broker_order = deserialize_payload::<Order>(response, "MT5 order")?;
+        // The account can change while waiting for the EA. Only reduce a
+        // correlated reply for the original account and order, before touching
+        // the cache or emitting a fill.
+        if let (Some(account), Some(expected)) = (expected_account.as_deref(), order.as_ref()) {
+            if self.account()?.account_id.trim() != account
+                || broker_order.order_id.trim().is_empty()
+                || expected.insight_id != broker_order.insight_id
+                || expected.asset.symbol != broker_order.asset.symbol
+                || expected.side != broker_order.side
+            {
+                return Err(BrokerError::TradeError("MT5 submit reply identity mismatch; reconciliation required".into()));
+            }
+        }
         self.map_order_to_aqe(&mut broker_order);
         if let Some(mut local_order) = order {
             local_order.order_id = broker_order.order_id.clone();
@@ -1396,9 +1410,12 @@ impl Mt5Bridge {
             local_order.status = broker_order.status.clone();
             local_order.filled_at = broker_order.filled_at;
             local_order.rejection_reason = broker_order.rejection_reason.clone();
-            self.upsert_order(local_order.clone());
-            self.emit_order_event(local_order.clone(), local_order.status.clone());
-            Ok(local_order)
+            let reply_status = local_order.status.clone();
+            let observed = self.upsert_order(local_order);
+            if observed.status == reply_status {
+                self.emit_order_event(observed.clone(), reply_status);
+            }
+            Ok(observed)
         } else {
             self.upsert_order(broker_order.clone());
             self.emit_order_event(broker_order.clone(), broker_order.status.clone());
@@ -1433,7 +1450,7 @@ impl Mt5Bridge {
 
         loop {
             let request_id = Uuid::new_v4().to_string();
-            let (tx, rx) = oneshot::channel();
+            let (tx, mut rx) = oneshot::channel();
             self.pending_rpc.lock().insert(request_id.clone(), tx);
 
             let queued_len = {
@@ -1466,7 +1483,24 @@ impl Mt5Bridge {
                 queued_len
             );
 
-            match tokio::time::timeout(request_timeout, rx).await {
+            let ack = matches!(action, Mt5RpcAction::SubmitOrder)
+                .then(|| super::submit_ack::register(&request_id, &self.rpc_queue)).flatten();
+            let mut result = tokio::time::timeout(request_timeout, &mut rx).await;
+            if result.is_err() && let Some(window) = ack {
+                if !window.handed_off() {
+                    return Err(BrokerError::ConnectionError(format!(
+                        "MT5 submit {request_id} expired in the outgoing queue and was withdrawn"
+                    )));
+                }
+                // The worker owns the hard deadline, stop fence, and account
+                // mutation slot. Keep the exact receiver, never requeue this RPC.
+                warn!("MT5 submit {request_id} awaiting original EA reply after {request_timeout:?}");
+                result = Ok(rx.await);
+                if matches!(result, Ok(Ok(_))) {
+                    info!("Received delayed MT5 reply for submit {request_id}");
+                }
+            }
+            match result {
                 Ok(Ok(response)) if response.ok => {
                     pending_guard.dismiss();
                     return Ok(response.payload.unwrap_or(Value::Null));
@@ -1607,9 +1641,12 @@ impl Mt5Bridge {
                 );
                 order.asset = existing.asset.clone();
             }
+            if existing.status == TradeUpdateEvent::Closed && order.status == TradeUpdateEvent::Filled {
+                return existing.clone();
+            }
             if matches!(
                 existing.status,
-                TradeUpdateEvent::Filled
+                TradeUpdateEvent::PartialFilled | TradeUpdateEvent::Filled
                     | TradeUpdateEvent::Closed
                     | TradeUpdateEvent::Cancelled
                     | TradeUpdateEvent::Rejected

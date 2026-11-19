@@ -141,6 +141,19 @@ If MT5 logs `initializing of AqeMt5BridgeEA failed with code 32767`, one of the 
 
 ## Connection Health and Automatic Recovery
 
+A durable live order has two distinct deadlines. At the normal mutation
+deadline (30 seconds by default), a submit still in the outgoing queue is
+withdrawn. If the EA has already taken it, AQE holds the account's mutation
+lane for up to 180 additional seconds for that **same RPC ID**. It never sends
+the order again. A manual stop interrupts the additional wait. Market reads
+and other mutation types do not get this extension.
+
+If the order outcome still cannot be confirmed, AQE follows normal teardown
+and journal recovery. A stopped process is not evidence of a flat account.
+Check the broker's orders, positions and trade history against the retained
+execution journal before relaunching; do not clear the journal or resubmit the
+order on the strength of a timeout.
+
 AQE tracks three separate connection states so an active HTTP poll is not mistaken for a healthy trading connection:
 
 - **Transport:** an authorized EA heartbeat or RPC poll reached AQE recently.

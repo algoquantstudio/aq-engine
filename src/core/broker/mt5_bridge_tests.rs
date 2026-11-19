@@ -968,6 +968,117 @@ fn reconcile_orders_action_uses_the_expected_ea_wire_name() {
 }
 
 #[tokio::test]
+async fn submit_ack_keeps_only_the_original_delivered_rpc_across_the_bridge_timeout() {
+    let bridge = Arc::new(test_bridge("synthetic"));
+    let worker_window = super::super::submit_ack::Window::default();
+    let request = tokio::spawn({
+        let bridge = bridge.clone();
+        async move {
+            worker_window.scope(bridge.request_rpc_with_timeout(
+                Mt5RpcAction::SubmitOrder, Value::Null, Duration::from_millis(50),
+            )).await
+        }
+    });
+    bridge.rpc_queue_notify.notified().await;
+    let (mut batch, _) = bridge.drain_rpc_requests(1);
+    let id = batch.pop().unwrap().request_id;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(!request.is_finished());
+    bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id: "wrong-id".into(),
+        ok: true, message: None, payload: None });
+    assert!(bridge.pending_rpc.lock().contains_key(&id));
+    assert!(bridge.drain_rpc_requests(1).0.is_empty(), "must not resubmit");
+    bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id: id, ok: true,
+        message: None, payload: Some(serde_json::json!("original-reply")) });
+    assert_eq!(request.await.unwrap().unwrap(), "original-reply");
+    assert!(bridge.pending_rpc.lock().is_empty());
+}
+
+#[tokio::test]
+async fn submit_ack_late_mt5_success_is_journaled_once_without_reopening_a_closed_ticket() {
+    use crate::core::broker::{command_journal::BrokerCommandJournal,
+        command_worker::{BrokerCommandWorker, BrokerCommandWorkerConfig, BrokerCommandWorkerEvent},
+        commands::{BrokerCommand, BrokerCommandAction, BrokerCommandOutcome, BrokerOrderRequest},
+        mt5_broker::Mt5Broker};
+    let bridge = Arc::new(test_bridge("synthetic"));
+    let account_id = format!("test-{}", Uuid::new_v4());
+    let account = serde_json::from_value(serde_json::json!({
+        "account_id": account_id, "account_type": "Live", "equity": 10000.0,
+        "cash": 10000.0, "currency": "USD", "buying_power": 10000.0,
+        "shorting_enabled": true, "leverage": 1
+    })).unwrap();
+    bridge.apply_snapshot("test", Mt5SnapshotPayload { account: Some(account), ..Default::default() });
+    let directory = std::env::temp_dir().join(format!("aqe-ack-{}", Uuid::new_v4()));
+    let journal = BrokerCommandJournal::open(directory.join("commands.db"), "fixture", &account_id).await.unwrap();
+    let mut worker = BrokerCommandWorker::start(Arc::new(Mt5Broker::new(bridge.clone())), journal,
+        BrokerCommandWorkerConfig { mutation_timeout: Duration::from_millis(100), ..Default::default() }).unwrap();
+    let mut request = BrokerOrderRequest::from(&crate::core::insight::Insight::default());
+    request.symbol = "AAPL".into();
+    request.side = OrderSide::Buy;
+    request.quantity = Some(1.0);
+    let insight = request.insight_id.clone();
+    let command = BrokerCommand::new("fixture", &account_id, &insight, BrokerCommandAction::Submit { request }, None);
+    worker.sender.try_enqueue(command.clone()).unwrap();
+    let margin = next_test_rpc(&bridge).await;
+    assert!(matches!(margin.action, Mt5RpcAction::EstimateMargin));
+    bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id: margin.request_id, ok: true,
+        message: None, payload: Some(serde_json::json!({"margin": 10.0})) });
+    let submit = next_test_rpc(&bridge).await;
+    assert!(matches!(submit.action, Mt5RpcAction::SubmitOrder));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    bridge.upsert_order(trade_event_order("ticket", &insight, TradeUpdateEvent::Closed));
+    bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id: submit.request_id, ok: true, message: None,
+        payload: Some(serde_json::to_value(trade_event_order("ticket", &insight, TradeUpdateEvent::Filled)).unwrap()) });
+    let completion = tokio::time::timeout(Duration::from_secs(3), worker.events.recv()).await.unwrap().unwrap();
+    assert!(matches!(completion, BrokerCommandWorkerEvent::Completion(ref c)
+        if matches!(&c.outcome, BrokerCommandOutcome::OrderResponse { order } if order.status == TradeUpdateEvent::Closed)));
+    assert!(bridge.drain_rpc_requests(1).0.is_empty());
+    drop(worker.sender);
+    drop(worker.events);
+    let journal = worker.task.await.unwrap().unwrap();
+    let saved = journal.get(&command.id).await.unwrap().unwrap().completion.unwrap();
+    assert!(matches!(saved.outcome, BrokerCommandOutcome::OrderResponse { order } if order.order_id == "ticket"));
+    drop(journal);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn submit_ack_missing_through_hard_deadline_drops_the_receiver_not_a_new_order() {
+    let bridge = Arc::new(test_bridge("synthetic"));
+    let window = super::super::submit_ack::Window::default();
+    let task = tokio::spawn({
+        let bridge = bridge.clone();
+        let window = window.clone();
+        async move {
+            window.bounded(bridge.request_rpc_with_timeout(
+                Mt5RpcAction::SubmitOrder, Value::Null, Duration::from_millis(30),
+            ), Duration::from_millis(30), Duration::from_millis(80),
+                || true, std::future::pending()).await
+        }
+    });
+    bridge.rpc_queue_notify.notified().await;
+    let (mut batch, _) = bridge.drain_rpc_requests(1);
+    let id = batch.pop().unwrap().request_id;
+    assert!(tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().is_none());
+    assert!(window.waiting(), "delivered submit received the bounded grace");
+    assert!(!bridge.pending_rpc.lock().contains_key(&id));
+    assert!(bridge.drain_rpc_requests(1).0.is_empty());
+}
+
+#[tokio::test]
+async fn submit_ack_expires_before_handoff_and_cannot_be_delivered_later() {
+    let bridge = test_bridge("synthetic");
+    let window = super::super::submit_ack::Window::default();
+    let result = window.scope(bridge.request_rpc_with_timeout(
+        Mt5RpcAction::SubmitOrder, Value::Null, Duration::from_millis(10),
+    )).await;
+    assert!(result.is_err());
+    assert!(!window.handed_off());
+    assert!(bridge.drain_rpc_requests(1).0.is_empty());
+    assert!(bridge.pending_rpc.lock().is_empty());
+}
+
+#[tokio::test]
 async fn submission_lookup_is_read_only_and_requires_exact_receipt_identity() {
     use crate::core::broker::{
         commands::{BrokerOrderRequest, SubmissionResolution},

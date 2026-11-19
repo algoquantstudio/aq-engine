@@ -193,6 +193,55 @@ impl CommandExecutor for ReceiptProbe {
 }
 
 #[tokio::test]
+async fn submit_ack_holds_the_lane_and_preserves_stop_and_journal_semantics() {
+    struct Delivered {
+        calls: AtomicUsize,
+        handed_off: tokio::sync::Notify,
+        reply: tokio::sync::Notify,
+    }
+    impl CommandExecutor for Delivered {
+        async fn execute(&self, _: BrokerCommandAction) -> BrokerCommandOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Model the EA having already taken this one RPC off the queue.
+            let queue = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+            assert!(super::super::submit_ack::register("synthetic-rpc", &queue).is_some());
+            self.handed_off.notify_one();
+            self.reply.notified().await;
+            BrokerCommandOutcome::Declined { reason: "synthetic broker refusal".into() }
+        }
+    }
+    for stop in [false, true] {
+        let fixture = Fixture::new();
+        let executor = Arc::new(Delivered { calls: AtomicUsize::new(0),
+            handed_off: Default::default(), reply: Default::default() });
+        let mut worker = BrokerCommandWorker::start_executor(executor.clone(), fixture.journal().await,
+            BrokerCommandWorkerConfig { mutation_timeout: Duration::from_millis(30), ..Default::default() }).unwrap();
+        let first = entry("first");
+        worker.sender.try_enqueue(first.clone()).unwrap();
+        executor.handed_off.notified().await;
+        worker.sender.try_enqueue(entry("second")).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(90), worker.events.recv()).await.is_err());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1, "second mutation must not dispatch during grace");
+        if stop { worker.sender.request_execution_stop(); } else { executor.reply.notify_one(); }
+        let result = next(&mut worker).await;
+        assert_eq!(result.receipt.id, first.id);
+        if stop {
+            assert!(matches!(result.outcome, BrokerCommandOutcome::Ambiguous { .. }));
+            assert!(matches!(next(&mut worker).await.outcome, BrokerCommandOutcome::CancelledBeforeDispatch));
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(matches!(result.outcome, BrokerCommandOutcome::Declined { .. }));
+            executor.reply.notify_one();
+            assert!(matches!(next(&mut worker).await.outcome, BrokerCommandOutcome::Declined { .. }));
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        }
+        let journal = finish(worker).await;
+        let saved = journal.get(&first.id).await.unwrap().unwrap().completion.unwrap();
+        assert_eq!(matches!(saved.outcome, BrokerCommandOutcome::Ambiguous { .. }), stop);
+    }
+}
+
+#[tokio::test]
 async fn ambiguous_submit_is_confirmed_by_exact_receipt_before_delivery() {
     let fixture = Fixture::new();
     let executor = Arc::new(ReceiptProbe {

@@ -1405,30 +1405,36 @@ async fn run<E: CommandExecutor>(
                 }
                 future.as_mut().poll(cx).map(Ok)
             });
-            let operation = tokio::time::timeout(config.mutation_timeout, operation);
-            tokio::pin!(operation);
-            let attempt = loop {
-                tokio::select! {
-                    biased;
-                    _ = events.stop.notify.notified() => {
-                        // Failure is exposed to the owner, but must not abort a
-                        // mutation already sent to the broker. Preserve its
-                        // result/ambiguity before releasing transport ownership.
-                        let _ = events.stop.persist(&mut journal, &events.ready).await;
+            let attempt = {
+                let ack = matches!(execution_action, BrokerCommandAction::Submit { .. })
+                    .then(super::submit_ack::Window::default);
+                let operation = async {
+                    match &ack {
+                        Some(window) => window.bounded(operation, config.mutation_timeout,
+                            super::submit_ack::GRACE, || !gate.lock().stopped && !events.is_closed(),
+                            events.closed()).await,
+                        None => tokio::time::timeout(config.mutation_timeout, operation).await.ok(),
                     }
-                    result = &mut operation => break match result {
-                        Ok(outcome) => outcome,
-                        Err(_) => Ok(BrokerCommandOutcome::Ambiguous {
-                            reason: "broker mutation timed out; reconciliation is required".into(),
-                        }),
-                    },
-                    // Checkpoint/recovery I/O must not wait for a remote broker
-                    // response. No additional broker command is dispatched here.
-                    Some(request) = journal_requests.recv() => {
-                        handle_journal_request(&mut journal, request, &events.ready).await;
+                };
+                tokio::pin!(operation);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = events.stop.notify.notified() => {
+                            let _ = events.stop.persist(&mut journal, &events.ready).await;
+                            // Keep the ordinary settlement window on stop, but
+                            // don't block requested teardown on the extra grace.
+                            if ack.as_ref().is_some_and(|w| w.waiting()) { break None; }
+                        }
+                        result = &mut operation => break result,
+                        Some(request) = journal_requests.recv() => {
+                            handle_journal_request(&mut journal, request, &events.ready).await;
+                        }
                     }
                 }
-            };
+            }.unwrap_or_else(|| Ok(BrokerCommandOutcome::Ambiguous {
+                reason: "broker mutation timed out; reconciliation is required".into(),
+            }));
             match attempt {
                 Ok(outcome) => {
                     if !started && cancellation_attempt.is_none() {
