@@ -18,6 +18,12 @@ pub struct Mt5Broker {
 }
 
 impl Mt5Broker {
+    fn unfilled_terminal_history(&self, row: &OrderLifecycleSnapshot) -> bool {
+        row.position_id.is_none() && row.position_qty.is_none()
+            && row.symbol.as_ref().is_some_and(|symbol| !symbol.trim().is_empty())
+            && !self.bridge.order(&row.order_id).is_ok_and(|saved| saved.filled_qty > 0.0 ||
+                matches!(saved.status, TradeUpdateEvent::PartialFilled | TradeUpdateEvent::Filled | TradeUpdateEvent::Closed))
+    }
     async fn cancellation_status(&self, account: &str, order: &str)
         -> Result<Option<OrderLifecycleSnapshot>, BrokerError> {
         if account.trim().is_empty() || order.trim().is_empty()
@@ -309,6 +315,23 @@ impl super::fill_history::ExecutionFillHistoryReader for Mt5Broker {
 
 #[async_trait::async_trait]
 impl super::traits::OrderLifecycleReconciler for Mt5Broker {
+    async fn reconcile_for_account(&self, account: &str, order_ids: &[String])
+        -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+        let check = || {
+            if account.trim().is_empty() || self.bridge.account()?.account_id.trim() != account {
+                Err(BrokerError::AccountError("MT5 recovery account mismatch".into()))
+            } else { Ok(()) }
+        };
+        check()?;
+        let mut rows = self.reconcile(order_ids).await?;
+        check()?;
+        rows.retain(|row| match row.status {
+            super::types::OrderLifecycleStatus::Cancelled | super::types::OrderLifecycleStatus::Expired |
+            super::types::OrderLifecycleStatus::Rejected => self.unfilled_terminal_history(row),
+            _ => true,
+        });
+        Ok(rows)
+    }
     async fn reconcile(
         &self,
         order_ids: &[String],
@@ -498,6 +521,31 @@ impl OrderManagementProvider for Mt5Broker {
             return Err(BrokerError::TradeError(
                 "submission receipt identity mismatch".into(),
             ));
+        }
+        Ok(SubmissionResolution::Confirmed(order))
+    }
+
+    async fn recover_submission(&self, account_id: &str, request: &BrokerOrderRequest)
+        -> Result<SubmissionResolution, BrokerError> {
+        let receipt = self.reconcile_submission(account_id, request).await?;
+        let SubmissionResolution::Confirmed(mut order) = receipt else { return Ok(receipt) };
+        // The receipt proves which order was placed, not what eventually
+        // happened to it. Check that exact ticket, never a symbol/time match.
+        // If entry and exit happened offline, preserve the original entry
+        // receipt: the owner reduces close details independently via history.
+        if matches!(order.status, TradeUpdateEvent::Accepted | TradeUpdateEvent::Pending | TradeUpdateEvent::New)
+            && order.filled_qty == 0.0
+            && let Some(row) = self.cancellation_status(account_id, &order.order_id).await?
+            && row.symbol.as_deref() == Some(request.symbol.as_str())
+            && self.unfilled_terminal_history(&row)
+        {
+            use super::types::OrderLifecycleStatus as Status;
+            order.status = match row.status {
+                Status::Cancelled => TradeUpdateEvent::Cancelled,
+                Status::Expired => TradeUpdateEvent::Expired,
+                Status::Rejected => TradeUpdateEvent::Rejected,
+                _ => order.status,
+            };
         }
         Ok(SubmissionResolution::Confirmed(order))
     }

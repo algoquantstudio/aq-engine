@@ -741,6 +741,16 @@ impl StrategyCommandDriver {
         self.by_insight.contains_key(id)
     }
 
+    // Prioritize the actual owners blocking a recovered stop, not every
+    // historical insight in the graph. The caller still checks the ticket.
+    pub(super) fn recovery_history_owners(&self) -> Vec<(uuid::Uuid, Option<String>)> {
+        let mut ids: Vec<_> = self.pending.values().filter(|p| p.recovery_replay)
+            .map(|p| (p.owner_id, p.command.action.order_id().map(str::to_owned))).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     pub(crate) fn has_consumable_receipts(&self, insight: &crate::core::insight::Insight) -> bool {
         self.by_insight
             .get(&insight.insight_id)

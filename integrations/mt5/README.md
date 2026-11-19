@@ -154,6 +154,14 @@ Check the broker's orders, positions and trade history against the retained
 execution journal before relaunching; do not clear the journal or resubmit the
 order on the strength of a timeout.
 
+On the next startup, AQE prioritizes the previous run's unresolved tickets in
+its read-only MT5 order/deal history requests. A submit with no known ticket
+first needs its original account-scoped submission receipt; AQE does not
+guess from symbol, time, quantity or comment. An exact, unfilled terminal
+order can settle a lost submit or cancel, while a fill is not evidence that
+the position closed. A missing receipt, inconclusive history or outstanding
+exposure keeps the new run fenced until the old run is settled.
+
 AQE tracks three separate connection states so an active HTTP poll is not mistaken for a healthy trading connection:
 
 - **Transport:** an authorized EA heartbeat or RPC poll reached AQE recently.

@@ -5,6 +5,109 @@ mod lifecycle_reconciliation_regressions {
     };
 
     struct CancelHistory(Arc<Mutex<Vec<String>>>);
+
+    #[tokio::test]
+    async fn recovery_polls_retained_tickets_before_unrelated_insights_and_rejects_conflicting_rows() {
+        use crate::core::strategy::lifecycle_reconciliation::{LifecycleCheck, recovery_tickets, BATCH_SIZE};
+        use crate::core::broker::traits::OrderLifecycleReconciler;
+        struct History(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl OrderLifecycleReconciler for History {
+            async fn reconcile(&self, _: &[String]) -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+                panic!("startup reads must carry the original account")
+            }
+            async fn reconcile_for_account(&self, account: &str, ids: &[String]) -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+                assert_eq!(account, "original-account");
+                *self.0.lock().unwrap() = ids.to_vec();
+                Ok(vec![evidence(&ids[0], OrderLifecycleStatus::Closed), evidence(&ids[0], OrderLifecycleStatus::Cancelled)])
+            }
+        }
+        let mut state = fixture();
+        let mut owners = Vec::new();
+        for ticket in ["a", "b", "newly-bound-submit"] {
+            let owner = row(ticket,false);
+            owners.push((owner.insight_id, (ticket != "newly-bound-submit").then(|| ticket.to_string())));
+            owners.push((owner.insight_id, Some("wrong-target".into())));
+            state.insights.add_insight(owner);
+        }
+        for i in 0..BATCH_SIZE*3 { state.insights.add_insight(row(&format!("unrelated-{i}"), false)); }
+        let priority = recovery_tickets(&owners, &state.insights);
+        assert_eq!(priority, ["a", "b", "newly-bound-submit"]);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut check = LifecycleCheck::start(Arc::new(History(requests.clone())), "original-account".into(), &mut tasks);
+        check.request(&state.insights, &priority);
+        assert!(check.results.recv().await.unwrap().is_empty());
+        let ids = requests.lock().unwrap();
+        assert!(ids.starts_with(&priority) && ids.len() > 3 && ids.len() <= BATCH_SIZE);
+        assert_eq!(ids.len(), ids.iter().collect::<std::collections::HashSet<_>>().len());
+    }
+    #[tokio::test(flavor="multi_thread", worker_threads=2)]
+    async fn startup_recovers_one_lost_submit_and_two_terminal_cancels_without_replay() {
+        use crate::core::{broker::{command_journal::{BrokerCommandJournal, ExecutionCheckpointBatch, ExecutionIntent, JournalCommandState},
+            commands::{BrokerCommand, BrokerCommandAction, BrokerCommandCompletion, BrokerCommandOutcome}},
+            insight::{execution_checkpoint::InsightExecutionCheckpoint, operations::{PendingInsightMutation, MutationKind, MutationEffect}}};
+        let dir = std::env::temp_dir().join(format!("aqe-three-command-recovery-{}", uuid::Uuid::new_v4()));
+        let mut submit = Insight::default();
+        submit.symbol = "AAPL".into();
+        submit.set_quantity(Some(1.0));
+        let request = (&submit).into();
+        let mut broker = TestExecutionBroker::with_features(&[]);
+        // Simulates GET_SUBMISSION followed by terminal history for its exact ticket.
+        broker.recovery_submit_receipt = Some(test_request_order("entry", &request,
+            TradeUpdateEvent::Cancelled, submit.side.clone(), None));
+        broker.lifecycle_reader = Some(Arc::new(CancelHistory(Arc::new(Mutex::new(vec!["cancel-a".into(),"cancel-b".into()])))));
+        let mut state = StrategyState::new("ThreeCommandRecovery".into(),"1".into(),
+            LiveCommandLifecycleFixture {teardown_calls:Default::default(),cleanup:true},
+            UnifiedBroker::new(broker.clone(),FixedScaleOutDataFeed::new()),StrategyMode::Live,
+            TimeFrame::new(1,TimeFrameUnit::Minute)).with_artifact_root(&dir);
+        let key = state.live_metrics_strategy_key(None);
+        let path = state.live_execution_journal_path(&key,"test");
+        let mut journal = BrokerCommandJournal::open(&path,&key,"test").await.unwrap();
+        let mut commands = Vec::new();
+        for (mut row, action, kind, effect) in [
+            (submit, BrokerCommandAction::Submit {request}, MutationKind::Submit, MutationEffect::Submit),
+            (row("cancel-a",false), BrokerCommandAction::Cancel {order_id:"cancel-a".into()}, MutationKind::Cancel, MutationEffect::Cancel),
+            (row("cancel-b",false), BrokerCommandAction::Cancel {order_id:"cancel-b".into()}, MutationKind::Cancel, MutationEffect::Cancel),
+        ] {
+            let command = BrokerCommand::new(&key,"test",&row.insight_id.to_string(),action,None);
+            row.cancelling = matches!(kind,MutationKind::Cancel);
+            row.pending_mutations.push(PendingInsightMutation {kind, receipt:command.receipt(), effect});
+            journal.persist_execution_batch(&ExecutionCheckpointBatch::with_intents(
+                vec![InsightExecutionCheckpoint::capture(&row,1,true,None)],vec![],
+                vec![ExecutionIntent {command:command.clone(),admission_order:commands.len() as u64+1,queued_at_us:1}]).unwrap()).await.unwrap();
+            journal.mark_dispatched(&command.id,2).await.unwrap();
+            journal.complete(&BrokerCommandCompletion {receipt:command.receipt(),queued_at_us:1,dispatched_at_us:Some(2),
+                completed_at_us:3,outcome:BrokerCommandOutcome::Ambiguous {reason:"no response".into()}}).await.unwrap();
+            commands.push(command);
+        }
+        journal.request_execution_stop().await.unwrap();
+        drop(journal);
+        let stop=state.shutdown_tx.clone();
+        let telemetry=state.runtime_telemetry.snapshot_handle();
+        let watcher=async {
+            loop {
+                if telemetry.read().unwrap().events.iter().any(|e| e.message=="Live strategy started after recovery") {break}
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            stop.send_replace(true);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(18), async {
+            let (result,())=tokio::join!(state.run_live(None),watcher);
+            result.unwrap();
+        }).await.expect("only confirmed outcomes should open a fresh epoch");
+        assert_eq!(broker.recovery_receipt_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(broker.submit_requests.lock().unwrap().is_empty());
+        assert!(broker.cancel_requests.lock().unwrap().is_empty());
+        assert!(broker.close_requests.lock().unwrap().is_empty());
+        let journal=BrokerCommandJournal::open(&path,&key,"test").await.unwrap();
+        assert_eq!(journal.execution_lifecycle().epoch,2);
+        for command in commands {
+            assert_eq!(journal.get(&command.id).await.unwrap().unwrap().state, JournalCommandState::Applied);
+        }
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[tokio::test(flavor="multi_thread",worker_threads=2)]
     async fn stuck_cancel_startup_recovers_same_journal_then_opens_exactly_one_new_epoch() {
         use crate::core::{broker::{command_journal::{BrokerCommandJournal,ExecutionCheckpointBatch,ExecutionIntent,lifecycle::ExecutionPhase},

@@ -787,6 +787,10 @@ trait CommandExecutor: Send + Sync {
     ) -> impl Future<Output = Result<SubmissionResolution, super::types::BrokerError>> + Send {
         async { Ok(SubmissionResolution::Unsupported) }
     }
+    fn recover_submission(&self, account: &str, request: &BrokerOrderRequest)
+        -> impl Future<Output = Result<SubmissionResolution, super::types::BrokerError>> + Send {
+        self.reconcile_submission(account, request)
+    }
     fn pending_cancellation_recovery(&self, _account: &str, _order: &str)
         -> impl Future<Output = Result<Option<super::types::OrderLifecycleSnapshot>, super::types::BrokerError>> + Send {
         async { Ok(None) }
@@ -879,6 +883,10 @@ impl<E: OrderManagementProvider> CommandExecutor for E {
     ) -> Result<SubmissionResolution, super::types::BrokerError> {
         OrderManagementProvider::reconcile_submission(self, account_id, request).await
     }
+    async fn recover_submission(&self, account: &str, request: &BrokerOrderRequest)
+        -> Result<SubmissionResolution, super::types::BrokerError> {
+        OrderManagementProvider::recover_submission(self, account, request).await
+    }
 
     async fn pending_cancellation_recovery(&self, account: &str, order: &str)
         -> Result<Option<super::types::OrderLifecycleSnapshot>, super::types::BrokerError> {
@@ -909,6 +917,7 @@ async fn reconcile_ambiguous_submission<E: CommandExecutor>(
     journal: &mut BrokerCommandJournal,
     command: &BrokerCommand,
     completion: BrokerCommandCompletion,
+    stopping: bool,
 ) -> Result<BrokerCommandCompletion, BrokerCommandError> {
     if !matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. }) {
         return Ok(completion);
@@ -918,7 +927,10 @@ async fn reconcile_ambiguous_submission<E: CommandExecutor>(
     };
     match tokio::time::timeout(
         Duration::from_secs(2),
-        executor.reconcile_submission(&command.account_id, request),
+        async {
+            if stopping { executor.recover_submission(&command.account_id, request).await }
+            else { executor.reconcile_submission(&command.account_id, request).await }
+        },
     )
     .await
     {
@@ -1025,10 +1037,31 @@ async fn run<E: CommandExecutor>(
                 let BrokerCommandAction::Submit { request } = &item.command.action else {
                     continue;
                 };
-                let resolution = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    executor.reconcile_submission(&item.command.account_id, request),
-                ).await;
+                // A stopped epoch can wait through an EA polling interval or
+                // history round trip. Keep the live budget and service stop /
+                // checkpoint requests while the read-only lookup is pending.
+                let stopping = gate.lock().stopped;
+                let budget = if stopping { Duration::from_secs(10) } else { Duration::from_millis(500) };
+                let resolution = {
+                    let read = tokio::time::timeout(budget, async {
+                        if stopping { executor.recover_submission(&item.command.account_id, request).await }
+                        else { executor.reconcile_submission(&item.command.account_id, request).await }
+                    });
+                    tokio::pin!(read);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = events.closed() => break 'commands,
+                            _ = events.stop.notify.notified() => {
+                                events.stop.persist(&mut journal, &events.ready).await?;
+                            }
+                            result = &mut read => break result,
+                            Some(request) = journal_requests.recv() => {
+                                handle_journal_request(&mut journal, request, &events.ready).await;
+                            }
+                        }
+                    }
+                };
                 match resolution {
                     Ok(Ok(SubmissionResolution::Confirmed(order))) => {
                         let completion = journal
@@ -1099,11 +1132,13 @@ async fn run<E: CommandExecutor>(
         // recovery paths. The strategy reducer uses receipt.id for deduplication.
         let mut cancellation_proof = None;
         if let Some(completion) = record.completion.clone() {
+            let stopping = gate.lock().stopped;
             let completion = reconcile_ambiguous_submission(
                 executor.as_ref(),
                 &mut journal,
                 &command,
                 completion,
+                stopping,
             )
             .await?;
             if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. })
@@ -1497,7 +1532,7 @@ async fn run<E: CommandExecutor>(
             completion
         };
         let completion =
-            reconcile_ambiguous_submission(executor.as_ref(), &mut journal, &command, completion)
+            reconcile_ambiguous_submission(executor.as_ref(), &mut journal, &command, completion, false)
                 .await?;
         if matches!(completion.outcome, BrokerCommandOutcome::Ambiguous { .. })
             && cancellation_attempts.get(&command.id).copied().unwrap_or(0) < MAX_CANCEL_RECOVERY_ATTEMPTS {

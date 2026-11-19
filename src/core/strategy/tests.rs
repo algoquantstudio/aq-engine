@@ -2996,6 +2996,8 @@ mod tests {
         fail_submit: bool,
         fail_close: bool,
         recover_pending_cancel: bool,
+        recovery_submit_receipt: Option<crate::core::broker::types::Order>,
+        recovery_receipt_reads: Arc<std::sync::atomic::AtomicUsize>,
         features: &'static [BrokerFeature],
     }
 
@@ -3022,6 +3024,8 @@ mod tests {
                 fail_submit: false,
                 fail_close: false,
                 recover_pending_cancel: false,
+                recovery_submit_receipt: None,
+                recovery_receipt_reads: Default::default(),
                 features,
             }
         }
@@ -3183,6 +3187,21 @@ mod tests {
     }
 
     impl OrderManagementProvider for TestExecutionBroker {
+        async fn recover_submission(&self, account: &str, request: &crate::core::broker::BrokerOrderRequest)
+            -> Result<crate::core::broker::commands::SubmissionResolution, BrokerError> {
+            use crate::core::broker::commands::SubmissionResolution;
+            Ok(match &self.recovery_submit_receipt {
+                Some(order) if account == "test" && order.insight_id.as_ref() == Some(&request.insight_id) => {
+                    if self.recovery_receipt_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return Ok(SubmissionResolution::Unknown);
+                    }
+                    // Outside the ordinary 500ms live retry budget.
+                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                    SubmissionResolution::Confirmed(order.clone())
+                }
+                _ => SubmissionResolution::Unsupported,
+            })
+        }
         async fn pending_cancellation_recovery(&self,account:&str,order:&str)
             -> Result<Option<crate::core::broker::types::OrderLifecycleSnapshot>,BrokerError> {
             if !self.recover_pending_cancel {return Ok(None);}

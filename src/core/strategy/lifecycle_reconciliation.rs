@@ -8,25 +8,47 @@ use std::time::Duration;
 
 pub(super) const BATCH_SIZE: usize = 32;
 
+// Keep the original owners through recovery: a verified submit receipt may
+// be consumed before the next history poll binds its newly learned ticket.
+pub(super) fn recovery_tickets(owners: &[(Uuid, Option<String>)], insights: &InsightCollection) -> Vec<String> {
+    let mut tickets: Vec<_> = owners.iter().filter_map(|(owner, target)| {
+        let row = insights.get(owner)?;
+        let ticket = row.order_id.as_ref()?;
+        (!row.state.is_inactive() && !ticket.is_empty() &&
+            target.as_ref().is_none_or(|id| id == ticket)).then(|| ticket.clone())
+    }).collect();
+    tickets.sort_unstable();
+    tickets.dedup();
+    tickets
+}
+
 pub(super) struct LifecycleCheck {
     requests: tokio::sync::mpsc::Sender<Vec<String>>,
     pub results: tokio::sync::mpsc::Receiver<Vec<OrderLifecycleSnapshot>>,
     pub busy: bool,
     after: Option<Uuid>,
+    priority_cursor: usize,
 }
 
 impl LifecycleCheck {
     pub fn start(
         reconciler: Arc<dyn crate::core::broker::traits::OrderLifecycleReconciler>,
+        account_id: String,
         tasks: &mut tokio::task::JoinSet<()>,
     ) -> Self {
         let (requests, mut receive) = tokio::sync::mpsc::channel::<Vec<String>>(1);
         let (send, results) = tokio::sync::mpsc::channel(1);
         tasks.spawn(async move {
             while let Some(ids) = receive.recv().await {
-                let result = tokio::time::timeout(Duration::from_secs(10), reconciler.reconcile(&ids)).await;
+                let result = tokio::time::timeout(Duration::from_secs(10), reconciler.reconcile_for_account(&account_id, &ids)).await;
                 let snapshots = match result {
-                    Ok(Ok(rows)) => rows.into_iter().filter(|row| ids.contains(&row.order_id)).take(BATCH_SIZE).collect(),
+                    Ok(Ok(rows)) if rows.len() <= ids.len() => {
+                        let mut seen = std::collections::HashSet::new();
+                        if rows.iter().all(|row| ids.contains(&row.order_id) && seen.insert(row.order_id.as_str())) {
+                            rows
+                        } else { Vec::new() }
+                    }
+                    Ok(Ok(_)) => Vec::new(),
                     Ok(Err(error)) => {
                         log::warn!("Local broker lifecycle reconciliation unavailable: {error}");
                         Vec::new()
@@ -44,28 +66,34 @@ impl LifecycleCheck {
             results,
             busy: false,
             after: None,
+            priority_cursor: 0,
         }
     }
 
-    pub fn request(&mut self, insights: &InsightCollection) {
+    pub fn request(&mut self, insights: &InsightCollection, priority: &[String]) {
         if self.busy {
             return;
         }
-        let Some(upper) = insights.active_insight_upper_bound() else {
-            self.after = None;
-            return;
-        };
-        let mut page = insights.active_insight_page(self.after, upper, BATCH_SIZE);
-        if page.is_empty() && self.after.take().is_some() {
-            page = insights.active_insight_page(None, upper, BATCH_SIZE);
+        let mut orders = Vec::with_capacity(BATCH_SIZE);
+        for _ in 0..priority.len().min(BATCH_SIZE / 2) {
+            self.priority_cursor %= priority.len();
+            orders.push(priority[self.priority_cursor].clone());
+            self.priority_cursor += 1;
         }
-        self.after = page.last().copied();
-        let orders: Vec<_> = page
-            .into_iter()
-            .filter_map(|id| insights.get(&id))
-            .filter_map(|row| row.order_id.clone())
-            .filter(|id| !id.is_empty())
-            .collect();
+        if let Some(upper) = insights.active_insight_upper_bound() {
+            let limit = BATCH_SIZE - orders.len();
+            let mut page = insights.active_insight_page(self.after, upper, limit);
+            if page.is_empty() && self.after.take().is_some() {
+                page = insights.active_insight_page(None, upper, limit);
+            }
+            self.after = page.last().copied();
+            for id in page {
+                if let Some(ticket) = insights.get(&id).and_then(|row| row.order_id.as_ref())
+                    && !ticket.is_empty() && !orders.contains(ticket) {
+                    orders.push(ticket.clone());
+                }
+            }
+        } else { self.after = None; }
         if !orders.is_empty() {
             self.busy = self.requests.try_send(orders).is_ok();
         }

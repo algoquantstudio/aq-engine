@@ -208,6 +208,13 @@ where
                 InsightState::New | InsightState::Executed,
                 TradeUpdateEvent::Cancelled | TradeUpdateEvent::Expired,
             ) if entry_order => {
+                // History can prove an exactly correlated submit was cancelled
+                // before we ever observed its acceptance. Keep the ticket so
+                // the durable submit receipt can be consumed without replay.
+                if source == OrderEvidenceSource::SubmitResponse && entry_side && insight.order_id.is_none()
+                    && order.insight_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(insight.insight_id) {
+                    insight.order_id = Some(order.order_id.clone());
+                }
                 Self::sync_broker_managed_levels(insight, order);
                 insight.order_cancelled("Order cancelled");
                 Terminal

@@ -354,6 +354,11 @@ where
             .await
     }
 
+    async fn recover_submission(&self, account: &str, request: &BrokerOrderRequest)
+        -> Result<commands::SubmissionResolution, BrokerError> {
+        self.execution.recover_submission(account, request).await
+    }
+
     async fn pending_cancellation_recovery(&self, account: &str, order: &str)
         -> Result<Option<types::OrderLifecycleSnapshot>, BrokerError> {
         self.execution.pending_cancellation_recovery(account, order).await
@@ -1085,6 +1090,10 @@ pub mod traits {
             &self,
             order_ids: &[String],
         ) -> Result<Vec<OrderLifecycleSnapshot>, BrokerError>;
+        async fn reconcile_for_account(&self, _account: &str, order_ids: &[String])
+            -> Result<Vec<OrderLifecycleSnapshot>, BrokerError> {
+            self.reconcile(order_ids).await
+        }
     }
 
     #[allow(async_fn_in_trait)]
@@ -1142,6 +1151,12 @@ pub mod traits {
             Output = Result<super::commands::SubmissionResolution, BrokerError>,
         > + Send {
             async { Ok(super::commands::SubmissionResolution::Unsupported) }
+        }
+        /// Stopped-epoch lookup may also read subsequent history for the
+        /// broker ticket. Normal live acknowledgement latency is unaffected.
+        fn recover_submission(&self, account: &str, request: &BrokerOrderRequest)
+            -> impl std::future::Future<Output = Result<super::commands::SubmissionResolution, BrokerError>> + Send {
+            self.reconcile_submission(account, request)
         }
         /// Read-only, account/ticket-exact proof that a previously uncertain
         /// cancellation still targets a pending order. Absence is not proof.

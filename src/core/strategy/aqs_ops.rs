@@ -1061,8 +1061,10 @@ where
         let mut prefer_command_continuations = false;
         let mut live_pipeline_sweep = super::pipeline_sweep::LivePipelineSweep::default();
         let mut lifecycle_reads = tokio::task::JoinSet::new();
+        let recovery_owners = self.command_driver.as_ref().filter(|_| recovering_previous_stop)
+            .map(|driver| driver.recovery_history_owners()).unwrap_or_default();
         let mut lifecycle_check = self.broker.lifecycle_reconciler().map(|reader| {
-            super::lifecycle_reconciliation::LifecycleCheck::start(reader, &mut lifecycle_reads)
+            super::lifecycle_reconciliation::LifecycleCheck::start(reader, initial_account.account_id.clone(), &mut lifecycle_reads)
         });
         let mut lifecycle_tick = tokio::time::interval(Duration::from_secs(5));
         lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1928,7 +1930,12 @@ where
                     }
 
                 _ = lifecycle_tick.tick(), if lifecycle_check.is_some() => {
-                    if let Some(check) = lifecycle_check.as_mut() { check.request(&self.insights); }
+                    if let Some(check) = lifecycle_check.as_mut().filter(|check| !check.busy) {
+                        let tickets = if recovering_previous_stop {
+                            super::lifecycle_reconciliation::recovery_tickets(&recovery_owners, &self.insights)
+                        } else { Vec::new() };
+                        check.request(&self.insights, &tickets);
+                    }
                 }
 
                 rows = async {
@@ -2166,7 +2173,7 @@ where
                 }
                 _ = tokio::task::yield_now(), if self.has_pending_broker_events() => {}
                 _ = lifecycle_tick.tick(), if lifecycle_check.is_some() => {
-                    if let Some(check) = lifecycle_check.as_mut() { check.request(&self.insights); }
+                    if let Some(check) = lifecycle_check.as_mut() { check.request(&self.insights, &[]); }
                 }
                 rows = async {
                     match lifecycle_check.as_mut() {

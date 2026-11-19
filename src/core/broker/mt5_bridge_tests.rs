@@ -1103,12 +1103,12 @@ async fn submission_lookup_is_read_only_and_requires_exact_receipt_identity() {
     let mut request = BrokerOrderRequest::from(&crate::core::insight::Insight::default());
     request.symbol = "AAPL".into();
     request.side = OrderSide::Buy;
-    for case in 0..4 {
+    for case in 0..6 {
         let lookup_broker = broker.clone();
         let lookup_request = request.clone();
         let task = tokio::spawn(async move {
             lookup_broker
-                .reconcile_submission("123", &lookup_request)
+                .recover_submission("123", &lookup_request)
                 .await
         });
         let rpc = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1129,6 +1129,7 @@ async fn submission_lookup_is_read_only_and_requires_exact_receipt_identity() {
             &request.insight_id,
             TradeUpdateEvent::Accepted,
         );
+        order.filled_qty = 0.0;
         if case == 3 {
             order.asset.symbol = "OTHER".into();
         }
@@ -1140,12 +1141,23 @@ async fn submission_lookup_is_read_only_and_requires_exact_receipt_identity() {
         bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id: rpc.request_id, ok: true,
             message: None, payload: Some(serde_json::json!({ "fingerprint": fingerprint,
                 "order": if case == 0 { Value::Null } else { serde_json::to_value(order).unwrap() } })) });
+        if matches!(case, 1 | 4 | 5) {
+            let history = next_test_rpc(&bridge).await;
+            assert!(matches!(history.action, Mt5RpcAction::ReconcileOrders));
+            assert_eq!(history.payload["orderIds"], serde_json::json!(["broker-ticket"]));
+            let status = if case == 1 { "Pending" } else { "Cancelled" };
+            bridge.apply_rpc_response(Mt5RpcResponsePayload { request_id:history.request_id, ok:true, message:None,
+                payload:Some(serde_json::json!([{"orderId":"broker-ticket","symbol":"AAPL","status":status,
+                    "positionId": if case == 5 {Some("exposure")} else {None}}])) });
+        }
         let result = task.await.unwrap();
         match case {
             0 => assert!(matches!(result.unwrap(), SubmissionResolution::Unknown)),
-            1 => assert!(
-                matches!(result.unwrap(), SubmissionResolution::Confirmed(order) if order.order_id == "broker-ticket")
+            1 | 5 => assert!(
+                matches!(result.unwrap(), SubmissionResolution::Confirmed(order) if order.order_id == "broker-ticket" && order.status == TradeUpdateEvent::Accepted)
             ),
+            4 => assert!(matches!(result.unwrap(), SubmissionResolution::Confirmed(order)
+                if order.order_id == "broker-ticket" && order.status == TradeUpdateEvent::Cancelled)),
             _ => assert!(result.is_err()),
         }
     }
